@@ -51,6 +51,9 @@
 #ifndef LORA_TX_POWER
 #define LORA_TX_POWER 20
 #endif
+#ifndef DEFAULT_PATH_HASH_MODE
+#define DEFAULT_PATH_HASH_MODE 0
+#endif
 #ifndef MAX_LORA_TX_POWER
 #define MAX_LORA_TX_POWER LORA_TX_POWER
 #endif
@@ -159,6 +162,7 @@ protected:
   void onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) override;
   void onControlDataRecv(mesh::Packet *packet) override;
   void onRawDataRecv(mesh::Packet *packet) override;
+  void onOtaDataRecv(mesh::Packet *packet) override;
   void onTraceRecv(mesh::Packet *packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
                    const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) override;
 

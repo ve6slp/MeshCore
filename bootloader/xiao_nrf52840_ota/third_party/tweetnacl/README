@@ -1,0 +1,6 @@
+TweetNaCl 20140427
+Source: https://tweetnacl.cr.yp.to/20140427/
+
+TweetNaCl is in the public domain. This copy changes the internal u32 typedef
+from unsigned long to uint32_t so it remains 32-bit on both ARM and LP64 host
+test builds. No cryptographic logic is otherwise changed.

@@ -4,9 +4,34 @@
 #include <Mesh.h>
 #include <helpers/ota/OtaDirectLease.h>
 
+#define PUSH_CODE_OTA_EVENT             0x91 // hardware-lab OTA receive evidence
+
 #if MESHCORE_LORA_OTA
 __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
   return false;
+}
+
+void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
+#if MESHCORE_LORA_OTA
+  const auto before = getOtaStatus(_ms->getMillis());
+  Mesh::onOtaDataRecv(packet);
+  const auto after = getOtaStatus(_ms->getMillis());
+
+  if (_serial->isConnected()) {
+    int i = 0;
+    out_frame[i++] = PUSH_CODE_OTA_EVENT;
+    out_frame[i++] = packet->payload_len >= 4 ? packet->payload[3] : 0;
+    out_frame[i++] = packet->getRouteType();
+    out_frame[i++] = packet->getPathHashSize();
+    out_frame[i++] = after.rxFrames != before.rxFrames ? 1 : 0;
+    out_frame[i++] = after.badFrames != before.badFrames ? 1 : 0;
+    memcpy(&out_frame[i], &after.rxFrames, 4); i += 4;
+    memcpy(&out_frame[i], &after.badFrames, 4); i += 4;
+    _serial->writeFrame(out_frame, i);
+  }
+#else
+  Mesh::onOtaDataRecv(packet);
+#endif
 }
 #endif
 
@@ -70,6 +95,7 @@ __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFi
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
 #define CMD_OTA_CONTROL               66
+#define CMD_OTA_LAB                   67
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -113,6 +139,8 @@ __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFi
 #define OTA_CTRL_ABORT                3
 #define OTA_CTRL_ROLLBACK             4
 #define OTA_CTRL_DIRECT_LEASE         5
+
+#define OTA_LAB_QUEUE_PRECEDENCE       0
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -909,6 +937,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.gps_interval = 0;      // No automatic GPS updates by default
   _prefs.radio_fem_rxgain = 1;
   _prefs.radio_fem_txgain = 0;
+  _prefs.path_hash_mode = DEFAULT_PATH_HASH_MODE;
   //_prefs.rx_delay_base = 10.0f;  enable once new algo fixed
   _prefs.setRepeatEn(false);
 #if defined(USE_SX1262) || defined(USE_SX1268)
@@ -1060,7 +1089,6 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
 
 bool MyMesh::setFirmwareOtaMode(const char* mode) {
 #if MESHCORE_LORA_OTA
-  if (!getOtaIntegration().backendAvailable()) return false;
   mesh::ota::FirmwareOtaMode parsed;
   if (!mesh::ota::parseFirmwareOtaMode(mode, parsed)) return false;
   _prefs.ota_mode = static_cast<uint8_t>(parsed);
@@ -1075,7 +1103,6 @@ bool MyMesh::setFirmwareOtaMode(const char* mode) {
 
 const char* MyMesh::getFirmwareOtaMode() const {
 #if MESHCORE_LORA_OTA
-  if (!getOtaIntegration().backendAvailable()) return "unavailable";
   return mesh::ota::firmwareOtaModeName(static_cast<mesh::ota::FirmwareOtaMode>(_prefs.ota_mode));
 #else
   return "unsupported";
@@ -1134,19 +1161,21 @@ void MyMesh::rollbackFirmwareOta() {
 void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
 #if MESHCORE_LORA_OTA
   auto status = getOtaStatus(_ms->getMillis());
-  if (!status.backendAvailable) {
-    snprintf(reply, reply_size, "OTA backend unavailable");
-    return;
-  }
-  snprintf(reply, reply_size, "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu lease=%u rollback=%u",
+  snprintf(reply, reply_size,
+           "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu aborts=%lu recv=%u coord=%u fleet=%u lease=%u rollback=%u backend=%u",
            mesh::ota::firmwareOtaModeName(status.mode),
            status.dutyCyclePercent,
            (unsigned long)status.dutyUsedMs,
            (unsigned long)status.dutyBudgetMs,
            (unsigned long)status.rxFrames,
            (unsigned long)status.badFrames,
+           (unsigned long)status.abortedSessions,
+           (uint32_t)status.receiverState,
+           (uint32_t)status.coordinatorState,
+           (uint32_t)status.fleetState,
            (uint32_t)status.leaseState,
-           status.rollbackRequested ? 1 : 0);
+           status.rollbackRequested ? 1 : 0,
+           status.backendAvailable ? 1 : 0);
 #else
   snprintf(reply, reply_size, "OTA unsupported");
 #endif
@@ -2196,6 +2225,51 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     } else {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    }
+#else
+    writeDisabledFrame();
+#endif
+  } else if (cmd_frame[0] == CMD_OTA_LAB && len >= 2) {
+#if MESHCORE_LORA_OTA
+    if (cmd_frame[1] != OTA_LAB_QUEUE_PRECEDENCE) {
+      writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    } else {
+      using namespace meshcore::ota::protocol;
+      uint8_t announcement_payload[kOtaAnnouncementPayloadSize] = {};
+      size_t announcement_len = 0;
+      OtaAnnouncementPayload announcement;
+      announcement.campaignId = _ms->getMillis();
+      announcement.descriptorTotalLength = 0;
+      announcement.priority = 0;
+      announcement.expiresAtMs = _ms->getMillis() + 60000;
+
+      uint8_t envelope[kOtaMaxFrameSize] = {};
+      size_t envelope_len = 0;
+      OtaEnvelopeHeader header;
+      header.type = OtaMessageType::Announcement;
+      header.campaignId = announcement.campaignId;
+      header.sessionId = 1;
+      header.attemptId = 1;
+
+      mesh::Packet* ota_packet = nullptr;
+      mesh::Packet* advert_packet = nullptr;
+      if (encodeOtaAnnouncement(announcement, announcement_payload, sizeof(announcement_payload),
+                                announcement_len) &&
+          encodeOtaEnvelope(header, announcement_payload, announcement_len,
+                            envelope, sizeof(envelope), envelope_len) == OtaCodecResult::Ok) {
+        ota_packet = createOtaData(envelope, envelope_len);
+        advert_packet = createSelfAdvert(_prefs.node_name);
+      }
+
+      if (ota_packet == nullptr || advert_packet == nullptr) {
+        if (ota_packet != nullptr) releasePacket(ota_packet);
+        if (advert_packet != nullptr) releasePacket(advert_packet);
+        writeErrFrame(ERR_CODE_TABLE_FULL);
+      } else {
+        sendFlood(ota_packet, static_cast<uint32_t>(0), 3);
+        sendFlood(advert_packet, static_cast<uint32_t>(0), 3);
+        writeOKFrame();
+      }
     }
 #else
     writeDisabledFrame();

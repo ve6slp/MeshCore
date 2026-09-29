@@ -752,6 +752,33 @@ TEST(LoraOtaIntegration, FutureNormalTrafficDoesNotStarveReadyOtaFrame) {
   EXPECT_EQ(1, radio.sends) << "future normal traffic is not active normal traffic for OTA fairness";
 }
 
+TEST(LoraOtaIntegration, ReadyNormalTrafficBlocksOtaRelayEvenIfOtaWasSelectedFirst) {
+  FakeClock clock;
+  FakeRadio radio;
+  QueuePacketManager manager;
+  TestDispatcher dispatcher(radio, clock, manager);
+  dispatcher.begin();
+
+  Packet* ota = manager.allocNew();
+  ASSERT_NE(nullptr, ota);
+  fillOtaChunkPayload(ota);
+  dispatcher.sendPacket(ota, 0);
+
+  Packet* normal = manager.allocNew();
+  ASSERT_NE(nullptr, normal);
+  normal->header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT);
+  normal->path_len = 0;
+  normal->payload_len = 1;
+  normal->payload[0] = 0x42;
+  dispatcher.sendPacket(normal, 1);
+
+  clock.advance(1);
+  dispatcher.loop();
+  EXPECT_EQ(0, radio.sends);
+  EXPECT_EQ(2, manager.getOutboundTotal());
+  EXPECT_EQ(normal, manager.getNextOutbound(clock.getMillis()));
+}
+
 TEST(LoraOtaIntegration, OtaStatusReportsDispatcherAirtimeAccounting) {
   FakeClock clock;
   FakeRadio radio;

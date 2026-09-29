@@ -56,10 +56,39 @@ TEST(SenseCapQspiLayoutTest, RegionsAreValidOnRealSizedFakeDevice) {
   FlashRegion backup = SenseCapQspiLayout::backupRegion(flash);
   FlashRegion journal = SenseCapQspiLayout::journalRegion(flash);
   FlashRegion filesystem = SenseCapQspiLayout::filesystemRegion(flash);
+  FlashRegion candidate_test = SenseCapQspiLayout::candidateTestRegion(flash);
+  FlashRegion journal_test = SenseCapQspiLayout::journalTestRegion(flash);
   EXPECT_TRUE(candidate.isValid());
   EXPECT_TRUE(backup.isValid());
   EXPECT_TRUE(journal.isValid());
   EXPECT_TRUE(filesystem.isValid());
+  EXPECT_TRUE(candidate_test.isValid());
+  EXPECT_TRUE(journal_test.isValid());
+}
+
+TEST(SenseCapQspiLayoutTest, HardwareTestRegionsNeverOverlapLittleFs) {
+  EXPECT_GE(SenseCapQspiLayout::kCandidateTestOffset,
+            SenseCapQspiLayout::kCandidateOffset);
+  EXPECT_TRUE(SenseCapQspiLayout::fitsWithin(
+      SenseCapQspiLayout::kCandidateTestOffset,
+      SenseCapQspiLayout::kCandidateTestSize,
+      SenseCapQspiLayout::kCandidateOffset + SenseCapQspiLayout::kCandidateSize));
+  EXPECT_GE(SenseCapQspiLayout::kJournalTestOffset,
+            SenseCapQspiLayout::kJournalOffset);
+  EXPECT_TRUE(SenseCapQspiLayout::fitsWithin(
+      SenseCapQspiLayout::kJournalTestOffset,
+      SenseCapQspiLayout::kJournalTestSize,
+      SenseCapQspiLayout::kJournalOffset + SenseCapQspiLayout::kJournalSize));
+  EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
+      SenseCapQspiLayout::kCandidateTestOffset,
+      SenseCapQspiLayout::kCandidateTestSize,
+      SenseCapQspiLayout::kFilesystemOffset,
+      SenseCapQspiLayout::kFilesystemSize));
+  EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
+      SenseCapQspiLayout::kJournalTestOffset,
+      SenseCapQspiLayout::kJournalTestSize,
+      SenseCapQspiLayout::kFilesystemOffset,
+      SenseCapQspiLayout::kFilesystemSize));
 }
 
 TEST(SenseCapQspiLayoutTest, OverlapDetectionCatchesIntroducedOverlap) {

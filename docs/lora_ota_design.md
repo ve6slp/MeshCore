@@ -134,10 +134,55 @@ The first hardware focus should be:
 
 - Seeed Studio SenseCAP Solar / nRF52840 platform
 - Xiao ESP32-S3R8 + Wio SX1262 platform
+- Xiao nRF52840 + SX1262 platform (validated as a compatible lab target)
 
 These are the most practical targets for the first production-grade OTA pattern. They are already represented in the repo and match the real-world deployment model we need to support.
 
 Heltec v3/v4 support should come second as a future upgrade path after the protocol and bootloader model is proven on the initial hardware set.
+
+The XIAO nRF52840 + SX1262 lab boards use the same nRF52840 class, P25Q16H
+2 MiB QSPI device, and SX1262 radio family as the first target hardware. The
+companion-radio target builds with the OTA core enabled, and two boards
+exchanged adverts at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5 with three-byte
+path IDs. This validates the MCU/radio/QSPI application surface, not OTA
+installation: the stock Adafruit bootloader still cannot consume a QSPI-staged
+image.
+
+The reproducible two-node RF lab entry points are:
+
+```sh
+make build-xiao-nrf52-ota-lab
+make upload-xiao-nrf52-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>
+make configure-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/configure
+make monitor-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/monitor
+make test-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/test
+```
+
+These targets are pinned to the two allowlisted USB by-id paths and never
+select a device by a transient tty number. The hardware harness records every
+serial frame and assertion in `serial-events.jsonl` plus a machine-readable
+`summary.json`. It exercises bidirectional adverts and OTA envelopes, direct
+radio leases, routed/flood traffic, fleet census/resolution, malformed-frame
+and foreign-abort rejection, normal-traffic precedence, and the separate 2%
+rolling OTA airtime budget.
+
+`MESHCORE_OTA_LAB_BACKEND` is deliberately a qualification-only backend. It
+uses the reserved 16 KiB candidate-test QSPI region and a deterministic lab
+Ed25519 key so the harness can prove signed descriptor acceptance,
+interrupted/resumed chunk staging, readback hashing, and staging completion.
+It does not install or boot the candidate, does not make the lab key a
+production trust anchor, and does not change the custom-bootloader acceptance
+gate.
+
+The XIAO nRF52840 application-side QSPI backend is commissioned through
+`Nrf52FlashAdapter`: it owns nrfx QSPI directly, validates the P25Q16H JEDEC
+identity, enforces device bounds and 4 KiB erase alignment, preserves byte
+granularity through word-aligned EasyDMA bounce buffers, rejects NOR 0-to-1
+programming, and waits for asynchronous erase/read/write completion. The
+companion build intentionally no longer mounts `CustomLFS_QSPIFlash`, because
+that implementation exposes and may format the complete chip; companion data
+continues to use internal ExtraFS while the lab OTA backend owns only its
+reserved QSPI test partition.
 
 ## Implementation status for this repository
 
@@ -168,9 +213,9 @@ been removed; `src/ota/runtime/` supersedes them.
 Software tests cannot qualify device behaviour. The following remain open
 acceptance gates and are deliberately not claimed as done:
 
-- the nRF52840 platform adapter has no `nrfx_qspi` driver, and the stock
-  Adafruit bootloader cannot consume a QSPI-staged image, so a custom
-  QSPI-aware bootloader is still required
+- the stock Adafruit bootloader cannot consume a QSPI-staged image, so the
+  application-side nRF52840 adapter does not by itself qualify installation
+  or rollback
 - the ESP32 platform adapter has no `esp_flash`/partition glue
 - the monotonic anti-rollback counter is interface-only; no eFuse/UICR/NVS
   backend exists

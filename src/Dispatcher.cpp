@@ -358,7 +358,8 @@ void Dispatcher::checkSend() {
             outbound_ota_category = mesh::ota::otaAirtimeCategoryForMessage(static_cast<OtaMessageType>(raw_type));
           }
         }
-        if (!active_ota->canTransmit(_ms->getMillis(), outbound_ota_category, prospective_airtime, true, false)) {
+        if (!active_ota->canTransmit(_ms->getMillis(), outbound_ota_category, prospective_airtime,
+                                     true, hasQueuedNormalTraffic())) {
           Packet* held = outbound;
           outbound = NULL;
           outbound_is_ota = false;
@@ -429,6 +430,16 @@ bool Dispatcher::hasQueuedNormalTraffic() {
   for (int i = 0; i < total; ++i) {
     Packet* packet = _mgr->getOutboundByIdx(i);
     if (packet != nullptr && !mesh::ota::isOtaPacket(packet)) return true;
+  }
+  return false;
+}
+
+bool Dispatcher::hasQueuedOtaTraffic() {
+  if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;
+  const int total = _mgr->getOutboundTotal();
+  for (int i = 0; i < total; ++i) {
+    Packet* packet = _mgr->getOutboundByIdx(i);
+    if (packet != nullptr && mesh::ota::isOtaPacket(packet)) return true;
   }
   return false;
 }

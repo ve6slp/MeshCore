@@ -39,6 +39,14 @@ struct SenseCapQspiLayout {
   static constexpr uint32_t kFilesystemOffset = 0x194000u;
   static constexpr uint32_t kFilesystemSize   = 0x06C000u;      // 432 KiB
 
+  // Destructive hardware qualification is confined to these explicitly
+  // reserved subregions. They are inside OTA-owned partitions and never
+  // overlap the partitioned LittleFS range.
+  static constexpr uint32_t kCandidateTestOffset = 0x0C2000u;
+  static constexpr uint32_t kCandidateTestSize   = 0x004000u;    // 16 KiB
+  static constexpr uint32_t kJournalTestOffset   = 0x192000u;
+  static constexpr uint32_t kJournalTestSize     = 0x002000u;    // 8 KiB
+
   // Overflow-safe: returns true if [a_offset, a_offset+a_size) and
   // [b_offset, b_offset+b_size) intersect, without forming offset+size sums
   // that could wrap (all inputs here are static layout constants well below
@@ -107,6 +115,12 @@ struct SenseCapQspiLayout {
   }
   static FlashRegion filesystemRegion(FlashDevice& device) {
     return FlashRegion(device, kFilesystemOffset, kFilesystemSize);
+  }
+  static FlashRegion candidateTestRegion(FlashDevice& device) {
+    return FlashRegion(device, kCandidateTestOffset, kCandidateTestSize);
+  }
+  static FlashRegion journalTestRegion(FlashDevice& device) {
+    return FlashRegion(device, kJournalTestOffset, kJournalTestSize);
   }
 };
 

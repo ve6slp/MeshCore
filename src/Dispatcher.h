@@ -197,6 +197,7 @@ public:
   void sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis=0);
 #if MESHCORE_LORA_OTA
   bool hasQueuedNormalTraffic();
+  bool hasQueuedOtaTraffic();
   void attachOtaIntegration(mesh::ota::OtaFirmwareIntegration* integration) {
     active_ota = integration != nullptr ? integration : &dispatcher_ota;
   }
