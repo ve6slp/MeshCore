@@ -54,6 +54,14 @@ TEST(LoraOtaPolicy, RoutedPlansDemandAMeshPath) {
     EXPECT_EQ(8640000U, plan.airtime_budget_ms);
 }
 
+TEST(LoraOtaPolicy, QspiLayoutReservesNonOverlappingFirmwareBanks) {
+    EXPECT_TRUE(LoraOtaStorageLayout::isValid());
+    EXPECT_EQ(0U, LoraOtaStorageLayout::kCandidateOffset);
+    EXPECT_EQ(0x0C6000U, LoraOtaStorageLayout::kBackupOffset);
+    EXPECT_EQ(0x18C000U, LoraOtaStorageLayout::kJournalOffset);
+    EXPECT_EQ(0x194000U, LoraOtaStorageLayout::kLittleFsOffset);
+}
+
 TEST(LoraOtaSession, ManifestValidationRejectsInvalidPolicy) {
     LoraOtaManifest manifest = {};
     manifest.manifest_version = 1;
@@ -62,8 +70,29 @@ TEST(LoraOtaSession, ManifestValidationRejectsInvalidPolicy) {
     manifest.chunk_size_bytes = 128;
     manifest.chunk_count = 8;
     manifest.duty_cycle_percent = 255;
+    manifest.required_bootloader_version = 7;
+    manifest.security_counter = 42;
     manifest.mode = static_cast<uint8_t>(LoraOtaMode::Direct);
     manifest.update_window_ms = LoraOtaPolicy::kMsPerDay;
+    strcpy(manifest.variant, "SenseCap Solar");
+    strcpy(manifest.region, "US915");
+
+    LoraOtaSession session;
+    EXPECT_FALSE(session.validateManifest(manifest));
+}
+
+TEST(LoraOtaSession, ManifestRequiresBootloaderAndSecurityVersion) {
+    LoraOtaManifest manifest = {};
+    manifest.manifest_version = 1;
+    manifest.image_size_bytes = 2048;
+    manifest.image_crc32 = 0xABCDEF01U;
+    manifest.chunk_size_bytes = 256;
+    manifest.chunk_count = 8;
+    manifest.update_window_ms = LoraOtaPolicy::kMsPerDay;
+    manifest.duty_cycle_percent = 2;
+    manifest.required_bootloader_version = 0;
+    manifest.security_counter = 0;
+    manifest.mode = static_cast<uint8_t>(LoraOtaMode::Direct);
     strcpy(manifest.variant, "SenseCap Solar");
     strcpy(manifest.region, "US915");
 
@@ -81,6 +110,8 @@ TEST(LoraOtaSession, SessionTracksResumableChunkState) {
     manifest.chunk_size_bytes = 256;
     manifest.chunk_count = 8;
     manifest.update_window_ms = LoraOtaPolicy::kMsPerDay;
+    manifest.required_bootloader_version = 7;
+    manifest.security_counter = 42;
     manifest.duty_cycle_percent = 2;
     manifest.mode = static_cast<uint8_t>(LoraOtaMode::RoutedMesh);
     strcpy(manifest.variant, "SenseCap Solar");
@@ -118,6 +149,8 @@ TEST(LoraOtaSession, BackgroundBudgetStaysWithinConfiguredShare) {
     manifest.chunk_size_bytes = 256;
     manifest.chunk_count = 160;
     manifest.update_window_ms = LoraOtaPolicy::kMsPer72Hours;
+    manifest.required_bootloader_version = 7;
+    manifest.security_counter = 42;
     manifest.duty_cycle_percent = 2;
     manifest.mode = static_cast<uint8_t>(LoraOtaMode::Background);
     strcpy(manifest.variant, "XiaoS3 WioSX1262");

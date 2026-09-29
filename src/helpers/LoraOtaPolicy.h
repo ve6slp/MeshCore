@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <array>
+#include <cstring>
 
 namespace mesh {
 
@@ -42,12 +43,84 @@ struct LoraOtaManifest {
   uint32_t chunk_count;
   uint32_t update_window_ms;
   uint32_t required_bootloader_version;
+  uint32_t security_counter;
   uint8_t duty_cycle_percent;
   uint8_t mode;
   uint8_t board_family;
   uint8_t reserved;
   char variant[24];
   char region[16];
+};
+
+enum class LoraOtaInstallState : uint8_t {
+  Empty = 0,
+  CandidateReceiving = 1,
+  CandidateReady = 2,
+  BackupCopying = 3,
+  BackupReady = 4,
+  InstallCopying = 5,
+  TrialBoot = 6,
+  Confirmed = 7,
+  RollbackCopying = 8,
+  Failed = 9,
+};
+
+struct LoraOtaStorageLayout {
+  static constexpr uint32_t kQspiTotalBytes = 2u * 1024u * 1024u;
+  static constexpr uint32_t kQspiEraseBytes = 4096u;
+  static constexpr uint32_t kSensecapAppBytes = 792u * 1024u;
+  static constexpr uint32_t kCandidateOffset = 0x000000u;
+  static constexpr uint32_t kCandidateSize = kSensecapAppBytes;
+  static constexpr uint32_t kBackupOffset = 0x0C6000u;
+  static constexpr uint32_t kBackupSize = kSensecapAppBytes;
+  static constexpr uint32_t kJournalOffset = 0x18C000u;
+  static constexpr uint32_t kJournalSize = 32u * 1024u;
+  static constexpr uint32_t kLittleFsOffset = 0x194000u;
+  static constexpr uint32_t kLittleFsSize = 432u * 1024u;
+
+  static bool rangesOverlap(uint32_t a_offset, uint32_t a_size, uint32_t b_offset, uint32_t b_size) {
+    if (a_size == 0 || b_size == 0) {
+      return false;
+    }
+    const uint32_t a_end = a_offset + a_size;
+    const uint32_t b_end = b_offset + b_size;
+    return !(a_end <= b_offset || b_end <= a_offset);
+  }
+
+  static bool isAligned(uint32_t value, uint32_t alignment) {
+    return alignment != 0 && (value % alignment) == 0;
+  }
+
+  static bool isValid() {
+    if (kQspiTotalBytes != (2u * 1024u * 1024u)) {
+      return false;
+    }
+
+    if (!isAligned(kCandidateOffset, kQspiEraseBytes) || !isAligned(kCandidateSize, kQspiEraseBytes) ||
+        !isAligned(kBackupOffset, kQspiEraseBytes) || !isAligned(kBackupSize, kQspiEraseBytes) ||
+        !isAligned(kJournalOffset, kQspiEraseBytes) || !isAligned(kJournalSize, kQspiEraseBytes) ||
+        !isAligned(kLittleFsOffset, kQspiEraseBytes) || !isAligned(kLittleFsSize, kQspiEraseBytes)) {
+      return false;
+    }
+
+    if (kCandidateOffset + kCandidateSize > kQspiTotalBytes ||
+        kBackupOffset + kBackupSize > kQspiTotalBytes ||
+        kJournalOffset + kJournalSize > kQspiTotalBytes ||
+        kLittleFsOffset + kLittleFsSize > kQspiTotalBytes) {
+      return false;
+    }
+
+    if (rangesOverlap(kCandidateOffset, kCandidateSize, kBackupOffset, kBackupSize) ||
+        rangesOverlap(kCandidateOffset, kCandidateSize, kJournalOffset, kJournalSize) ||
+        rangesOverlap(kCandidateOffset, kCandidateSize, kLittleFsOffset, kLittleFsSize) ||
+        rangesOverlap(kBackupOffset, kBackupSize, kJournalOffset, kJournalSize) ||
+        rangesOverlap(kBackupOffset, kBackupSize, kLittleFsOffset, kLittleFsSize) ||
+        rangesOverlap(kJournalOffset, kJournalSize, kLittleFsOffset, kLittleFsSize)) {
+      return false;
+    }
+
+    return true;
+  }
 };
 
 class LoraOtaPolicy {
@@ -177,6 +250,15 @@ public:
     if (manifest.duty_cycle_percent == 0 || manifest.duty_cycle_percent > 100) {
       return false;
     }
+    if (manifest.required_bootloader_version == 0) {
+      return false;
+    }
+    if (manifest.security_counter == 0) {
+      return false;
+    }
+    if (!LoraOtaStorageLayout::isValid()) {
+      return false;
+    }
 
     const LoraOtaMode mode = static_cast<LoraOtaMode>(manifest.mode);
     if (mode != LoraOtaMode::Direct && mode != LoraOtaMode::RoutedMesh && mode != LoraOtaMode::Background) {
@@ -203,6 +285,8 @@ public:
     chunk_bitmap_.fill(0);
     bytes_received_ = 0;
     bytes_transmitted_ = 0;
+    airtime_used_ms_ = 0;
+    install_state_ = LoraOtaInstallState::CandidateReceiving;
     return true;
   }
 
@@ -221,6 +305,7 @@ public:
     duty_cycle_percent_ = manifest.duty_cycle_percent;
     chunk_bitmap_.fill(0);
     state_ = LoraOtaSessionState::Ready;
+    install_state_ = LoraOtaInstallState::CandidateReceiving;
     return true;
   }
 
@@ -262,6 +347,7 @@ public:
       return false;
     }
     state_ = LoraOtaSessionState::Complete;
+    install_state_ = LoraOtaInstallState::Confirmed;
     return true;
   }
 
@@ -300,6 +386,15 @@ public:
     return airtime_used_ms < budget_ms;
   }
 
+  void noteAirTimeUsage(uint32_t airtime_used_ms) {
+    if (airtime_used_ms > airtime_used_ms_) {
+      airtime_used_ms_ = airtime_used_ms;
+    }
+    if (state_ == LoraOtaSessionState::Downloading || state_ == LoraOtaSessionState::Validating) {
+      install_state_ = LoraOtaInstallState::CandidateReceiving;
+    }
+  }
+
   uint32_t budgetMs() const {
     return LoraOtaPolicy::computeAirtimeBudgetMs(update_window_ms_, duty_cycle_percent_);
   }
@@ -317,10 +412,13 @@ public:
   uint32_t getUpdateWindowMs() const { return update_window_ms_; }
   uint32_t getDutyCyclePercent() const { return duty_cycle_percent_; }
   LoraOtaSessionState getState() const { return state_; }
+  LoraOtaInstallState getInstallState() const { return install_state_; }
+  uint32_t getAirTimeUsedMs() const { return airtime_used_ms_; }
 
 private:
   LoraOtaManifest manifest_;
   LoraOtaSessionState state_;
+  LoraOtaInstallState install_state_;
   uint32_t update_window_ms_;
   uint32_t duty_cycle_percent_;
   uint32_t chunk_count_;
@@ -329,6 +427,7 @@ private:
   uint32_t chunk_size_bytes_;
   uint32_t image_crc32_;
   uint32_t image_size_bytes_;
+  uint32_t airtime_used_ms_;
   std::array<uint8_t, kMaxChunkBitmapBytes> chunk_bitmap_;
 };
 

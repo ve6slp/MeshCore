@@ -34,16 +34,29 @@ A node must receive a signed manifest before it starts accepting chunked data. T
 
 This prevents a node from accepting arbitrary packets as firmware.
 
-### 2. Dual-slot update with rollback
-Every target must have at least two firmware image slots:
+### 2. Recoverable update with rollback
+Every target must retain two complete firmware images:
 
 - active image
 - staged image
 
-The bootloader should validate the staged image before it becomes active. If validation fails, the previous image remains active. This is the same pattern used in robust embedded stacks and is essential for an OTA process that may be interrupted by radio loss or power outage.
+On ESP32-S3 these can be normal internal A/B application partitions. The
+SenseCAP Solar cannot fit two applications in internal flash, so it uses an
+external-QSPI candidate bank and rollback bank with a bootloader-controlled
+copy/restore transaction. The bootloader validates the candidate before
+altering the active image and retains the previous image until the new
+application confirms a successful trial boot.
+
+See [SenseCAP Solar nRF52840 QSPI staging design](lora_ota_nrf52840_qspi.md).
 
 ### 3. Duty-cycle-aware scheduling
-The on-mesh update modes must respect traffic fairness. A setting such as 2% airtime budget should be interpreted as: spend at most 2% of the update window transmitting OTA traffic. That means a 24-hour update cycle can support a maximum of about 28.8 minutes of OTA airtime; a 72-hour cycle allows about 86.4 minutes. This is a practical “background mode” that respects mesh traffic.
+The on-mesh update modes must respect traffic fairness. A setting such as 2%
+airtime means that OTA may consume at most 2% of each rolling scheduling
+interval after regulatory and normal-traffic reservations are applied. The
+long 24-72 hour campaign window controls completion expectations; it must not
+permit the accumulated allowance to be transmitted as one burst. Each radio
+sub-band also has an independent legal airtime or dwell-time ceiling that the
+OTA scheduler cannot override.
 
 ### 4. Multicast/census/resolution is the fleet mode
 This is the closest analog to LoRaWAN firmware update groups. It uses a phased pattern:
@@ -89,24 +102,31 @@ Phases:
 4. Transfer: each cohort receives data over a low-duty-cycle queue, with chunk retransmission only for missing blocks.
 5. Commit: after final validation, the device installs the image and reboots into the new firmware.
 
-The traffic budget is enforced as a strict upload-share fraction of the configured update window.
+The traffic budget is enforced at every transmitting node, including relays,
+as a strict OTA share inside the radio's stricter regulatory budget.
 
 ## Duty-cycle behaviour
 
-The policy model is deliberately simple and deterministic:
+The policy has two nested limits:
 
 - default background mode target is 2% airtime budget
 - routed mode can use 5-10% if a maintenance window is explicitly scheduled
 - direct mode may temporarily allow a higher rate, but should still be bounded by the current radio policy and local legal limits
+- a rolling per-sub-band regulatory limiter always takes precedence
+- unused OTA allowance expires instead of accumulating into a later burst
+- normal MeshCore traffic is served before background OTA traffic
 
-The implementation model for the repo encodes this as a policy object that computes:
+The current policy prototype computes:
 
 - `computeAirtimeBudgetMs(update_window_ms, duty_cycle_percent)`
 - `computeUploadWindowMs(...)`
 - `isBackgroundEligible(...)`
 - `buildPlan(...)`
 
-This is the anchor logic we can unit-test in native mode without hardware.
+This arithmetic is useful for planning but is not yet the production
+scheduler. The production implementation must debit measured packet airtime
+from both the regulatory bucket and a separate OTA bucket at every forwarding
+node.
 
 ## Target hardware focus
 
@@ -121,23 +141,28 @@ Heltec v3/v4 support should come second as a future upgrade path after the proto
 
 ## Implementation status for this repository
 
-This repository now includes a policy model and testable scheduling logic that captures the operational behavior described above:
+This repository currently includes only a policy/session model and native
+tests:
 
 - `src/helpers/LoraOtaPolicy.h`
 - `test/test_lora_ota_policy/test_lora_ota_policy.cpp`
 
-These are native-buildable and validate the airtime budgeting logic and the three-mode policy model.
-
-This is the software-verifiable portion of the implementation. Full hardware validation is not possible in this environment because the physical devices are not attached to this session. The policy and state machine are now in place and can be ported directly onto the target boards once they are available for bench validation.
+These validate planning arithmetic and in-memory chunk bookkeeping. They are
+not included by a firmware target and do not constitute an OTA transport,
+durable resume implementation, image verifier, or bootloader.
 
 ## Follow-up execution plan
 
-After approval, the next staged execution is:
+The implementation sequence is:
 
-1. add a dedicated OTA packet type and control-plane definitions to the mesh packet model
-2. implement a dual-slot bootloader contract for the primary target boards
-3. add a board-specific LoRa packet transport adapter for the upload path
-4. wire a background update scheduler that enforces duty-cycle quotas
-5. validate on target hardware with a known-good image and rollback test
+1. implement and bench-validate the target-specific staging and rollback
+   contract
+2. add the signed OTA envelope and durable receiver state
+3. implement one-hop direct transfer with a timed high-speed profile lease
+4. add routed transfer with relay-side OTA airtime accounting
+5. add multicast announcement, census, cohort resolution, and repair
+6. validate success, interrupted transfer, corrupt image, failed trial boot,
+   rollback, and traffic fairness on both target boards
 
-This is a outcome-driven plan rather than a task list, and it keeps the protocol, bootloader, and radio logic separate so that each can be verified independently.
+The gate for each stage is a measurable hardware outcome, not completion of a
+code task.
