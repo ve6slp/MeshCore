@@ -5,6 +5,11 @@
 #include <Packet.h>
 #include <Utils.h>
 #include <string.h>
+#include <helpers/ota/OtaMeshHooks.h>
+
+#if MESHCORE_LORA_OTA
+#include <helpers/ota/OtaFirmwareIntegration.h>
+#endif
 
 namespace mesh {
 
@@ -118,6 +123,12 @@ typedef uint32_t  DispatcherAction;
 class Dispatcher {
   Packet* outbound;  // current outbound packet
   unsigned long outbound_expiry, outbound_start, total_air_time, rx_air_time;
+#if MESHCORE_LORA_OTA
+  bool outbound_is_ota;
+  meshcore::ota::protocol::OtaAirtimeCategory outbound_ota_category;
+  mesh::ota::OtaFirmwareIntegration dispatcher_ota;
+  mesh::ota::OtaFirmwareIntegration* active_ota;
+#endif
   unsigned long next_tx_time;
   unsigned long cad_busy_start;
   unsigned long radio_nonrx_start;
@@ -142,6 +153,11 @@ protected:
     : _radio(&radio), _ms(&ms), _mgr(&mgr)
   {
     outbound = NULL;
+#if MESHCORE_LORA_OTA
+    outbound_is_ota = false;
+    outbound_ota_category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
+    active_ota = &dispatcher_ota;
+#endif
     total_air_time = rx_air_time = 0;
     next_tx_time = ms.getMillis();
     cad_busy_start = 0;
@@ -179,10 +195,28 @@ public:
   Packet* obtainNewPacket();
   void releasePacket(Packet* packet);
   void sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis=0);
+#if MESHCORE_LORA_OTA
+  bool hasQueuedNormalTraffic();
+  void attachOtaIntegration(mesh::ota::OtaFirmwareIntegration* integration) {
+    active_ota = integration != nullptr ? integration : &dispatcher_ota;
+  }
+  mesh::ota::OtaFirmwareIntegration& getDispatcherOtaIntegration() { return *active_ota; }
+  const mesh::ota::OtaFirmwareIntegration& getDispatcherOtaIntegration() const { return *active_ota; }
+#endif
 
   unsigned long getTotalAirTime() const { return total_air_time; }
   unsigned long getReceiveAirTime() const {return rx_air_time; }
   unsigned long getRemainingTxBudget() const { return tx_budget_ms; }
+#if MESHCORE_LORA_OTA
+  bool setOtaAirtimeDutyCyclePercent(float percent) { return active_ota->setDutyCyclePercent(percent); }
+  float getOtaAirtimeDutyCyclePercent() const { return active_ota->dutyCyclePercent(); }
+  unsigned long getRemainingOtaAirtimeBudget(unsigned long now_ms) const {
+    uint32_t used = active_ota->airtimeLimiter().storedUsageMs(now_ms);
+    uint32_t budget = active_ota->dutyBudgetMs();
+    return used >= budget ? 0 : budget - used;
+  }
+  mesh::ota::FirmwareOtaStatus getOtaStatus(unsigned long now_ms) const { return active_ota->status(now_ms); }
+#endif
   uint32_t getNumSentFlood() const { return n_sent_flood; }
   uint32_t getNumSentDirect() const { return n_sent_direct; }
   uint32_t getNumRecvFlood() const { return n_recv_flood; }

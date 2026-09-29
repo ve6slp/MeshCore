@@ -101,6 +101,18 @@ public:
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
+  void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins);
+  bool setFirmwareOtaMode(const char* mode);
+  const char* getFirmwareOtaMode() const;
+  bool setFirmwareOtaDutyCycle(float percent);
+  float getFirmwareOtaDutyCycle() const;
+  void abortFirmwareOta();
+  void rollbackFirmwareOta();
+  void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+#if MESHCORE_LORA_OTA
+  bool attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
+                                meshcore::ota::runtime::IOtaStagingSink& staging_sink);
+#endif
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -203,6 +215,7 @@ private:
   void checkCLIRescueCmd();
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
+  void checkTempRadioLease();
 
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
@@ -229,6 +242,12 @@ private:
   uint8_t *sign_data;
   uint32_t sign_data_len;
   unsigned long dirty_contacts_expiry;
+  unsigned long set_radio_at;
+  unsigned long revert_radio_at;
+  float pending_freq;
+  float pending_bw;
+  uint8_t pending_sf;
+  uint8_t pending_cr;
 
   TransportKey send_scope;
 

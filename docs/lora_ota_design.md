@@ -141,15 +141,41 @@ Heltec v3/v4 support should come second as a future upgrade path after the proto
 
 ## Implementation status for this repository
 
-This repository currently includes only a policy/session model and native
-tests:
+The portable OTA core lives under `src/ota/` and is header-only:
 
-- `src/helpers/LoraOtaPolicy.h`
-- `test/test_lora_ota_policy/test_lora_ota_policy.cpp`
+- `src/ota/protocol/` — wire types, byte stream codec, envelope, canonical
+  descriptor, message set
+- `src/ota/runtime/` — chunk geometry, receipt bitmap, session identity,
+  receiver/coordinator/fleet state machines, radio-profile lease, airtime
+  limiter
+- `src/ota/storage/` — CRC32, redundant journal, receipt map, storage manager
+  over the SenseCAP QSPI layout
+- `src/ota/trust/` — SHA-256 and Ed25519 (vendored orlp/ed25519, zlib) with a
+  fail-closed descriptor verification pipeline
+- `src/ota/boot/` — `BootTransaction`, which gates erase of the running image
+  behind candidate authentication and a verified durable backup
+- `src/ota/platform/` — flash device/region abstraction and the SenseCAP QSPI
+  layout
 
-These validate planning arithmetic and in-memory chunk bookkeeping. They are
-not included by a firmware target and do not constitute an OTA transport,
-durable resume implementation, image verifier, or bootloader.
+Corresponding native tests live in `test/test_lora_ota_{protocol,runtime,storage,trust,boot}/`
+and run via `make test`.
+
+The earlier `src/helpers/LoraOtaPolicy.h` planning prototype and its tests have
+been removed; `src/ota/runtime/` supersedes them.
+
+### What this does not yet prove
+
+Software tests cannot qualify device behaviour. The following remain open
+acceptance gates and are deliberately not claimed as done:
+
+- the nRF52840 platform adapter has no `nrfx_qspi` driver, and the stock
+  Adafruit bootloader cannot consume a QSPI-staged image, so a custom
+  QSPI-aware bootloader is still required
+- the ESP32 platform adapter has no `esp_flash`/partition glue
+- the monotonic anti-rollback counter is interface-only; no eFuse/UICR/NVS
+  backend exists
+- real radio behaviour, real flash timing, and power-loss rollback are
+  untested outside simulation
 
 ## Follow-up execution plan
 

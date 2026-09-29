@@ -2,6 +2,10 @@
 
 #include <Dispatcher.h>
 
+#if MESHCORE_LORA_OTA
+#include <helpers/ota/OtaFirmwareIntegration.h>
+#endif
+
 namespace mesh {
 
 class GroupChannel {
@@ -146,6 +150,11 @@ protected:
   virtual void onRawDataRecv(Packet* packet) { }
 
   /**
+   * \brief  A packet with PAYLOAD_TYPE_LORA_OTA has been received.
+  */
+  virtual void onOtaDataRecv(Packet* packet);
+
+  /**
    * \brief  Perform search of local DB of matching GroupChannels.
    * \param  channels  OUT - store matching channels in this array, up to max_matches
    * \returns  Number of channels with matching hash
@@ -169,6 +178,9 @@ protected:
   Mesh(Radio& radio, MillisecondClock& ms, RNG& rng, RTCClock& rtc, PacketManager& mgr, MeshTables& tables)
     : Dispatcher(radio, ms, mgr), _rng(&rng), _rtc(&rtc), _tables(&tables)
   {
+#if MESHCORE_LORA_OTA
+    attachOtaIntegration(&_ota);
+#endif
   }
 
   MeshTables* getTables() const { return _tables; }
@@ -193,8 +205,14 @@ public:
   Packet* createPathReturn(const uint8_t* dest_hash, const uint8_t* secret, const uint8_t* path, uint8_t path_len, uint8_t extra_type, const uint8_t*extra, size_t extra_len);
   Packet* createPathReturn(const Identity& dest, const uint8_t* secret, const uint8_t* path, uint8_t path_len, uint8_t extra_type, const uint8_t*extra, size_t extra_len);
   Packet* createRawData(const uint8_t* data, size_t len);
+  Packet* createOtaData(const uint8_t* data, size_t len);
   Packet* createTrace(uint32_t tag, uint32_t auth_code, uint8_t flags = 0);
   Packet* createControlData(const uint8_t* data, size_t len);
+
+#if MESHCORE_LORA_OTA
+  mesh::ota::OtaFirmwareIntegration& getOtaIntegration() { return _ota; }
+  const mesh::ota::OtaFirmwareIntegration& getOtaIntegration() const { return _ota; }
+#endif
 
   /**
    * \brief  send a locally-generated Packet with flood routing
@@ -223,6 +241,10 @@ public:
   */
   void sendZeroHop(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis=0);
 
+#if MESHCORE_LORA_OTA
+private:
+  mesh::ota::OtaFirmwareIntegration _ota;
+#endif
 };
 
 }

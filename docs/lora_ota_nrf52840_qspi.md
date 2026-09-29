@@ -152,12 +152,19 @@ recognizes only the three OTA partitions and never mounts LittleFS.
 
 The bootloader is the root of trust.
 
-- signature algorithm: ECDSA P-256, matching the signed-firmware facility
-  already supported by the Adafruit bootloader toolchain
+- signature algorithm: Ed25519, as implemented in `src/ota/trust/`
+  (vendored orlp/ed25519). The earlier draft specified ECDSA P-256; Ed25519
+  was chosen instead for its smaller, constant-size signatures and simpler
+  constant-time implementation on these MCUs. A QSPI-aware bootloader must
+  therefore verify Ed25519, not the stock signed-firmware facility's curve.
 - verification key: compiled into the bootloader configuration
-- signed fields: image bytes, image length, board family, variant, application
-  start address, firmware security counter, minimum bootloader version, and
-  manifest format version
+- signed fields: image bytes, image length, image SHA-256 hash, board family,
+  target/variant, role, application start address, manifest format id, key id,
+  signature algorithm id, firmware security counter, and the minimum
+  bootloader capability bitmask. This list is the canonical signed descriptor
+  serialised by `src/ota/trust/CanonicalDescriptor.h`; every install-relevant
+  wire field in `src/ota/protocol/OtaDescriptor.h` is covered by the
+  signature.
 - integrity: SHA-256 over the exact candidate image
 - anti-rollback: bootloader refuses a security counter lower than the highest
   confirmed counter

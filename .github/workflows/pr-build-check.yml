@@ -46,6 +46,9 @@ jobs:
           - wio_wm1110_repeater
           # SX1276 (ESP32)
           - Tbeam_SX1276_repeater
+          # LoRa OTA enabled targets
+          - SenseCap_Solar_companion_radio_usb
+          - Xiao_S3_WIO_companion_radio_usb
 
     steps:
       - name: Clone Repo

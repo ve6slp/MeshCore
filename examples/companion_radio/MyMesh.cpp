@@ -2,6 +2,13 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
+#include <helpers/ota/OtaDirectLease.h>
+
+#if MESHCORE_LORA_OTA
+__attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
+  return false;
+}
+#endif
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -62,6 +69,7 @@
 #define CMD_SET_DEFAULT_FLOOD_SCOPE   63
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
+#define CMD_OTA_CONTROL               66
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -97,6 +105,14 @@
 #define RESP_ALLOWED_REPEAT_FREQ      26
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+#define RESP_CODE_OTA_STATUS          29
+
+#define OTA_CTRL_GET_STATUS           0
+#define OTA_CTRL_SET_MODE             1
+#define OTA_CTRL_SET_DUTY             2
+#define OTA_CTRL_ABORT                3
+#define OTA_CTRL_ROLLBACK             4
+#define OTA_CTRL_DIRECT_LEASE         5
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -871,6 +887,12 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   next_ack_idx = 0;
   sign_data = NULL;
   dirty_contacts_expiry = 0;
+  set_radio_at = 0;
+  revert_radio_at = 0;
+  pending_freq = 0.0f;
+  pending_bw = 0.0f;
+  pending_sf = 0;
+  pending_cr = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
@@ -947,6 +969,14 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
+  _prefs.ota_mode = constrain(_prefs.ota_mode, 0, 2);
+  _prefs.ota_duty_percent = constrain(_prefs.ota_duty_percent <= 0.0f ? 2.0f : _prefs.ota_duty_percent, 0.1f, 100.0f);
+#if MESHCORE_LORA_OTA
+  getOtaIntegration().setMode(static_cast<mesh::ota::FirmwareOtaMode>(_prefs.ota_mode));
+  getOtaIntegration().setDutyCyclePercent(_prefs.ota_duty_percent);
+  setOtaAirtimeDutyCyclePercent(_prefs.ota_duty_percent);
+  configureCompanionFirmwareOtaBackend(getOtaIntegration());
+#endif
 
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
@@ -1017,6 +1047,109 @@ bool MyMesh::isValidClientRepeatFreq(uint32_t f) const {
 void MyMesh::startInterface(BaseSerialInterface &serial) {
   _serial = &serial;
   serial.enable();
+}
+
+void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) {
+  set_radio_at = futureMillis(2000);
+  pending_freq = freq;
+  pending_bw = bw;
+  pending_sf = sf;
+  pending_cr = cr;
+  revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000);
+}
+
+bool MyMesh::setFirmwareOtaMode(const char* mode) {
+#if MESHCORE_LORA_OTA
+  if (!getOtaIntegration().backendAvailable()) return false;
+  mesh::ota::FirmwareOtaMode parsed;
+  if (!mesh::ota::parseFirmwareOtaMode(mode, parsed)) return false;
+  _prefs.ota_mode = static_cast<uint8_t>(parsed);
+  getOtaIntegration().setMode(parsed);
+  savePrefs();
+  return true;
+#else
+  (void)mode;
+  return false;
+#endif
+}
+
+const char* MyMesh::getFirmwareOtaMode() const {
+#if MESHCORE_LORA_OTA
+  if (!getOtaIntegration().backendAvailable()) return "unavailable";
+  return mesh::ota::firmwareOtaModeName(static_cast<mesh::ota::FirmwareOtaMode>(_prefs.ota_mode));
+#else
+  return "unsupported";
+#endif
+}
+
+bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
+#if MESHCORE_LORA_OTA
+  if (percent <= 0.0f || percent > 100.0f) return false;
+  if (!getOtaIntegration().setDutyCyclePercent(percent)) return false;
+  if (!setOtaAirtimeDutyCyclePercent(percent)) return false;
+  _prefs.ota_duty_percent = percent;
+  savePrefs();
+  return true;
+#else
+  (void)percent;
+  return false;
+#endif
+}
+
+float MyMesh::getFirmwareOtaDutyCycle() const {
+#if MESHCORE_LORA_OTA
+  return _prefs.ota_duty_percent;
+#else
+  return 0.0f;
+#endif
+}
+
+#if MESHCORE_LORA_OTA
+bool MyMesh::attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
+                                      meshcore::ota::runtime::IOtaStagingSink& staging_sink) {
+  getOtaIntegration().attachTrustProvider(&trust_provider);
+  getOtaIntegration().attachStagingSink(&staging_sink);
+  return true;
+}
+#endif
+
+void MyMesh::abortFirmwareOta() {
+#if MESHCORE_LORA_OTA
+  getOtaIntegration().abortSession();
+#endif
+  if (revert_radio_at || set_radio_at) {
+    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    set_radio_at = 0;
+    revert_radio_at = 0;
+  }
+}
+
+void MyMesh::rollbackFirmwareOta() {
+#if MESHCORE_LORA_OTA
+  getOtaIntegration().requestRollback();
+#endif
+  abortFirmwareOta();
+}
+
+void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
+#if MESHCORE_LORA_OTA
+  auto status = getOtaStatus(_ms->getMillis());
+  if (!status.backendAvailable) {
+    snprintf(reply, reply_size, "OTA backend unavailable");
+    return;
+  }
+  snprintf(reply, reply_size, "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu lease=%u rollback=%u",
+           mesh::ota::firmwareOtaModeName(status.mode),
+           status.dutyCyclePercent,
+           (unsigned long)status.dutyUsedMs,
+           (unsigned long)status.dutyBudgetMs,
+           (unsigned long)status.rxFrames,
+           (unsigned long)status.badFrames,
+           (uint32_t)status.leaseState,
+           status.rollbackRequested ? 1 : 0);
+#else
+  snprintf(reply, reply_size, "OTA unsupported");
+#endif
 }
 
 void MyMesh::handleCmdFrame(size_t len) {
@@ -2007,6 +2140,66 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+  } else if (cmd_frame[0] == CMD_OTA_CONTROL && len >= 2) {
+#if MESHCORE_LORA_OTA
+    uint8_t op = cmd_frame[1];
+    if (op == OTA_CTRL_GET_STATUS) {
+      int i = 0;
+      out_frame[i++] = RESP_CODE_OTA_STATUS;
+      formatFirmwareOtaStatus((char*)&out_frame[i], sizeof(out_frame) - i);
+      i += strlen((char*)&out_frame[i]);
+      _serial->writeFrame(out_frame, i);
+    } else if (op == OTA_CTRL_SET_MODE && len >= 3) {
+      const char* mode = cmd_frame[2] == 0 ? "direct" : (cmd_frame[2] == 1 ? "routed" : (cmd_frame[2] == 2 ? "fleet" : ""));
+      if (setFirmwareOtaMode(mode)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    } else if (op == OTA_CTRL_SET_DUTY && len >= 6) {
+      uint32_t milli_percent;
+      memcpy(&milli_percent, &cmd_frame[2], 4);
+      if (setFirmwareOtaDutyCycle(((float)milli_percent) / 1000.0f)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    } else if (op == OTA_CTRL_ABORT) {
+      abortFirmwareOta();
+      writeOKFrame();
+    } else if (op == OTA_CTRL_ROLLBACK) {
+      rollbackFirmwareOta();
+      writeOKFrame();
+    } else if (op == OTA_CTRL_DIRECT_LEASE && len >= 16) {
+      int i = 2;
+      uint32_t freq;
+      uint32_t bw;
+      memcpy(&freq, &cmd_frame[i], 4); i += 4;
+      memcpy(&bw, &cmd_frame[i], 4); i += 4;
+      uint8_t sf = cmd_frame[i++];
+      uint8_t cr = cmd_frame[i++];
+      uint16_t timeout_mins;
+      memcpy(&timeout_mins, &cmd_frame[i], 2);
+      mesh::ota::OtaDirectLeaseParams lease{((float)freq) / 1000.0f, ((float)bw) / 1000.0f, sf, cr, timeout_mins};
+      if (mesh::ota::isValidOtaDirectLease(lease)) {
+        class BinaryLeaseHandler : public mesh::ota::OtaDirectLeaseHandler {
+        public:
+          explicit BinaryLeaseHandler(MyMesh* mesh) : mesh_(mesh) {}
+          bool setOtaDirectMode() override { return mesh_->setFirmwareOtaMode("direct"); }
+          void applyOtaDirectLease(const mesh::ota::OtaDirectLeaseParams& params) override {
+            mesh_->applyTempRadioParams(params.freqMhz, params.bandwidthKhz,
+                                        params.spreadingFactor, params.codingRate,
+                                        params.timeoutMinutes);
+          }
+        private:
+          MyMesh* mesh_;
+        } handler(this);
+        if (mesh::ota::requestOtaDirectLease(handler, lease)) {
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      } else {
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      }
+    } else {
+      writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    }
+#else
+    writeDisabledFrame();
+#endif
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
@@ -2228,6 +2421,7 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+  checkTempRadioLease();
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
@@ -2244,6 +2438,17 @@ void MyMesh::loop() {
 #ifdef DISPLAY_CLASS
   if (_ui) _ui->setHasConnection(_serial->isConnected());
 #endif
+}
+
+void MyMesh::checkTempRadioLease() {
+  if (set_radio_at && millisHasNowPassed(set_radio_at)) {
+    radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
+    set_radio_at = 0;
+  }
+  if (revert_radio_at && millisHasNowPassed(revert_radio_at)) {
+    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    revert_radio_at = 0;
+  }
 }
 
 bool MyMesh::advert() {

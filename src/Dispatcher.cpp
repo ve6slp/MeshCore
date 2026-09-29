@@ -97,6 +97,15 @@ void Dispatcher::loop() {
         tx_budget_ms -= t;
       }
 
+#if MESHCORE_LORA_OTA
+      if (outbound_is_ota) {
+        if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
+          MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: OTA airtime accounting ring full", getLogDateTime());
+        }
+        outbound_is_ota = false;
+      }
+#endif
+
       if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
         float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
         unsigned long needed = MIN_TX_BUDGET_RESERVE_MS - tx_budget_ms;
@@ -324,7 +333,43 @@ void Dispatcher::checkSend() {
     } else {
       memcpy(&raw[len], outbound->payload, outbound->payload_len); len += outbound->payload_len;
 
-      uint32_t max_airtime = _radio->getEstAirtimeFor(len)*3/2;
+      uint32_t prospective_airtime = _radio->getEstAirtimeFor(len);
+      updateTxBudget();
+      if (tx_budget_ms < prospective_airtime) {
+        float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+        unsigned long needed = prospective_airtime - tx_budget_ms;
+        unsigned long delay = duty_cycle > 0.0f ? (unsigned long)(needed / duty_cycle) : getDutyCycleWindowMs();
+        Packet* held = outbound;
+        outbound = NULL;
+        sendPacket(held, held->getPayloadType() == PAYLOAD_TYPE_LORA_OTA ? mesh::ota::kOtaForwardPriority : 1, delay);
+        next_tx_time = futureMillis(delay);
+        return;
+      }
+
+#if MESHCORE_LORA_OTA
+      outbound_is_ota = mesh::ota::isOtaPacket(outbound);
+      if (outbound_is_ota) {
+        using meshcore::ota::protocol::OtaMessageType;
+        using meshcore::ota::protocol::OtaAirtimeCategory;
+        outbound_ota_category = OtaAirtimeCategory::Control;
+        if (outbound->payload_len >= 4 && outbound->payload[0] == 0x4F && outbound->payload[1] == 0x54) {
+          uint8_t raw_type = outbound->payload[3];
+          if (meshcore::ota::protocol::isKnownOtaMessageType(raw_type)) {
+            outbound_ota_category = mesh::ota::otaAirtimeCategoryForMessage(static_cast<OtaMessageType>(raw_type));
+          }
+        }
+        if (!active_ota->canTransmit(_ms->getMillis(), outbound_ota_category, prospective_airtime, true, false)) {
+          Packet* held = outbound;
+          outbound = NULL;
+          outbound_is_ota = false;
+          sendPacket(held, mesh::ota::kOtaForwardPriority, 60000);
+          next_tx_time = futureMillis(1000);
+          return;
+        }
+      }
+#endif
+
+      uint32_t max_airtime = prospective_airtime*3/2;
       outbound_start = _ms->getMillis();
       bool success = _radio->startSendRaw(raw, len);
       if (!success) {
@@ -376,6 +421,18 @@ void Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_mil
     _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));
   }
 }
+
+#if MESHCORE_LORA_OTA
+bool Dispatcher::hasQueuedNormalTraffic() {
+  if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;
+  const int total = _mgr->getOutboundTotal();
+  for (int i = 0; i < total; ++i) {
+    Packet* packet = _mgr->getOutboundByIdx(i);
+    if (packet != nullptr && !mesh::ota::isOtaPacket(packet)) return true;
+  }
+  return false;
+}
+#endif
 
 // Utility function -- handles the case where millis() wraps around back to zero
 //   2's complement arithmetic will handle any unsigned subtraction up to HALF the word size (32-bits in this case)

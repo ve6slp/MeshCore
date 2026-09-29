@@ -219,6 +219,29 @@ public:
   virtual void saveIdentity(const mesh::LocalIdentity& new_id) = 0;
   virtual void clearStats() = 0;
   virtual void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) = 0;
+  virtual void formatOtaStatusReply(char *reply) {
+    strcpy(reply, "OTA unsupported");
+  }
+  virtual bool setOtaMode(const char* mode) {
+    (void)mode;
+    return false;
+  }
+  virtual const char* getOtaMode() {
+    return "unsupported";
+  }
+  virtual bool setOtaDutyCycle(float percent) {
+    (void)percent;
+    return false;
+  }
+  virtual float getOtaDutyCycle() {
+    return 0.0f;
+  }
+  virtual bool abortOtaSession() {
+    return false;
+  }
+  virtual bool rollbackOtaSession() {
+    return false;
+  }
 
   virtual void startRegionsLoad() {
     // no op by default
