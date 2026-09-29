@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <array>
 
 namespace mesh {
 
@@ -8,6 +9,18 @@ enum class LoraOtaMode : uint8_t {
   Direct = 0,
   RoutedMesh = 1,
   Background = 2,
+};
+
+enum class LoraOtaSessionState : uint8_t {
+  Idle = 0,
+  ManifestPending = 1,
+  Ready = 2,
+  Downloading = 3,
+  Validating = 4,
+  Committing = 5,
+  Complete = 6,
+  Failed = 7,
+  Aborted = 8,
 };
 
 struct LoraOtaPlan {
@@ -18,6 +31,23 @@ struct LoraOtaPlan {
   uint32_t cadence_ms;
   bool background_allowed;
   bool mesh_path_required;
+};
+
+struct LoraOtaManifest {
+  uint32_t manifest_version;
+  uint32_t firmware_version;
+  uint32_t image_size_bytes;
+  uint32_t image_crc32;
+  uint32_t chunk_size_bytes;
+  uint32_t chunk_count;
+  uint32_t update_window_ms;
+  uint32_t required_bootloader_version;
+  uint8_t duty_cycle_percent;
+  uint8_t mode;
+  uint8_t board_family;
+  uint8_t reserved;
+  char variant[24];
+  char region[16];
 };
 
 class LoraOtaPolicy {
@@ -115,6 +145,191 @@ public:
 
     return plan;
   }
+};
+
+class LoraOtaSession {
+public:
+  static constexpr uint16_t kMaxChunkBitmapBytes = 256;
+
+  LoraOtaSession()
+      : state_(LoraOtaSessionState::Idle),
+        update_window_ms_(0),
+        duty_cycle_percent_(0),
+        chunk_count_(0),
+        bytes_received_(0),
+        bytes_transmitted_(0),
+        chunk_size_bytes_(0),
+        image_crc32_(0),
+        image_size_bytes_(0) {
+    chunk_bitmap_.fill(0);
+  }
+
+  bool validateManifest(const LoraOtaManifest& manifest) const {
+    if (manifest.manifest_version == 0) {
+      return false;
+    }
+    if (manifest.image_size_bytes == 0 || manifest.chunk_size_bytes == 0) {
+      return false;
+    }
+    if (manifest.chunk_count == 0 || manifest.chunk_count > (kMaxChunkBitmapBytes * 8U)) {
+      return false;
+    }
+    if (manifest.duty_cycle_percent == 0 || manifest.duty_cycle_percent > 100) {
+      return false;
+    }
+
+    const LoraOtaMode mode = static_cast<LoraOtaMode>(manifest.mode);
+    if (mode != LoraOtaMode::Direct && mode != LoraOtaMode::RoutedMesh && mode != LoraOtaMode::Background) {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool begin(const LoraOtaManifest& manifest) {
+    if (!validateManifest(manifest)) {
+      state_ = LoraOtaSessionState::Failed;
+      return false;
+    }
+
+    manifest_ = manifest;
+    state_ = LoraOtaSessionState::ManifestPending;
+    chunk_count_ = manifest.chunk_count;
+    chunk_size_bytes_ = manifest.chunk_size_bytes;
+    image_size_bytes_ = manifest.image_size_bytes;
+    image_crc32_ = manifest.image_crc32;
+    update_window_ms_ = manifest.update_window_ms;
+    duty_cycle_percent_ = manifest.duty_cycle_percent;
+    chunk_bitmap_.fill(0);
+    bytes_received_ = 0;
+    bytes_transmitted_ = 0;
+    return true;
+  }
+
+  bool acceptManifest(const LoraOtaManifest& manifest) {
+    if (!validateManifest(manifest)) {
+      state_ = LoraOtaSessionState::Failed;
+      return false;
+    }
+
+    manifest_ = manifest;
+    chunk_count_ = manifest.chunk_count;
+    chunk_size_bytes_ = manifest.chunk_size_bytes;
+    image_size_bytes_ = manifest.image_size_bytes;
+    image_crc32_ = manifest.image_crc32;
+    update_window_ms_ = manifest.update_window_ms;
+    duty_cycle_percent_ = manifest.duty_cycle_percent;
+    chunk_bitmap_.fill(0);
+    state_ = LoraOtaSessionState::Ready;
+    return true;
+  }
+
+  bool recordChunk(uint32_t chunk_index, uint32_t chunk_crc32) {
+    if (state_ == LoraOtaSessionState::Idle || state_ == LoraOtaSessionState::Failed || state_ == LoraOtaSessionState::Aborted) {
+      return false;
+    }
+    if (chunk_index >= chunk_count_ || chunk_count_ == 0) {
+      return false;
+    }
+
+    const uint32_t byte_index = chunk_index / 8U;
+    const uint8_t bit_mask = static_cast<uint8_t>(1U << (chunk_index % 8U));
+    if (byte_index >= chunk_bitmap_.size()) {
+      return false;
+    }
+
+    if ((chunk_bitmap_[byte_index] & bit_mask) != 0U) {
+      return true;
+    }
+
+    chunk_bitmap_[byte_index] |= bit_mask;
+    bytes_received_ += chunk_size_bytes_;
+    (void)chunk_crc32;
+
+    if (isComplete()) {
+      state_ = LoraOtaSessionState::Validating;
+    } else {
+      state_ = LoraOtaSessionState::Downloading;
+    }
+    return true;
+  }
+
+  bool setComplete() {
+    if (state_ == LoraOtaSessionState::Failed || state_ == LoraOtaSessionState::Aborted) {
+      return false;
+    }
+    if (!isComplete()) {
+      return false;
+    }
+    state_ = LoraOtaSessionState::Complete;
+    return true;
+  }
+
+  bool markFailed() {
+    state_ = LoraOtaSessionState::Failed;
+    return true;
+  }
+
+  bool abort() {
+    state_ = LoraOtaSessionState::Aborted;
+    return true;
+  }
+
+  uint32_t countReceivedChunks() const {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < chunk_count_; ++i) {
+      const uint32_t byte_index = i / 8U;
+      const uint8_t bit_mask = static_cast<uint8_t>(1U << (i % 8U));
+      if (byte_index < chunk_bitmap_.size() && (chunk_bitmap_[byte_index] & bit_mask) != 0U) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  uint32_t countMissingChunks() const {
+    return chunk_count_ > countReceivedChunks() ? (chunk_count_ - countReceivedChunks()) : 0U;
+  }
+
+  bool isComplete() const {
+    return countReceivedChunks() == chunk_count_;
+  }
+
+  bool canTransmitAdditional(uint32_t airtime_used_ms) const {
+    const uint32_t budget_ms = LoraOtaPolicy::computeAirtimeBudgetMs(update_window_ms_, duty_cycle_percent_);
+    return airtime_used_ms < budget_ms;
+  }
+
+  uint32_t budgetMs() const {
+    return LoraOtaPolicy::computeAirtimeBudgetMs(update_window_ms_, duty_cycle_percent_);
+  }
+
+  uint32_t remainingBudgetMs(uint32_t airtime_used_ms) const {
+    const uint32_t budget = budgetMs();
+    return budget > airtime_used_ms ? (budget - airtime_used_ms) : 0U;
+  }
+
+  uint32_t getChunkCount() const { return chunk_count_; }
+  uint32_t getImageSizeBytes() const { return image_size_bytes_; }
+  uint32_t getBytesReceived() const { return bytes_received_; }
+  uint32_t getBytesTransmitted() const { return bytes_transmitted_; }
+  void setBytesTransmitted(uint32_t transmitted) { bytes_transmitted_ = transmitted; }
+  uint32_t getUpdateWindowMs() const { return update_window_ms_; }
+  uint32_t getDutyCyclePercent() const { return duty_cycle_percent_; }
+  LoraOtaSessionState getState() const { return state_; }
+
+private:
+  LoraOtaManifest manifest_;
+  LoraOtaSessionState state_;
+  uint32_t update_window_ms_;
+  uint32_t duty_cycle_percent_;
+  uint32_t chunk_count_;
+  uint32_t bytes_received_;
+  uint32_t bytes_transmitted_;
+  uint32_t chunk_size_bytes_;
+  uint32_t image_crc32_;
+  uint32_t image_size_bytes_;
+  std::array<uint8_t, kMaxChunkBitmapBytes> chunk_bitmap_;
 };
 
 }  // namespace mesh
