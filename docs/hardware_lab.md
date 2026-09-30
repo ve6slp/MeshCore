@@ -125,6 +125,12 @@ any hardware result from this lab elsewhere.
 
 ## Recovering an unresponsive board
 
+`make lab-reset-client` and `make lab-reset-target` send the companion
+firmware's binary `reboot` command and require USB disconnection followed by
+application re-enumeration. DTR/RTS toggling alone does not reset these
+boards. Firmware without that command, including the QSPI diagnostic image,
+needs DFU entry or a physical reset instead.
+
 ```sh
 make lab-devices           # is it present at all?
 make lab-power-cycle-target

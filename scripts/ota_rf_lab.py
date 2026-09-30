@@ -33,10 +33,12 @@ CMD_OTA_LAB = 67
 
 RESP_OK = 0
 RESP_ERR = 1
+ERR_TABLE_FULL = 3
 RESP_SELF_INFO = 5
 RESP_DEVICE_INFO = 13
 RESP_OTA_STATUS = 29
 PUSH_ADVERT = 0x80
+PUSH_RAW_LOG = 0x88
 PUSH_NEW_ADVERT = 0x8A
 PUSH_OTA_EVENT = 0x91
 
@@ -62,6 +64,10 @@ PAYLOAD_TYPE_LORA_OTA = 0x0C
 OTA_PRIORITY = 4
 OTA_CHUNK_BYTES = 128
 MAX_SERIAL_FRAME_SIZE = 176
+
+
+class OtaQueueFull(RuntimeError):
+    pass
 
 
 def utc_now():
@@ -284,11 +290,28 @@ def chunk_payload(image, chunk_index):
     return struct.pack(">IH", chunk_index, len(data)) + data
 
 
+def announcement_payload(campaign):
+    return struct.pack(">IHBI", campaign, 123, OTA_PRIORITY, 3600000)
+
+
+def lease_payload(subtype, lease_id):
+    return struct.pack(">BIIB", subtype, lease_id, 60000, 1)
+
+
+def budget_chunk_payload(index):
+    data = struct.pack(">I", index) + bytes(OTA_CHUNK_BYTES - 4)
+    return struct.pack(">IH", index, len(data)) + data
+
+
 def send_ota(node, route, message_type, campaign, session=1, attempt=1, payload=b"", namespace=0x4F54):
+    if message_type == OTA_ANNOUNCEMENT and not payload:
+        payload = announcement_payload(campaign)
     envelope = ota_envelope(message_type, campaign, session, attempt, payload, namespace)
     header = route | (PAYLOAD_TYPE_LORA_OTA << 2)
     raw = bytes([header, 0x80]) + envelope
     response = node.command(bytes([CMD_SEND_RAW_PACKET, OTA_PRIORITY]) + raw, timeout=8.0)
+    if response == bytes([RESP_ERR, ERR_TABLE_FULL]):
+        raise OtaQueueFull(f"{node.name}: OTA packet pool full")
     if response[0] != RESP_OK:
         raise RuntimeError(f"{node.name}: OTA packet queue failed: {response.hex()}")
 
@@ -309,6 +332,100 @@ def wait_advert(node, timeout=15.0):
     return node.wait_frame({PUSH_ADVERT, PUSH_NEW_ADVERT}, timeout=timeout)
 
 
+def wait_raw_packet(node, predicate, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        frame = node.wait_frame({PUSH_RAW_LOG}, timeout=deadline - time.monotonic())
+        if predicate(frame[3:]):
+            return frame[3:]
+    raise TimeoutError(f"{node.name}: no matching raw radio packet")
+
+
+def wait_advert_from(node, public_key, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        frame = wait_advert(node, timeout=deadline - time.monotonic())
+        if frame[1:33] == public_key:
+            return frame
+    raise TimeoutError(f"{node.name}: no fresh advert from {public_key.hex()}")
+
+
+def run_airtime_test(client, target, client_info, evidence, duty_timeout):
+    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_DUTY]) + struct.pack("<I", 2000))
+    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
+    start = last_progress = time.monotonic()
+    sent = refused = 0
+    packet_cost = None
+    previous = status(client)
+    reached = False
+    while time.monotonic() - start < duty_timeout:
+        try:
+            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 5000,
+                     payload=budget_chunk_payload(sent))
+            sent += 1
+        except OtaQueueFull as exc:
+            refused += 1
+            evidence.log("ota_backpressure", error=str(exc), refused=refused)
+        target.poll(0.05)
+        target.take_pending({PUSH_OTA_EVENT})
+        time.sleep(0.25)
+        current = status(client)
+        increment = current["used"] - previous["used"]
+        if increment > 0:
+            packet_cost = increment if packet_cost is None else min(packet_cost, increment)
+            last_progress = time.monotonic()
+        if sent % 12 == 0 or current["used"] != previous["used"]:
+            evidence.log("duty_progress", sent=sent, refused=refused, status=current,
+                         observed_packet_cost_ms=packet_cost)
+        evidence.check("airtime-cap-not-exceeded",
+                       current["used_limit"] == 72000 and current["used"] <= 72000,
+                       status=current)
+        previous = current
+        remaining = current["used_limit"] - current["used"]
+        if packet_cost is not None and remaining < packet_cost and time.monotonic() - last_progress >= 15:
+            reached = True
+            break
+    evidence.check("airtime-budget-exhausted", reached, sent=sent, refused=refused,
+                   status=previous, observed_packet_cost_ms=packet_cost,
+                   synthetic_load=True, install_or_boot_claim=False)
+
+    target.poll(0.1)
+    target.take_pending({PUSH_OTA_EVENT, PUSH_ADVERT, PUSH_NEW_ADVERT})
+    target_before = status(target)["rx"]
+    for index in range(8):
+        try:
+            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 5000,
+                     payload=budget_chunk_payload(sent + index))
+        except OtaQueueFull as exc:
+            refused += 1
+            evidence.log("ota_backpressure", error=str(exc), refused=refused)
+        target.poll(0.1)
+        target.take_pending({PUSH_OTA_EVENT})
+    target.collect(15.0)
+    blocked = status(client)
+    evidence.check("ota-remains-budget-blocked",
+                   blocked["used"] == previous["used"] and status(target)["rx"] == target_before,
+                   before=previous, after=blocked)
+
+    target.take_pending({PUSH_ADVERT, PUSH_NEW_ADVERT})
+    request_time = time.monotonic()
+    advert_response = client.command(bytes([CMD_SEND_SELF_ADVERT, 1]))
+    evidence.check("normal-advert-allocates-after-ota-cap",
+                   advert_response == bytes([RESP_OK]), response=advert_response.hex(),
+                   status=blocked)
+    advert = wait_advert_from(target, client_info["pubkey_bytes"])
+    after_advert = status(client)
+    evidence.check("normal-advert-after-ota-cap",
+                   after_advert["used"] == blocked["used"],
+                   sender=client_info["pubkey"], received_frame=advert.hex(),
+                   delay_seconds=time.monotonic() - request_time,
+                   before=blocked, after=after_advert)
+    evidence.check("airtime-two-percent-enforced",
+                   after_advert["used"] <= 72000 and after_advert["used_limit"] == 72000,
+                   sent=sent, refused=refused, observed_packet_cost_ms=packet_cost,
+                   remaining_ms=after_advert["used_limit"] - after_advert["used"])
+
+
 def run_configure(client, target, evidence):
     client_info = run_configure_client(client, evidence)
     target_info, target_status = configure_node(target, "OTA-LAB-TARGET")
@@ -321,7 +438,6 @@ def run_configure(client, target, evidence):
     evidence.check("default-radio-target",
                    (target_info["freq_khz"], target_info["bw_hz"], target_info["sf"], target_info["cr"]) == expected,
                    observed=serializable_app_info(target_info))
-    evidence.check("three-byte-path-mode", True, configured_mode=2, bytes_per_hash=3)
     return client_info, target_info
 
 
@@ -335,37 +451,78 @@ def run_configure_client(client, evidence):
     evidence.check("default-radio-client",
                    (client_info["freq_khz"], client_info["bw_hz"], client_info["sf"], client_info["cr"]) == expected,
                    observed=serializable_app_info(client_info))
-    evidence.check("three-byte-path-mode-client", True, configured_mode=2, bytes_per_hash=3)
+    evidence.log("path_hash_mode_configured", mode=2, bytes_per_hash=3,
+                 radio_verification_pending=True)
     return client_info
 
 
-def run_hardware_test(client, target, evidence, duty_timeout):
+def run_hardware_test(client, target, evidence, duty_timeout, staging_only=False, airtime_only=False):
     client_info, target_info = run_configure(client, target, evidence)
 
     require_ok(client, bytes([CMD_SEND_SELF_ADVERT, 1]))
+    advert_ct = wait_raw_packet(
+        target, lambda raw: len(raw) >= 34 and raw[0] >> 2 & 15 == 4
+        and raw[2:34] == client_info["pubkey_bytes"])
     wait_advert(target)
     require_ok(target, bytes([CMD_SEND_SELF_ADVERT, 1]))
+    advert_tc = wait_raw_packet(
+        client, lambda raw: len(raw) >= 34 and raw[0] >> 2 & 15 == 4
+        and raw[2:34] == target_info["pubkey_bytes"])
     wait_advert(client)
+    evidence.check("three-byte-path-mode",
+                   (advert_ct[1] >> 6) + 1 == 3 and (advert_tc[1] >> 6) + 1 == 3,
+                   client_path_header=advert_ct[1], target_path_header=advert_tc[1],
+                   physical_multi_hop_claim=False)
     evidence.check("bidirectional-advert-rf", True, frequency_khz=907525, bandwidth_hz=62500, sf=7, cr=5)
 
+    if not staging_only and not airtime_only:
+        run_transport_probes(client, target, client_info["pubkey_bytes"], evidence)
+    if not airtime_only:
+        run_signed_staging(client, target, evidence)
+    if not staging_only:
+        run_airtime_test(client, target, client_info, evidence, duty_timeout)
+    evidence.summary["measurements"]["final"] = {
+        "client": status(client),
+        "target": status(target),
+        "client_identity": client_info["pubkey"],
+        "target_identity": target_info["pubkey"],
+    }
+
+
+def run_precedence_probe(client, target, client_public_key, evidence):
+    event_codes = {PUSH_ADVERT, PUSH_NEW_ADVERT, PUSH_OTA_EVENT}
+    target.poll(0.2)
+    target.take_pending(event_codes)
+    require_ok(client, bytes([CMD_OTA_LAB, 0]))
+    deadline = time.monotonic() + 15.0
+    ordered = []
+    observed_types = set()
+    while time.monotonic() < deadline and len(observed_types) < 2:
+        target.poll(0.2)
+        for timestamp, payload in target.take_pending(event_codes):
+            if payload[0] in (PUSH_ADVERT, PUSH_NEW_ADVERT):
+                if payload[1:33] != client_public_key:
+                    continue
+                kind = "normal-advert"
+            elif len(payload) >= 2 and payload[1] == OTA_ANNOUNCEMENT:
+                kind = "ota-announcement"
+            else:
+                continue
+            ordered.append((timestamp, kind, payload.hex()))
+            observed_types.add(kind)
+    evidence.check("normal-traffic-precedence",
+                   len(observed_types) == 2 and ordered[0][1] == "normal-advert",
+                   observed=ordered, expected_sender=client_public_key.hex())
+
+
+def run_transport_probes(client, target, client_public_key, evidence):
     send_ota(client, ROUTE_FLOOD, OTA_ANNOUNCEMENT, 1001)
     event_ct = wait_ota_event(target, OTA_ANNOUNCEMENT)
     send_ota(target, ROUTE_FLOOD, OTA_ANNOUNCEMENT, 1002)
     event_tc = wait_ota_event(client, OTA_ANNOUNCEMENT)
     evidence.check("bidirectional-ota-rf", True, client_to_target=event_ct.hex(), target_to_client=event_tc.hex())
 
-    require_ok(client, bytes([CMD_OTA_LAB, 0]))
-    deadline = time.monotonic() + 15.0
-    ordered = []
-    while time.monotonic() < deadline and len(ordered) < 2:
-        target.poll(0.2)
-        for timestamp, payload in target.take_pending({PUSH_ADVERT, PUSH_NEW_ADVERT, PUSH_OTA_EVENT}):
-            if payload[0] in (PUSH_ADVERT, PUSH_NEW_ADVERT):
-                ordered.append((timestamp, "normal-advert", payload.hex()))
-            elif len(payload) >= 2 and payload[1] == OTA_ANNOUNCEMENT:
-                ordered.append((timestamp, "ota-announcement", payload.hex()))
-    evidence.check("normal-traffic-precedence", len(ordered) >= 2 and ordered[0][1] == "normal-advert",
-                   observed=ordered)
+    run_precedence_probe(client, target, client_public_key, evidence)
 
     for node in (client, target):
         require_ok(node, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 0]))
@@ -378,11 +535,19 @@ def run_hardware_test(client, target, evidence, duty_timeout):
                    direct_client["bw_hz"] == 250000 and direct_target["bw_hz"] == 250000,
                    client=serializable_app_info(direct_client),
                    target=serializable_app_info(direct_target))
-    send_ota(client, ROUTE_DIRECT, OTA_LEASE, 2001, payload=bytes(10))
-    wait_ota_event(target, OTA_LEASE)
-    send_ota(target, ROUTE_DIRECT, OTA_LEASE, 2002, payload=bytes(10))
-    wait_ota_event(client, OTA_LEASE)
-    evidence.check("direct-high-speed-bidirectional", True, bandwidth_hz=250000, route="direct-zero-hop")
+    for sender, receiver, lease_id in ((client, target, 2001), (target, client, 2002)):
+        before_lease = status(receiver)
+        for subtype in (1, 2):
+            send_ota(sender, ROUTE_DIRECT, OTA_LEASE, lease_id,
+                     payload=lease_payload(subtype, lease_id))
+            wait_ota_event(receiver, OTA_LEASE)
+        after_lease = status(receiver)
+        evidence.check(f"typed-lease-probe-{receiver.name}",
+                       after_lease["bad"] == before_lease["bad"],
+                       before=before_lease, after=after_lease)
+    evidence.check("direct-high-speed-bidirectional", True, bandwidth_hz=250000,
+                   route="direct-zero-hop", frequency_khz=907525, sf=7, cr=5,
+                   remote_radio_negotiation_claim=False)
 
     before_bad = status(target)
     send_ota(client, ROUTE_DIRECT, OTA_ANNOUNCEMENT, 2100, namespace=0x0000)
@@ -405,25 +570,35 @@ def run_hardware_test(client, target, evidence, duty_timeout):
     require_ok(target, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
     campaign = 3001
     progression = []
-    for message_type in (OTA_ANNOUNCEMENT, OTA_CENSUS, OTA_COHORT, OTA_MISSING):
-        send_ota(client, ROUTE_FLOOD, message_type, campaign)
+    probes = (
+        (OTA_ANNOUNCEMENT, announcement_payload(campaign)),
+        (OTA_CENSUS, struct.pack(">IBIH", campaign, 0, 0, 1)),
+        (OTA_CENSUS, struct.pack(">IBIH", campaign, 1, 0, 1)),
+        (OTA_COHORT, struct.pack(">IHHH", campaign, 1, 1, 0)),
+        (OTA_CENSUS, struct.pack(">IBIH", campaign, 1, 128, 1)),
+        (OTA_MISSING, struct.pack(">III", campaign, 1, 1)),
+    )
+    for message_type, payload in probes:
+        send_ota(client, ROUTE_FLOOD, message_type, campaign, payload=payload)
         wait_ota_event(target, message_type)
         progression.append({"type": message_type, "status": status(target)})
     fleet_before_abort = progression[-1]["status"]["fleet"]
     send_ota(client, ROUTE_FLOOD, OTA_ABORT_MESSAGE, campaign + 99, session=99, payload=bytes(5))
     wait_ota_event(target, OTA_ABORT_MESSAGE)
     fleet_after_abort = status(target)["fleet"]
-    evidence.check("fleet-census-resolution-progress", len({row["status"]["fleet"] for row in progression}) >= 3,
-                   progression=progression)
+    evidence.check("fleet-control-state-probes", len({row["status"]["fleet"] for row in progression}) >= 3,
+                   progression=progression, full_fleet_update_claim=False)
     evidence.check("foreign-abort-rejection", fleet_after_abort == fleet_before_abort,
                    before=fleet_before_abort, after=fleet_after_abort)
 
+
+def run_signed_staging(client, target, evidence):
     require_ok(target, bytes([CMD_OTA_CONTROL, OTA_ABORT]))
     image = bytes((index * 37 + 0x5A) & 0xFF for index in range(320))
     security_counter = 1
     send_ota(client, ROUTE_DIRECT, OTA_DESCRIPTOR, 4001,
              payload=descriptor_fragment(image, security_counter))
-    wait_ota_event(target, OTA_DESCRIPTOR)
+    wait_ota_event(target, OTA_DESCRIPTOR, timeout=60.0)
     descriptor_status = status(target)
     evidence.check("signed-descriptor-accepted",
                    descriptor_status["backend"] == 1 and descriptor_status["recv"] == 2,
@@ -441,9 +616,18 @@ def run_hardware_test(client, target, evidence, duty_timeout):
     wait_ota_event(target, OTA_CHUNK)
     progress_before_resume = status(target)
     time.sleep(1.0)
+    target.take_pending({PUSH_RAW_LOG})
     send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=first_chunk)
-    wait_ota_event(target, OTA_CHUNK)
+    duplicate_raw = bytes([ROUTE_DIRECT | PAYLOAD_TYPE_LORA_OTA << 2, 0x80]) + \
+        ota_envelope(OTA_CHUNK, 4001, 1, 1, first_chunk)
+    wait_raw_packet(target, lambda raw: raw == duplicate_raw)
     progress_after_resume = status(target)
+    evidence.check("radio-duplicate-chunk-rejection",
+                   progress_after_resume["rx"] == progress_before_resume["rx"] and
+                   progress_after_resume["recv"] == 3 and
+                   progress_after_resume["bad"] == progress_before_resume["bad"],
+                   before=progress_before_resume, after=progress_after_resume,
+                   receiver_duplicate_handler_claim=False)
     chunk_count = (len(image) + OTA_CHUNK_BYTES - 1) // OTA_CHUNK_BYTES
     for chunk_index in range(1, chunk_count):
         send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001,
@@ -453,7 +637,7 @@ def run_hardware_test(client, target, evidence, duty_timeout):
     send_ota(client, ROUTE_DIRECT, OTA_COMMIT, 4001, payload=commit)
     wait_ota_event(target, OTA_COMMIT)
     staged = status(target)
-    evidence.check("progress-resume-and-qspi-stage",
+    evidence.check("signed-rf-qspi-stage",
                    progress_before_resume["recv"] == 3 and
                    progress_after_resume["recv"] == 3 and
                    staged["recv"] == 6,
@@ -461,54 +645,9 @@ def run_hardware_test(client, target, evidence, duty_timeout):
                    after_resume=progress_after_resume,
                    staged=staged,
                    receiver_state_complete_staging=6,
+                   bytes_staged=len(image), sha256=hashlib.sha256(image).hexdigest(),
+                   reboot_resume_claim=False,
                    install_or_boot_claim=False)
-
-    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_DUTY]) + struct.pack("<I", 2000))
-    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
-    start = time.monotonic()
-    sent = 0
-    last_status = status(client)
-    while time.monotonic() - start < duty_timeout:
-        chunk_data = struct.pack(">I", sent) + bytes(145)
-        chunk_payload = struct.pack(">IH", sent, len(chunk_data)) + chunk_data
-        try:
-            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 5000 + sent, payload=chunk_payload)
-            sent += 1
-        except RuntimeError:
-            time.sleep(0.5)
-        time.sleep(0.25)
-        if sent % 12 == 0:
-            last_status = status(client)
-            evidence.log("duty_progress", sent=sent, status=last_status)
-            if last_status["used"] >= last_status["used_limit"] - 700:
-                break
-    used_at_limit = status(client)
-    target_before_extra = status(target)["rx"]
-    for index in range(8):
-        chunk_data = struct.pack(">I", 0xF0000000 + index) + bytes(145)
-        chunk_payload = struct.pack(">IH", index, len(chunk_data)) + chunk_data
-        try:
-            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 9000 + index, payload=chunk_payload)
-        except RuntimeError:
-            pass
-    time.sleep(5.0)
-    used_after_extra = status(client)
-    target_after_extra = status(target)["rx"]
-    evidence.check("airtime-two-percent-enforced",
-                   used_after_extra["used"] <= 72000 and
-                   used_after_extra["used_limit"] == 72000 and
-                   used_at_limit["used"] >= 70000 and
-                   target_after_extra == target_before_extra,
-                   sent=sent, at_limit=used_at_limit, after_extra=used_after_extra,
-                   target_rx_before=target_before_extra, target_rx_after=target_after_extra)
-
-    evidence.summary["measurements"]["final"] = {
-        "client": status(client),
-        "target": status(target),
-        "client_identity": client_info["pubkey"],
-        "target_identity": target_info["pubkey"],
-    }
-
 
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
@@ -532,9 +671,14 @@ def main():
     parser.add_argument("--configure-only", action="store_true")
     parser.add_argument("--monitor-seconds", type=float, default=0)
     parser.add_argument("--duty-timeout", type=float, default=420)
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--staging-only", action="store_true")
+    scope.add_argument("--airtime-only", action="store_true")
     args = parser.parse_args()
     if args.client_only and not (args.configure_only or args.monitor_seconds > 0):
         parser.error("--client-only requires --configure-only or --monitor-seconds")
+    if (args.staging_only or args.airtime_only) and (args.configure_only or args.monitor_seconds > 0):
+        parser.error("a qualification scope cannot be combined with configuration or monitoring")
 
     evidence = Evidence(args.artifact_dir)
     client = target = None
@@ -561,7 +705,8 @@ def main():
             else:
                 run_configure(client, target, evidence)
         else:
-            run_hardware_test(client, target, evidence, args.duty_timeout)
+            run_hardware_test(client, target, evidence, args.duty_timeout,
+                              args.staging_only, args.airtime_only)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)

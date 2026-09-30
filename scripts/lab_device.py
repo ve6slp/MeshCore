@@ -206,6 +206,8 @@ def wait_for(role: str, mode: str, timeout: float, absent_first: bool = False) -
             except SystemExit:
                 break
             time.sleep(0.1)
+        else:
+            raise SystemExit(f"role '{role}' did not disconnect after reset; physical reset required")
     last: SystemExit | None = None
     while time.monotonic() < deadline:
         try:
@@ -289,18 +291,16 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    """Restart the application without entering the bootloader."""
+    """Restart companion firmware using its binary reboot command."""
     device = resolve(args.role, MODE_APP)
     try:
         import serial  # type: ignore
     except ImportError:
-        raise SystemExit("pyserial is required for `reset`; use `power-cycle` instead")
-    with serial.Serial(str(device.by_id), 115200, timeout=1) as port:
-        port.dtr = False
-        port.rts = True
-        time.sleep(0.1)
-        port.rts = False
-        time.sleep(0.1)
+        raise SystemExit("pyserial is required for `reset`")
+    with serial.Serial(str(device.by_id), 115200, timeout=1, write_timeout=2) as port:
+        frame = b"<\x07\x00\x13reboot"
+        if port.write(frame) != len(frame):
+            raise SystemExit(f"short reboot command write for role '{args.role}'")
     ready = wait_for(args.role, MODE_APP, args.timeout, absent_first=True)
     print(ready.by_id)
     return 0

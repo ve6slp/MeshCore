@@ -1,11 +1,35 @@
 import argparse
 import pathlib
 import sys
+import types
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import lab_device
+
+
+class CompanionResetTests(unittest.TestCase):
+    def test_reset_uses_companion_reboot_and_requires_reenumeration(self):
+        device = argparse.Namespace(by_id="/dev/serial/by-id/authorized-target")
+        args = argparse.Namespace(role="target", timeout=30)
+        serial_factory = mock.MagicMock()
+        port = serial_factory.return_value.__enter__.return_value
+        port.write.return_value = 10
+        with mock.patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=serial_factory)}), \
+                mock.patch.object(lab_device, "resolve", return_value=device), \
+                mock.patch.object(lab_device, "wait_for", return_value=device) as wait, \
+                mock.patch("builtins.print"):
+            self.assertEqual(lab_device.cmd_reset(args), 0)
+        port.write.assert_called_once_with(b"<\x07\x00\x13reboot")
+        wait.assert_called_once_with("target", lab_device.MODE_APP, 30, absent_first=True)
+
+    def test_a_port_that_never_disappears_is_not_a_successful_reset(self):
+        with mock.patch.object(lab_device.time, "monotonic", side_effect=[0, 0, 6]), \
+                mock.patch.object(lab_device, "resolve") as resolve:
+            with self.assertRaisesRegex(SystemExit, "did not disconnect"):
+                lab_device.wait_for("target", lab_device.MODE_APP, 10, absent_first=True)
+        resolve.assert_not_called()
 
 
 class ProtectedPowerDomainTests(unittest.TestCase):
