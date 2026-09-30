@@ -84,7 +84,8 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
 
   static ota::trust::DescriptorVerifier lab_verifier(
       hasher, signature_verifier, counter, anchor);
-  static mesh::ota::OtaFirmwareTrustProvider lab_trust(lab_verifier, candidate);
+  static mesh::ota::OtaFirmwareTrustProvider lab_trust(
+      lab_verifier, candidate, signature_verifier, kLabPublicKey);
   static mesh::ota::OtaFirmwareStorageSink lab_staging(candidate);
   verifier = &lab_verifier;
   trust = &lab_trust;

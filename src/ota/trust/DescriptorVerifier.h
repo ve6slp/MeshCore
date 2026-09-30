@@ -57,6 +57,17 @@ public:
       return VerificationResult::fail(TrustFailureReason::SignatureInvalid);
     }
 
+    return verifyPolicy(descriptor);
+  }
+
+  // Verifies all receiver-local descriptor policy after an external caller
+  // has authenticated a different canonical representation of the same
+  // fields (for example, the OTA protocol's canonical wire descriptor).
+  VerificationResult verifyPolicy(const ImageDescriptor& descriptor) const {
+    if (descriptor.image_size_bytes == 0) {
+      return VerificationResult::fail(TrustFailureReason::MalformedDescriptor);
+    }
+
     if (descriptor.target_id != anchor_.expected_target_id) {
       return VerificationResult::fail(TrustFailureReason::TargetMismatch);
     }

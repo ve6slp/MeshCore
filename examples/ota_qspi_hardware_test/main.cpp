@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <Ed25519.h>
 
 #include <cstring>
 
@@ -8,7 +9,6 @@
 #include <ota/storage/StorageManager.h>
 #include <ota/trust/CanonicalDescriptor.h>
 #include <ota/trust/DescriptorVerifier.h>
-#include <ota/trust/Ed25519SignatureVerifier.h>
 #include <ota/trust/Sha256.h>
 
 namespace {
@@ -50,6 +50,18 @@ public:
 
 private:
   uint32_t value_ = 0;
+};
+
+class LabSignatureVerifier : public ota::trust::SignatureVerifier {
+public:
+  bool verify(const uint8_t* signature, size_t signature_len,
+              const uint8_t* message, size_t message_len,
+              const uint8_t* public_key, size_t public_key_len) const override {
+    return signature != nullptr && public_key != nullptr &&
+           (message != nullptr || message_len == 0) &&
+           signature_len == 64 && public_key_len == 32 &&
+           Ed25519::verify(signature, public_key, message, message_len);
+  }
 };
 
 ota::platform::Nrf52FlashAdapter flash;
@@ -166,7 +178,7 @@ bool stageAndVerifySignedImage() {
 
   LabCounter counter;
   ota::trust::Sha256 verifier_hash;
-  ota::trust::Ed25519SignatureVerifier signature_verifier;
+  LabSignatureVerifier signature_verifier;
   ota::trust::DescriptorVerifier verifier(verifier_hash, signature_verifier, counter, anchor);
 
   const ota::trust::VerificationResult descriptor_result =

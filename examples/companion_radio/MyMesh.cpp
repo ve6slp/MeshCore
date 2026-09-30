@@ -1231,14 +1231,19 @@ void MyMesh::handleCmdFrame(size_t len) {
                      (_prefs.telemetry_mode_base); // v5+
     out_frame[i++] = _prefs.manual_add_contacts;
 
-    uint32_t freq = _prefs.freq * 1000;
+    const bool temp_radio_active = revert_radio_at && !set_radio_at;
+    const float active_freq = temp_radio_active ? pending_freq : _prefs.freq;
+    const float active_bw = temp_radio_active ? pending_bw : _prefs.bw;
+    const uint8_t active_sf = temp_radio_active ? pending_sf : _prefs.sf;
+    const uint8_t active_cr = temp_radio_active ? pending_cr : _prefs.cr;
+    uint32_t freq = active_freq * 1000;
     memcpy(&out_frame[i], &freq, 4);
     i += 4;
-    uint32_t bw = _prefs.bw * 1000;
+    uint32_t bw = active_bw * 1000;
     memcpy(&out_frame[i], &bw, 4);
     i += 4;
-    out_frame[i++] = _prefs.sf;
-    out_frame[i++] = _prefs.cr;
+    out_frame[i++] = active_sf;
+    out_frame[i++] = active_cr;
 
     int tlen = strlen(_prefs.node_name); // revisit: UTF_8 ??
     memcpy(&out_frame[i], _prefs.node_name, tlen);
@@ -2191,7 +2196,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else if (op == OTA_CTRL_ROLLBACK) {
       rollbackFirmwareOta();
       writeOKFrame();
-    } else if (op == OTA_CTRL_DIRECT_LEASE && len >= 16) {
+    } else if (op == OTA_CTRL_DIRECT_LEASE && len >= 14) {
       int i = 2;
       uint32_t freq;
       uint32_t bw;

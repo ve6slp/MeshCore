@@ -50,10 +50,29 @@ public:
                            ::ota::platform::FlashRegion& candidate_region)
       : verifier_(verifier), candidate_region_(candidate_region) {}
 
-  bool verifyDescriptorSignature(const uint8_t*, size_t,
-                                 const uint8_t*, size_t,
+  OtaFirmwareTrustProvider(::ota::trust::DescriptorVerifier& verifier,
+                           ::ota::platform::FlashRegion& candidate_region,
+                           const ::ota::trust::SignatureVerifier& wire_signature_verifier,
+                           const uint8_t trusted_wire_public_key[32])
+      : verifier_(verifier),
+        candidate_region_(candidate_region),
+        wire_signature_verifier_(&wire_signature_verifier) {
+    if (trusted_wire_public_key != nullptr) {
+      std::memcpy(trusted_wire_public_key_, trusted_wire_public_key,
+                  sizeof(trusted_wire_public_key_));
+    }
+  }
+
+  bool verifyDescriptorSignature(const uint8_t* canonical_descriptor, size_t descriptor_len,
+                                 const uint8_t* signature, size_t signature_len,
                                  uint16_t, uint16_t) override {
-    return false;
+    return wire_signature_verifier_ != nullptr &&
+           canonical_descriptor != nullptr &&
+           signature != nullptr &&
+           signature_len == sizeof(descriptor_.signature_ed25519) &&
+           wire_signature_verifier_->verify(
+               signature, signature_len, canonical_descriptor, descriptor_len,
+               trusted_wire_public_key_, sizeof(trusted_wire_public_key_));
   }
 
   bool verifyDescriptor(const meshcore::ota::protocol::OtaDescriptor& descriptor,
@@ -63,7 +82,22 @@ public:
       return false;
     }
     descriptor_ = otaTrustImageDescriptorFromWire(descriptor, signature, signature_len);
-    const ::ota::trust::VerificationResult result = verifier_.verifyDescriptor(descriptor_);
+    ::ota::trust::VerificationResult result;
+    if (wire_signature_verifier_ != nullptr) {
+      uint8_t canonical[meshcore::ota::protocol::kOtaDescriptorCanonicalSize] = {};
+      size_t canonical_len = 0;
+      if (meshcore::ota::protocol::encodeOtaDescriptorCanonical(
+              descriptor, canonical, sizeof(canonical), canonical_len) !=
+              meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
+          !verifyDescriptorSignature(canonical, canonical_len, signature, signature_len,
+                                     descriptor.keyId, descriptor.algorithmId)) {
+        descriptor_verified_ = false;
+        return false;
+      }
+      result = verifier_.verifyPolicy(descriptor_);
+    } else {
+      result = verifier_.verifyDescriptor(descriptor_);
+    }
     descriptor_verified_ = result.ok;
     return result.ok;
   }
@@ -98,6 +132,8 @@ private:
   ::ota::platform::FlashRegion& candidate_region_;
   ::ota::trust::ImageDescriptor descriptor_;
   bool descriptor_verified_ = false;
+  const ::ota::trust::SignatureVerifier* wire_signature_verifier_ = nullptr;
+  uint8_t trusted_wire_public_key_[32] = {};
 };
 
 class OtaFirmwareStorageSink : public meshcore::ota::runtime::IOtaStagingSink {

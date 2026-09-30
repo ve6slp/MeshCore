@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import pathlib
+import select
 import sys
+import termios
 import time
-
-import serial
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import lab_device  # noqa: E402
@@ -29,22 +30,49 @@ def main() -> int:
 
     lines = []
     passed = False
-    with serial.Serial(str(port), 115200, timeout=0.25) as device:
-        device.reset_input_buffer()
-        device.write(b"run\n")
-        device.flush()
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
+        attrs[3] = 0
+        attrs[4] = termios.B115200
+        attrs[5] = termios.B115200
+        attrs[6][termios.VMIN] = 0
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        time.sleep(2.0)
+        _, writable, _ = select.select([], [fd], [], 2.0)
+        if not writable:
+            raise RuntimeError("target serial endpoint did not become writable")
+        if os.write(fd, b"run\n") != 4:
+            raise RuntimeError("short write sending QSPI test command")
+        deadline = time.monotonic() + args.timeout
+        pending = bytearray()
         while time.monotonic() < deadline:
-            raw = device.readline()
+            readable, _, _ = select.select([fd], [], [], 0.25)
+            if not readable:
+                continue
+            raw = os.read(fd, 1024)
             if not raw:
                 continue
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            print(line, flush=True)
-            lines.append(line)
-            if line == "OTA_QSPI_TEST RESULT PASS":
-                passed = True
+            pending.extend(raw)
+            while b"\n" in pending:
+                raw_line, _, pending = pending.partition(b"\n")
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r")
+                print(line, flush=True)
+                lines.append(line)
+                if line == "OTA_QSPI_TEST RESULT PASS":
+                    passed = True
+                    break
+                if line == "OTA_QSPI_TEST RESULT FAIL":
+                    break
+            if lines and lines[-1].startswith("OTA_QSPI_TEST RESULT "):
                 break
-            if line == "OTA_QSPI_TEST RESULT FAIL":
-                break
+    finally:
+        os.close(fd)
 
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

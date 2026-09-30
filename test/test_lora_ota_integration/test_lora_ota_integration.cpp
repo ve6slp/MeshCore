@@ -333,6 +333,39 @@ TEST(LoraOtaIntegration, OtaStatusReportsBackendUnavailableUntilCompleteBackendA
   EXPECT_TRUE(integration.status(0).backendAvailable);
 }
 
+TEST(LoraOtaIntegration, ProductionProviderVerifiesCanonicalWireDescriptorSignature) {
+  uint8_t seed[32] = {};
+  for (size_t i = 0; i < sizeof(seed); ++i) seed[i] = static_cast<uint8_t>(0x30u + i);
+  ::ota::test::Ed25519TestSigner signer(seed);
+  ::ota::test::FakeNorFlash flash(4096, 4096);
+  ::ota::platform::FlashRegion candidate(flash, 0, 4096);
+  ::ota::test::FakeMonotonicCounter counter(0);
+  ::ota::trust::Sha256 hasher;
+  ::ota::trust::Ed25519SignatureVerifier sig_verifier;
+  ::ota::trust::DeviceTrustAnchor anchor;
+  std::memcpy(anchor.trusted_signer_public_key_ed25519, signer.publicKey(), 32);
+  anchor.expected_target_id = (0x1001u << 16) | 0x0002u;
+  anchor.expected_role_id = 7;
+  anchor.supported_boot_capability_flags = 0x0000000Fu;
+  ::ota::trust::DescriptorVerifier verifier(hasher, sig_verifier, counter, anchor);
+  mesh::ota::OtaFirmwareTrustProvider trust(
+      verifier, candidate, sig_verifier, signer.publicKey());
+
+  uint8_t image[kOtaDefaultChunkPayloadSize] = {};
+  OtaDescriptor descriptor = buildProtocolDescriptor(image, sizeof(image), 1);
+  uint8_t canonical[kOtaDescriptorCanonicalSize] = {};
+  size_t canonical_len = 0;
+  ASSERT_EQ(OtaDescriptorCodecResult::Ok,
+            encodeOtaDescriptorCanonical(
+                descriptor, canonical, sizeof(canonical), canonical_len));
+  uint8_t signature[64] = {};
+  signer.sign(canonical, canonical_len, signature);
+
+  EXPECT_TRUE(trust.verifyDescriptor(descriptor, signature, sizeof(signature)));
+  signature[0] ^= 0x80u;
+  EXPECT_FALSE(trust.verifyDescriptor(descriptor, signature, sizeof(signature)));
+}
+
 namespace {
 class RecordingDirectLeaseHandler : public mesh::ota::OtaDirectLeaseHandler {
 public:
