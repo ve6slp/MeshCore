@@ -40,11 +40,15 @@ UF2_FAMILY_ID_BOOTLOADER = 0xD663823C
 # Deliberately EXCLUDED even though they sit between the bootloader and
 # UICR ranges above: the MBR Params Page (0xFE000..0xFF000) and the
 # Bootloader Settings page (0xFF000..0x100000, durable bank/CRC/size
-# metadata and this project's anti-rollback floor/command records) -- an
-# update artifact must never be able to overwrite either, and neither
-# appears in a real packaged UF2. Also excluded: the application image
-# region (0x27000..0xED000) and any external-flash/ExtraFS addressing --
-# a block targeting either must always be rejected.
+# metadata only) -- an update artifact must never be able to overwrite
+# either, and neither appears in a real packaged UF2. Also excluded: the
+# application image region (0x27000..0xED000) and any external-flash
+# addressing -- a UF2 targets only the internal-flash address space, so it
+# can never reach the anti-rollback floor/command-record journal or
+# ExtraFS at all (both live on the separate EXTERNAL QSPI chip, addressed
+# 0x18C000..0x194000 and 0x194000.. respectively, a distinct address space
+# from every internal-flash range above/below) -- but any block claiming
+# to target the application region must still always be rejected.
 PERMITTED_ADDRESS_RANGES = (
     (0x00000, 0x01000),        # MBR / vector table page
     (0xF4000, 0xFE000),        # bootloader code (38KiB) + bootloader config (2KiB)
@@ -196,6 +200,20 @@ def install(args):
     if args.validate_only:
         print(f"VALIDATE-ONLY: artifact {args.artifact} passed all artifact checks")
         return
+
+    # Physical installs are authorized for the XIAO lab board only: the
+    # mounted UF2 volume and lab inventory below are always for a real XIAO
+    # (BOARD_ID check further down), so a --board sensecap_solar_p1 artifact
+    # (even one whose own boot-info marker validates correctly for that
+    # profile) must never reach volume-copy against it. SenseCAP artifacts
+    # may only ever be checked with --validate-only.
+    if board != "xiao_nrf52840":
+        raise ValueError(
+            f"physical install is only authorized for board profile "
+            f"'xiao_nrf52840' (the XIAO lab target); got {board!r} -- "
+            "other board profiles may only be checked with --validate-only, "
+            "never physically installed"
+        )
 
     permitted = authorized_serials()
     if args.serial not in permitted:

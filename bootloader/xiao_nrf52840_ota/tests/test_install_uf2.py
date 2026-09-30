@@ -216,7 +216,10 @@ class GuardedInstallerTest(unittest.TestCase):
 
     def test_rejects_block_targeting_settings_page(self):
         # 0xFF000 is the durable bootloader-settings page (bank/CRC/size
-        # metadata and this project's anti-rollback floor/command records).
+        # metadata only, internal flash) -- the anti-rollback floor/command
+        # journal is a separate region on the EXTERNAL QSPI chip
+        # (0x18C000..0x194000), a UF2 (internal-flash-only) can never reach
+        # it regardless.
         data = _genuine_uf2(extra_blocks=[(0xFF000, b"\xAA" * 32)])
         artifact = self._replace_artifact(data)
         with self.assertRaisesRegex(ValueError, "outside the permitted"):
@@ -256,6 +259,35 @@ class GuardedInstallerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "boot-info marker"):
             INSTALLER.install(self.args(artifact=artifact, dry_run=False))
         self.assertFalse((self.volume / "replacement.uf2").exists())
+
+    def test_physical_install_rejects_non_xiao_board_even_with_valid_marker(self):
+        # A --board sensecap_solar_p1 artifact whose own boot-info marker
+        # validates correctly for that profile must still never reach
+        # volume-copy: physical installs here are only ever authorized
+        # against the real mounted XIAO lab board.
+        data = _genuine_uf2(marker=_build_marker_bytes(board="sensecap_solar_p1"))
+        artifact = self._replace_artifact(data)
+        with self.assertRaisesRegex(ValueError, "only authorized"):
+            INSTALLER.install(
+                self.args(artifact=artifact, board="sensecap_solar_p1", dry_run=False)
+            )
+        self.assertFalse((self.volume / "replacement.uf2").exists())
+
+    def test_validate_only_allows_non_xiao_board_artifact_check(self):
+        # --validate-only must still pass for a genuine sensecap artifact:
+        # the board restriction only guards the physical volume-copy path.
+        data = _genuine_uf2(marker=_build_marker_bytes(board="sensecap_solar_p1"))
+        artifact = self._replace_artifact(data)
+        args = self.args(
+            artifact=artifact,
+            board="sensecap_solar_p1",
+            validate_only=True,
+            serial=None,
+            boot_port=str(self.work / "no-such-boot-port"),
+            mountinfo=str(self.work / "no-such-mountinfo"),
+        )
+        INSTALLER.install(args)  # must not raise
+        self.assertFalse((self.volume / self.artifact.name).exists())
 
     def test_validate_only_needs_no_serial_or_device_resolution(self):
         # --validate-only must accept a genuine artifact with no serial,
