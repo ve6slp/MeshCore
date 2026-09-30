@@ -135,15 +135,18 @@ built and tested separately and remains unproven end to end. See the
 for the current, dated evidence ledger and its explicit gaps before quoting
 any hardware result from this lab elsewhere.
 
-The latest stock-only integration qualification is **not passing**. Both
-authorized boards boot the frozen application and exchange ordinary radio
-traffic, but signed staging aborts before authorization. The independent
-2% pressure run stays within 71,663/72,000 ms while ordinary advert
-allocation still fails with `ERR_TABLE_FULL`. Earlier signed-staging
-results do not establish success for this newer artifact. Evidence is in
-`.tmp/ota-rf-lab/stock-floor-gated-qualification/` and
-`.tmp/ota-rf-lab/stock-floor-gated-airtime/`; neither run proves a firmware
-installation, reboot resume or completed multicast repair.
+The **2026-09-30T12:26:14Z stock-only integration qualification passed**:
+the signed 320-byte RF-to-QSPI fixture completed, and ordinary advert
+allocation and expected-peer reception succeeded under 2% OTA pressure.
+Usage stayed at 71,822/72,000 ms; the ordinary advert arrived in 0.983 s
+without consuming that OTA budget. Paired post-run reads confirmed that
+all eight boot-journal sectors remained blank. Evidence is in
+`.tmp/ota-rf-lab/stock-policy-allocation-fixed-qualification/` and
+`.tmp/ota-boot-preflight/stock-policy-allocation-fixed-after-qualification/`.
+This supersedes the failing `stock-floor-gated-*` artifact, whose missing
+descriptor-format policy and raw-injection allocation reserve were fixed.
+It proves stock-only staging and this two-board fairness witness, not a
+firmware installation, reboot resume or completed multicast repair.
 
 ## Bootloader commissioning preflight
 

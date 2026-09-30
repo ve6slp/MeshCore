@@ -146,10 +146,11 @@ budget check against whatever firmware is already flashed on `client` and
 current state of the source tree. It accepts the same `OTA_LAB_DUTY_TIMEOUT`
 override as `test-xiao-nrf52-ota-lab` (default 420 seconds) for longer
 stress runs, e.g. `make test-xiao-nrf52-ota-airtime OTA_LAB_DUTY_TIMEOUT=900`.
-The recorded pressure run reached 71,851 of 72,000 ms permitted airtime,
-but ordinary advert allocation failed with `ERR_TABLE_FULL`. The airtime
-acceptance gate now also requires ordinary advert allocation and reception
-from the expected peer under pressure. A numerical quota pass alone is
+The latest full RF harness passed on 2026-09-30T12:26:14Z: usage reached
+71,822 of 72,000 ms, and an ordinary advert allocated and reached the
+expected peer in 0.983 s without changing OTA usage. This supersedes
+earlier pressure runs that enforced the quota but failed ordinary advert
+allocation with `ERR_TABLE_FULL`. A numerical quota pass alone is still
 not a passing background-service result.
 
 `scripts/ota_rf_lab.py` drives both boards over serial, sends and waits for
@@ -167,6 +168,19 @@ on it, since hardware qualification is ongoing.
 
 Verified:
 
+- **2026-09-30T12:26:14Z -- full stock-only RF harness**:
+  `.tmp/ota-rf-lab/stock-policy-allocation-fixed-qualification/summary.json`
+  records signed 320-byte RF-to-QSPI staging, queue precedence, manual
+  radio-lease/reversion and fleet-control probes, plus 2% budget pressure
+  with successful ordinary advert allocation and expected-peer reception.
+  The staged SHA-256 is
+  `9b5b15f57a4b1e4ead22796bc4fd085a636322fa0aae00291f79b7c3d7e907da`.
+  Both boards ran the frozen 502,300-byte application whose BIN SHA-256 is
+  `80fd9ebd972ae06c5e54634332be8332708b7e0375db928a00f81bc2721de118`.
+  Paired full-sector reads afterward found all eight boot-journal sectors
+  blank; no install command, confirmation or floor was written. This
+  fixture is not a bootable firmware update, and manual lease/probe
+  results do not establish autonomous three-mode operation.
 - **Raw QSPI backend, `target` role board (serial `3BE94917B92DC5E9`)**:
   `make validate-xiao-nrf52-qspi-hardware` passed — JEDEC ID `85:60:15`,
   2 MiB geometry, raw erase, program, readback, correct NOR 0-to-1 rejection,
@@ -209,15 +223,15 @@ Verified:
   normal-traffic-precedence probe, the direct-mode radio lease, the
   fleet-control-state probes, and the duty-cycle/airtime test — none of
   those were exercised in this run. The full harness
-  (`make test-xiao-nrf52-ota-lab`), which does exercise them, most
-  recently failed its `normal-traffic-precedence` check
+  (`make test-xiao-nrf52-ota-lab`), which does exercise them,
+  failed its `normal-traffic-precedence` check in that qualification period
   **nondeterministically**: the command that queues the synthetic
   advert-then-OTA-announcement flood returned success, but no advert event
   was observed on the receiving side within the check's window. Identical
   same-second adverts are legitimately deduplicated, so the host fixture
   now uses fresh advert bytes and requires enqueue success. These host
-  corrections are not a hardware pass: normal-traffic precedence, the
-  direct-mode lease and fleet-control probes still require a clean rerun.
+  corrections were not themselves a hardware pass. The later
+  2026-09-30T12:26:14Z full-harness result above supplies that clean rerun.
 - **Bootloader packaging/offline tooling gate** (`make
   test-xiao-ota-bootloader-tools`, `make verify-xiao-ota-boot-info-artifacts`,
   both `XIAO_OTA_BOARD=xiao_nrf52840` default and
@@ -229,12 +243,13 @@ Verified:
 - The previous 160-byte OTA chunk size, which didn't fit the companion
   serial frame, has been replaced with a 128-byte chunk (fitting the
   184-byte `kOtaMaxFrameSize`, the 255-byte LoRa payload limit, and the
-  64-byte mesh path field). The required strong transport uses a 16-byte tag, a
-  4-byte sequence number, and AES padding, with a 156-byte plaintext
-  ceiling that includes a 21-byte envelope. A 128-byte chunk therefore
-  becomes a 155-byte plaintext, a 179-byte payload once wrapped by the
-  strong transport, and up to 249 bytes on the wire in the worst-case
-  multi-hop RF path (64-byte path plus 4-byte scope) — under the
+  64-byte mesh path field). The required strong transport is
+  ChaCha20-Poly1305 with a 16-byte tag and a 4-byte sequence number;
+  it has no padding or transmitted IV. Its 156-byte plaintext ceiling
+  includes the 21-byte envelope. A 128-byte chunk therefore becomes a
+  155-byte plaintext, a 178-byte protected payload and up to 248 bytes
+  on the worst-case RF path. The full 156-byte plaintext ceiling becomes
+  a 179-byte protected payload and up to 249 bytes on the wire — under the
   255-byte RF limit but over the 176-byte companion serial limit. Do not
   use the smaller, weaker 2-byte MAC variant instead, and do not claim
   the raw serial link can hold an encrypted, full-path frame at this
@@ -289,32 +304,16 @@ against, not as a result.
 Not verified, and not to be represented as done in any documentation or
 release notes:
 - Full three-mode signed firmware transfer and install on real hardware.
-  Signed staging (descriptor through commit) has now passed in an isolated
-  run on `target`, but a confirmed clean pass of the full RF harness
-  (normal-traffic precedence, direct-mode lease, fleet-control probes,
-  and duty-cycle), and any actual device install, have not — do not
-  describe any mode as a complete end-to-end pass yet.
+  Signed staging and the full stock-only RF harness have passed, but
+  neither transfers and installs a bootable firmware through all three
+  autonomous modes. No actual device install has passed.
 - Routed (directed, mesh-relayed) image delivery to an out-of-reach target
   has not been attempted yet; only direct-mode application-layer traffic and
   fleet-mode state probes have been run over real RF so far.
-- The OTA airtime/duty-cycle budget: **2026-09-30T08:19:33Z result** — an
-  extended `make test-xiao-nrf52-ota-airtime` stress run (evidence
-  `.tmp/ota-rf-lab/airtime-pressure-baseline/summary.json`, log
-  `.tmp/ota-rf-airtime-pressure.log`) correctly drove the budget to its
-  configured limit and correctly enforced it: 71,851 of 72,000 ms used, no
-  overshoot (measured cost per 128-byte OTA chunk ≈ 553 ms, 149 ms
-  remaining when the run stopped queuing), and `target` held a stable
-  RX count of 129 throughout. **But the overall run failed**: immediately
-  after the budget was reached, an attempt to send an ordinary self-advert
-  (`CMD_SEND_SELF_ADVERT`) failed outright with `ERR_TABLE_FULL` (wire
-  code `0103`), because the shared outgoing-packet pool — general to
-  MeshCore, not OTA-specific — was full of queued/refused OTA sends. So
-  the duty-cycle time-budget subcheck passed, but ordinary-service-under-
-  OTA-load did **not**, and normal-traffic fairness under sustained OTA
-  pressure remains unverified. A firmware fix reserving pool capacity
-  below the application layer for raw/RX/relay ingress is in progress; the
-  full gate will be re-run once that lands. Do not describe this target as
-  passing until then.
+- Sustained multi-node and multihop fairness during a real background
+  campaign remains unverified. The latest two-board pressure run does
+  pass both the quota and ordinary-service witness, but it does not model
+  fleet contention, autonomous byte repair or a 24-72-hour campaign.
 - Turning a staged image into a running update is not proven end to end,
   but the pieces are at different stages, not all "not started":
   - The bootloader's boot marker (at flash offset `0xFDC00`) and a
