@@ -21,10 +21,10 @@ class OtaHostWireTests(unittest.TestCase):
         self.assertEqual(len(signature), 64)
         self.assertEqual(
             descriptor[:13],
-            bytes.fromhex("52840001010002700000000100"),
+            bytes.fromhex("584e3430000002700000000100"),
         )
         self.assertEqual(descriptor[13:45], hashlib.sha256(image).digest())
-        self.assertEqual(descriptor[45:], bytes.fromhex("0000000100000000000100010001"))
+        self.assertEqual(descriptor[45:], bytes.fromhex("0000000100000001000100010001"))
         public_key = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33))).public_key()
         public_key.verify(signature, descriptor)
         mutated = bytearray(descriptor)

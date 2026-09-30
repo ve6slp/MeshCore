@@ -4,6 +4,24 @@ Every operation against a physical board goes through one tool,
 `scripts/lab_device.py`, wrapped by `make lab-*` targets. No target, script, or
 ad-hoc command names a `ttyACM` number or a literal USB serial.
 
+## Host dependencies
+
+The lab scripts need Python packages beyond the base toolchain. Install them
+before running any `make lab-*` target or the host-side tests:
+
+```sh
+python3 -m pip install -r requirements-ota.txt
+```
+
+This pins `cryptography>=43.0` and `pyserial>=3.5`.
+
+`make test-ota-lab-host` runs the host-side unit tests for
+`scripts/lab_device.py` and `scripts/ota_rf_lab.py` (`scripts/tests/`),
+including the protected-power-domain behaviour described below. It exercises
+the actual wire/USB-protection logic against mocked device topology, not a
+placeholder or infrastructure-only check. It is part of `make test`/`make
+test-ota` and does not require a board attached.
+
 ## Roles, not ports
 
 Boards are addressed by **role**. `lab/devices.ini` pins each role to a USB
@@ -66,11 +84,33 @@ fails when the board is already in DFU or when numbering shifts mid-upload.
 Pointing `adafruit-nrfutil` at an already-resolved DFU port is deterministic.
 
 **Power cycling uses `uhubctl -f`, never the sysfs `authorized` toggle.** The
-bench hubs report ganged power switching, so uhubctl skips them without `-f`
-even though per-port switching works. The `authorized` toggle looks like a
-reasonable fallback but leaves the nRF52840 USB stack wedged
-(`can't set config #1, error -32`), recoverable only by a real power cut or a
-physical reset. It cost the lab one board before this was understood.
+`authorized` toggle looks like a reasonable fallback but leaves the
+nRF52840 USB stack wedged (`can't set config #1, error -32`), recoverable
+only by a real power cut or a physical reset. It cost the lab one board
+before this was understood.
+
+## Protected power domains
+
+The bench hubs report ganged power switching: forcing a port off/on with
+`uhubctl -f` can affect every device sharing that hub, not just the port
+you asked for. `scripts/lab_device.py` therefore refuses to run `uhubctl`
+against **any** hub that also carries a device listed under `[protected]`
+in `lab/devices.ini`, even with `-f`, even for a role that isn't itself
+protected.
+
+Right now the `target` role and the protected Pine board are both attached
+under the same physical hub (`target` at `1-4.2.3`, Pine at `1-4.2.1.2`,
+sharing parent hub `1-4.2`). `make lab-power-cycle-target` will refuse and
+print `refusing to power-cycle hub 1-4.2: protected device shares its power
+domain` instead of touching `uhubctl`. Recovering `target` in that state
+needs a physical reset or replug, not a lab command. `make lab-doctor`
+reports this case as `physical reset required`.
+
+`client` is on a separate, isolated bus and is not affected — `uhubctl`
+power-cycling for `client` continues to work normally through the same
+`make lab-power-cycle-client` target. This isolation depends on physical
+wiring, not configuration, and can change if boards are moved to different
+hub ports.
 
 ## What this lab has verified for LoRa OTA
 
@@ -94,5 +134,12 @@ make upload-xiao-nrf52-target
 `lab-power-cycle` locates the board in sysfs by serial rather than by role
 resolution, so it still works on a board that exposes no serial port.
 
+`lab-power-cycle-target` currently refuses, per
+[Protected power domains](#protected-power-domains) above, because `target`
+shares a hub with the protected Pine board. If it refuses, physically reset
+or replug `target` instead, then continue with `make upload-xiao-nrf52-target`.
+
 If `make lab-doctor` reports `physical reset required` for a role, that port has
-no software power control and the board's reset button is the only recovery.
+no software power control (or, as with `target` today, shares a hub with a
+protected device), and the board's reset button or a manual replug is the
+only recovery.

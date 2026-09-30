@@ -84,11 +84,18 @@ Handled in `examples/companion_radio/MyMesh.cpp::handleCmdFrame`:
   self-advert to exercise OTA-vs-normal traffic precedence. This exists for
   lab/test harnesses, not as a fleet-management primitive.
 
-The equivalent text CLI (`ota status`, `ota abort`, `ota rollback`,
-`ota direct ...`, `set ota.mode`, `set ota.dutycycle`, `get ota.mode`,
-`get ota.dutycycle`) is implemented in `src/helpers/CommonCLI.cpp` and is
-documented for operators in the
-[administrator guide](lora_ota_administration.md).
+`src/helpers/CommonCLI.cpp` also parses text-CLI equivalents (`ota status`,
+`ota abort`, `ota rollback`, `ota direct ...`, `set ota.mode`,
+`set ota.dutycycle`, `get ota.mode`, `get ota.dutycycle`), but they do
+**not** work today: the underlying `CommonCLICallbacks` OTA methods
+(`src/helpers/CommonCLI.h:221-244`) default to no-op/"unsupported" stubs,
+and `companion_radio` does not use `CommonCLI` at all, so no example
+currently overrides them. `simple_repeater`, `simple_room_server`, and
+`simple_sensor` are the only examples that use `CommonCLI`, and none of
+them wires these callbacks up to `src/ota/`. If you're adding OTA support to
+one of those examples, this is the gap to close. See the
+[administrator guide](lora_ota_administration.md) for the operator-facing
+writeup of this gap and the binary protocol used in the meantime.
 
 ## Hardware lab workflow
 

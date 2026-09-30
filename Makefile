@@ -95,7 +95,7 @@ test-ota-integration: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_integration'
 
 test-ota-lab-host: tmpdir
-	python3 -m unittest discover -s scripts/tests -p 'test_ota_rf_lab.py'
+	python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
 ## Compile the OTA-capable firmware targets.
 build-ota-targets: tmpdir

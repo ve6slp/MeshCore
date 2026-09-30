@@ -3,19 +3,33 @@
 ## Scope and status
 
 This guide documents the operator-facing controls for the LoRa OTA
-subsystem: the serial/BLE text CLI, the companion binary protocol, and the
-build-time switch that enables it. It is aimed at people who administer
-MeshCore nodes and want to inspect or exercise the feature on lab or test
-hardware.
+subsystem: the companion binary protocol, the plain-text CLI as declared in
+`CommonCLI`, and the build-time switch that enables OTA. It is aimed at
+people who administer MeshCore nodes and want to inspect or exercise the
+feature on lab or test hardware.
 
-**LoRa OTA is not production-ready.** The controls below let you observe
-status, change policy settings, and drive protocol-level test traffic. None
-of them can install a new firmware image on a device yet: the custom
-bootloader needed to install a staged image has source code and can be
-built, but the hand-off from the running application to that bootloader is
-incomplete, and installing firmware this way has not been proven on
-physical hardware. Do not rely on these commands to manage firmware on a
-network you care about.
+**Only one of these two control surfaces actually works on a shipped
+example today.** `examples/companion_radio` does not use `CommonCLI` at
+all; it implements OTA control itself, over the binary `CMD_OTA_CONTROL`
+serial command, and that path is fully wired and working. The plain-text
+`ota ...`/`set ota.*`/`get ota.*` commands are declared as virtual callbacks
+in `src/helpers/CommonCLI.h` with no-op/"unsupported" default bodies. The
+only examples that use `CommonCLI` — `simple_repeater`, `simple_room_server`,
+and `simple_sensor` — do not override those callbacks, so every text-CLI OTA
+command below currently returns "OTA unsupported" (or fails) on every
+shipped example, regardless of whether `MESHCORE_LORA_OTA` is enabled.
+Someone would need to wire those callbacks in the `simple_*` examples before
+the text CLI becomes functional; that work is outside `companion_radio`'s
+scope.
+
+**LoRa OTA is not production-ready either way.** The controls below let you
+observe status, change policy settings, and drive protocol-level test
+traffic on a companion-radio build. None of them can install a new firmware
+image on a device yet: the custom bootloader needed to install a staged
+image has source code and can be built, but the hand-off from the running
+application to that bootloader is incomplete, and installing firmware this
+way has not been proven on physical hardware. Do not rely on these commands
+to manage firmware on a network you care about.
 
 ## Build-time requirement
 
@@ -26,26 +40,31 @@ target. It is currently enabled on these `platformio.ini` environments:
 - `variants/sensecap_solar/platformio.ini` (SenseCAP Solar)
 - `variants/xiao_s3_wio/platformio.ini` (XIAO ESP32-S3 + Wio SX1262)
 
-A node built without this flag returns "OTA unsupported" for every command
-below.
+A companion-radio node built without this flag returns "OTA unsupported"
+for the binary `CMD_OTA_CONTROL` command below. `simple_repeater`,
+`simple_room_server`, and `simple_sensor` return "OTA unsupported" for the
+text CLI regardless of this flag, for the reason explained above.
 
-## Text CLI (serial, BLE, or companion terminal)
+## Companion binary protocol (working today, companion-radio builds only)
 
-These are plain-text commands sent the same way as `advert`, `clock`, or
-`set` — see [CLI Commands](cli_commands.md) for the general command
-mechanism. `start ota` (USB/BLE bootloader DFU) is a separate, pre-existing
-feature and is not affected by any of this.
+Companion apps talk to `CMD_OTA_CONTROL` (frame code `66`) and, for lab use
+only, `CMD_OTA_LAB` (frame code `67`). This is the control surface to use
+today; there is no working text-CLI equivalent yet.
 
-| Command | Effect |
-| --- | --- |
-| `ota status` | Reports mode, duty-cycle setting and usage, receive/error counters, and internal state machine values. |
-| `set ota.mode <direct\|routed\|fleet>` | Selects which OTA mode the node currently participates in. |
-| `get ota.mode` | Reports the current mode. |
-| `set ota.dutycycle <percent>` | Sets the OTA airtime budget, from just above 0 up to 100. The default is 2% of a 1-hour window (72,000 ms) for background/fleet mode. |
-| `get ota.dutycycle` | Reports the current duty-cycle setting. |
-| `ota direct <freq> <bw> <sf> <cr> <timeout_mins>` | Requests a temporary, high-speed direct-mode radio lease (frequency in MHz, bandwidth in kHz, spreading factor, coding rate, lease length in minutes). The node automatically reverts to its normal radio settings when the lease expires. |
-| `ota abort` | Aborts any in-progress OTA session and immediately reverts a direct-mode radio lease if one is active. |
-| `ota rollback` | Requests a rollback of a staged/candidate update, then aborts the session. |
+| Sub-command | Byte value | Effect |
+| --- | --- | --- |
+| `OTA_CTRL_GET_STATUS` | 0 | Returns `RESP_CODE_OTA_STATUS` (29) with a status string (see example below). |
+| `OTA_CTRL_SET_MODE` | 1 | Sets mode: `0`=direct, `1`=routed, `2`=fleet. |
+| `OTA_CTRL_SET_DUTY` | 2 | Sets duty cycle, encoded as milli-percent (e.g. `2000` = 2.0%). |
+| `OTA_CTRL_ABORT` | 3 | Aborts any in-progress OTA session and immediately reverts a direct-mode radio lease if one is active. |
+| `OTA_CTRL_ROLLBACK` | 4 | Requests a rollback of a staged/candidate update, then aborts the session. |
+| `OTA_CTRL_DIRECT_LEASE` | 5 | Requests a temporary, high-speed direct-mode radio lease: frequency/bandwidth in kHz-scaled integers, spreading factor, coding rate, and a 16-bit lease timeout in minutes. The node automatically reverts to its normal radio settings when the lease expires. |
+
+`CMD_OTA_LAB` currently exposes one operation, `OTA_LAB_QUEUE_PRECEDENCE`
+(`0`), which floods a synthetic OTA announcement and advert pair for
+precedence testing. It exists to exercise the traffic-priority behaviour in a
+lab, not as an administrative fleet-update trigger — see the
+[developer guide](lora_ota_development.md) for the full protocol reference.
 
 Example status reply:
 
@@ -61,25 +80,28 @@ missing and any transfer attempt will fail closed. This flag says nothing
 about bootloader or physical-install capability, which is a separate,
 unproven part of the system.
 
-## Companion binary protocol
+## Text CLI (declared, not currently wired to any example)
 
-Companion apps talk to `CMD_OTA_CONTROL` (frame code `66`) and, for lab use
-only, `CMD_OTA_LAB` (frame code `67`). These mirror the text CLI:
+`src/helpers/CommonCLI.cpp` parses these plain-text commands the same way
+it parses `advert`, `clock`, or `set` — see [CLI Commands](cli_commands.md)
+for the general command mechanism. `start ota` (USB/BLE bootloader DFU) is
+a separate, pre-existing feature and is not affected by any of this. As
+explained above, every command in this table returns "OTA unsupported" (or
+fails) on `simple_repeater`, `simple_room_server`, and `simple_sensor` as
+currently shipped, and does not exist at all on `companion_radio`, which
+uses the binary protocol instead. The table is included so the intended
+surface is documented, not as a claim that it works today.
 
-| Sub-command | Byte value | Effect |
-| --- | --- | --- |
-| `OTA_CTRL_GET_STATUS` | 0 | Returns `RESP_CODE_OTA_STATUS` (29) with the same status string as `ota status`. |
-| `OTA_CTRL_SET_MODE` | 1 | Sets mode: `0`=direct, `1`=routed, `2`=fleet. |
-| `OTA_CTRL_SET_DUTY` | 2 | Sets duty cycle, encoded as milli-percent (e.g. `2000` = 2.0%). |
-| `OTA_CTRL_ABORT` | 3 | Same as `ota abort`. |
-| `OTA_CTRL_ROLLBACK` | 4 | Same as `ota rollback`. |
-| `OTA_CTRL_DIRECT_LEASE` | 5 | Same as `ota direct`, with frequency/bandwidth in kHz-scaled integers, spreading factor, coding rate, and a 16-bit lease timeout in minutes. |
-
-`CMD_OTA_LAB` currently exposes one operation, `OTA_LAB_QUEUE_PRECEDENCE`
-(`0`), which floods a synthetic OTA announcement and advert pair for
-precedence testing. It exists to exercise the traffic-priority behaviour in a
-lab, not as an administrative fleet-update trigger — see the
-[developer guide](lora_ota_development.md) for the full protocol reference.
+| Command | Intended effect |
+| --- | --- |
+| `ota status` | Reports mode, duty-cycle setting and usage, receive/error counters, and internal state machine values. |
+| `set ota.mode <direct\|routed\|fleet>` | Selects which OTA mode the node currently participates in. |
+| `get ota.mode` | Reports the current mode. |
+| `set ota.dutycycle <percent>` | Sets the OTA airtime budget, from just above 0 up to 100. The default is 2% of a 1-hour window (72,000 ms) for background/fleet mode. |
+| `get ota.dutycycle` | Reports the current duty-cycle setting. |
+| `ota direct <freq> <bw> <sf> <cr> <timeout_mins>` | Requests a temporary, high-speed direct-mode radio lease. |
+| `ota abort` | Aborts any in-progress OTA session and reverts an active direct-mode radio lease. |
+| `ota rollback` | Requests a rollback of a staged/candidate update, then aborts the session. |
 
 ## Duty-cycle policy in practice
 
@@ -104,9 +126,11 @@ for the full policy model.
 ## What administrators can honestly rely on today
 
 - Setting mode and duty cycle, and reading them back, works as documented
-  above on any OTA-enabled build.
-- `ota status` accurately reflects internal protocol state and is useful for
-  diagnosing lab or bench sessions.
+  above on any OTA-enabled **companion-radio** build, using the binary
+  `CMD_OTA_CONTROL` protocol. It does not work through the text CLI on any
+  currently shipped example.
+- `OTA_CTRL_GET_STATUS` accurately reflects internal protocol state and is
+  useful for diagnosing lab or bench sessions.
 - A direct-mode radio lease correctly applies and automatically reverts
   temporary radio parameters; this has been reconfirmed on repeated lab runs
   over real RF at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5.

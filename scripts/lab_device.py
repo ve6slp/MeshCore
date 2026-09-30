@@ -366,6 +366,16 @@ def _run(cmd: list[str], timeout: float) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
+def _protected_on_hub(hub: str) -> list[str]:
+    prefix = hub + ("-" if hub.isdigit() else ".")
+    members = []
+    for name, serial in load_protected().items():
+        device = sysfs_for_serial(serial)
+        if device is not None and device.name.startswith(prefix):
+            members.append(f"{name} ({serial})")
+    return members
+
+
 def cmd_power_cycle(args: argparse.Namespace) -> int:
     """Cut and restore USB port power, then wait for re-enumeration.
 
@@ -374,9 +384,9 @@ def cmd_power_cycle(args: argparse.Namespace) -> int:
     wedged ("can't set config #1, error -32") and recoverable only by a real
     power cut or a physical reset.
 
-    `-f` is required because the bench hubs report ganged power switching,
-    which makes uhubctl skip them by default even though per-port switching
-    demonstrably works.
+    Bench hubs report ganged power switching, so forced port control may
+    affect siblings. Never force power control on a hub containing a
+    protected device.
     """
     roles = load_roles()
     if args.role not in roles:
@@ -388,6 +398,12 @@ def cmd_power_cycle(args: argparse.Namespace) -> int:
     location = sysfs.name  # e.g. "8-4.4.3" or "1-10"
     separator = "." if "." in location else "-"
     hub, _, port = location.rpartition(separator)
+    protected = _protected_on_hub(hub)
+    if protected:
+        raise SystemExit(
+            f"refusing to power-cycle hub {hub}: protected device shares its power domain: "
+            f"{', '.join(protected)}\n"
+            f"physically reset or reattach role '{args.role}' instead")
 
     rc, out = _run(["sudo", "-n", "uhubctl", "-f", "-l", hub, "-p", port,
                     "-a", "cycle", "-d", str(args.delay)], UHUBCTL_TIMEOUT)
@@ -425,6 +441,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 continue
             separator = "." if "." in location else "-"
             hub, _, port = location.rpartition(separator)
+            if _protected_on_hub(hub):
+                print(f"power-cycle {role} (hub {hub} port {port}): "
+                      "no - protected device shares hub; physical reset required")
+                continue
             rc, _ = _run(["sudo", "-n", "uhubctl", "-f", "-l", hub, "-p", port],
                          UHUBCTL_TIMEOUT)
             print(f"power-cycle {role} (hub {hub} port {port}): "

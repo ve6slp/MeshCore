@@ -264,11 +264,11 @@ def descriptor_fragment(image, security_counter):
     if not image or security_counter <= 0:
         raise ValueError("a descriptor requires an image and a positive security counter")
     descriptor = (
-        struct.pack(">HHBII", 0x5284, 1, 1, 0x27000, len(image)) +
+        struct.pack(">HHBII", 0x584E, 0x3430, 0, 0x27000, len(image)) +
         hashlib.sha256(image).digest() +
-        struct.pack(">IIHHH", security_counter, 0, 1, 1, 1)
+        struct.pack(">IIHHH", security_counter, 1, 1, 1, 1)
     )
-    # This publicly reproducible fixture key authorizes lab staging only.
+    # Publicly reproducible lab fixture; never use this key on deployed nodes.
     signature = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33))).sign(descriptor)
     blob = descriptor + signature
     return bytes([0, 1]) + struct.pack(">HH", len(blob), len(blob)) + blob
