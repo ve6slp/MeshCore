@@ -224,15 +224,17 @@ raw reads, not formatting, programming, erasing, or restoration. Building
 does not flash either board; installation must use a separately qualified,
 immutable application package through the lab-device workflow.
 
-After that diagnostic is installed, use explicit local key and archive
-paths:
+After that diagnostic is installed, use explicit private, persistent key
+and archive paths outside `.tmp`, which is disposable build scratch:
 
 ```sh
-make generate-ota-lab-archive-key OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key"
-make archive-xiao-nrf52-client OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key" \
-  OTA_LAB_ARCHIVE_FILE="$PWD/.tmp/client-media.archive"
-make verify-xiao-nrf52-client-archive OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key" \
-  OTA_LAB_ARCHIVE_FILE="$PWD/.tmp/client-media.archive"
+archive_dir="$HOME/.local/state/meshcore-ota-lab/capture-001"
+install -d -m 700 "$archive_dir"
+make generate-ota-lab-archive-key OTA_LAB_ARCHIVE_KEY="$archive_dir/archive.key"
+make archive-xiao-nrf52-client OTA_LAB_ARCHIVE_KEY="$archive_dir/archive.key" \
+  OTA_LAB_ARCHIVE_FILE="$archive_dir/client-media.archive"
+make verify-xiao-nrf52-client-archive OTA_LAB_ARCHIVE_KEY="$archive_dir/archive.key" \
+  OTA_LAB_ARCHIVE_FILE="$archive_dir/client-media.archive"
 ```
 
 The corresponding target-board commands are `archive-xiao-nrf52-target`
