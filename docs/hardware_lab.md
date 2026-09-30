@@ -72,6 +72,17 @@ reasonable fallback but leaves the nRF52840 USB stack wedged
 (`can't set config #1, error -32`), recoverable only by a real power cut or a
 physical reset. It cost the lab one board before this was understood.
 
+## What this lab has verified for LoRa OTA
+
+This bench pair is currently used to validate the LoRa OTA subsystem. What is
+proven here is application-level radio behaviour and raw/staged flash
+correctness on the `target` board — not a completed firmware install. The
+custom bootloader that would turn a staged image into a running update is
+built and tested separately and remains unproven end to end. See the
+[LoRa OTA developer guide](lora_ota_development.md#current-hardware-evidence)
+for the current, dated evidence ledger and its explicit gaps before quoting
+any hardware result from this lab elsewhere.
+
 ## Recovering an unresponsive board
 
 ```sh

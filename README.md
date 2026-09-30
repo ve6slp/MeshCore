@@ -31,6 +31,7 @@ MeshCore provides the ability to create wireless mesh networks, similar to Mesht
 - Watch the [MeshCore QuickStart Playlist](https://www.youtube.com/watch?v=iaFltojJrAc&list=PLshzThxhw4O4WU_iZo3NmNZOv6KMrUuF9) by The Comms Channel
 - Watch the [MeshCore Technical Presentation](https://www.youtube.com/watch?v=OwmkVkZQTf4) by Liam Cottle.
 - Read through our [Frequently Asked Questions](./docs/faq.md) and [Documentation](https://docs.meshcore.io).
+  - LoRa OTA firmware updates are in development — see the [user guide](./docs/lora_ota_users.md) for current status.
 - Flash the MeshCore firmware on a supported device.
 - Connect with a supported client.
 

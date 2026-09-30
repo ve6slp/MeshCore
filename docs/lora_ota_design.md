@@ -1,5 +1,15 @@
 # LoRa OTA patching design for MeshCore
 
+This is the design and hardware-qualification record for LoRa OTA. For
+audience-specific guides, see:
+
+- [User guide](lora_ota_users.md) — what LoRa OTA is and its current
+  availability status
+- [Administrator guide](lora_ota_administration.md) — CLI/API controls and
+  duty-cycle policy for operators
+- [Developer guide](lora_ota_development.md) — source layout, build/test
+  targets, and the current hardware evidence ledger
+
 ## Design intent
 
 MeshCore already has the right transport primitives for a robust OTA design: direct delivery, zero-hop local traffic, and routed/flood traffic with transport codes. We should not build a separate radio subsystem; we should build a firmware-update control plane that rides on the existing packet layer and uses the radio only when the update session is permitted.

@@ -186,12 +186,14 @@ XIAO_NRF52_LAB_PACKAGE ?= .pio/build/Xiao_nrf52_companion_radio_usb/firmware.zip
 upload-xiao-nrf52-client: build-xiao-nrf52-lab
 	@mkdir -p $(OTA_LAB_ARTIFACT_DIR)
 	@$(LAB_DEVICE) flash client --package $(XIAO_NRF52_LAB_PACKAGE) \
-	  2>&1 | tee $(OTA_LAB_ARTIFACT_DIR)/flash-client.log
+	  > $(OTA_LAB_ARTIFACT_DIR)/flash-client.log 2>&1; \
+	  result=$$?; cat $(OTA_LAB_ARTIFACT_DIR)/flash-client.log; exit $$result
 
 upload-xiao-nrf52-target: build-xiao-nrf52-lab
 	@mkdir -p $(OTA_LAB_ARTIFACT_DIR)
 	@$(LAB_DEVICE) flash target --package $(XIAO_NRF52_LAB_PACKAGE) \
-	  2>&1 | tee $(OTA_LAB_ARTIFACT_DIR)/flash-target.log
+	  > $(OTA_LAB_ARTIFACT_DIR)/flash-target.log 2>&1; \
+	  result=$$?; cat $(OTA_LAB_ARTIFACT_DIR)/flash-target.log; exit $$result
 
 upload-xiao-nrf52-lab: upload-xiao-nrf52-client upload-xiao-nrf52-target
 
