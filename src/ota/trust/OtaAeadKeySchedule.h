@@ -77,17 +77,15 @@ public:
   static constexpr size_t kPairwiseContextBytes = kFullPubKeyBytes * 2;  // 64
   static constexpr size_t kGroupContextBytes = 32 + 4 + 4 + 2 + 32 + 2 + 16;  // 92
 
-  // Salt is fixed and public: SHA256("MeshCore/OTA/AEAD1"). Computed once
-  // and cached -- every derivation (pairwise or group) uses this same salt.
+  // SHA256("MeshCore/OTA/AEAD1"), without NUL. Immutable initialization
+  // avoids racing concurrent first derivations.
   static const uint8_t* salt() {
-    static uint8_t cached[32];
-    static bool computed = false;
-    if (!computed) {
-      static const char kLabel[] = "MeshCore/OTA/AEAD1";  // no NUL included, per spec.
-      Sha256::hash(reinterpret_cast<const uint8_t*>(kLabel), sizeof(kLabel) - 1, cached);
-      computed = true;
-    }
-    return cached;
+    static const uint8_t value[32] = {
+        0x76, 0x14, 0x73, 0xb8, 0xd7, 0x25, 0x72, 0x14,
+        0x15, 0xfa, 0x33, 0x7d, 0xfe, 0x5a, 0x92, 0xdc,
+        0xa6, 0x60, 0xc1, 0x6d, 0x8f, 0x63, 0x88, 0x22,
+        0xa8, 0x67, 0x0f, 0x84, 0x51, 0x84, 0x7a, 0xb5};
+    return value;
   }
 
   // Pairwise key material for the direction sender -> receiver. `out_key`

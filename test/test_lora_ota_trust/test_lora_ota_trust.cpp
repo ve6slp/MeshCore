@@ -493,6 +493,28 @@ TEST(HkdfSha256, Rfc5869TestCase3ZeroLengthSaltAndInfo) {
 // group derivation determinism.
 // -----------------------------------------------------------------------
 
+TEST(OtaAeadKeySchedule, ImmutableSaltMatchesProtocolDomain) {
+  static const char label[] = "MeshCore/OTA/AEAD1";
+  uint8_t expected[32];
+  ota::trust::Sha256::hash(reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1, expected);
+  EXPECT_EQ(0, memcmp(expected, ota::trust::OtaAeadKeySchedule::salt(), sizeof(expected)));
+  EXPECT_EQ(toHex(ota::trust::OtaAeadKeySchedule::salt(), 32),
+            "761473b8d725721415fa337dfe5a92dca660c16d8f638822a8670f8451847ab5");
+}
+
+TEST(OtaAeadKeySchedule, PairwiseIndependentKnownAnswer) {
+  uint8_t secret[32], sender[32], receiver[32];
+  for (size_t i = 0; i < 32; ++i) {
+    secret[i] = static_cast<uint8_t>(i + 1);
+    sender[i] = static_cast<uint8_t>(i);
+    receiver[i] = static_cast<uint8_t>(i + 0x40);
+  }
+  uint8_t key[32], prefix[8];
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::derivePairwise(secret, sender, receiver, key, prefix));
+  EXPECT_EQ(toHex(key, sizeof(key)), "ae212921a0efd580b41d0c742fd3f078e7f3ec4a15b883c8e6cd38f48f69459a");
+  EXPECT_EQ(toHex(prefix, sizeof(prefix)), "145bde9e70f03ce9");
+}
+
 TEST(OtaAeadKeySchedule, RejectsAllZeroSharedSecret) {
   uint8_t zero_secret[32] = {0};
   uint8_t pub_a[32], pub_b[32];

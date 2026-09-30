@@ -78,6 +78,11 @@ explicitly with the corresponding PlatformIO package-install command.
 These checks do not qualify authenticated transport, durable replay
 protection, installation, or hardware.
 
+The key schedule uses immutable public salt bytes, avoiding concurrent
+first-call initialization races. Native SHA-256 and independently computed
+HKDF known-answer vectors pin the exact no-NUL protocol domain and
+directional key/nonce outputs.
+
 The native runtime suite also exercises the durable TX/RX primitives
 through 103 erase/body/marker/readback fault cases each, reconstructing
 fresh objects over the resulting NOR bytes. Corrupt or unreadable slots
