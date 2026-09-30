@@ -12,7 +12,10 @@ serial:
 ```ini
 [roles]
 client = 4186AE911D94CDB1
-target = 49C5BAF21EEF44A1
+target = 3BE94917B92DC5E9
+
+[protected]
+pine = 49C5BAF21EEF44A1
 ```
 
 Override a role for one run without editing the file:
@@ -20,6 +23,10 @@ Override a role for one run without editing the file:
 ```sh
 MESHCORE_LAB_TARGET_SERIAL=ABC123 make lab-devices
 ```
+
+Serials in `[protected]` cannot be assigned to a lab role, including through
+an environment override. This prevents the Pine project board from being
+reset, flashed, or power-cycled by a MeshCore lab command.
 
 `ttyACM` numbering changes whenever a board re-enumerates — a DFU entry alone
 moves it. Resolving a role to the current `/dev/serial/by-id` path at the moment

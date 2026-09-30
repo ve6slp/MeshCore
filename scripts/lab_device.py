@@ -138,15 +138,35 @@ def discover() -> list[Device]:
 def load_roles() -> dict[str, str]:
     """Role -> USB serial. Environment overrides the committed inventory."""
     roles: dict[str, str] = {}
+    protected: dict[str, str] = {}
     if CONFIG_PATH.is_file():
         parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
         parser.read(CONFIG_PATH)
         if parser.has_section("roles"):
             roles.update({k: v.strip() for k, v in parser.items("roles") if v.strip()})
+        if parser.has_section("protected"):
+            protected.update({k: v.strip() for k, v in parser.items("protected") if v.strip()})
     for key, value in os.environ.items():
         if key.startswith("MESHCORE_LAB_") and key.endswith("_SERIAL") and value.strip():
             roles[key[len("MESHCORE_LAB_"):-len("_SERIAL")].lower()] = value.strip()
+    protected_by_serial = {serial: name for name, serial in protected.items()}
+    conflicts = [(role, protected_by_serial[serial])
+                 for role, serial in roles.items() if serial in protected_by_serial]
+    if conflicts:
+        details = ", ".join(f"{role} is protected as {name}" for role, name in conflicts)
+        raise SystemExit(f"refusing protected lab device assignment: {details}")
     return roles
+
+
+def load_protected() -> dict[str, str]:
+    """Protected name -> USB serial. These devices must never be lab targets."""
+    if not CONFIG_PATH.is_file():
+        return {}
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    parser.read(CONFIG_PATH)
+    if not parser.has_section("protected"):
+        return {}
+    return {k: v.strip() for k, v in parser.items("protected") if v.strip()}
 
 
 def resolve(role: str, mode: str = "any") -> Device:
@@ -229,13 +249,16 @@ def _touch_1200(port: Path) -> None:
 def cmd_list(args: argparse.Namespace) -> int:
     roles = load_roles()
     by_serial = {serial: role for role, serial in roles.items()}
+    protected_by_serial = {serial: f"protected:{name}"
+                           for name, serial in load_protected().items()}
     devices = discover()
     if not devices:
         print("no XIAO nRF52840 boards attached")
     else:
-        print(f"{'ROLE':<8} {'SERIAL':<18} {'MODE':<11} {'TTY':<10} {'USB':<10} PRODUCT")
-        for d in sorted(devices, key=lambda d: (by_serial.get(d.serial, "~"), d.serial)):
-            print(f"{by_serial.get(d.serial, '-'):<8} {d.serial:<18} {d.mode:<11} "
+        print(f"{'ROLE':<14} {'SERIAL':<18} {'MODE':<11} {'TTY':<10} {'USB':<10} PRODUCT")
+        labels = {**protected_by_serial, **by_serial}
+        for d in sorted(devices, key=lambda d: (labels.get(d.serial, "~"), d.serial)):
+            print(f"{labels.get(d.serial, '-'):<14} {d.serial:<18} {d.mode:<11} "
                   f"{d.tty:<10} {d.sysfs.name:<10} {d.product}")
     missing = [r for r, s in roles.items() if not any(d.serial == s for d in devices)]
     if missing:
