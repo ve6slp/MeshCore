@@ -84,7 +84,7 @@ def inspect_target(node, evidence, erase_known_residue=False):
     classification = classify_snapshot(first)
     evidence.summary["measurements"]["floor_classification"] = classification
     evidence.check("legacy-commissioning-preflight", True, classification=classification,
-                   installed_or_bootloader_qualified=False)
+                   journal_transactions_blank=True, bootloader_qualification="not-evaluated")
     if not erase_known_residue or classification == "blank":
         evidence.log("cleanup-not-performed", explicit_approval=erase_known_residue,
                      classification=classification)

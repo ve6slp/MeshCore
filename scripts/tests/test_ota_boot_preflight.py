@@ -97,6 +97,9 @@ class JournalReadTests(unittest.TestCase):
                 for name, _ in preflight.JOURNAL_SECTORS:
                     self.assertEqual((evidence.directory / phase / f"{name}.bin").read_bytes(), snapshot[name])
         self.assertEqual(node.command.call_count, 512)
+        evidence.check.assert_any_call(
+            "legacy-commissioning-preflight", True, classification="historical-lab-residue",
+            journal_transactions_blank=True, bootloader_qualification="not-evaluated")
 
 
 class CleanupApprovalTests(unittest.TestCase):
