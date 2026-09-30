@@ -495,4 +495,5 @@ verify-ota-software: test build-ota-targets build-non-ota-targets
 	@echo "NOT qualified here: on-device radio, flash, bootloader, anti-rollback, rollback."
 
 clean-tmp:
-	rm -rf $(TMPDIR)
+	@echo "Refusing to delete shared TMPDIR: $(TMPDIR). Remove only explicitly owned scratch paths." >&2
+	@exit 1

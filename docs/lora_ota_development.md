@@ -237,6 +237,10 @@ make verify-xiao-nrf52-client-archive OTA_LAB_ARCHIVE_KEY="$archive_dir/archive.
   OTA_LAB_ARCHIVE_FILE="$archive_dir/client-media.archive"
 ```
 
+Build scratch is shared across qualification owners. `make clean-tmp`
+refuses whole-directory deletion; cleanup must target only individually
+named paths owned by the operation, never `.tmp` itself or wildcards.
+
 The corresponding target-board commands are `archive-xiao-nrf52-target`
 and `verify-xiao-nrf52-target-archive`. A complete capture requires all
 1 MiB of internal flash and 2 MiB of QSPI, encrypted locally; neither
