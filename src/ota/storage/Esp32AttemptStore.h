@@ -31,6 +31,17 @@ public:
   virtual ~Esp32AttemptPolicy() = default;
   virtual bool commissionedSecurityValid(const uint8_t* payload, size_t len) const = 0;
   virtual bool authorizedAttemptValid(const Esp32AttemptRecord& record) const = 0;
+
+  // Explicitly authorize retiring this terminal record for this NEW bound
+  // attempt, with fresh authenticated-controller authorization/local consent,
+  // not the terminal record's stored grant. For Staged, positively establish
+  // that no installer/trial still owns it; unknown state or a stock profile
+  // is not qualification. Unsupported retirement fails closed. Authorization
+  // and exclusive ownership must remain held through the synchronous save.
+  virtual bool authorizeTerminalReplacement(const Esp32AttemptRecord& /*terminal*/,
+                                            const Esp32AttemptRecord& /*next*/) const {
+    return false;
+  }
 };
 
 class Esp32AttemptCodec {
@@ -123,6 +134,8 @@ public:
   Esp32AttemptStore(Esp32DurableBlobStore& blobs, platform::Esp32FlashAdapter& flash,
                     const Esp32AttemptPolicy& policy) : blobs_(blobs), flash_(flash), policy_(policy) {}
 
+  // First admission only. An existing record is never implicitly discarded;
+  // subsequent campaigns require the explicit replaceTerminal transition.
   Esp32PersistenceResult admit(const Esp32AttemptRecord& record) {
     flash_.unbind();
     if (!Esp32AttemptCodec::valid(record) || record.phase != Esp32StagingPhase::Admitted ||
@@ -138,11 +151,59 @@ public:
     if (loaded.status != Esp32PersistenceStatus::Missing) return loaded;
     const auto binding = bind(record);
     if (!binding.ok()) return binding;
-    uint8_t bytes[Esp32AttemptCodec::kBytes];
-    const auto len = Esp32AttemptCodec::encode(record, bytes, sizeof(bytes));
-    const auto saved = blobs_.save(Esp32BlobKind::Attempt, bytes, len, Esp32BlobCreation::ExplicitProvision);
-    if (!saved.ok()) flash_.unbind();
-    return saved;
+    return save(record, Esp32BlobCreation::ExplicitProvision);
+  }
+
+  // Retire Aborted, or explicitly policy-qualified Staged, and admit next in
+  // ONE journal generation. expected_terminal must match the entire winning
+  // checkpoint. next must be Admitted/Granted with zero progress, a strictly
+  // newer tuple under OtaReplayGuard's ordering, a new bound attempt digest,
+  // and freshly validated policy/SDK ownership/boot selection. A new attempt
+  // may retry the SAME signed image; changing only its descriptor/controller
+  // cannot resurrect the old tuple. Never delete metadata, reset Security/TX/
+  // RX state, erase image bytes, or recover corrupt/uncertain state here.
+  Esp32PersistenceResult replaceTerminal(const Esp32AttemptRecord& expected_terminal,
+                                        const Esp32AttemptRecord& next_request) {
+    flash_.unbind();
+    // Policy callbacks may update caller-owned state through other aliases;
+    // approval and persistence must refer to the SAME frozen request.
+    const Esp32AttemptRecord next = next_request;
+    if (!Esp32AttemptCodec::valid(expected_terminal) || !Esp32AttemptCodec::valid(next) ||
+        next.phase != Esp32StagingPhase::Admitted || next.consent != Esp32ConsentState::Granted ||
+        !policy_.authorizedAttemptValid(next)) return {Esp32PersistenceStatus::InvalidArgument};
+    auto security = securityReady();
+    if (!security.ok()) return security;
+    Esp32DurableBlob stored;
+    auto loaded = blobs_.load(Esp32BlobKind::Attempt, stored);
+    if (!loaded.ok()) return loaded;
+    Esp32AttemptRecord current;
+    if (!Esp32AttemptCodec::decode(stored.payload, stored.size, current))
+      return {Esp32PersistenceStatus::Corrupt};
+    if (!sameCheckpoint(current, expected_terminal) ||
+        (current.phase != Esp32StagingPhase::Aborted && current.phase != Esp32StagingPhase::Staged) ||
+        !meshcore::ota::runtime::otaSessionIsNewer(next.session, current.session) ||
+        memcmp(next.attemptDigest, current.attemptDigest, sizeof(next.attemptDigest)) == 0)
+      return {Esp32PersistenceStatus::Conflict};
+    const auto capacity = blobs_.capacity(Esp32AttemptCodec::kBytes);
+    if (!capacity.ok()) return capacity;
+    if (!policy_.authorizeTerminalReplacement(current, next))
+      return {Esp32PersistenceStatus::OwnershipDenied};
+    // The policy decision must not become a stale retirement proof if its
+    // callback changes commissioning or the winning transaction.
+    security = securityReady();
+    if (!security.ok()) return security;
+    Esp32DurableBlob latest;
+    loaded = blobs_.load(Esp32BlobKind::Attempt, latest);
+    if (!loaded.ok()) return loaded;
+    Esp32AttemptRecord latest_record;
+    if (!Esp32AttemptCodec::decode(latest.payload, latest.size, latest_record))
+      return {Esp32PersistenceStatus::Corrupt};
+    if (latest.generation != stored.generation || !sameCheckpoint(current, latest_record))
+      return {Esp32PersistenceStatus::Conflict};
+    if (!policy_.authorizedAttemptValid(next)) return {Esp32PersistenceStatus::OwnershipDenied};
+    const auto binding = bind(next);
+    if (!binding.ok()) return binding;
+    return save(next);
   }
 
   // Resume only reads metadata and rebinds a fresh inactive partition.
@@ -180,15 +241,27 @@ public:
          (next.verifiedBytes != current.verifiedBytes || next.erasedBytes != current.erasedBytes ||
           (next.phase != current.phase && next.phase != Esp32StagingPhase::Aborted))) ||
         !phaseTransition(current.phase, next.phase)) return {Esp32PersistenceStatus::Conflict};
-    uint8_t bytes[Esp32AttemptCodec::kBytes];
-    const auto len = Esp32AttemptCodec::encode(next, bytes, sizeof(bytes));
-    const auto saved = blobs_.save(Esp32BlobKind::Attempt, bytes, len);
+    const auto saved = save(next);
     if (!saved.ok() || next.consent != Esp32ConsentState::Granted ||
         next.phase == Esp32StagingPhase::Aborted) flash_.unbind();
     return saved;
   }
 
 private:
+  static bool sameCheckpoint(const Esp32AttemptRecord& a, const Esp32AttemptRecord& b) {
+    return Esp32AttemptCodec::sameAttempt(a, b) && a.erasedBytes == b.erasedBytes &&
+           a.verifiedBytes == b.verifiedBytes && a.consent == b.consent && a.phase == b.phase;
+  }
+
+  Esp32PersistenceResult save(const Esp32AttemptRecord& record,
+                            Esp32BlobCreation creation = Esp32BlobCreation::ExistingOnly) {
+    uint8_t bytes[Esp32AttemptCodec::kBytes];
+    const auto len = Esp32AttemptCodec::encode(record, bytes, sizeof(bytes));
+    const auto saved = blobs_.save(Esp32BlobKind::Attempt, bytes, len, creation);
+    if (!saved.ok()) flash_.unbind();
+    return saved;
+  }
+
   static bool phaseTransition(Esp32StagingPhase from, Esp32StagingPhase to) {
     if (from == to) return true;
     if (from == Esp32StagingPhase::Aborted || from == Esp32StagingPhase::Staged) return false;

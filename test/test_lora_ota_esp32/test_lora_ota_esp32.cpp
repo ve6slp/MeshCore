@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <functional>
 #include <ota/platform/Esp32FlashAdapter.h>
 #include <ota/platform/FlashRegion.h>
 #include <ota/storage/Esp32AttemptStore.h>
@@ -50,22 +51,56 @@ public:
   uint8_t controllerSeed[32] = {0x83, 0x6a, 0xef};
   Ed25519TestSigner controllerKey{controllerSeed};
   std::vector<uint8_t> security;
+  meshcore::ota::runtime::OtaSessionId authorizedSession{0x12345678, 0x89abcdef, 0x1357};
+  uint8_t authorizedController[32] = {};
+  bool localConsentValid = true;
+  bool replacementAuthorized = false;
+  bool stagedRetirementAuthorized = false;
+  mutable uint32_t replacementCalls = 0;
+  std::function<void()> onReplacement;
+  std::function<void()> onSecurityValidated;
   TestAttemptPolicy() {
     security.insert(security.end(), signer.publicKey(), signer.publicKey() + 32);
     security.insert(security.end(), controllerKey.publicKey(), controllerKey.publicKey() + 32);
     security.insert(security.end(), {0, 0, 0, 7});  // commissioned, nonzero floor
+    memcpy(authorizedController, controllerKey.publicKey(), sizeof(authorizedController));
   }
   bool commissionedSecurityValid(const uint8_t* payload, size_t len) const override {
-    return len == security.size() && memcmp(payload, security.data(), len) == 0;
+    const bool valid = len == security.size() && memcmp(payload, security.data(), len) == 0;
+    if (valid && onSecurityValidated) onSecurityValidated();
+    return valid;
   }
   bool authorizedAttemptValid(const Esp32AttemptRecord& record) const override {
     const ota::trust::Ed25519SignatureVerifier verifier;
-    return record.consent == Esp32ConsentState::Granted &&
-           memcmp(record.controller, controllerKey.publicKey(), 32) == 0 &&
-           record.session.campaignId == 0x12345678 && record.session.sessionId == 0x89abcdef &&
-           record.session.attemptId == 0x1357 &&
+    uint8_t digest[32];
+    attemptDigest(record, digest);
+    return localConsentValid && record.consent == Esp32ConsentState::Granted &&
+           memcmp(record.controller, authorizedController, 32) == 0 &&
+           meshcore::ota::runtime::otaSessionEquals(record.session, authorizedSession) &&
+           memcmp(record.attemptDigest, digest, sizeof(digest)) == 0 &&
            verifier.verify(record.signedDescriptor + 59, 64, record.signedDescriptor, 59,
                            signer.publicKey(), 32);
+  }
+
+  bool authorizeTerminalReplacement(const Esp32AttemptRecord& terminal,
+                                    const Esp32AttemptRecord&) const override {
+    ++replacementCalls;
+    const bool allowed = replacementAuthorized &&
+        (terminal.phase != Esp32StagingPhase::Staged || stagedRetirementAuthorized);
+    if (onReplacement) onReplacement();
+    return allowed;
+  }
+
+  // Test-only frozen binding; this does not define a production nonce codec.
+  static void attemptDigest(const Esp32AttemptRecord& record, uint8_t out[32]) {
+    uint8_t bytes[123 + 32 + 10];
+    meshcore::ota::protocol::OtaBoundedWriter writer(bytes, sizeof(bytes));
+    EXPECT_TRUE(writer.putBytes(record.signedDescriptor, 123));
+    EXPECT_TRUE(writer.putBytes(record.controller, 32));
+    EXPECT_TRUE(writer.putU32(record.session.campaignId));
+    EXPECT_TRUE(writer.putU32(record.session.sessionId));
+    EXPECT_TRUE(writer.putU16(record.session.attemptId));
+    ota::trust::Sha256::hash(bytes, writer.size(), out);
   }
 
   Esp32AttemptRecord attempt(const Esp32PartitionIdentity& partition,
@@ -92,11 +127,24 @@ public:
     record.session = {0x12345678, 0x89abcdef, 0x1357};
     // A fixture token only: production obtains this immutable digest from
     // the shared attempt owner, not an ESP-specific nonce derivation.
-    ota::trust::Sha256::hash(record.signedDescriptor, 123, record.attemptDigest);
+    attemptDigest(record, record.attemptDigest);
     record.partition = partition;
     record.consent = Esp32ConsentState::Granted;
     return record;
   }
+};
+
+class DefaultReplacementPolicy final : public Esp32AttemptPolicy {
+public:
+  explicit DefaultReplacementPolicy(const TestAttemptPolicy& policy) : policy_(policy) {}
+  bool commissionedSecurityValid(const uint8_t* payload, size_t len) const override {
+    return policy_.commissionedSecurityValid(payload, len);
+  }
+  bool authorizedAttemptValid(const Esp32AttemptRecord& record) const override {
+    return policy_.authorizedAttemptValid(record);
+  }
+private:
+  const TestAttemptPolicy& policy_;
 };
 
 class AttemptFixture : public ::testing::Test {
@@ -125,6 +173,90 @@ protected:
     ASSERT_TRUE(attempts.checkpoint(record).ok());
     record.phase = Esp32StagingPhase::Receiving;
     ASSERT_TRUE(attempts.checkpoint(record).ok());
+  }
+  void makeTerminal(Esp32StagingPhase phase = Esp32StagingPhase::Aborted,
+                    Esp32ConsentState consent = Esp32ConsentState::Granted) {
+    admitAndPrepare();
+    ASSERT_FALSE(HasFatalFailure());
+    if (phase == Esp32StagingPhase::Staged) {
+      FlashRegion candidate(flash, 0, flash.totalSizeBytes());
+      ASSERT_TRUE(StorageManager::writeAndVerifyChunk(candidate, 0, 512, image.data(), 512));
+      ASSERT_TRUE(StorageManager::writeAndVerifyChunk(candidate, 1, 512, image.data() + 512, 512));
+      ota::trust::Sha256 hash;
+      uint8_t digest[32];
+      ASSERT_TRUE(ota::trust::ImageHasher::hashRegion(hash, candidate, image.size(), digest));
+      meshcore::ota::protocol::OtaDescriptor descriptor;
+      ASSERT_TRUE(Esp32AttemptCodec::descriptor(record, descriptor));
+      ASSERT_EQ(0, memcmp(descriptor.sha256, digest, sizeof(digest)));
+      record.verifiedBytes = static_cast<uint32_t>(image.size());
+    }
+    record.phase = phase;
+    record.consent = consent;
+    ASSERT_TRUE(attempts.checkpoint(record).ok());
+  }
+  void seedProtectedBlobs() {
+    ASSERT_TRUE(blobs.save(Esp32BlobKind::Security, policy.security.data(), policy.security.size()).ok());
+    for (auto kind : {Esp32BlobKind::TxSequence, Esp32BlobKind::RxReplay}) {
+      injectRecord(nvs, kind, Esp32NvsSlot::A, 9, {0x01, 0x24, 0x80, 0x18});
+      injectRecord(nvs, kind, Esp32NvsSlot::B, 10, {0x01, 0x24, 0x80, 0x19});
+    }
+  }
+  Esp32AttemptRecord nextAttempt() {
+    auto next = record;
+    ++next.session.attemptId;
+    next.phase = Esp32StagingPhase::Admitted;
+    next.erasedBytes = next.verifiedBytes = 0;
+    next.consent = Esp32ConsentState::Granted;
+    TestAttemptPolicy::attemptDigest(next, next.attemptDigest);
+    policy.authorizedSession = next.session;
+    policy.replacementAuthorized = true;
+    return next;
+  }
+  std::map<Esp32NvsModel::Key, std::vector<uint8_t>> protectedBlobs() const {
+    std::map<Esp32NvsModel::Key, std::vector<uint8_t>> out;
+    for (const auto& entry : nvs.durable)
+      if (entry.first.first != Esp32BlobKind::Attempt) out.insert(entry);
+    return out;
+  }
+  Esp32DurableBlob currentBlob(Esp32DurableBlobStore& store) {
+    Esp32DurableBlob stored;
+    EXPECT_TRUE(store.load(Esp32BlobKind::Attempt, stored).ok());
+    return stored;
+  }
+  std::vector<uint8_t> attemptPayload(const Esp32AttemptRecord& attempt) {
+    std::vector<uint8_t> bytes(Esp32AttemptCodec::kBytes);
+    EXPECT_EQ(bytes.size(), Esp32AttemptCodec::encode(attempt, bytes.data(), bytes.size()));
+    return bytes;
+  }
+  struct Snapshot {
+    std::map<Esp32NvsModel::Key, std::vector<uint8_t>> durable;
+    std::map<std::string, std::vector<uint8_t>> unrelated;
+    std::vector<uint8_t> nor;
+    std::vector<uint32_t> erased;
+    uint32_t sets, commits, programs;
+  };
+  Snapshot snapshot() const {
+    return {nvs.durable, nvs.unrelated, partitions.bytes, partitions.erasedOffsets,
+            nvs.setCalls, nvs.commitCalls, partitions.writeCalls};
+  }
+  void expectProtectedState(const Snapshot& before) const {
+    EXPECT_EQ(before.unrelated, nvs.unrelated);
+    EXPECT_EQ(before.nor, partitions.bytes);
+    EXPECT_EQ(before.erased, partitions.erasedOffsets);
+    EXPECT_EQ(before.programs, partitions.writeCalls);
+    for (const auto& entry : before.durable) {
+      if (entry.first.first == Esp32BlobKind::Attempt) continue;
+      const auto found = nvs.durable.find(entry.first);
+      ASSERT_NE(nvs.durable.end(), found);
+      EXPECT_EQ(entry.second, found->second);
+    }
+    EXPECT_EQ(6u, protectedBlobs().size());
+  }
+  void expectUnchanged(const Snapshot& before) const {
+    expectProtectedState(before);
+    EXPECT_EQ(before.durable, nvs.durable);
+    EXPECT_EQ(before.sets, nvs.setCalls);
+    EXPECT_EQ(before.commits, nvs.commitCalls);
   }
 };
 
@@ -961,6 +1093,604 @@ TEST_F(AttemptFixture, PreparedMetadataAfterLostCommitBlocksFreshResumeWithoutAp
   EXPECT_EQ(before, partitions.bytes);
   EXPECT_EQ(sentinel, nvs.unrelated);
   EXPECT_EQ(1u, partitions.erasedOffsets.size());
+}
+
+TEST_F(AttemptFixture, AbortedAttemptExplicitlyReplacedByFreshConsentedSameImageAfterReconstruction) {
+  makeTerminal();
+  ASSERT_FALSE(HasFatalFailure());
+  seedProtectedBlobs();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto terminal = record;
+  const auto old_blob = currentBlob(blobs);
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  Esp32FlashAdapter reboot_flash(partitions, owners);
+  Esp32DurableBlobStore reboot_blobs(nvs, owners);
+  Esp32AttemptStore reboot_attempts(reboot_blobs, reboot_flash, policy);
+  const auto result = reboot_attempts.replaceTerminal(terminal, next);
+  ASSERT_EQ(Status::Ok, result.status);
+  EXPECT_TRUE(result.mutationMayHaveOccurred);
+  EXPECT_EQ(1u, policy.replacementCalls);
+  EXPECT_EQ(before.sets + 2, nvs.setCalls);
+  EXPECT_EQ(before.commits + 2, nvs.commitCalls);
+  auto expected = before.durable;
+  const auto slot = old_blob.slot == Esp32NvsSlot::A ? Esp32NvsSlot::B : Esp32NvsSlot::A;
+  expected[{Esp32BlobKind::Attempt, slot}] = encoded(
+      Esp32BlobKind::Attempt, Esp32BlobPhase::Committed, old_blob.generation + 1, attemptPayload(next));
+  EXPECT_EQ(expected, nvs.durable);
+  expectProtectedState(before);
+  EXPECT_EQ(0, memcmp(terminal.signedDescriptor, next.signedDescriptor, 123));
+  EXPECT_NE(0, memcmp(terminal.attemptDigest, next.attemptDigest, 32));
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  Esp32AttemptRecord restored;
+  ASSERT_TRUE(fresh_attempts.resume(restored).ok());
+  EXPECT_TRUE(Esp32AttemptCodec::sameAttempt(next, restored));
+  EXPECT_EQ(Esp32StagingPhase::Admitted, restored.phase);
+  EXPECT_EQ(Esp32ConsentState::Granted, restored.consent);
+  EXPECT_EQ(0u, restored.erasedBytes);
+  EXPECT_EQ(0u, restored.verifiedBytes);
+  EXPECT_EQ(old_blob.generation + 1, currentBlob(fresh_blobs).generation);
+  const auto accepted = snapshot();
+  EXPECT_EQ(Status::Conflict, fresh_attempts.replaceTerminal(terminal, next).status);
+  EXPECT_EQ(Status::Conflict, fresh_attempts.admit(next).status);
+  EXPECT_EQ(Status::Conflict, fresh_attempts.checkpoint(terminal).status);
+  expectUnchanged(accepted);
+}
+
+TEST_F(AttemptFixture, StagedExplicitRetirementRequiresPolicyAndNeverErasesItsImage) {
+  makeTerminal(Esp32StagingPhase::Staged);
+  ASSERT_FALSE(HasFatalFailure());
+  seedProtectedBlobs();
+  const auto terminal = record;
+  const auto old_blob = currentBlob(blobs);
+  auto next = nextAttempt();
+  policy.stagedRetirementAuthorized = true;
+  const auto before = snapshot();
+  Esp32FlashAdapter reboot_flash(partitions, owners);
+  Esp32DurableBlobStore reboot_blobs(nvs, owners);
+  Esp32AttemptStore reboot_attempts(reboot_blobs, reboot_flash, policy);
+  ASSERT_TRUE(reboot_attempts.replaceTerminal(terminal, next).ok());
+  expectProtectedState(before);
+  const auto old_key = Esp32NvsModel::Key{Esp32BlobKind::Attempt, old_blob.slot};
+  EXPECT_EQ(before.durable.at(old_key), nvs.durable.at(old_key));
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  Esp32AttemptRecord restored;
+  ASSERT_TRUE(fresh_attempts.resume(restored).ok());
+  EXPECT_TRUE(Esp32AttemptCodec::sameAttempt(next, restored));
+  EXPECT_EQ(Esp32StagingPhase::Admitted, restored.phase);
+  EXPECT_EQ(0u, restored.erasedBytes);
+  EXPECT_EQ(0u, restored.verifiedBytes);
+  EXPECT_EQ(old_blob.generation + 1, currentBlob(fresh_blobs).generation);
+  EXPECT_EQ(0, memcmp(image.data(), partitions.bytes.data() + terminal.partition.address, image.size()));
+  EXPECT_FALSE(Esp32FlashAdapter::installationAvailable());
+}
+
+TEST_F(AttemptFixture, FreshControllerCampaignAndSessionCanReplaceTerminalWithoutResettingSecurity) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  ++next.session.campaignId;
+  next.session.sessionId = 0x01020304;
+  next.session.attemptId = 1;
+  const uint8_t seed[32] = {0x53, 0x29, 0x81, 0x14};
+  Ed25519TestSigner another_controller(seed);
+  memcpy(next.controller, another_controller.publicKey(), 32);
+  TestAttemptPolicy::attemptDigest(next, next.attemptDigest);
+  memcpy(policy.authorizedController, next.controller, 32);
+  policy.authorizedSession = next.session;
+  const auto before = snapshot();
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  ASSERT_TRUE(fresh_attempts.replaceTerminal(record, next).ok());
+  Esp32AttemptRecord restored;
+  ASSERT_TRUE(fresh_attempts.resume(restored).ok());
+  EXPECT_TRUE(meshcore::ota::runtime::otaSessionEquals(next.session, restored.session));
+  EXPECT_EQ(0, memcmp(next.controller, restored.controller, 32));
+  EXPECT_EQ(0, memcmp(next.attemptDigest, restored.attemptDigest, 32));
+  EXPECT_EQ(0, memcmp(record.signedDescriptor, restored.signedDescriptor, 123));
+  EXPECT_EQ(Esp32StagingPhase::Admitted, restored.phase);
+  EXPECT_EQ(before.sets + 2, nvs.setCalls);
+  EXPECT_EQ(before.commits + 2, nvs.commitCalls);
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, ReplacementPolicyHookDefaultsToRefusalEvenWithValidNewAuthorization) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  DefaultReplacementPolicy default_policy(policy);
+  Esp32AttemptStore denied(blobs, flash, default_policy);
+  const auto before = snapshot();
+  const auto result = denied.replaceTerminal(record, next);
+  EXPECT_EQ(Status::OwnershipDenied, result.status);
+  EXPECT_FALSE(result.mutationMayHaveOccurred);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, ActiveAttemptsCannotBeRetiredEvenWhenReplacementPolicyWouldApprove) {
+  provisionSecurity();
+  ASSERT_TRUE(attempts.admit(record).ok());
+  seedProtectedBlobs();
+  const Esp32StagingPhase phases[] = {
+      Esp32StagingPhase::Admitted, Esp32StagingPhase::Erasing, Esp32StagingPhase::Receiving};
+  for (const auto phase : phases) {
+    SCOPED_TRACE(static_cast<int>(phase));
+    policy.authorizedSession = record.session;
+    if (phase == Esp32StagingPhase::Erasing) {
+      record.phase = phase;
+      ASSERT_TRUE(attempts.checkpoint(record).ok());
+    } else if (phase == Esp32StagingPhase::Receiving) {
+      ASSERT_EQ(FlashStatus::Ok, flash.eraseSector(0));
+      record.erasedBytes = 4096;
+      ASSERT_TRUE(attempts.checkpoint(record).ok());
+      record.phase = phase;
+      ASSERT_TRUE(attempts.checkpoint(record).ok());
+    }
+    auto next = nextAttempt();
+    const auto before = snapshot();
+    EXPECT_EQ(Status::Conflict, attempts.replaceTerminal(record, next).status);
+    EXPECT_EQ(0u, policy.replacementCalls);
+    EXPECT_FALSE(flash.isBound());
+    expectUnchanged(before);
+    // Restore only the existing valid capability for preparing the next phase.
+    policy.authorizedSession = record.session;
+    Esp32AttemptRecord restored;
+    ASSERT_TRUE(attempts.resume(restored).ok());
+  }
+}
+
+TEST_F(AttemptFixture, StagedAwaitingInstallerIsNeverImplicitlyOverwritten) {
+  makeTerminal(Esp32StagingPhase::Staged);
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  EXPECT_EQ(Status::Conflict, attempts.admit(next).status);
+  EXPECT_EQ(Status::OwnershipDenied, attempts.replaceTerminal(record, next).status);
+  EXPECT_EQ(1u, policy.replacementCalls);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, OldTupleCannotBeResurrectedByChangingOnlyImageControllerOrPartition) {
+  makeTerminal();
+  seedProtectedBlobs();
+  const auto before = snapshot();
+  for (size_t field = 0; field < 4; ++field) {
+    auto next = policy.attempt(record.partition, image);
+    if (field == 1) {
+      auto different_image = image;
+      different_image[0] ^= 1;
+      next = policy.attempt(record.partition, different_image);
+    } else if (field == 2) {
+      const uint8_t seed[] = {0x81, 0x27, 0x39, 0x15, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+      Ed25519TestSigner another_controller(seed);
+      memcpy(next.controller, another_controller.publicKey(), 32);
+    } else if (field == 3) next.partition = partitions.snapshot.running;
+    memcpy(policy.authorizedController, next.controller, 32);
+    TestAttemptPolicy::attemptDigest(next, next.attemptDigest);
+    policy.authorizedSession = next.session;
+    policy.replacementAuthorized = true;
+    ASSERT_TRUE(policy.authorizedAttemptValid(next));
+    EXPECT_EQ(Status::Conflict, attempts.replaceTerminal(record, next).status);
+    EXPECT_EQ(0u, policy.replacementCalls);
+    EXPECT_FALSE(flash.isBound());
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, OlderCampaignSessionAndAttemptReplayRemainRefusedAfterAnotherTerminal) {
+  makeTerminal();
+  seedProtectedBlobs();
+  const auto original_terminal = record;
+  auto next = nextAttempt();
+  ASSERT_TRUE(attempts.replaceTerminal(record, next).ok());
+  next.phase = Esp32StagingPhase::Aborted;
+  ASSERT_TRUE(attempts.checkpoint(next).ok());
+  const auto before = snapshot();
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  for (size_t field = 0; field < 3; ++field) {
+    auto replay = original_terminal;
+    replay.phase = Esp32StagingPhase::Admitted;
+    replay.erasedBytes = replay.verifiedBytes = 0;
+    if (field == 1) {
+      replay.session = next.session;
+      --replay.session.sessionId;
+      ++replay.session.attemptId;
+    } else if (field == 2) {
+      replay.session = next.session;
+      --replay.session.campaignId;
+      ++replay.session.sessionId;
+      ++replay.session.attemptId;
+    }
+    TestAttemptPolicy::attemptDigest(replay, replay.attemptDigest);
+    policy.authorizedSession = replay.session;
+    ASSERT_TRUE(policy.authorizedAttemptValid(replay));
+    EXPECT_EQ(Status::Conflict, fresh_attempts.replaceTerminal(next, replay).status);
+    EXPECT_FALSE(fresh_flash.isBound());
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, RevokedTerminalConsentCannotResumeButDistinctFreshGrantCanReplaceIt) {
+  makeTerminal(Esp32StagingPhase::Aborted, Esp32ConsentState::Revoked);
+  seedProtectedBlobs();
+  Esp32AttemptRecord loaded;
+  EXPECT_EQ(Status::Conflict, attempts.resume(loaded).status);
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  policy.localConsentValid = false;
+  EXPECT_EQ(Status::InvalidArgument, attempts.replaceTerminal(record, next).status);
+  expectUnchanged(before);
+  policy.localConsentValid = true;
+  ASSERT_TRUE(attempts.replaceTerminal(record, next).ok());
+  EXPECT_EQ(Esp32ConsentState::Revoked, record.consent);
+  ASSERT_TRUE(attempts.resume(loaded).ok());
+  EXPECT_EQ(Esp32ConsentState::Granted, loaded.consent);
+  EXPECT_TRUE(Esp32AttemptCodec::sameAttempt(next, loaded));
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, FreshReplacementRequiresValidSignatureFullControllerDigestAndConsent) {
+  makeTerminal();
+  seedProtectedBlobs();
+  const auto valid_next = nextAttempt();
+  const auto before = snapshot();
+  for (size_t field = 0; field < 6; ++field) {
+    auto next = valid_next;
+    switch (field) {
+      case 0: next.signedDescriptor[122] ^= 1; break;
+      case 1: next.controller[31] ^= 1; break;
+      case 2: next.attemptDigest[31] ^= 1; break;
+      case 3: next.consent = Esp32ConsentState::Denied; break;
+      case 4: next.consent = Esp32ConsentState::Revoked; break;
+      case 5: --next.session.attemptId; break;
+    }
+    EXPECT_EQ(Status::InvalidArgument, attempts.replaceTerminal(record, next).status);
+    EXPECT_EQ(0u, policy.replacementCalls);
+    expectUnchanged(before);
+  }
+  policy.replacementAuthorized = false;
+  EXPECT_EQ(Status::OwnershipDenied, attempts.replaceTerminal(record, valid_next).status);
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, RetirementProofMustMatchTheEntireWinningTerminalCheckpoint) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  for (size_t field = 0; field < 9; ++field) {
+    auto expected = record;
+    switch (field) {
+      case 0: expected.phase = Esp32StagingPhase::Receiving; break;
+      case 1: expected.erasedBytes = 0; break;
+      case 2: expected.verifiedBytes = 1; break;
+      case 3: expected.consent = Esp32ConsentState::Revoked; break;
+      case 4: ++expected.session.attemptId; break;
+      case 5: expected.controller[31] ^= 1; break;
+      case 6: expected.attemptDigest[31] ^= 1; break;
+      case 7: expected.signedDescriptor[122] ^= 1; break;
+      case 8: expected.partition = partitions.snapshot.running; break;
+    }
+    ASSERT_TRUE(Esp32AttemptCodec::valid(expected));
+    EXPECT_EQ(Status::Conflict, attempts.replaceTerminal(expected, next).status);
+    EXPECT_EQ(0u, policy.replacementCalls);
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, StagedRetirementRevalidatesSdkLeaseBootTrialAndPartitionAfterPolicyDecision) {
+  makeTerminal(Esp32StagingPhase::Staged);
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  policy.stagedRetirementAuthorized = true;
+  const auto original_sdk = partitions.snapshot;
+  const auto before = snapshot();
+  for (size_t condition = 0; condition < 7; ++condition) {
+    SCOPED_TRACE(condition);
+    partitions.snapshot = original_sdk;
+    owners.flash = Esp32UpdateOwnership::ExclusiveStorage;
+    partitions.inspectError = kEsp32Ok;
+    policy.onReplacement = [&]() {
+      switch (condition) {
+        case 0: owners.flash = Esp32UpdateOwnership::Unknown; break;
+        case 1: owners.flash = Esp32UpdateOwnership::OtherUpdater; break;
+        case 2: partitions.snapshot.boot = partitions.snapshot.next; break;
+        case 3: partitions.snapshot.appStates[0] = Esp32ImageState::PendingVerify; break;
+        case 4: partitions.snapshot.appStates[1] = Esp32ImageState::New; break;
+        case 5: --partitions.snapshot.table[3].size; break;
+        case 6: partitions.inspectError = 0x107; break;
+      }
+    };
+    const auto result = attempts.replaceTerminal(record, next);
+    EXPECT_EQ(condition == 6 ? Status::IoError : Status::PartitionMismatch, result.status);
+    EXPECT_EQ(condition == 6 ? 0x107 : kEsp32Ok, result.sdkError);
+    EXPECT_FALSE(result.mutationMayHaveOccurred);
+    EXPECT_FALSE(flash.isBound());
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, NewPartitionBindingCannotAddressTheRunningOrWrongInactiveSlot) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  next.partition = partitions.snapshot.running;
+  const auto before = snapshot();
+  EXPECT_EQ(Status::PartitionMismatch, attempts.replaceTerminal(record, next).status);
+  expectUnchanged(before);
+  next.partition = record.partition;
+  std::swap(partitions.snapshot.running, partitions.snapshot.next);
+  partitions.snapshot.boot = partitions.snapshot.running;
+  EXPECT_EQ(Status::PartitionMismatch, attempts.replaceTerminal(record, next).status);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, RevokedConsentOrMetadataOwnershipDuringPolicyDecisionCannotMutate) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  for (size_t condition = 0; condition < 3; ++condition) {
+    policy.localConsentValid = true;
+    owners.metadata = true;
+    nvs.free = 500;
+    policy.onReplacement = [&]() {
+      if (condition == 0) policy.localConsentValid = false;
+      else if (condition == 1) owners.metadata = false;
+      else nvs.free = 146;
+    };
+    EXPECT_EQ(condition == 2 ? Status::NoSpace : Status::OwnershipDenied,
+              attempts.replaceTerminal(record, next).status);
+    EXPECT_FALSE(flash.isBound());
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, MissingCorruptOrPreparedAttemptIsNeverDiscardedByReplacement) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto old_blob = currentBlob(blobs);
+  const auto original = nvs.durable;
+  for (size_t condition = 0; condition < 4; ++condition) {
+    nvs.durable = original;
+    const auto key = Esp32NvsModel::Key{Esp32BlobKind::Attempt, old_blob.slot};
+    if (condition == 0) nvs.durable[key].back() ^= 1;
+    else if (condition == 1) {
+      auto invalid = attemptPayload(record);
+      invalid.back() = 0x7f;
+      injectRecord(nvs, Esp32BlobKind::Attempt, old_blob.slot, old_blob.generation, invalid);
+    } else if (condition == 2) {
+      injectRecord(nvs, Esp32BlobKind::Attempt, old_blob.slot, old_blob.generation,
+                   attemptPayload(record), Esp32BlobPhase::Prepared);
+    } else {
+      nvs.durable.erase({Esp32BlobKind::Attempt, Esp32NvsSlot::A});
+      nvs.durable.erase({Esp32BlobKind::Attempt, Esp32NvsSlot::B});
+    }
+    const auto before = snapshot();
+    Esp32FlashAdapter fresh_flash(partitions, owners);
+    Esp32DurableBlobStore fresh_blobs(nvs, owners);
+    Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+    EXPECT_EQ(condition < 2 ? Status::Corrupt :
+              condition == 2 ? Status::DurabilityUncertain : Status::Missing,
+              fresh_attempts.replaceTerminal(record, next).status);
+    EXPECT_EQ(0u, policy.replacementCalls);
+    EXPECT_FALSE(fresh_flash.isBound());
+    expectUnchanged(before);
+  }
+}
+
+TEST_F(AttemptFixture, ReplacementGenerationExhaustionAndInsufficientCapacityNeverMutate) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  auto old_blob = currentBlob(blobs);
+  nvs.free = 146;
+  auto before = snapshot();
+  EXPECT_EQ(Status::NoSpace, attempts.replaceTerminal(record, next).status);
+  EXPECT_EQ(0u, policy.replacementCalls);
+  expectUnchanged(before);
+  nvs.free = 147;
+  injectRecord(nvs, Esp32BlobKind::Attempt, old_blob.slot, UINT32_MAX, attemptPayload(record));
+  before = snapshot();
+  EXPECT_EQ(Status::GenerationExhausted, attempts.replaceTerminal(record, next).status);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, SaveFailureBeforeMutationReloadsOldTerminalInsteadOfInventingNewAttempt) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto old_blob = currentBlob(blobs);
+  const auto before = snapshot();
+  nvs.failSetAt = nvs.setCalls + 1;
+  nvs.setTiming = FaultTiming::Before;
+  const auto failed = attempts.replaceTerminal(record, next);
+  EXPECT_EQ(Status::DurabilityUncertain, failed.status);
+  EXPECT_EQ(-1, failed.sdkError);
+  EXPECT_FALSE(flash.isBound());
+  EXPECT_EQ(before.durable, nvs.durable);
+  EXPECT_EQ(before.sets + 1, nvs.setCalls);
+  EXPECT_EQ(before.commits, nvs.commitCalls);
+  expectProtectedState(before);
+  nvs.clearFaults();
+  const auto after_failure = snapshot();
+  EXPECT_EQ(Status::DurabilityUncertain, attempts.replaceTerminal(record, next).status);
+  expectUnchanged(after_failure);
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  const auto persisted = currentBlob(fresh_blobs);
+  EXPECT_EQ(old_blob.generation, persisted.generation);
+  EXPECT_EQ(old_blob.slot, persisted.slot);
+  EXPECT_EQ(0, memcmp(persisted.payload, old_blob.payload, old_blob.size));
+  Esp32AttemptRecord restored;
+  EXPECT_EQ(Status::Conflict, fresh_attempts.resume(restored).status);
+  ASSERT_TRUE(fresh_attempts.replaceTerminal(record, next).ok());
+  EXPECT_EQ(old_blob.generation + 1, currentBlob(fresh_blobs).generation);
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, DurableNewAttemptBeforeLostAcknowledgementWinsAfterFreshReconstruction) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto old_blob = currentBlob(blobs);
+  const auto before = snapshot();
+  nvs.failCommitAt = nvs.commitCalls + 2;
+  nvs.commitTiming = FaultTiming::After;
+  const auto failed = attempts.replaceTerminal(record, next);
+  EXPECT_EQ(Status::DurabilityUncertain, failed.status);
+  EXPECT_EQ(-1, failed.sdkError);
+  EXPECT_TRUE(failed.mutationMayHaveOccurred);
+  EXPECT_FALSE(flash.isBound());
+  EXPECT_EQ(before.sets + 2, nvs.setCalls);
+  EXPECT_EQ(before.commits + 2, nvs.commitCalls);
+  expectProtectedState(before);
+  const auto old_key = Esp32NvsModel::Key{Esp32BlobKind::Attempt, old_blob.slot};
+  EXPECT_EQ(before.durable.at(old_key), nvs.durable.at(old_key));
+  nvs.clearFaults();
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  Esp32AttemptRecord restored;
+  ASSERT_TRUE(fresh_attempts.resume(restored).ok());
+  EXPECT_TRUE(Esp32AttemptCodec::sameAttempt(next, restored));
+  EXPECT_EQ(Esp32StagingPhase::Admitted, restored.phase);
+  EXPECT_EQ(0u, restored.erasedBytes);
+  EXPECT_EQ(0u, restored.verifiedBytes);
+  EXPECT_EQ(old_blob.generation + 1, currentBlob(fresh_blobs).generation);
+  const auto accepted = snapshot();
+  EXPECT_EQ(Status::Conflict, fresh_attempts.replaceTerminal(record, next).status);
+  expectUnchanged(accepted);
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, PreparedReplacementAfterCommitUncertaintyBlocksFreshRetryWithoutErase) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  nvs.failCommitAt = nvs.commitCalls + 1;
+  nvs.commitTiming = FaultTiming::After;
+  EXPECT_EQ(Status::DurabilityUncertain, attempts.replaceTerminal(record, next).status);
+  nvs.clearFaults();
+  const auto uncertain = snapshot();
+  Esp32FlashAdapter fresh_flash(partitions, owners);
+  Esp32DurableBlobStore fresh_blobs(nvs, owners);
+  Esp32AttemptStore fresh_attempts(fresh_blobs, fresh_flash, policy);
+  EXPECT_EQ(Status::DurabilityUncertain, fresh_attempts.replaceTerminal(record, next).status);
+  Esp32AttemptRecord restored;
+  EXPECT_EQ(Status::DurabilityUncertain, fresh_attempts.resume(restored).status);
+  EXPECT_FALSE(fresh_flash.isBound());
+  expectUnchanged(uncertain);
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, PolicyCallbackCannotReplaceAChangedWinningActiveCheckpoint) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto old_blob = currentBlob(blobs);
+  const auto before = snapshot();
+  policy.onReplacement = [&]() {
+    injectRecord(nvs, Esp32BlobKind::Attempt, old_blob.slot, old_blob.generation + 1, attemptPayload(next));
+  };
+  EXPECT_EQ(Status::Conflict, attempts.replaceTerminal(record, next).status);
+  EXPECT_EQ(before.sets, nvs.setCalls);
+  EXPECT_EQ(before.commits, nvs.commitCalls);
+  const auto winner = currentBlob(blobs);
+  EXPECT_EQ(old_blob.generation + 1, winner.generation);
+  EXPECT_EQ(0, memcmp(winner.payload, attemptPayload(next).data(), winner.size));
+  EXPECT_FALSE(flash.isBound());
+  expectProtectedState(before);
+}
+
+TEST_F(AttemptFixture, ChangedCommissionedSecurityDuringRetirementProofCannotAuthorizeSave) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  policy.onReplacement = [&]() {
+    nvs.durable[{Esp32BlobKind::Security, Esp32NvsSlot::B}].back() ^= 1;
+  };
+  EXPECT_EQ(Status::Corrupt, attempts.replaceTerminal(record, next).status);
+  EXPECT_EQ(before.sets, nvs.setCalls);
+  EXPECT_EQ(before.commits, nvs.commitCalls);
+  EXPECT_EQ(before.nor, partitions.bytes);
+  EXPECT_EQ(before.erased, partitions.erasedOffsets);
+  EXPECT_EQ(before.programs, partitions.writeCalls);
+  for (const auto& entry : before.durable)
+    if (entry.first != Esp32NvsModel::Key{Esp32BlobKind::Security, Esp32NvsSlot::B})
+      EXPECT_EQ(entry.second, nvs.durable.at(entry.first));
+  EXPECT_EQ(before.unrelated, nvs.unrelated);
+  EXPECT_FALSE(flash.isBound());
+}
+
+TEST_F(AttemptFixture, RefreshedCommissionedPolicyCanRevokeNewConsentBeforeReplacementSave) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  policy.onReplacement = [&]() {
+    policy.onSecurityValidated = [&]() { policy.localConsentValid = false; };
+  };
+  const auto result = attempts.replaceTerminal(record, next);
+  EXPECT_EQ(Status::OwnershipDenied, result.status);
+  EXPECT_FALSE(result.mutationMayHaveOccurred);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, PolicyCallbackCannotRebindTheApprovedProposalToTheRetiredTuple) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto before = snapshot();
+  policy.onReplacement = [&]() {
+    next.session = record.session;
+    TestAttemptPolicy::attemptDigest(next, next.attemptDigest);
+    policy.authorizedSession = next.session;
+  };
+  const auto result = attempts.replaceTerminal(record, next);
+  EXPECT_EQ(Status::OwnershipDenied, result.status);
+  EXPECT_FALSE(result.mutationMayHaveOccurred);
+  EXPECT_FALSE(flash.isBound());
+  expectUnchanged(before);
+}
+
+TEST_F(AttemptFixture, ReplacementPersistsFrozenAdmittedZeroProgressNotCallerAliasedStagedState) {
+  makeTerminal();
+  seedProtectedBlobs();
+  auto next = nextAttempt();
+  const auto approved = next;
+  const auto before = snapshot();
+  policy.onReplacement = [&]() {
+    next.phase = Esp32StagingPhase::Staged;
+    next.erasedBytes = 4096;
+    next.verifiedBytes = static_cast<uint32_t>(image.size());
+  };
+  ASSERT_TRUE(attempts.replaceTerminal(record, next).ok());
+  Esp32AttemptRecord restored;
+  ASSERT_TRUE(attempts.resume(restored).ok());
+  EXPECT_TRUE(Esp32AttemptCodec::sameAttempt(approved, restored));
+  EXPECT_EQ(Esp32StagingPhase::Admitted, restored.phase);
+  EXPECT_EQ(0u, restored.erasedBytes);
+  EXPECT_EQ(0u, restored.verifiedBytes);
+  expectProtectedState(before);
 }
 
 int main(int argc, char** argv) {

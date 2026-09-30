@@ -236,7 +236,17 @@ automatic NVS erasure or counter reset. Attempt records preserve the signed
 descriptor, controller/session binding, partition identity, consent and
 progress; resume does not erase the candidate.
 
-The bounded storage checkpoint passes 37 native cases and compiles for the
+Terminal records are not discarded by ordinary admission.
+`Esp32AttemptStore::replaceTerminal()` explicitly retires an exact winning
+Aborted or policy-qualified Staged checkpoint and persists a fresh attempt
+in one journal generation. It requires a strictly newer session tuple,
+different attempt digest, fresh authorization and consent, and current
+inactive-slot ownership. Staged retirement defaults to denial unless the
+shared policy proves no installer or trial still owns it. Replacement
+never resets security/TX/RX history or erases candidate bytes, and does not
+repair corrupt or uncertain metadata.
+
+The bounded storage checkpoint passes 61 native cases and compiles for the
 actual XIAO S3/Wio environment. It is **not connected to the board receiver**:
 the update-ownership arbiter, commissioned security/AEAD ledger schemas and
 local-consent policy must be supplied by shared integration. Unreferenced
