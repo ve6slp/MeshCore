@@ -48,6 +48,9 @@
 #define XIAO_OTA_QSPI_SECTOR_SIZE      UINT32_C(0x1000)
 #define XIAO_OTA_QSPI_PAGE_SIZE        UINT32_C(0x0100)
 
+#define XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS UINT32_C(0x000FF000)
+#define XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE UINT32_C(28)
+
 /* Physical P25Q16H pins, verified against variants/xiao_nrf52/variant.cpp. */
 #define XIAO_OTA_QSPI_SCK_PIN          21u
 #define XIAO_OTA_QSPI_CS_PIN           25u

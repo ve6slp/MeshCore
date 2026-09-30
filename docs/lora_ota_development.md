@@ -216,6 +216,39 @@ OTA envelopes and adverts, and writes machine-readable evidence
 built from the `Xiao_nrf52_ota_qspi_hardware_test` PlatformIO environment and
 captures its serial evidence log.
 
+### Read-only evidence capture
+
+`make build-xiao-nrf52-archive` builds a separate USB diagnostic application
+without normal MeshCore startup or radio operation. Its protocol exposes
+raw reads, not formatting, programming, erasing, or restoration. Building
+does not flash either board; installation must use a separately qualified,
+immutable application package through the lab-device workflow.
+
+After that diagnostic is installed, use explicit local key and archive
+paths:
+
+```sh
+make generate-ota-lab-archive-key OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key"
+make archive-xiao-nrf52-client OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key" \
+  OTA_LAB_ARCHIVE_FILE="$PWD/.tmp/client-media.archive"
+make verify-xiao-nrf52-client-archive OTA_LAB_ARCHIVE_KEY="$PWD/.tmp/lab-archive.key" \
+  OTA_LAB_ARCHIVE_FILE="$PWD/.tmp/client-media.archive"
+```
+
+The corresponding target-board commands are `archive-xiao-nrf52-target`
+and `verify-xiao-nrf52-target-archive`. A complete capture requires all
+1 MiB of internal flash and 2 MiB of QSPI, encrypted locally; neither
+plaintext media nor the encryption key belongs in logs or Git.
+`make test-ota-lab-archive` exercises the archive protocol and failure
+paths without hardware.
+
+The diagnostic replaces the running application, so its internal-flash
+capture contains the diagnostic application and its SDK settings, not the
+previous stock application. Preserve the original immutable application
+artifact separately. These archives are evidence only: they do not
+authorize restoring old counters, floors, identity, or firmware, and
+capturing them does not qualify OTA installation or rollback.
+
 ## Current hardware evidence
 
 This reflects the most recent lab runs and should be re-checked against

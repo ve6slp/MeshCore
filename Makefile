@@ -27,6 +27,10 @@ XIAO_NRF52_TARGET_PORT = $(shell $(LAB_DEVICE) path target)
 XIAO_NRF52_BOOT_PORT = $(shell $(LAB_DEVICE) path target --mode bootloader)
 XIAO_NRF52_TARGET_SERIAL = $(shell $(LAB_DEVICE) serial target)
 XIAO_NRF52_QSPI_TEST_ENV ?= Xiao_nrf52_ota_qspi_hardware_test
+XIAO_NRF52_ARCHIVE_ENV ?= Xiao_nrf52_ota_readonly_archive
+OTA_LAB_ARCHIVE_KEY ?=
+OTA_LAB_ARCHIVE_FILE ?=
+OTA_LAB_ARCHIVE_ROLE ?= target
 XIAO_NRF52_QSPI_EVIDENCE = $(TMPDIR)/xiao-nrf52-qspi-$(XIAO_NRF52_TARGET_SERIAL).log
 XIAO_OTA_UPSTREAM ?= $(TMPDIR)/Adafruit_nRF52_Bootloader
 XIAO_OTA_WORK ?= $(TMPDIR)/$(XIAO_OTA_BOARD)_ota_upstream
@@ -56,7 +60,7 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
 
 .PHONY: tmpdir test test-ota test-ota-index test-ota-protocol test-ota-runtime \
         test-ota-counter-ports-index test-ota-image-layout-index test-ota-storage \
-        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host test-ota-aead-cipher clean-ota-targets \
+        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host test-ota-lab-archive test-ota-aead-cipher clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
@@ -71,6 +75,9 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
         inspect-xiao-nrf52-boot-journal clean-xiao-nrf52-legacy-floor \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
+        build-xiao-nrf52-archive generate-ota-lab-archive-key \
+        archive-xiao-nrf52-device archive-xiao-nrf52-client archive-xiao-nrf52-target \
+        verify-xiao-nrf52-archive verify-xiao-nrf52-client-archive verify-xiao-nrf52-target-archive \
         fetch-xiao-ota-bootloader provision-xiao-ota-lab-key \
         test-xiao-ota-bootloader test-xiao-ota-bootloader-tools build-xiao-stock-bootloader \
         build-xiao-ota-bootloader package-xiao-ota-bootloader \
@@ -140,6 +147,9 @@ test-ota-integration: tmpdir
 
 test-ota-lab-host: tmpdir
 	python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+test-ota-lab-archive: tmpdir
+	python3 -m unittest discover -s scripts/tests -p 'test_ota_lab_archive.py'
 
 ## Compile the OTA-capable firmware targets.
 build-ota-targets: tmpdir
@@ -285,6 +295,34 @@ clean-xiao-nrf52-legacy-floor: tmpdir
 
 build-xiao-nrf52-qspi-test: tmpdir
 	$(PLATFORMIO) run -e $(XIAO_NRF52_QSPI_TEST_ENV)
+
+build-xiao-nrf52-archive: tmpdir
+	$(PLATFORMIO) run -e $(XIAO_NRF52_ARCHIVE_ENV)
+
+generate-ota-lab-archive-key: tmpdir
+	@test -n "$(OTA_LAB_ARCHIVE_KEY)" || \
+	  { echo "Set OTA_LAB_ARCHIVE_KEY to a new local encryption-key path" >&2; exit 1; }
+	python3 scripts/ota_lab_archive.py genkey --output "$(OTA_LAB_ARCHIVE_KEY)"
+
+archive-xiao-nrf52-client: OTA_LAB_ARCHIVE_ROLE = client
+archive-xiao-nrf52-target: OTA_LAB_ARCHIVE_ROLE = target
+archive-xiao-nrf52-client archive-xiao-nrf52-target: archive-xiao-nrf52-device
+
+archive-xiao-nrf52-device: tmpdir
+	@test -n "$(OTA_LAB_ARCHIVE_KEY)" && test -n "$(OTA_LAB_ARCHIVE_FILE)" || \
+	  { echo "Set OTA_LAB_ARCHIVE_KEY and OTA_LAB_ARCHIVE_FILE explicitly" >&2; exit 1; }
+	python3 scripts/ota_lab_archive.py archive --role "$(OTA_LAB_ARCHIVE_ROLE)" \
+	  --key-file "$(OTA_LAB_ARCHIVE_KEY)" --output "$(OTA_LAB_ARCHIVE_FILE)"
+
+verify-xiao-nrf52-client-archive: OTA_LAB_ARCHIVE_ROLE = client
+verify-xiao-nrf52-target-archive: OTA_LAB_ARCHIVE_ROLE = target
+verify-xiao-nrf52-client-archive verify-xiao-nrf52-target-archive: verify-xiao-nrf52-archive
+
+verify-xiao-nrf52-archive: tmpdir
+	@test -n "$(OTA_LAB_ARCHIVE_KEY)" && test -n "$(OTA_LAB_ARCHIVE_FILE)" || \
+	  { echo "Set OTA_LAB_ARCHIVE_KEY and OTA_LAB_ARCHIVE_FILE explicitly" >&2; exit 1; }
+	python3 scripts/ota_lab_archive.py verify --role "$(OTA_LAB_ARCHIVE_ROLE)" \
+	  --key-file "$(OTA_LAB_ARCHIVE_KEY)" --archive "$(OTA_LAB_ARCHIVE_FILE)"
 
 upload-xiao-nrf52-qspi-test: build-xiao-nrf52-qspi-test
 	@$(LAB_DEVICE) flash target --package .pio/build/$(XIAO_NRF52_QSPI_TEST_ENV)/firmware.zip
