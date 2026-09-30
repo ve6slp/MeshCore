@@ -156,14 +156,18 @@ installation, not as already qualified in the field.
 | Range | Size | Owner |
 |---|---:|---|
 | `0x00000..0x27000` | 156 KiB | unchanged MBR + S140 v7 |
-| `0x27000..0xED000` | 792 KiB | active MeshCore application |
+| `0x27000..0xD4000` | 692 KiB | active MeshCore application |
+| `0xD4000..0xED000` | 100 KiB | preserved `InternalExtraFS` |
 | `0xED000..0xF4000` | 28 KiB | preserved `InternalFS` |
 | `0xF4000..0xFD800` | 38 KiB | QSPI-capable signed bootloader |
 | `0xFD800..0xFE000` | 2 KiB | immutable bootloader configuration |
 | `0xFE000..0xFF000` | 4 KiB | MBR parameters |
 | `0xFF000..0x100000` | 4 KiB | redundant boot status/settings |
 
-The application capacity remains 811,008 bytes. The bootloader build must fail if its code exceeds `0x9800` bytes. Its UICR
+OTA application image capacity is 708,608 bytes (`0x027000..0x0D4000`).
+The existing `InternalExtraFS` range (`0x0D4000..0x0ED000`) is not image
+capacity and remains unmoved. The bootloader build must fail if its code
+exceeds `0x9800` bytes. Its UICR
 boot start address and `BOOTLOADER_REGION_START` both remain `0xF4000`.
 The 66 KiB BLE-enabled fallback still uses `0xED000` and requires SWD for its
 first installation.
@@ -172,16 +176,58 @@ first installation.
 
 | Range | Size | Owner |
 |---|---:|---|
-| `0x000000..0x0C6000` | 792 KiB | candidate application |
-| `0x0C6000..0x18C000` | 792 KiB | last-known-good backup |
+| `0x000000..0x0AD000` | 692 KiB (708,608 B) | candidate application (image capacity) |
+| `0x0AD000..0x0C6000` | 100 KiB | candidate security tail (`securityA`) |
+| `0x0C6000..0x173000` | 692 KiB (708,608 B) | last-known-good backup (image capacity) |
+| `0x173000..0x18C000` | 100 KiB | backup security tail (`securityB`) |
 | `0x18C000..0x194000` | 32 KiB | redundant OTA journal |
-| `0x194000..0x200000` | 432 KiB | partitioned LittleFS |
+| `0x194000..0x200000` | 432 KiB | external filesystem reservation |
 
-All boundaries are 4 KiB erase-sector aligned. The candidate and backup banks
-each equal the maximum internal application range. Detached manifests,
-signatures, hashes, copy progress, and trial state live in the journal rather
-than consuming image capacity. The filesystem remains substantially larger
-than the current 28 KiB `InternalFS` plus 100 KiB companion `ExtraFS`.
+All boundaries are 4 KiB erase-sector aligned. The physical bank stride
+(`0x0C6000` bytes between the start of the candidate bank and the start of
+the backup bank) is fixed and unchanged, but it is NOT itself writable
+image capacity: each bank now exposes only its first 692 KiB (708,608 B) as
+image capacity, with the remaining 100 KiB reserved as a
+security-tail region (`securityA`/`securityB`). `securityA` and
+`securityB` are NOT independent per-bank signature/descriptor material --
+together they are the two halves (A/B generations) of one global,
+identity-owned append/compaction store; this document and the app-side
+layout headers only publish their raw capability boundaries, not a store
+implementation.
+
+App-side, `src/ota/platform/SenseCapQspiLayout.h` and
+`src/ota/platform/Nrf52FlashLayoutContract.h` are the authoritative source
+for these exact byte offsets (the latter is a plain-C header so
+boot/signing code can reuse the same constants). `FlashRegion`'s own
+bounds checking means any erase/program starting at or past the first
+tail byte via the candidate/backup accessors is rejected as out-of-range,
+not merely discouraged by convention. The internal nRF52840 application
+image slot (`0x027000..0x0D4000`, 708,608 B, immediately followed by the
+unmoved 100 KiB `InternalExtraFS` at `0x0D4000..0x0ED000`) matches this
+same 708,608-byte capacity exactly, so a candidate/backup image is always
+exactly self-install-sized.
+
+The lab-only hardware-qualification destructive scratch carve-out --
+historically `0x0C2000..0x0C6000` (see the qualification log below), which
+the new `securityA` tail would otherwise overlap -- is relocated to
+`0x0A9000..0x0AD000`: entirely inside the candidate bank's own image
+capacity, immediately before `securityA`. It is maintenance/lab-only
+destructive scratch space, never ordinary shared/spare capacity. A blank
+journal or a false result from `ota::storage::XiaoOtaCommissioningGuard`
+is absence of evidence only, not proof the device was never
+commissioned; any use of this scratch range must be gated on explicit
+maintenance authorization plus confirmation that no live candidate image
+or backup/recovery state exists, never on the guard's signals alone.
+
+This reserves space; it does not move or mount a filesystem. The USB lab
+profiles retain their existing internal filesystem ownership. No security
+tail may be provisioned until both the baseline and rollback artifacts
+are tail-safe and existing data has been archived.
+
+`make test-ota-image-layout-index` qualifies the prospective Git index
+against the native runtime, storage and boot suites. These checks prove
+app-side region behavior, not custom-loader commissioning or physical
+installation.
 
 ## Shared QSPI ownership
 
@@ -419,7 +465,12 @@ It runs against the `target` lab role, resolved to a stable
 `/dev/serial/by-id` path by `scripts/lab_device.py` from the serial pinned in
 `lab/devices.ini`. The firmware accepts only the `run` command and destructively touches only:
 
-- candidate test: `0x0C2000..0x0C6000` (16 KiB)
+- (historical) candidate test: `0x0C2000..0x0C6000` (16 KiB) -- this was the
+  full-bank-era address of the lab firmware's destructive scratch probe,
+  captured here as the actual hardware evidence log for that run and left
+  unaltered. It is superseded by the tail-safe relocated carve-out at
+  `0x0A9000..0x0AD000` documented above; new qualification runs must target
+  the relocated range, not this historical address.
 - journal test: `0x192000..0x194000` (8 KiB)
 
 Both are OTA-owned subregions below the LittleFS boundary at `0x194000`.

@@ -41,9 +41,9 @@ TEST(SenseCapQspiLayoutTest, StaticLayoutIsValid) {
 
 TEST(SenseCapQspiLayoutTest, ExactRequiredRanges) {
   EXPECT_EQ(SenseCapQspiLayout::kCandidateOffset, 0x000000u);
-  EXPECT_EQ(SenseCapQspiLayout::kCandidateOffset + SenseCapQspiLayout::kCandidateSize, 0x0C6000u);
+  EXPECT_EQ(SenseCapQspiLayout::kCandidateOffset + SenseCapQspiLayout::kCandidateSize, 0x0AD000u);
   EXPECT_EQ(SenseCapQspiLayout::kBackupOffset, 0x0C6000u);
-  EXPECT_EQ(SenseCapQspiLayout::kBackupOffset + SenseCapQspiLayout::kBackupSize, 0x18C000u);
+  EXPECT_EQ(SenseCapQspiLayout::kBackupOffset + SenseCapQspiLayout::kBackupSize, 0x173000u);
   EXPECT_EQ(SenseCapQspiLayout::kJournalOffset, 0x18C000u);
   EXPECT_EQ(SenseCapQspiLayout::kJournalOffset + SenseCapQspiLayout::kJournalSize, 0x194000u);
   EXPECT_EQ(SenseCapQspiLayout::kFilesystemOffset, 0x194000u);
@@ -66,7 +66,7 @@ TEST(SenseCapQspiLayoutTest, RegionsAreValidOnRealSizedFakeDevice) {
   EXPECT_TRUE(journal_test.isValid());
 }
 
-TEST(SenseCapQspiLayoutTest, HardwareTestRegionsNeverOverlapLittleFs) {
+TEST(SenseCapQspiLayoutTest, HardwareTestRegionsStayCandidateOwnedAndNeverOverlapJournalOrLittleFs) {
   EXPECT_GE(SenseCapQspiLayout::kCandidateTestOffset,
             SenseCapQspiLayout::kCandidateOffset);
   EXPECT_TRUE(SenseCapQspiLayout::fitsWithin(
@@ -74,21 +74,44 @@ TEST(SenseCapQspiLayoutTest, HardwareTestRegionsNeverOverlapLittleFs) {
       SenseCapQspiLayout::kCandidateTestSize,
       SenseCapQspiLayout::kCandidateOffset + SenseCapQspiLayout::kCandidateSize));
   EXPECT_GE(SenseCapQspiLayout::kJournalTestOffset,
-            SenseCapQspiLayout::kJournalOffset);
+            SenseCapQspiLayout::kCandidateTestOffset);
   EXPECT_TRUE(SenseCapQspiLayout::fitsWithin(
       SenseCapQspiLayout::kJournalTestOffset,
       SenseCapQspiLayout::kJournalTestSize,
-      SenseCapQspiLayout::kJournalOffset + SenseCapQspiLayout::kJournalSize));
+      SenseCapQspiLayout::kCandidateTestOffset + SenseCapQspiLayout::kCandidateTestSize));
   EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
       SenseCapQspiLayout::kCandidateTestOffset,
       SenseCapQspiLayout::kCandidateTestSize,
       SenseCapQspiLayout::kFilesystemOffset,
       SenseCapQspiLayout::kFilesystemSize));
   EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
+      SenseCapQspiLayout::kCandidateTestOffset,
+      SenseCapQspiLayout::kCandidateTestSize,
+      SenseCapQspiLayout::kJournalOffset,
+      SenseCapQspiLayout::kJournalSize));
+  EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
+      SenseCapQspiLayout::kJournalTestOffset,
+      SenseCapQspiLayout::kJournalTestSize,
+      SenseCapQspiLayout::kJournalOffset,
+      SenseCapQspiLayout::kJournalSize));
+  EXPECT_FALSE(SenseCapQspiLayout::rangesOverlap(
       SenseCapQspiLayout::kJournalTestOffset,
       SenseCapQspiLayout::kJournalTestSize,
       SenseCapQspiLayout::kFilesystemOffset,
       SenseCapQspiLayout::kFilesystemSize));
+}
+
+TEST(SenseCapQspiLayoutTest, XiaoJournalFullRegionCoversAllEightSubSlotsExactly) {
+  FakeNorFlash flash(2 * 1024 * 1024, 4096);
+  FlashRegion journal_full = SenseCapQspiLayout::xiaoJournalFullRegion(flash);
+  ASSERT_TRUE(journal_full.isValid());
+  EXPECT_EQ(journal_full.sizeBytes(), 8u * 4096u);
+  // Base offset must match the physically-first sub-slot (install command
+  // A) at kJournalOffset, per the fixed 8-index map:
+  // 0=floorA,1=floorB,2=commandA,3=commandB,4=stateA,5=stateB,6=confirmA,
+  // 7=confirmB -- a *logical* index used by the wire contract, distinct
+  // from physical sub-slot order within the region.
+  EXPECT_EQ(SenseCapQspiLayout::kXiaoCommandOffset, SenseCapQspiLayout::kJournalOffset);
 }
 
 TEST(SenseCapQspiLayoutTest, OverlapDetectionCatchesIntroducedOverlap) {
