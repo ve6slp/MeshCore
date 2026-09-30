@@ -9,12 +9,57 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lab_device  # noqa: E402
+import verify_boot_info_artifact as boot_info  # noqa: E402
 
 BOARD_ID = "nRF52840-SeeedXiao-v1"
 UF2_MAGIC_START0 = 0x0A324655
 UF2_MAGIC_START1 = 0x9E5D5157
 UF2_MAGIC_END = 0x0AB16F30
+UF2_PAYLOAD_MAX_SIZE = 476
+# The "self bootloader update" UF2 family ID this Makefile packages with
+# (see .tmp/Adafruit_nRF52_Bootloader/Makefile UF2_FAMILY_ID_BOOTLOADER).
+# It is NOT the generic NRF52840 application family ID (0xADA52840): a
+# block claiming any other family here means this file was never actually
+# produced by this project's bootloader packaging step.
+UF2_FAMILY_ID_BOOTLOADER = 0xD663823C
+
+# Address ranges a genuine no-SWD bootloader-update UF2 is allowed to
+# target, derived from (a) this target's documented flash layout and (b) a
+# byte-exact read of a real packaged artifact
+# (.tmp/xiao_nrf52840_ota_artifacts/custom-noswd/*_update.uf2): MBR/vector
+# table, the 38KiB bootloader code region, the 2KiB bootloader-config slot
+# (which holds the boot-info marker at 0xFDC00), and the two UICR words the
+# bootloader reads at boot. Each tuple is a half-open [start, stop) byte
+# range (stop is exclusive, never itself written). The UICR range below is
+# [0x10001000, 0x10001100): its last WRITTEN byte is 0x100010FF, not
+# 0x100011FF -- read this as "up to but not including 0x10001100", never as
+# an inclusive endpoint.
+#
+# Deliberately EXCLUDED even though they sit between the bootloader and
+# UICR ranges above: the MBR Params Page (0xFE000..0xFF000) and the
+# Bootloader Settings page (0xFF000..0x100000, durable bank/CRC/size
+# metadata and this project's anti-rollback floor/command records) -- an
+# update artifact must never be able to overwrite either, and neither
+# appears in a real packaged UF2. Also excluded: the application image
+# region (0x27000..0xED000) and any external-flash/ExtraFS addressing --
+# a block targeting either must always be rejected.
+PERMITTED_ADDRESS_RANGES = (
+    (0x00000, 0x01000),        # MBR / vector table page
+    (0xF4000, 0xFE000),        # bootloader code (38KiB) + bootloader config (2KiB)
+    (0x10001000, 0x10001100),  # UICR words this bootloader reads: [.., ..) half-open, last byte 0x100010FF
+)
+
+
+def _address_range_permitted(target_addr, payload_size):
+    if payload_size == 0:
+        return False
+    end = target_addr + payload_size  # exclusive
+    for start, stop in PERMITTED_ADDRESS_RANGES:
+        if target_addr >= start and end <= stop:
+            return True
+    return False
 
 
 def usb_serial_ancestor(path):
@@ -52,7 +97,9 @@ def validate_uf2(path):
         for index in range(expected_blocks):
             block = stream.read(512)
             start0, start1 = struct.unpack_from("<II", block, 0)
+            target_addr, payload_size = struct.unpack_from("<II", block, 12)
             block_number, block_count = struct.unpack_from("<II", block, 20)
+            family_id = struct.unpack_from("<I", block, 28)[0]
             end_magic = struct.unpack_from("<I", block, 508)[0]
             if (start0, start1, end_magic) != (
                 UF2_MAGIC_START0,
@@ -62,6 +109,23 @@ def validate_uf2(path):
                 raise ValueError(f"invalid UF2 magic in block {index}")
             if block_count != expected_blocks or block_number >= block_count:
                 raise ValueError(f"invalid UF2 block numbering in block {index}")
+            if family_id != UF2_FAMILY_ID_BOOTLOADER:
+                raise ValueError(
+                    f"block {index} declares family_id 0x{family_id:08X}, "
+                    f"expected the bootloader-update family 0x{UF2_FAMILY_ID_BOOTLOADER:08X}"
+                )
+            if payload_size == 0 or payload_size > UF2_PAYLOAD_MAX_SIZE:
+                raise ValueError(
+                    f"block {index} declares payload_size {payload_size}, "
+                    f"expected 1..{UF2_PAYLOAD_MAX_SIZE}"
+                )
+            if not _address_range_permitted(target_addr, payload_size):
+                raise ValueError(
+                    f"block {index} targets 0x{target_addr:X}..0x{target_addr + payload_size:X}, "
+                    "which is outside the permitted bootloader/config/UICR ranges "
+                    "(this never touches the application image, ExtraFS, or the "
+                    "durable bootloader settings page)"
+                )
             seen.add(block_number)
     if seen != set(range(expected_blocks)):
         raise ValueError("UF2 block sequence is incomplete or duplicated")
@@ -105,7 +169,34 @@ def authorized_serials():
     return set(lab_device.load_roles().values())
 
 
+def validate_artifact(artifact_path, board, key_header):
+    """Artifact-only checks: UF2 structure/whitelist plus the boot-info
+    marker/board/key. Runs with no serial, port, or mounted-device
+    resolution -- callable standalone (e.g. in CI, before any board is
+    connected) via --validate-only.
+    """
+    artifact = Path(artifact_path)
+    validate_uf2(artifact)
+    marker_errors = boot_info.check_artifact(artifact, board, Path(key_header))
+    if marker_errors:
+        raise ValueError(
+            "boot-info marker in artifact failed independent verification: "
+            + "; ".join(marker_errors)
+        )
+
+
 def install(args):
+    board = getattr(args, "board", "xiao_nrf52840")
+    key_header = getattr(
+        args, "key_header",
+        Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",
+    )
+    validate_artifact(args.artifact, board, key_header)
+
+    if args.validate_only:
+        print(f"VALIDATE-ONLY: artifact {args.artifact} passed all artifact checks")
+        return
+
     permitted = authorized_serials()
     if args.serial not in permitted:
         raise ValueError(
@@ -132,7 +223,6 @@ def install(args):
         )
 
     artifact = Path(args.artifact)
-    validate_uf2(artifact)
     volumes = matching_mounts(
         args.serial, Path(args.mountinfo), Path(args.sys_dev_block_root)
     )
@@ -162,15 +252,32 @@ def install(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--serial", required=True)
-    parser.add_argument("--boot-port", required=True)
+    parser.add_argument("--serial", required=False)
+    parser.add_argument("--boot-port", required=False)
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="only run artifact checks (UF2 structure/whitelist, boot-info "
+             "marker/board/key); no serial, port, or mounted-device "
+             "resolution is performed or required",
+    )
+    parser.add_argument("--board", choices=sorted(boot_info.BOARD_TARGET_VALUE),
+                        default="xiao_nrf52840",
+                        help="board profile the artifact's boot-info marker must match")
+    parser.add_argument(
+        "--key-header", type=Path,
+        default=Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",
+        help="public key header the artifact's trusted_public_key field must match",
+    )
     parser.add_argument("--by-id-dir", default="/dev/serial/by-id")
     parser.add_argument("--mountinfo", default="/proc/self/mountinfo")
     parser.add_argument("--sys-dev-char-root", default="/sys/dev/char")
     parser.add_argument("--sys-dev-block-root", default="/sys/dev/block")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.validate_only and (not args.serial or not args.boot_port):
+        parser.error("--serial and --boot-port are required unless --validate-only is given")
+    return args
 
 
 def main():

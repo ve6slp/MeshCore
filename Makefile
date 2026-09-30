@@ -40,6 +40,8 @@ XIAO_OTA_BOARD ?= xiao_nrf52840
 XIAO_OTA_STEM = $(XIAO_OTA_BOARD)_ota
 VERIFY_OTA_BOOT_INFO = python3 bootloader/xiao_nrf52840_ota/tools/verify_boot_info_artifact.py \
 	--board "$(XIAO_OTA_BOARD)" --key-header bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h
+VERIFY_OTA_INSTALL_ARTIFACT = python3 bootloader/xiao_nrf52840_ota/tools/install_uf2.py \
+	--validate-only --board "$(XIAO_OTA_BOARD)" --key-header bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h
 OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_DUTY_TIMEOUT ?= 420
 OTA_LAB_MONITOR_SECONDS ?= 60
@@ -65,7 +67,7 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
         fetch-xiao-ota-bootloader provision-xiao-ota-lab-key \
-        test-xiao-ota-bootloader build-xiao-stock-bootloader \
+        test-xiao-ota-bootloader test-xiao-ota-bootloader-tools build-xiao-stock-bootloader \
         build-xiao-ota-bootloader package-xiao-ota-bootloader \
         build-xiao-ota-bootloader-noswd package-xiao-ota-bootloader-noswd \
         sign-xiao-ota-image verify-xiao-ota-bootloader verify-xiao-ota-boot-info-artifacts \
@@ -261,7 +263,11 @@ fetch-xiao-ota-bootloader: tmpdir
 provision-xiao-ota-lab-key: tmpdir
 	python3 bootloader/xiao_nrf52840_ota/tools/provision_lab_key.py --board "$(XIAO_OTA_BOARD)"
 
-test-xiao-ota-bootloader: tmpdir
+test-xiao-ota-bootloader-tools: tmpdir
+	python3 bootloader/xiao_nrf52840_ota/tests/test_install_uf2.py
+	python3 -m unittest discover -s bootloader/xiao_nrf52840_ota/tests -p 'test_tools.py'
+
+test-xiao-ota-bootloader: tmpdir test-xiao-ota-bootloader-tools
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
 	$(CC) -std=c11 -Wall -Wextra -Werror \
 	  -Ibootloader/xiao_nrf52840_ota/include \
@@ -304,8 +310,6 @@ test-xiao-ota-bootloader: tmpdir
 	  -o "$(TMPDIR)/xiao-ota-host/test_boot_info"
 	"$(TMPDIR)/xiao-ota-host/test_boot_info"
 	python3 bootloader/xiao_nrf52840_ota/tests/test_source.py
-	python3 bootloader/xiao_nrf52840_ota/tests/test_install_uf2.py
-	python3 -m unittest discover -s bootloader/xiao_nrf52840_ota/tests -p 'test_tools.py'
 
 build-xiao-stock-bootloader: fetch-xiao-ota-bootloader
 	@$(MAKE) -C "$(XIAO_OTA_UPSTREAM)" BOARD=xiao_nrf52840_ble clean
@@ -366,6 +370,7 @@ package-xiao-ota-bootloader-noswd: build-xiao-ota-bootloader-noswd
 	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.map"
 	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.hex"
 	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
+	$(VERIFY_OTA_INSTALL_ARTIFACT) --artifact "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
 	@sha256sum "$(XIAO_OTA_ARTIFACTS)"/custom-noswd/*
 
 ## Install only the packaged no-SWD custom bootloader UF2 on the authorized XIAO.
@@ -382,6 +387,7 @@ install-xiao-nrf52-target-ota-bootloader: package-xiao-ota-bootloader-noswd
 verify-xiao-ota-boot-info-artifacts: tmpdir
 	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.hex"
 	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
+	$(VERIFY_OTA_INSTALL_ARTIFACT) --artifact "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
 
 sign-xiao-ota-image: provision-xiao-ota-lab-key
 	@test -n "$(XIAO_OTA_IMAGE)" && test -n "$(XIAO_OTA_ACTIVE_IMAGE)"
