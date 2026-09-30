@@ -94,6 +94,25 @@ freeze the current instance. Both runtime constructors default to
 facts from the caller, not merely blank records. The production transport
 and commissioning-store wiring are still pending.
 
+`OtaSequenceBackingPort` separates those runtime algorithms from physical
+storage. TX reservations compare the expected global counter before
+claiming a new range; after a conflict, the allocator skips ranges owned
+by other writers and reserves its own before emitting a sequence. RX
+refresh closes the externally advanced replay window rather than
+reopening earlier admissions. `WouldBlock` and `Conflict` remain
+retryable at every open, read and mutation boundary; uncertain or
+regressing durable facts freeze the instance.
+
+The two-sector flash adapters are existing-record-only references, not
+commissioning authorities or a production wear solution. Missing records
+do not prove first use. Full-identity collision and bounded-capacity
+fixtures exercise the port in RAM; they do not qualify a persistent
+350-peer store, compaction, endurance or firmware transport.
+
+`make test-ota-counter-ports-index` archives the prospective Git index
+under `.tmp/` and runs its runtime, actual-cipher and lab-host gates.
+Unstaged work is excluded, and the output identifies the exact tree.
+
 Combine native suite selectors in one invocation when working across
 layers, for example:
 

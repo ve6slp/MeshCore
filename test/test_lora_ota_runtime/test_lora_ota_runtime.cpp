@@ -15,6 +15,9 @@
 #include "ota/runtime/OtaFleetStateMachine.h"
 #include "ota/runtime/OtaTxSequenceLedger.h"
 #include "ota/runtime/OtaRxReplayLedger.h"
+#include "ota/runtime/OtaSequenceBackingPort.h"
+#include "ota/runtime/OtaFlashSequenceBackingAdapters.h"
+#include "ota/runtime/OtaSequenceBackedLedgers.h"
 #include "ota/platform/FlashDevice.h"
 #include "ota/platform/FlashRegion.h"
 
@@ -1343,6 +1346,1242 @@ TEST(OtaRxReplayLedger, EveryEraseBodyMarkerAndReadbackCutFreezesEvenReorderedFr
     EXPECT_EQ(std::memcmp(flash.rawBuffer(), guard.data(), guard.size()), 0);
     EXPECT_EQ(std::memcmp(flash.rawBuffer() + 3 * kLedgerEraseUnit, guard.data(), guard.size()), 0);
   }
+}
+
+// -----------------------------------------------------------------------
+// Store-agnostic backing port (OtaSequenceBackingPort.h /
+// OtaSequenceBackedLedgers.h / OtaFlashSequenceBackingAdapters.h):
+// proves the SAME block-reservation / watermark-bitmap semantics work
+// against (a) the existing FlashRegion-backed 2-sector journal via the
+// new adapter, and (b) a bounded, multi-context, deliberately-hash-
+// colliding in-memory backing modeling a future shared append store --
+// full-byte identity, never a hash/selector, capacity denial, cold
+// reconstruction, and durable-but-lost-ack (Uncertain) recovery.
+// -----------------------------------------------------------------------
+namespace {
+
+// Directly-controllable fakes: every call's result is settable ahead of
+// time, so each OtaSequenceBackingResult value can be exercised in
+// isolation against OtaBackedTxSequenceAllocator/OtaBackedRxReplayLedger.
+class FakeControllableTxBackingStore : public ITxSequenceBackingStore {
+public:
+  OtaSequenceBackingResult openExisting() override {
+    ++openCalls;
+    return nextOpenResult;
+  }
+  OtaSequenceBackingResult readCounter(uint32_t& outReservedUpperBound) override {
+    ++readCalls;
+    outReservedUpperBound = counter;
+    return nextReadResult;
+  }
+  OtaSequenceBackingResult reserveTx(uint32_t expectedCurrentUpperBound, uint32_t blockSize,
+                                      uint32_t& outNewUpperBound) override {
+    ++reserveCalls;
+    (void)expectedCurrentUpperBound;
+    if (nextReserveResult == OtaSequenceBackingResult::Committed) {
+      counter += blockSize;
+      outNewUpperBound = counter;
+    }
+    return nextReserveResult;
+  }
+
+  OtaSequenceBackingResult nextOpenResult = OtaSequenceBackingResult::Committed;
+  OtaSequenceBackingResult nextReadResult = OtaSequenceBackingResult::Committed;
+  OtaSequenceBackingResult nextReserveResult = OtaSequenceBackingResult::Committed;
+  uint32_t counter = 0;
+  int openCalls = 0;
+  int readCalls = 0;
+  int reserveCalls = 0;
+};
+
+class FakeControllableRxBackingStore : public IRxSequenceBackingStore {
+public:
+  OtaSequenceBackingResult openExisting(const OtaRxLedgerContext&) override {
+    ++openCalls;
+    return nextOpenResult;
+  }
+  OtaSequenceBackingResult readCounter(const OtaRxLedgerContext&, uint32_t& outWatermark) override {
+    ++readCalls;
+    outWatermark = watermark;
+    return nextReadResult;
+  }
+  OtaSequenceBackingResult advanceRx(const OtaRxLedgerContext&, uint32_t expectedHead, uint32_t newHead) override {
+    ++advanceCalls;
+    if (nextAdvanceResult == OtaSequenceBackingResult::Conflict) {
+      // Simulates the durable head having genuinely already moved past
+      // what the caller expected (e.g. a previous Uncertain call had
+      // actually landed).
+      return OtaSequenceBackingResult::Conflict;
+    }
+    (void)expectedHead;
+    if (nextAdvanceResult == OtaSequenceBackingResult::Committed) {
+      watermark = newHead;
+    } else if (advanceAppliesEvenWhenUncertain && nextAdvanceResult == OtaSequenceBackingResult::Uncertain) {
+      watermark = newHead;  // durable write actually landed, ack simply "lost".
+    }
+    return nextAdvanceResult;
+  }
+
+  OtaSequenceBackingResult nextOpenResult = OtaSequenceBackingResult::Committed;
+  OtaSequenceBackingResult nextReadResult = OtaSequenceBackingResult::Committed;
+  OtaSequenceBackingResult nextAdvanceResult = OtaSequenceBackingResult::Committed;
+  bool advanceAppliesEvenWhenUncertain = false;
+  uint32_t watermark = 0;
+  int openCalls = 0;
+  int readCalls = 0;
+  int advanceCalls = 0;
+};
+
+uint8_t peerByte(uint8_t seed) { return static_cast<uint8_t>(seed * 7u + 3u); }
+
+OtaRxLedgerContext makeFullPeerContext(uint16_t index) {
+  uint8_t bytes[32] = {};
+  bytes[0] = static_cast<uint8_t>(index & 0xFFu);
+  bytes[1] = static_cast<uint8_t>((index >> 8) & 0xFFu);
+  for (int i = 2; i < 32; ++i) bytes[i] = peerByte(static_cast<uint8_t>(index + i));
+  return OtaRxLedgerContext::forPeer(bytes);
+}
+
+OtaRxLedgerContext makeFullGroupContext(uint16_t index) {
+  uint8_t bytes[92] = {};
+  bytes[0] = static_cast<uint8_t>(index & 0xFFu);
+  bytes[1] = static_cast<uint8_t>((index >> 8) & 0xFFu) | 0x80u;  // distinguish from any peer pattern.
+  for (int i = 2; i < 92; ++i) bytes[i] = peerByte(static_cast<uint8_t>(index + i + 1));
+  return OtaRxLedgerContext::forGroup(bytes);
+}
+
+// A bounded, multi-context RX backing modeling the essential shape of a
+// future shared append store: durable state OUTLIVES any individual
+// OtaBackedRxReplayLedger wrapper (so destroying/recreating the wrapper
+// over the SAME store instance genuinely models cold reconstruction),
+// capacity is hard-bounded per Astra's "350 full-peer / 4 active group"
+// contract, and lookups deliberately hash into only a HANDFUL of
+// buckets (so many distinct real contexts collide) yet always resolve
+// correctly because every comparison is full-byte, never truncated.
+class BoundedMultiContextRxBackingStore : public IRxSequenceBackingStore, public IRxSequenceCommissioningAuthority {
+public:
+  static constexpr size_t kMaxPeerContexts = 350;
+  static constexpr size_t kMaxGroupContexts = 4;
+  static constexpr size_t kBucketCount = 8;  // deliberately small: guarantees real collisions at scale 350/4.
+
+  OtaSequenceBackingResult openExisting(const OtaRxLedgerContext& context) override {
+    if (forceOpenWouldBlockOnce) {
+      forceOpenWouldBlockOnce = false;
+      return OtaSequenceBackingResult::WouldBlock;
+    }
+    Entry* e = find(context);
+    if (e == nullptr) return OtaSequenceBackingResult::Missing;
+    return OtaSequenceBackingResult::Committed;
+  }
+
+  OtaSequenceBackingResult readCounter(const OtaRxLedgerContext& context, uint32_t& outWatermark) override {
+    Entry* e = find(context);
+    if (e == nullptr) return OtaSequenceBackingResult::Missing;
+    outWatermark = e->watermark;
+    return OtaSequenceBackingResult::Committed;
+  }
+
+  OtaSequenceBackingResult advanceRx(const OtaRxLedgerContext& context, uint32_t expectedHead,
+                                     uint32_t newHead) override {
+    Entry* e = find(context);
+    if (e == nullptr) return OtaSequenceBackingResult::Missing;
+    if (e->watermark != expectedHead) return OtaSequenceBackingResult::Conflict;
+    if (forceUncertainOnceForNextAdvance) {
+      forceUncertainOnceForNextAdvance = false;
+      e->watermark = newHead;  // durably applied; only the ACK is "lost".
+      return OtaSequenceBackingResult::Uncertain;
+    }
+    e->watermark = newHead;
+    return OtaSequenceBackingResult::Committed;
+  }
+
+  bool commissionVirginRx(const OtaRxLedgerContext& context, uint32_t initialWatermark) override {
+    if (initialWatermark == 0) return false;
+    if (find(context) != nullptr) return false;  // already commissioned: never relax/overwrite.
+    auto& bucket = bucketFor(context);
+    auto& vec = context.kind() == OtaRxLedgerContext::Kind::Peer ? peerCount_ : groupCount_;
+    const size_t cap = context.kind() == OtaRxLedgerContext::Kind::Peer ? kMaxPeerContexts : kMaxGroupContexts;
+    if (vec >= cap) return false;  // bounded capacity exhausted.
+    bucket.push_back({context, initialWatermark});
+    ++vec;
+    return true;
+  }
+
+  bool forceOpenWouldBlockOnce = false;
+  bool forceUncertainOnceForNextAdvance = false;
+
+private:
+  struct Entry {
+    OtaRxLedgerContext context;
+    uint32_t watermark;
+  };
+
+  // Deliberately weak/colliding index: only the first byte, folded into
+  // a handful of buckets -- real distinguishing power comes ONLY from
+  // the full-byte equals() scan below, never from this index alone.
+  size_t hashIndex(const OtaRxLedgerContext& context) const {
+    const uint8_t firstByte = context.kind() == OtaRxLedgerContext::Kind::Peer ? context.peerId()[0]
+                                                                               : context.groupContext()[0];
+    return static_cast<size_t>(firstByte) % kBucketCount;
+  }
+
+  std::vector<Entry>& bucketFor(const OtaRxLedgerContext& context) { return buckets_[hashIndex(context)]; }
+
+  Entry* find(const OtaRxLedgerContext& context) {
+    auto& bucket = bucketFor(context);
+    for (auto& e : bucket) {
+      if (e.context.equals(context)) return &e;
+    }
+    return nullptr;
+  }
+
+  std::vector<Entry> buckets_[kBucketCount];
+  size_t peerCount_ = 0;
+  size_t groupCount_ = 0;
+};
+
+}  // namespace
+
+TEST(OtaSequenceBackingPort, ContextEqualityIsFullByteNeverKindCrossed) {
+  const auto peerA = makeFullPeerContext(1);
+  const auto peerB = makeFullPeerContext(1);
+  const auto peerC = makeFullPeerContext(2);
+  EXPECT_TRUE(peerA.equals(peerB));
+  EXPECT_FALSE(peerA.equals(peerC));
+  const auto groupA = makeFullGroupContext(1);
+  EXPECT_FALSE(peerA.equals(groupA));  // different Kind must never compare equal.
+}
+
+TEST(OtaSequenceBackingPort, UnwiredDefaultCommissioningAuthoritiesAlwaysDenyNeverInferPermissionFromAbsence) {
+  // The concrete safe-default bases must NEVER treat "no real authority
+  // wired" as implicit permission to commission -- blank/Missing alone
+  // is never proof of virginity; an unwired default must deny.
+  ITxSequenceCommissioningAuthority defaultTxAuthority;
+  EXPECT_FALSE(defaultTxAuthority.commissionVirginTx(1));
+  EXPECT_FALSE(defaultTxAuthority.commissionVirginTx(64));
+
+  IRxSequenceCommissioningAuthority defaultRxAuthority;
+  EXPECT_FALSE(defaultRxAuthority.commissionVirginRx(makeFullPeerContext(1), 1));
+  EXPECT_FALSE(defaultRxAuthority.commissionVirginRx(makeFullGroupContext(1), 1));
+}
+
+TEST(OtaBackedTxSequenceAllocator, MissingBackingFailsClosedPermanently) {
+  FakeControllableTxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::Missing;  // never silently commissions.
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_TRUE(allocator.isDisabled());
+  EXPECT_FALSE(allocator.allocate(&seq));  // stays disabled, no "recovery".
+  EXPECT_EQ(1, backing.openCalls);         // never retried once disabled.
+}
+
+TEST(OtaBackedTxSequenceAllocator, WouldBlockOnOpenIsTransientNotPermanentlyDisabling) {
+  FakeControllableTxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::WouldBlock;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_FALSE(allocator.isDisabled());
+  backing.nextOpenResult = OtaSequenceBackingResult::Committed;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(allocator.allocate(&seq));  // now succeeds: proves WouldBlock never permanently disabled it.
+  EXPECT_EQ(2u, seq);  // sequence 1 is already claimed by the preseeded commissioning value.
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictOnOpenIsTransientNotPermanentlyDisabling) {
+  // The abstract port permits Conflict from openExisting()/readCounter()
+  // too (e.g. a future immutable-snapshot read racing a compaction) --
+  // every non-Committed, non-permanent-fault result must be treated
+  // identically to WouldBlock at every site, not just a hardcoded
+  // WouldBlock check.
+  FakeControllableTxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_FALSE(allocator.isDisabled());
+  backing.nextOpenResult = OtaSequenceBackingResult::Committed;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(allocator.allocate(&seq));  // proves Conflict-on-open never permanently disabled it.
+  EXPECT_EQ(2u, seq);  // sequence 1 is already claimed by the preseeded commissioning value.
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictOnInitialReadIsTransientNotPermanentlyDisabling) {
+  FakeControllableTxBackingStore backing;
+  backing.nextReadResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_FALSE(allocator.isDisabled());
+  backing.nextReadResult = OtaSequenceBackingResult::Committed;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(allocator.allocate(&seq));
+  EXPECT_EQ(2u, seq);  // sequence 1 is already claimed by the preseeded commissioning value.
+}
+
+TEST(OtaBackedTxSequenceAllocator, WouldBlockOnReserveIsTransientAndSequenceStillNeverRepeats) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  OtaBackedTxSequenceAllocator allocator(backing, /*blockSize=*/4);
+  uint32_t seq = 0;
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(allocator.allocate(&seq));
+  EXPECT_EQ(5u, seq);  // sequence 1 already claimed by the preseeded commissioning value.
+  backing.nextReserveResult = OtaSequenceBackingResult::WouldBlock;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_FALSE(allocator.isDisabled());
+  backing.nextReserveResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(allocator.allocate(&seq));
+  EXPECT_EQ(6u, seq);  // never repeats/skips due to the transient WouldBlock.
+}
+
+TEST(OtaBackedTxSequenceAllocator, UncertainReserveDisablesPermanentlyUntilFreshReconstruction) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  {
+    OtaBackedTxSequenceAllocator allocator(backing, /*blockSize=*/4);
+    uint32_t seq = 0;
+    ASSERT_TRUE(allocator.allocate(&seq));
+    backing.nextReserveResult = OtaSequenceBackingResult::Uncertain;
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(allocator.allocate(&seq));  // exhausts the first block of 4.
+    EXPECT_FALSE(allocator.allocate(&seq));                             // 5th needs a new block: Uncertain.
+    EXPECT_TRUE(allocator.isDisabled());
+    EXPECT_FALSE(allocator.allocate(&seq));  // stays disabled: same instance never self-heals.
+  }
+  // Fresh reconstruction against the SAME backing re-derives the actual
+  // durable truth rather than trusting the disabled instance's RAM.
+  backing.nextReserveResult = OtaSequenceBackingResult::Committed;
+  OtaBackedTxSequenceAllocator reconstructed(backing);
+  uint32_t seq = 0;
+  ASSERT_TRUE(reconstructed.allocate(&seq));
+  EXPECT_GT(seq, 5u);  // never repeats anything from [1,5] (1 was the preseeded commissioning claim).
+}
+
+TEST(OtaBackedRxReplayLedger, MissingBackingFailsClosedPermanently) {
+  FakeControllableRxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::Missing;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.admit(1));
+  EXPECT_TRUE(ledger.isDisabled());
+  EXPECT_FALSE(ledger.admit(2));
+}
+
+TEST(OtaBackedRxReplayLedger, WouldBlockOnLoadIsTransientNotPermanentlyDisabling) {
+  FakeControllableRxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::WouldBlock;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.admit(5));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextOpenResult = OtaSequenceBackingResult::Committed;
+  backing.watermark = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(ledger.admit(5));
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictOnLoadOpenIsTransientNotPermanentlyDisabling) {
+  // Same broadening as the TX-side ConflictOnOpen test: the abstract
+  // port permits Conflict here too, and it must be treated identically
+  // to WouldBlock, never a hardcoded WouldBlock-only special case.
+  FakeControllableRxBackingStore backing;
+  backing.nextOpenResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.admit(5));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextOpenResult = OtaSequenceBackingResult::Committed;
+  backing.watermark = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(ledger.admit(5));
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictOnInitialReadIsTransientNotPermanentlyDisabling) {
+  FakeControllableRxBackingStore backing;
+  backing.nextReadResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.admit(5));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextReadResult = OtaSequenceBackingResult::Committed;
+  backing.watermark = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  ASSERT_TRUE(ledger.admit(5));
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictRefreshesAndRetriesWithoutPermanentlyDisabling) {
+  // Force exactly one Conflict on the FIRST underlying advance() call,
+  // modeling the durable head having already moved (e.g. a previous
+  // Uncertain call had actually landed, or -- for a real shared store --
+  // another writer advanced it) by the time this attempt is issued.
+  class OneShotConflictThenCommit : public FakeControllableRxBackingStore {
+   public:
+    OtaSequenceBackingResult advanceRx(const OtaRxLedgerContext& c, uint32_t expectedHead,
+                                        uint32_t newHead) override {
+      if (!firstAttempted) {
+        firstAttempted = true;
+        return OtaSequenceBackingResult::Conflict;
+      }
+      return FakeControllableRxBackingStore::advanceRx(c, expectedHead, newHead);
+    }
+    bool firstAttempted = false;
+  };
+  OneShotConflictThenCommit conflictBacking;
+  conflictBacking.watermark = 10;  // load() sees this as the reboot floor.
+  OtaBackedRxReplayLedger conflictLedger(conflictBacking, makeFullPeerContext(1));
+  // Bump the backing's real watermark to 12 to model the concurrent
+  // advance, so the refresh (readCounter) the ledger performs after the
+  // Conflict observes it before the bounded single retry.
+  conflictBacking.watermark = 12;
+  EXPECT_TRUE(conflictLedger.admit(15));
+  EXPECT_FALSE(conflictLedger.isDisabled());
+}
+
+TEST(OtaBackedRxReplayLedger, UncertainAdvanceDisablesPermanentlyEvenThoughBytesActuallyLanded) {
+  BoundedMultiContextRxBackingStore backing;
+  const auto ctx = makeFullPeerContext(7);
+  ASSERT_TRUE(backing.commissionVirginRx(ctx, 1));  // sequence 1 marked already-seen at commissioning.
+  {
+    OtaBackedRxReplayLedger ledger(backing, ctx);
+    ASSERT_TRUE(ledger.admit(2));
+    backing.forceUncertainOnceForNextAdvance = true;
+    EXPECT_FALSE(ledger.admit(3));  // durable write actually applies, but the caller sees Uncertain.
+    EXPECT_TRUE(ledger.isDisabled());
+    EXPECT_FALSE(ledger.admit(4));  // stays disabled: no self-healing within this instance.
+  }
+  // Fresh reconstruction against the SAME real backing sees the ACTUAL
+  // durable truth (watermark really did advance to 3), not a fake
+  // sentinel -- 3 must be rejected as already-admitted, and only 4+ is
+  // genuinely new.
+  OtaBackedRxReplayLedger reconstructed(backing, ctx);
+  EXPECT_FALSE(reconstructed.admit(1));
+  EXPECT_FALSE(reconstructed.admit(3));
+  EXPECT_TRUE(reconstructed.admit(4));
+}
+
+TEST(BoundedMultiContextRxBackingStore, ThreeHundredFiftyFullPeerContextsWithDeliberatelyCollidingHashRemainDistinct) {
+  BoundedMultiContextRxBackingStore backing;
+  std::vector<OtaRxLedgerContext> contexts;
+  contexts.reserve(BoundedMultiContextRxBackingStore::kMaxPeerContexts);
+  for (uint16_t i = 0; i < BoundedMultiContextRxBackingStore::kMaxPeerContexts; ++i) {
+    contexts.push_back(makeFullPeerContext(i));
+    ASSERT_TRUE(backing.commissionVirginRx(contexts.back(), 1)) << "context " << i;
+  }
+  // Every one of the 350 contexts admits its OWN independent sequence
+  // stream without any cross-contamination, despite the backing's
+  // deliberately tiny (8-bucket) hash index guaranteeing many real
+  // collisions among 350 distinct full identities.
+  std::vector<OtaBackedRxReplayLedger> ledgers;
+  ledgers.reserve(contexts.size());
+  for (auto& c : contexts) ledgers.emplace_back(backing, c);
+  for (size_t i = 0; i < ledgers.size(); ++i) {
+    EXPECT_TRUE(ledgers[i].admit(static_cast<uint32_t>(100 + i))) << i;
+  }
+  // Each context's OWN durable watermark must be EXACTLY its own
+  // admitted value, never a colliding-bucket neighbor's -- proves the
+  // deliberately-weak 8-bucket hash index never leaks/aliases state
+  // across the 350 distinct full identities that hash into it.
+  for (size_t i = 0; i < contexts.size(); ++i) {
+    uint32_t watermark = 0;
+    ASSERT_EQ(OtaSequenceBackingResult::Committed, backing.readCounter(contexts[i], watermark)) << i;
+    EXPECT_EQ(static_cast<uint32_t>(100 + i), watermark) << i;
+  }
+  // Exact replay of a context's own just-admitted sequence is rejected.
+  for (size_t i = 0; i < ledgers.size(); ++i) {
+    EXPECT_FALSE(ledgers[i].admit(static_cast<uint32_t>(100 + i))) << i;
+  }
+}
+
+
+TEST(BoundedMultiContextRxBackingStore, FourActiveGroupContextsBoundedSeparatelyFromPeerCapacity) {
+  BoundedMultiContextRxBackingStore backing;
+  for (uint16_t i = 0; i < BoundedMultiContextRxBackingStore::kMaxGroupContexts; ++i) {
+    ASSERT_TRUE(backing.commissionVirginRx(makeFullGroupContext(i), 1)) << i;
+  }
+  EXPECT_FALSE(backing.commissionVirginRx(makeFullGroupContext(999), 1));  // 5th group: capacity denied.
+  // Peer capacity is untouched by group capacity being exhausted.
+  EXPECT_TRUE(backing.commissionVirginRx(makeFullPeerContext(1), 1));
+}
+
+TEST(BoundedMultiContextRxBackingStore, CapacityDenialAtThreeHundredFiftyFirstPeerContext) {
+  BoundedMultiContextRxBackingStore backing;
+  for (uint16_t i = 0; i < BoundedMultiContextRxBackingStore::kMaxPeerContexts; ++i) {
+    ASSERT_TRUE(backing.commissionVirginRx(makeFullPeerContext(i), 1)) << i;
+  }
+  EXPECT_FALSE(backing.commissionVirginRx(makeFullPeerContext(9999), 1));  // 351st: denied, never silently evicts.
+  // Every previously-commissioned context is still fully intact/usable.
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(0));
+  EXPECT_TRUE(ledger.admit(2));
+}
+
+TEST(BoundedMultiContextRxBackingStore, DelayedConstructionAndColdReconstructionAcrossManyContexts) {
+  BoundedMultiContextRxBackingStore backing;
+  const auto ctxA = makeFullPeerContext(11);
+  const auto ctxB = makeFullGroupContext(2);
+  ASSERT_TRUE(backing.commissionVirginRx(ctxA, 1));
+  ASSERT_TRUE(backing.commissionVirginRx(ctxB, 1));
+  {
+    OtaBackedRxReplayLedger ledgerA(backing, ctxA);
+    ASSERT_TRUE(ledgerA.admit(2));
+    ASSERT_TRUE(ledgerA.admit(3));
+  }  // ledgerA destroyed: only the shared backing's durable state survives.
+  // Delayed construction: ctxB's very first ledger wrapper is only
+  // constructed now, long after ctxA already transacted.
+  OtaBackedRxReplayLedger ledgerB(backing, ctxB);
+  ASSERT_TRUE(ledgerB.admit(2));
+  // Cold reconstruction of ctxA: a brand new wrapper independently
+  // re-derives the exact same durable truth (rejects 2 and 3, accepts
+  // 4), proving no per-instance RAM was ever the source of truth.
+  OtaBackedRxReplayLedger reconstructedA(backing, ctxA);
+  EXPECT_FALSE(reconstructedA.admit(2));
+  EXPECT_FALSE(reconstructedA.admit(3));
+  EXPECT_TRUE(reconstructedA.admit(4));
+  // ctxB's independent state was never perturbed by ctxA's activity.
+  OtaBackedRxReplayLedger reconstructedB(backing, ctxB);
+  EXPECT_FALSE(reconstructedB.admit(2));
+  EXPECT_TRUE(reconstructedB.admit(3));
+}
+
+// ---------------------------------------------------------------------
+// Flash-backed reference adapters (OtaFlashSequenceBackingAdapters.h):
+// proves the store-agnostic port/ledgers reproduce the SAME durable
+// behavior as the existing, already fully-tested OtaTxSequenceAllocator
+// / OtaRxReplayLedger classes when bridged over the identical physical
+// 2-sector journal -- and that commissioning is reachable ONLY through
+// the separate one-use authority, never an implicit ctor flag.
+// ---------------------------------------------------------------------
+TEST(FlashTxSequenceBackingStore, RegularApiRefusesUntilIndependentlyCommissionedRecordExists) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  FlashTxSequenceBackingStore store(region);
+  OtaBackedTxSequenceAllocator allocator(store);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));  // blank/never-commissioned: regular API never silently bootstraps.
+  EXPECT_TRUE(allocator.isDisabled());
+
+  // Explicitly-authorized test setup: preseed a genuinely-commissioned
+  // starting record directly via the existing, already-proven
+  // OtaTxSequenceLedgerRecord::reserve() primitive -- NOT via any
+  // "authority" method on the reference adapter itself (this adapter
+  // deliberately implements no such role; see its header comment).
+  // Minimal-waste commissioning (mirrors the RX side's "sequence 1
+  // already seen" convention): marks upper bound 1 as already reserved,
+  // so the reconstructed allocator's very first real allocate() call
+  // reserves a brand new block starting at 2 -- exactly the SAME
+  // "skip whatever the ledger cannot prove is unused" discipline
+  // OtaTxSequenceAllocator already applies on every ordinary reboot.
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 1));
+  FlashTxSequenceBackingStore freshStore(region);  // separate instance: the disabled one never "recovers".
+  OtaBackedTxSequenceAllocator reconstructed(freshStore);
+  ASSERT_TRUE(reconstructed.allocate(&seq));
+  EXPECT_EQ(2u, seq);
+  ASSERT_TRUE(reconstructed.allocate(&seq));
+  EXPECT_EQ(3u, seq);
+}
+
+TEST(FlashTxSequenceBackingStore, CorruptRecordFailsClosedEvenAfterExternalPreseeding) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 1));
+  FlashTxSequenceBackingStore store(region);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting());  // genuinely commissioned: opens fine.
+
+  ota::test::FakeNorFlash corruptFlash(kLedgerRegionBytes, kLedgerEraseUnit);
+  uint8_t garbage[kLedgerEraseUnit];
+  memset(garbage, 0x42, sizeof(garbage));
+  ASSERT_TRUE(ota::platform::isOk(corruptFlash.program(0, garbage, sizeof(garbage))));
+  ota::platform::FlashRegion corruptRegion(corruptFlash, 0, kLedgerRegionBytes);
+  FlashTxSequenceBackingStore corruptStore(corruptRegion);
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, corruptStore.openExisting());  // corrupt: never treated as blank.
+}
+
+TEST(FlashRxSequenceBackingStore, OwnershipDeniedForMismatchedContextEvenIfBoundIdentityIsCommissioned) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  const auto boundCtx = makeFullPeerContext(1);
+  const auto otherCtx = makeFullPeerContext(2);
+  // Explicitly-authorized test setup via the existing reference
+  // primitive (see FlashRxSequenceBackingStore header comment) --
+  // never a fake "authority" method on the reference adapter itself.
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 1));
+  FlashRxSequenceBackingStore store(region, boundCtx);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting(boundCtx));
+  uint32_t watermark = 0;
+  EXPECT_EQ(OtaSequenceBackingResult::OwnershipDenied, store.readCounter(otherCtx, watermark));
+  EXPECT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(boundCtx, watermark));
+}
+
+TEST(FlashRxSequenceBackingStore, RegularApiRefusesUntilIndependentlyCommissionedRecordExistsThenBehavesLikeReference) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  const auto ctx = makeFullPeerContext(3);
+  FlashRxSequenceBackingStore store(region, ctx);
+  OtaBackedRxReplayLedger ledger(store, ctx);
+  EXPECT_FALSE(ledger.admit(5));
+  EXPECT_TRUE(ledger.isDisabled());
+
+  // Explicitly-authorized test setup: sequence 1 marked already-seen,
+  // via the existing reference primitive directly.
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 1));
+  FlashRxSequenceBackingStore freshStore(region, ctx);
+  OtaBackedRxReplayLedger reconstructed(freshStore, ctx);
+  EXPECT_FALSE(reconstructed.admit(1));
+  ASSERT_TRUE(reconstructed.admit(2));
+  EXPECT_FALSE(reconstructed.admit(2));
+
+  // Reboot: brand new store+ledger over the SAME region reproduces the
+  // exact same durable watermark, exactly like OtaRxReplayLedger's own
+  // reboot behavior.
+  FlashRxSequenceBackingStore rebooted(region, ctx);
+  OtaBackedRxReplayLedger rebootedLedger(rebooted, ctx);
+  EXPECT_FALSE(rebootedLedger.admit(2));
+  ASSERT_TRUE(rebootedLedger.admit(3));
+}
+
+TEST(FlashTxSequenceBackingStore, SecondAdapterInstanceOverSameRegionIsSeenAsGenuineConflictNotSpuriousUncertain) {
+  // Root port-correctness fix: readCounter()/reserveTx() must compare
+  // against the ACTUAL current durable journal, not one adapter
+  // instance's private cache. Two independent FlashTxSequenceBackingStore
+  // instances taking turns over the SAME FlashRegion (e.g. two
+  // allocators, or the same allocator reconstructed mid-sequence) must
+  // never spuriously disable each other with Uncertain -- a stale
+  // cache must surface as a transient Conflict that a fresh refresh
+  // resolves, exactly like the in-memory GenuineSharedTxBackingStore
+  // test double already proves for the abstract port.
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 64));  // explicitly-authorized test commissioning.
+
+  FlashTxSequenceBackingStore storeA(region);
+  OtaBackedTxSequenceAllocator allocatorA(storeA);
+  uint32_t seq = 0;
+  ASSERT_TRUE(allocatorA.allocate(&seq));  // opens at actual 64, reserves [65..128].
+  EXPECT_EQ(65u, seq);
+  for (uint32_t i = 66; i <= 128; ++i) {
+    ASSERT_TRUE(allocatorA.allocate(&seq)) << i;
+    EXPECT_EQ(i, seq);
+  }  // A has now fully drained its own [65..128] block.
+
+  FlashTxSequenceBackingStore storeB(region);
+  OtaBackedTxSequenceAllocator allocatorB(storeB);
+  ASSERT_TRUE(allocatorB.allocate(&seq));  // opens fresh, sees ACTUAL 128, reserves [129..192].
+  EXPECT_EQ(129u, seq);
+  for (uint32_t i = 130; i <= 192; ++i) {
+    ASSERT_TRUE(allocatorB.allocate(&seq)) << i;
+    EXPECT_EQ(i, seq);
+  }  // B has now fully drained its own [129..192] block.
+
+  // A's cached upper bound is still the stale 128 -- its next allocate()
+  // must refresh against the ACTUAL durable 192 (never Uncertain/
+  // permanently disable) and own a brand-new [193..256] block.
+  ASSERT_TRUE(allocatorA.allocate(&seq));
+  EXPECT_FALSE(allocatorA.isDisabled());
+  EXPECT_EQ(193u, seq);
+  for (uint32_t i = 194; i <= 256; ++i) {
+    ASSERT_TRUE(allocatorA.allocate(&seq)) << i;
+    EXPECT_EQ(i, seq);
+  }
+  EXPECT_FALSE(allocatorB.isDisabled());
+}
+
+TEST(FlashRxSequenceBackingStore, SecondAdapterInstanceOverSameRegionActuallyAdvancingIsObservedNotStaleCache) {
+  // RX mirror of the TX case above: a second FlashRxSequenceBackingStore
+  // bound to the SAME context/region durably advancing the watermark
+  // must be genuinely observed on refresh (closing the now-external
+  // window) rather than trusted from a stale cache -- and a rejection
+  // due to that external advance must never permanently disable the
+  // ledger.
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  const auto ctx = makeFullPeerContext(7);
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 5));  // explicitly-authorized test commissioning.
+
+  FlashRxSequenceBackingStore storeA(region, ctx);
+  OtaBackedRxReplayLedger ledgerA(storeA, ctx);
+  ASSERT_TRUE(ledgerA.load());  // A's cached/known watermark is 5.
+
+  FlashRxSequenceBackingStore storeB(region, ctx);
+  OtaBackedRxReplayLedger ledgerB(storeB, ctx);
+  ASSERT_TRUE(ledgerB.admit(10));  // B independently, durably advances the ACTUAL watermark to 10.
+
+  // A's stale cache still says 5: sequence 7 falls inside the window B
+  // already closed -- must be rejected, but NEVER by disabling A.
+  EXPECT_FALSE(ledgerA.admit(7));
+  EXPECT_FALSE(ledgerA.isDisabled());
+
+  // Past the now-actual watermark, A resumes normal admission correctly.
+  EXPECT_TRUE(ledgerA.admit(11));
+}
+
+TEST(FlashTxSequenceBackingStore, PostOpenReadFailureIsCorruptAndLeavesOutParamUntouchedNeverCachedCommitted) {
+  // One case covering BOTH the read-only path (readCounter()) and the
+  // mutation path (reserveTx()): a genuine read failure on the journal
+  // AFTER a successful open+warm-read must surface as Corrupt with the
+  // out-param left exactly as the caller passed it in -- never a
+  // stale/cached success.
+  for (int variant = 0; variant < 2; ++variant) {
+    ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+    ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+    ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 64));  // explicitly-authorized test commissioning.
+
+    FlashTxSequenceBackingStore store(region);
+    ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting()) << variant;
+    uint32_t warm = 0;
+    ASSERT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(warm)) << variant;
+    ASSERT_EQ(64u, warm) << variant;
+
+    // Inject a genuine failure on the NEXT journal read -- models either
+    // a damaged newest-record CRC or a transient IoError.
+    flash.armFault({ota::test::FakeNorFlash::OpKind::Read,
+                    ota::test::FakeNorFlash::InjectionTiming::Before, flash.readOpCount() + 1, 0});
+
+    uint32_t out = 0xDEADBEEFu;
+    if (variant == 0) {
+      EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(out)) << variant;
+    } else {
+      EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.reserveTx(64, 64, out)) << variant;
+    }
+    EXPECT_EQ(0xDEADBEEFu, out) << variant;  // out-param left untouched, never a stale success value.
+  }
+}
+
+TEST(FlashRxSequenceBackingStore, PostOpenReadFailureIsCorruptAndLeavesOutParamUntouchedNeverCachedCommitted) {
+  for (int variant = 0; variant < 2; ++variant) {
+    ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+    ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+    const auto ctx = makeFullPeerContext(7);
+    ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 5));  // explicitly-authorized test commissioning.
+
+    FlashRxSequenceBackingStore store(region, ctx);
+    ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting(ctx)) << variant;
+    uint32_t warm = 0;
+    ASSERT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(ctx, warm)) << variant;
+    ASSERT_EQ(5u, warm) << variant;
+
+    flash.armFault({ota::test::FakeNorFlash::OpKind::Read,
+                    ota::test::FakeNorFlash::InjectionTiming::Before, flash.readOpCount() + 1, 0});
+
+    if (variant == 0) {
+      uint32_t out = 0xDEADBEEFu;
+      EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(ctx, out)) << variant;
+      EXPECT_EQ(0xDEADBEEFu, out) << variant;
+    } else {
+      EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.advanceRx(ctx, 5, 7)) << variant;
+    }
+  }
+}
+
+TEST(FlashTxSequenceBackingStore, RecordGoingBlankAfterSuccessfulOpenIsCorruptNeverSilentRebootstrap) {
+  // A record that reads back blank AFTER this instance already
+  // successfully opened it (e.g. both sectors erased by some other
+  // path) must be reported Corrupt, never treated as a fresh/virgin
+  // Missing that would let a lost identity silently rebootstrap.
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 64));
+
+  FlashTxSequenceBackingStore store(region);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting());
+
+  // Erase both journal sectors directly -- simulates the durable record
+  // going blank out from under this already-opened instance.
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(kLedgerEraseUnit)));
+
+  uint32_t out = 0xDEADBEEFu;
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(out));
+  EXPECT_EQ(0xDEADBEEFu, out);
+}
+
+TEST(FlashRxSequenceBackingStore, RecordGoingBlankAfterSuccessfulOpenIsCorruptNeverSilentRebootstrap) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  const auto ctx = makeFullPeerContext(7);
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 5));
+
+  FlashRxSequenceBackingStore store(region, ctx);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting(ctx));
+
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(kLedgerEraseUnit)));
+
+  uint32_t out = 0xDEADBEEFu;
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(ctx, out));
+  EXPECT_EQ(0xDEADBEEFu, out);
+}
+
+TEST(FlashTxSequenceBackingStore, DurableHeadRegressingBelowPreviouslyObservedValueIsCorruptNeverTrustedFresh) {
+  // The private cache is not dead weight kept only for its own sake: it
+  // is the known-durable-floor guard that catches a lower-but-
+  // otherwise-valid-looking record (rollback/corruption) that this
+  // instance must never trust as a legitimate fresh state.
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 64));
+
+  FlashTxSequenceBackingStore store(region);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting());
+  uint32_t warm = 0;
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(warm));
+  ASSERT_EQ(64u, warm);
+
+  // Directly overwrite the holding slot with a structurally-valid but
+  // LOWER record -- models raw corruption/rollback bypassing the
+  // journal's own strictly-increasing reserve() invariant.
+  uint8_t record[OtaTxSequenceLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(30, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+
+  // Read path (this SAME instance is still `opened_` from its earlier
+  // legitimate open): must refuse, out-param untouched.
+  uint32_t out = 0xDEADBEEFu;
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(out));
+  EXPECT_EQ(0xDEADBEEFu, out);
+
+  // Mutation path against the same regressed physical state: must also
+  // refuse, never silently reserve a block rooted below the known floor.
+  uint32_t reserved = 0xDEADBEEFu;
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.reserveTx(30, 64, reserved));
+  EXPECT_EQ(0xDEADBEEFu, reserved);
+
+  // openExisting() itself -- an explicit reopen of the SAME instance --
+  // must ALSO catch the regression (not just readCounter/reserveTx).
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting());
+
+  // A record gone fully blank after a known-positive floor is the SAME
+  // kind of regression (0 is always < any known-positive floor) --
+  // never re-Missing/rebootstrap it via openExisting() either.
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(kLedgerEraseUnit)));
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting());
+
+  // The known floor (64) must have been PRESERVED across all of the
+  // above failed reopen/read/mutation attempts -- never lowered to 30,
+  // 0, or anything else observed only transiently during the fault.
+  // Prove it precisely: a value between the corrupted low (30) and the
+  // true floor (64) must STILL be rejected...
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(50, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting());
+
+  // ...while a value genuinely AT/ABOVE the retained floor is correctly
+  // accepted and resumes normal operation.
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(100, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  EXPECT_EQ(OtaSequenceBackingResult::Committed, store.openExisting());
+  uint32_t resumed = 0;
+  EXPECT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(resumed));
+  EXPECT_EQ(100u, resumed);
+}
+
+TEST(FlashRxSequenceBackingStore, DurableHeadRegressingBelowPreviouslyObservedValueIsCorruptNeverTrustedFresh) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  const auto ctx = makeFullPeerContext(7);
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(region, 64));
+
+  FlashRxSequenceBackingStore store(region, ctx);
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.openExisting(ctx));
+  uint32_t warm = 0;
+  ASSERT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(ctx, warm));
+  ASSERT_EQ(64u, warm);
+
+  uint8_t record[OtaRxReplayLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaRxReplayLedgerRecord::serialize(30, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+
+  uint32_t out = 0xDEADBEEFu;
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.readCounter(ctx, out));
+  EXPECT_EQ(0xDEADBEEFu, out);
+
+  // Mutation path against the same regressed physical state.
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.advanceRx(ctx, 30, 31));
+
+  // openExisting() itself must ALSO catch the regression.
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting(ctx));
+
+  // Fully blank after a known-positive floor: same regression class.
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(kLedgerEraseUnit)));
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting(ctx));
+
+  // The known floor (64) must have been PRESERVED across all of the
+  // above -- a value between the corrupted low (30) and the true floor
+  // must STILL be rejected...
+  ASSERT_EQ(OtaRxReplayLedgerRecord::serialize(50, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  EXPECT_EQ(OtaSequenceBackingResult::Corrupt, store.openExisting(ctx));
+
+  // ...while a value genuinely AT/ABOVE the retained floor resumes
+  // normal operation correctly.
+  ASSERT_EQ(OtaRxReplayLedgerRecord::serialize(100, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  EXPECT_EQ(OtaSequenceBackingResult::Committed, store.openExisting(ctx));
+  uint32_t resumed = 0;
+  EXPECT_EQ(OtaSequenceBackingResult::Committed, store.readCounter(ctx, resumed));
+  EXPECT_EQ(100u, resumed);
+}
+
+TEST(OtaBackedTxSequenceAllocator, ExhaustedColdCounterNeverEmitsZero) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = UINT32_MAX;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_EQ(0x12345678u, sequence);
+}
+
+TEST(OtaBackedTxSequenceAllocator, ReadBackpressureNeverPermanentlyDisables) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = 64;
+  backing.nextReadResult = OtaSequenceBackingResult::WouldBlock;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_FALSE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
+  backing.nextReadResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(allocator.allocate(&sequence));
+  EXPECT_EQ(65u, sequence);
+}
+
+TEST(OtaBackedTxSequenceAllocator, ReservationConflictNeverPermanentlyDisables) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = 64;
+  backing.nextReserveResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_FALSE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
+  backing.nextReserveResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(allocator.allocate(&sequence));
+  EXPECT_EQ(65u, sequence);
+}
+
+// A genuine (not canned-answer) CAS-enforcing shared backing: reserveTx()
+// actually compares `expectedCurrentUpperBound` against its own live
+// counter and returns real Conflict on mismatch, exactly as a future
+// real shared store must. Used to prove the allocator's refresh+retry
+// against an ACTUAL race, not a scripted fake result.
+class GenuineSharedTxBackingStore : public ITxSequenceBackingStore {
+ public:
+  OtaSequenceBackingResult openExisting() override {
+    opened_ = true;
+    return counter == 0 ? OtaSequenceBackingResult::Missing : OtaSequenceBackingResult::Committed;
+  }
+  OtaSequenceBackingResult readCounter(uint32_t& outReservedUpperBound) override {
+    if (!opened_) return OtaSequenceBackingResult::OwnershipDenied;
+    outReservedUpperBound = counter;
+    return OtaSequenceBackingResult::Committed;
+  }
+  OtaSequenceBackingResult reserveTx(uint32_t expectedCurrentUpperBound, uint32_t blockSize,
+                                     uint32_t& outNewUpperBound) override {
+    if (!opened_) return OtaSequenceBackingResult::OwnershipDenied;
+    if (expectedCurrentUpperBound != counter) return OtaSequenceBackingResult::Conflict;
+    if (blockSize == 0 || counter > (0xFFFFFFFFu - blockSize)) return OtaSequenceBackingResult::NoCapacity;
+    counter += blockSize;
+    outNewUpperBound = counter;
+    return OtaSequenceBackingResult::Committed;
+  }
+  bool opened_ = false;
+  uint32_t counter = 64;  // preseeded as already genuinely commissioned.
+};
+
+TEST(OtaBackedTxSequenceAllocator, TwoAllocatorsOverGenuineSharedCounterNeverOverlapAndSurviveExternalConflict) {
+  GenuineSharedTxBackingStore shared;
+  OtaBackedTxSequenceAllocator allocatorA(shared, 64);
+  OtaBackedTxSequenceAllocator allocatorB(shared, 64);
+
+  uint32_t seq = 0;
+  ASSERT_TRUE(allocatorA.allocate(&seq));  // opens at counter=64, reserves [65..128].
+  EXPECT_EQ(65u, seq);
+  ASSERT_TRUE(allocatorB.allocate(&seq));  // opens fresh, sees counter=128, reserves [129..192].
+  EXPECT_EQ(129u, seq);
+
+  // Drain B's whole reserved block so its NEXT allocate() must reserve a
+  // new one -- its cached upper bound is 192.
+  for (uint32_t i = 130; i <= 192; ++i) {
+    ASSERT_TRUE(allocatorB.allocate(&seq));
+    EXPECT_EQ(i, seq);
+  }
+
+  OtaBackedTxSequenceAllocator allocatorC(shared, 64);
+  uint32_t externallyIssued = 0;
+  ASSERT_TRUE(allocatorC.allocate(&externallyIssued));
+  EXPECT_EQ(193u, externallyIssued);
+  EXPECT_EQ(256u, shared.counter);
+
+  ASSERT_TRUE(allocatorB.allocate(&seq));
+  EXPECT_FALSE(allocatorB.isDisabled());
+  EXPECT_NE(externallyIssued, seq);
+  EXPECT_EQ(257u, seq);
+
+  for (uint32_t i = 66; i <= 128; ++i) {
+    ASSERT_TRUE(allocatorA.allocate(&seq));
+    EXPECT_EQ(i, seq);
+  }
+  ASSERT_TRUE(allocatorA.allocate(&seq));
+  EXPECT_EQ(321u, seq);
+}
+
+TEST(OtaBackedTxSequenceAllocator, ReservationNearUint32MaxBoundaryFailsClosedWithoutWrapping) {
+  GenuineSharedTxBackingStore shared;
+  shared.counter = 0xFFFFFFFFu - 10u;  // only 10 values of room left; default block size is 64.
+  OtaBackedTxSequenceAllocator allocator(shared);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));  // a full 64-block would overflow: fail closed, never wrap.
+  EXPECT_TRUE(allocator.isDisabled());
+  EXPECT_EQ(shared.counter, 0xFFFFFFFFu - 10u);  // the live counter was never mutated.
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictRefreshThenTransientWouldBlockNeitherDisablesNorSkipsSequence) {
+  // Force exactly one Conflict, then exactly one WouldBlock, on
+  // successive reserveTx() calls before finally landing -- proving the
+  // bounded single-refresh discipline composes correctly with ordinary
+  // transient backpressure on the retried reservation itself.
+  class ConflictThenWouldBlockThenCommit : public FakeControllableTxBackingStore {
+   public:
+    OtaSequenceBackingResult reserveTx(uint32_t expectedCurrentUpperBound, uint32_t blockSize,
+                                       uint32_t& outNewUpperBound) override {
+      ++attempts;
+      if (attempts == 1) return OtaSequenceBackingResult::Conflict;
+      if (attempts == 2) return OtaSequenceBackingResult::WouldBlock;
+      return FakeControllableTxBackingStore::reserveTx(expectedCurrentUpperBound, blockSize, outNewUpperBound);
+    }
+    int attempts = 0;
+  };
+  ConflictThenWouldBlockThenCommit backing;
+  backing.counter = 64;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0;
+
+  // First call: reserveTx() Conflicts; the bounded refresh (readCounter)
+  // sees the SAME counter (64, nothing external actually moved), so the
+  // retried reserveTx() is attempted immediately and hits WouldBlock.
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_FALSE(allocator.isDisabled());
+
+  // Second call: opened_/reservedUpperBound_ state is unchanged (65 is
+  // still pending); reserveTx() is attempted a third time and lands.
+  ASSERT_TRUE(allocator.allocate(&sequence));
+  EXPECT_EQ(65u, sequence);
+}
+
+TEST(OtaBackedRxReplayLedger, ReadBackpressureNeverPermanentlyDisables) {
+  FakeControllableRxBackingStore backing;
+  backing.watermark = 10;
+  backing.nextReadResult = OtaSequenceBackingResult::WouldBlock;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.load());
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextReadResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(ledger.load());
+  EXPECT_TRUE(ledger.admit(11));
+}
+
+TEST(OtaBackedRxReplayLedger, ExternalWatermarkAdvanceNeverReopensKnownOrUnknownAdmissions) {
+  FakeControllableRxBackingStore backing;
+  backing.watermark = 10;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  ASSERT_TRUE(ledger.load());
+  ASSERT_TRUE(ledger.admit(11));
+  backing.watermark = 13;
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Conflict;
+  EXPECT_FALSE(ledger.admit(12));
+  EXPECT_FALSE(ledger.admit(11));
+  EXPECT_FALSE(ledger.admit(13));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Committed;
+  EXPECT_TRUE(ledger.admit(14));
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictRefreshReadBackpressureNeverPermanentlyDisables) {
+  class BackpressuredRefresh : public FakeControllableTxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(uint32_t& outCounter) override {
+      if (++attempts == 2) return OtaSequenceBackingResult::WouldBlock;
+      return FakeControllableTxBackingStore::readCounter(outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  BackpressuredRefresh backing;
+  backing.counter = 64;
+  backing.nextReserveResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_FALSE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
+  backing.nextReserveResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(allocator.allocate(&sequence));
+  EXPECT_EQ(65u, sequence);
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictRefreshReadBackpressureNeverPermanentlyDisables) {
+  class BackpressuredRefresh : public FakeControllableRxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(const OtaRxLedgerContext& context,
+                                        uint32_t& outCounter) override {
+      if (++attempts == 2) return OtaSequenceBackingResult::WouldBlock;
+      return FakeControllableRxBackingStore::readCounter(context, outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  BackpressuredRefresh backing;
+  backing.watermark = 10;
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  ASSERT_TRUE(ledger.load());
+  EXPECT_FALSE(ledger.admit(11));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Committed;
+  EXPECT_TRUE(ledger.admit(11));
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictOnRefreshReadIsTransientNotPermanentlyDisabling) {
+  // The refresh read triggered mid-Conflict-handling can itself return
+  // Conflict from an abstract port (e.g. a snapshot read racing a
+  // future compaction) -- must be treated exactly like WouldBlock here
+  // too, not only the WouldBlock literal.
+  class ConflictedRefresh : public FakeControllableTxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(uint32_t& outCounter) override {
+      if (++attempts == 2) return OtaSequenceBackingResult::Conflict;
+      return FakeControllableTxBackingStore::readCounter(outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  ConflictedRefresh backing;
+  backing.counter = 64;
+  backing.nextReserveResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_FALSE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
+  backing.nextReserveResult = OtaSequenceBackingResult::Committed;
+  ASSERT_TRUE(allocator.allocate(&sequence));
+  EXPECT_EQ(65u, sequence);
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictOnRefreshReadIsTransientNotPermanentlyDisabling) {
+  class ConflictedRefresh : public FakeControllableRxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(const OtaRxLedgerContext& context,
+                                        uint32_t& outCounter) override {
+      if (++attempts == 2) return OtaSequenceBackingResult::Conflict;
+      return FakeControllableRxBackingStore::readCounter(context, outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  ConflictedRefresh backing;
+  backing.watermark = 10;
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Conflict;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  ASSERT_TRUE(ledger.load());
+  EXPECT_FALSE(ledger.admit(11));
+  EXPECT_FALSE(ledger.isDisabled());
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Committed;
+  EXPECT_TRUE(ledger.admit(11));
+}
+
+TEST(OtaBackedTxSequenceAllocator, ConflictRefreshReportingLowerBoundThanAlreadyKnownDisablesRatherThanReopeningClaimedRange) {
+  // A refresh reporting an upper bound LOWER than what this instance
+  // already durably knows can only mean corruption/downgrade/a
+  // malicious or buggy backing -- trusting it would imply a previously
+  // reserved (exclusively-owned) range shrank, which is impossible for
+  // an honest monotonic store. Must fail closed, never "reopen" it.
+  class LyingLowerRefresh : public FakeControllableTxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(uint32_t& outCounter) override {
+      if (++attempts == 2) {
+        // Reports a bound lower than the 64 already reserved below.
+        outCounter = 32;
+        return OtaSequenceBackingResult::Committed;
+      }
+      return FakeControllableTxBackingStore::readCounter(outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  LyingLowerRefresh backing;
+  backing.counter = 1;  // 0 is never a valid durable value -- preseed a positive already-commissioned counter.
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0;
+  ASSERT_TRUE(allocator.allocate(&sequence));  // reserves [2..65] (1 already claimed by commissioning).
+  EXPECT_EQ(2u, sequence);
+  for (uint32_t i = 3; i <= 65; ++i) {
+    ASSERT_TRUE(allocator.allocate(&sequence));
+    EXPECT_EQ(i, sequence);
+  }
+  backing.nextReserveResult = OtaSequenceBackingResult::Conflict;
+  sequence = 0xAAAAAAAA;
+  EXPECT_FALSE(allocator.allocate(&sequence));  // refresh reports 32 < known 65.
+  EXPECT_TRUE(allocator.isDisabled());
+  EXPECT_EQ(0xAAAAAAAAu, sequence);
+  EXPECT_FALSE(allocator.allocate(&sequence));  // stays disabled, no "recovery".
+}
+
+TEST(OtaBackedRxReplayLedger, ConflictRefreshReportingLowerWatermarkThanAlreadyKnownDisablesRatherThanReopeningClosedHistory) {
+  // Same rationale as the TX case, mirrored for RX: a refresh reporting
+  // a watermark LOWER than already-known would silently reopen history
+  // already treated as closed/consumed. Must fail closed, never trust it.
+  class LyingLowerRefresh : public FakeControllableRxBackingStore {
+   public:
+    OtaSequenceBackingResult readCounter(const OtaRxLedgerContext& context,
+                                        uint32_t& outCounter) override {
+      if (++attempts == 2) {
+        outCounter = 5;  // lower than the watermark(10) already known below.
+        return OtaSequenceBackingResult::Committed;
+      }
+      return FakeControllableRxBackingStore::readCounter(context, outCounter);
+    }
+    uint32_t attempts = 0;
+  };
+  LyingLowerRefresh backing;
+  backing.watermark = 10;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  ASSERT_TRUE(ledger.load());
+  backing.nextAdvanceResult = OtaSequenceBackingResult::Conflict;
+  EXPECT_FALSE(ledger.admit(11));  // refresh reports 5 < known watermark 10.
+  EXPECT_TRUE(ledger.isDisabled());
+  EXPECT_FALSE(ledger.admit(11));  // stays disabled, no "recovery".
+}
+
+TEST(OtaBackedTxSequenceAllocator, CommittedZeroCounterNeverAuthorizesFirstUse) {
+  FakeControllableTxBackingStore backing;
+  backing.counter = 0;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_TRUE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
+  EXPECT_EQ(0, backing.reserveCalls);
+}
+
+TEST(OtaBackedRxReplayLedger, CommittedZeroCounterNeverAuthorizesFirstUse) {
+  FakeControllableRxBackingStore backing;
+  backing.watermark = 0;
+  OtaBackedRxReplayLedger ledger(backing, makeFullPeerContext(1));
+  EXPECT_FALSE(ledger.admit(1));
+  EXPECT_TRUE(ledger.isDisabled());
+  EXPECT_EQ(0, backing.advanceCalls);
+}
+
+TEST(OtaBackedTxSequenceAllocator, CommittedReservationMustMatchTheClaimedRangeExactly) {
+  class InvalidReservation : public FakeControllableTxBackingStore {
+   public:
+    OtaSequenceBackingResult reserveTx(uint32_t, uint32_t, uint32_t& outUpper) override {
+      outUpper = 192;
+      return OtaSequenceBackingResult::Committed;
+    }
+  };
+  InvalidReservation backing;
+  backing.counter = 64;
+  OtaBackedTxSequenceAllocator allocator(backing);
+  uint32_t sequence = 0x12345678;
+  EXPECT_FALSE(allocator.allocate(&sequence));
+  EXPECT_TRUE(allocator.isDisabled());
+  EXPECT_EQ(0x12345678u, sequence);
 }
 
 int main(int argc, char** argv) {

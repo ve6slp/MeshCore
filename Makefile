@@ -53,7 +53,7 @@ OTA_BOOT_PREFLIGHT_DIR ?= $(TMPDIR)/ota-boot-preflight/$(shell date -u +%Y%m%dT%
 # platformio.ini changes did not regress platforms that never enable OTA.
 NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
 
-.PHONY: tmpdir test test-ota test-ota-protocol test-ota-runtime test-ota-storage \
+.PHONY: tmpdir test test-ota test-ota-protocol test-ota-runtime test-ota-counter-ports-index test-ota-storage \
         test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host test-ota-aead-cipher clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target \
@@ -93,6 +93,19 @@ test-ota-protocol: tmpdir
 
 test-ota-runtime: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_runtime'
+
+test-ota-counter-ports-index: tmpdir
+	@set -eu; \
+	  tree="$$(git write-tree)"; \
+	  work="$(TMPDIR)/ota-counter-port-index/$$tree"; \
+	  mkdir -p "$$work"; \
+	  git archive "$$tree" | tar -x -C "$$work"; \
+	  echo "==> qualifying counter ports in prospective tree $$tree"; \
+	  PLATFORMIO_LIBDEPS_DIR="$(CURDIR)/.pio/libdeps" \
+	  PLATFORMIO_BUILD_DIR="$$work/pio-build" \
+	  $(MAKE) -C "$$work" TMPDIR="$$work/.tmp" \
+	    PLATFORMIO="$(PLATFORMIO)" OTA_CRYPTO_LIBRARY="$(OTA_CRYPTO_LIBRARY)" \
+	    test-ota-runtime test-ota-aead-cipher test-ota-lab-host
 
 test-ota-storage: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_storage'
