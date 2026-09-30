@@ -43,6 +43,7 @@ VERIFY_OTA_BOOT_INFO = python3 bootloader/xiao_nrf52840_ota/tools/verify_boot_in
 OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_DUTY_TIMEOUT ?= 420
 OTA_LAB_MONITOR_SECONDS ?= 60
+OTA_BOOT_PREFLIGHT_DIR ?= $(TMPDIR)/ota-boot-preflight/$(shell date -u +%Y%m%dT%H%M%SZ)
 
 # Representative non-OTA targets, used to prove the OTA build-filter and
 # platformio.ini changes did not regress platforms that never enable OTA.
@@ -60,6 +61,7 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
         install-xiao-nrf52-target-ota-bootloader \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab test-xiao-nrf52-ota-stage test-xiao-nrf52-ota-airtime \
+        inspect-xiao-nrf52-boot-journal clean-xiao-nrf52-legacy-floor \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
         fetch-xiao-ota-bootloader provision-xiao-ota-lab-key \
@@ -228,6 +230,12 @@ test-xiao-nrf52-ota-stage: tmpdir
 
 test-xiao-nrf52-ota-airtime: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --airtime-only --duty-timeout $(OTA_LAB_DUTY_TIMEOUT)
+
+inspect-xiao-nrf52-boot-journal: tmpdir
+	python3 scripts/ota_boot_preflight.py --artifact-dir "$(OTA_BOOT_PREFLIGHT_DIR)"
+
+clean-xiao-nrf52-legacy-floor: tmpdir
+	python3 scripts/ota_boot_preflight.py --artifact-dir "$(OTA_BOOT_PREFLIGHT_DIR)" --erase-known-residue
 
 build-xiao-nrf52-qspi-test: tmpdir
 	$(PLATFORMIO) run -e $(XIAO_NRF52_QSPI_TEST_ENV)

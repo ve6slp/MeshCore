@@ -490,6 +490,16 @@ def run_hardware_test(client, target, evidence, duty_timeout, staging_only=False
 
 
 def run_precedence_probe(client, target, client_public_key, evidence):
+    # Avoid identical signed adverts when the board's RTC has not advanced.
+    fresh_name = b"OTA-LAB-CLIENT-" + os.urandom(4).hex().encode("ascii")
+    require_ok(client, bytes([CMD_SET_ADVERT_NAME]) + fresh_name)
+    try:
+        return observe_precedence_probe(client, target, client_public_key, evidence)
+    finally:
+        require_ok(client, bytes([CMD_SET_ADVERT_NAME]) + b"OTA-LAB-CLIENT")
+
+
+def observe_precedence_probe(client, target, client_public_key, evidence):
     event_codes = {PUSH_ADVERT, PUSH_NEW_ADVERT, PUSH_OTA_EVENT}
     target.poll(0.2)
     target.take_pending(event_codes)

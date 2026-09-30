@@ -51,6 +51,7 @@ make test-ota-storage
 make test-ota-trust
 make test-ota-boot
 make test-ota-integration
+make test-ota-lab-host        # host-side unittest suite for lab scripts (below)
 
 make build-ota-targets        # compile the OTA-enabled firmware targets
 make build-ota-baseline-targets  # same targets, OTA disabled, for size diffing
@@ -62,6 +63,17 @@ make verify-ota-software      # native tests + both build passes, in one gate
 `verify-ota-software` is explicitly a **software-only** qualification gate.
 Its own summary output says so: passing it means native tests are green and
 firmware links, not that any device can be updated.
+
+`test-ota-lab-host` runs `python3 -m unittest discover -s scripts/tests` —
+real unit tests for the lab tooling itself (for example, the protected-
+power-domain refusal logic in `scripts/lab_device.py`), not a proxy for
+hardware or firmware qualification. It is now a dependency of both `make
+test` and `make test-ota`. Before running it, or any other lab script,
+install the lab's Python dependencies:
+
+```sh
+python3 -m pip install -r requirements-ota.txt   # cryptography>=43.0, pyserial>=3.5
+```
 
 ## Binary protocol (companion frame codes)
 
@@ -116,8 +128,23 @@ make build-xiao-nrf52-ota-lab          # build companion firmware, OTA enabled
 make upload-xiao-nrf52-lab             # flash both client and target
 make configure-xiao-nrf52-ota-lab      # apply lab radio/name configuration
 make test-xiao-nrf52-ota-lab           # run the two-node RF harness (scripts/ota_rf_lab.py)
+make test-xiao-nrf52-ota-stage         # same harness, signed-descriptor/staging path only
+                                        # (skips the airtime-budget-exhaustion pass below)
+make test-xiao-nrf52-ota-airtime       # same harness, airtime/duty-cycle stress only
+                                        # (skips normal-traffic precedence, direct-mode
+                                        # lease, fleet-control probes, and signed staging)
 make validate-xiao-nrf52-qspi-hardware # run the on-target QSPI hardware test
 ```
+
+`make test-xiao-nrf52-ota-airtime` exercises only the airtime/duty-cycle
+budget check against whatever firmware is already flashed on `client` and
+`target` — it does not build or flash first, so it's independent of the
+current state of the source tree. It accepts the same `OTA_LAB_DUTY_TIMEOUT`
+override as `test-xiao-nrf52-ota-lab` (default 420 seconds) for longer
+stress runs, e.g. `make test-xiao-nrf52-ota-airtime OTA_LAB_DUTY_TIMEOUT=900`.
+As of this writing a longer stress run is in progress and this target is
+**not yet qualified** — do not cite a pass or fail result for it until one
+is confirmed.
 
 `scripts/ota_rf_lab.py` drives both boards over serial, sends and waits for
 OTA envelopes and adverts, and writes machine-readable evidence
@@ -146,45 +173,140 @@ Verified:
   This backend is qualification-only: it does not install or boot the
   candidate, and its key is not a production trust anchor.
 - **Two-node RF lab, baseline behaviour**: reconfirmed on both approved
-  boards after reflashing companion firmware built from commit `e03926a4`.
-  Adverts and OTA envelopes at the default 907.525 MHz, 62.5 kHz bandwidth,
-  SF7, CR5, three-byte path IDs; a temporary direct-mode lease at 250 kHz
-  bandwidth that reverted automatically; normal-traffic precedence over OTA
-  traffic; fleet `STATE` progression; and rejection of a foreign session's
-  abort all passed again on this repeat run.
+  boards after reflashing companion firmware. Adverts at the default
+  907.525 MHz, 62.5 kHz bandwidth, SF7, CR5, three-byte path IDs (the raw
+  advert packet header byte was observed as `128` on the wire in both
+  directions, which decodes to the 3-byte path-hash mode, not just a
+  settings-getter return value).
+- **2026-09-30T08:03:15Z — signed staging path passed in full, isolated
+  run**: `make test-xiao-nrf52-ota-stage` passed against evidence file
+  `.tmp/ota-rf-lab/qualified-be128-stage/summary.json`. The earlier
+  `recv7` byte-order failure (below) is fixed: the canonical signed image
+  descriptor is a fixed 59-byte, big-endian field layout
+  (`src/ota/protocol/OtaDescriptor.h`) used consistently by both ends of
+  the link. On `target`, descriptor → Ed25519 signature acceptance →
+  authorization → 128+128+64-byte chunks → commit all passed, ending in
+  receiver state 6 (staging complete), for a 320-byte test image (SHA-256
+  `9b5b15f57a4b1e4ead22796bc4fd085a636322fa0aae00291f79b7c3d7e907da`). A
+  repeated (duplicate) first chunk was not reprocessed by the OTA receiver,
+  but the test explicitly does **not** treat that as proof of the
+  receiver's own duplicate-chunk handling: MeshCore's general raw-packet
+  seen-hash cache drops the duplicate before it reaches the OTA layer at
+  all (the raw receive is logged, the OTA event callback is not invoked a
+  second time). This is radio-level deduplication, not a resume-after-
+  interruption capability, and no reboot-persisted session resume exists.
+  Evidence also carries explicit `install_or_boot_claim: false` and
+  `reboot_resume_claim: false` flags — this pass is staging into QSPI
+  only, not an install.
 
-**Failed on the same run** — a signed wire-descriptor transfer
-(`recv7`) failed. The root cause identified is a byte-order (little-endian
-vs. big-endian) mismatch in how a descriptor field is framed on the wire,
-separate from the lab-only staging path above. A fix to the wire protocol,
-session handling, and the production application bridge across all three
-modes is in progress on a dedicated branch and has not landed yet. A second,
-independent blocker was also found: the current chunk size (160 bytes) does
-not fit the companion serial frame's existing 176-byte limit, so the chunk
-geometry needs to be bounded to the frame size before a full image can move
-over that transport. Neither issue is fixed as of this writing.
+  **This was an isolated run and must not be read as a full RF baseline
+  pass.** `test-xiao-nrf52-ota-stage` deliberately skips the
+  normal-traffic-precedence probe, the direct-mode radio lease, the
+  fleet-control-state probes, and the duty-cycle/airtime test — none of
+  those were exercised in this run. The full harness
+  (`make test-xiao-nrf52-ota-lab`), which does exercise them, most
+  recently failed its `normal-traffic-precedence` check
+  **nondeterministically**: the command that queues the synthetic
+  advert-then-OTA-announcement flood returned success, but no advert event
+  was observed on the receiving side within the check's window. The root
+  cause is unresolved — it could be a queueing, radio seen-hash, or PHY
+  timing issue, and none of those is confirmed — so do not describe
+  normal-traffic precedence, the direct-mode lease, or the fleet-control
+  probes as currently passing until the failure is root-caused and the
+  full harness is re-run clean.
+- The previous 160-byte OTA chunk size, which didn't fit the companion
+  serial frame, has been replaced with a 128-byte chunk (fitting the
+  184-byte `kOtaMaxFrameSize`, the 255-byte LoRa payload limit, and the
+  64-byte mesh path field). **A zero-hop raw chunk frame (155 bytes) does
+  fit the 176-byte companion serial frame.** An encrypted, full-path
+  (multi-hop) chunk does **not**: with the existing 2-byte cipher MAC it
+  costs 237 bytes, and with a 16-byte auth tag it costs 251 bytes — both
+  over the 176-byte serial limit, even though both fit comfortably under
+  the 255-byte RF payload limit (235 and 249 bytes respectively). An
+  autonomous cache engine that would let the runtime keep each serial
+  write at or under ~145 bytes to close this gap is a **proposed design**,
+  not an implemented or tested mechanism — do not describe chunked
+  full-route transfer over the current serial link as working.
+
+**Fixed, previously failed** — a signed wire-descriptor transfer (`recv7`)
+failed in an earlier run. The root cause was a byte-order (little-endian
+vs. big-endian) mismatch in how the descriptor was framed on the wire. As
+described above, the descriptor format is now defined and used as a single
+59-byte big-endian layout end to end, and the fix is exercised by both a
+new native C++ test in `test/test_lora_ota_protocol/` and the RF lab
+harness. A separate, older wire authentication scheme — command version 1,
+using a 71-byte little-endian descriptor — also exists; it has no
+connection to the durable floor/state/confirmation boot record (also
+called version 1), which is a distinct, independent on-flash record
+unaffected by this fix.
 
 Not verified, and not to be represented as done in any documentation or
 release notes:
 
 - Full three-mode signed firmware transfer and install on real hardware.
-  The most recent attempt to run the signed wire-descriptor path **failed**
-  (`recv7`, endianness mismatch) — do not describe any mode as a complete
-  end-to-end pass until this is fixed and re-run.
+  Signed staging (descriptor through commit) has now passed in an isolated
+  run on `target`, but a confirmed clean pass of the full RF harness
+  (normal-traffic precedence, direct-mode lease, fleet-control probes,
+  and duty-cycle), and any actual device install, have not — do not
+  describe any mode as a complete end-to-end pass yet.
 - Routed (directed, mesh-relayed) image delivery to an out-of-reach target
   has not been attempted yet; only direct-mode application-layer traffic and
   fleet-mode state probes have been run over real RF so far.
-- The OTA airtime/duty-cycle budget has not been exercised to exhaustion on
-  hardware. Lab runs to date have stopped for other reasons (protocol
-  failures) well before the configured budget was used up, so duty-cycle
-  enforcement itself remains unverified under sustained load.
-- Any durable install handoff from the application-side QSPI backend to a
-  bootloader — the custom QSPI-aware bootloader install/trial/rollback path
-  is being built and tested separately and is unproven end to end.
-- The anti-rollback counter is RAM-only (`src/ota/trust/MonotonicCounter.h`
-  is an interface with no eFuse/UICR/NVS-backed implementation yet), so it
-  does not survive a reset and cannot be relied on for real anti-downgrade
-  protection.
+- The OTA airtime/duty-cycle budget: **2026-09-30T08:19:33Z result** — an
+  extended `make test-xiao-nrf52-ota-airtime` stress run (evidence
+  `.tmp/ota-rf-lab/airtime-pressure-baseline/summary.json`, log
+  `.tmp/ota-rf-airtime-pressure.log`) correctly drove the budget to its
+  configured limit and correctly enforced it: 71,851 of 72,000 ms used, no
+  overshoot (measured cost per 128-byte OTA chunk ≈ 553 ms, 149 ms
+  remaining when the run stopped queuing), and `target` held a stable
+  RX count of 129 throughout. **But the overall run failed**: immediately
+  after the budget was reached, an attempt to send an ordinary self-advert
+  (`CMD_SEND_SELF_ADVERT`) failed outright with `ERR_TABLE_FULL` (wire
+  code `0103`), because the shared outgoing-packet pool — general to
+  MeshCore, not OTA-specific — was full of queued/refused OTA sends. So
+  the duty-cycle time-budget subcheck passed, but ordinary-service-under-
+  OTA-load did **not**, and normal-traffic fairness under sustained OTA
+  pressure remains unverified. A firmware fix reserving pool capacity
+  below the application layer for raw/RX/relay ingress is in progress; the
+  full gate will be re-run once that lands. Do not describe this target as
+  passing until then.
+- Turning a staged image into a running update is not proven end to end,
+  but the pieces are at different stages, not all "not started":
+  - The bootloader's boot marker (at flash offset `0xFDC00`) and a
+    distinct SenseCAP flash profile **are implemented and covered by
+    native tests**. Packaged HEX and UF2 build artifacts with marker
+    verification now build separately for both the XIAO and SenseCAP
+    profiles, in their own board-specific output directories/names, for
+    both the 66 KiB fallback and the no-SWD (34,612 of 38,912 bytes
+    used, 4,300 free) package variants.
+  - The boot candidate region is capped at 708,608 bytes, preserving the
+    extra-filesystem range `0xD4000`–`0xED000` until that region is
+    migrated. The full candidate-plus-backup capacity (811,008 bytes) is
+    still permitted, but only as storage/backup space — not as
+    installable code. A fresh, live read of `BANK_VALID`, the app flag,
+    size, and CRC16 is now required before a candidate is trusted; a
+    stale floor value or a guessed extent is no longer accepted.
+  - The application-to-bootloader hand-off, and commissioning/installing
+    that bootloader on physical hardware, are **not qualified** — no
+    device has gone through commissioning, a real install, or a confirmed
+    boot from an image delivered this way. The backend/integrated
+    firmware side of OTA is also still work in progress: there is no
+    installed image, no full-mesh repeater delivery, and none of the
+    three transfer modes are working yet.
+  Do not describe the marker or SenseCAP profile as "not implemented" —
+  they exist and are tested; the gap is specifically the hand-off and
+  physical hardware qualification.
+- Anti-rollback protection is a mix of levels, not uniformly RAM-only:
+  the generic `src/ota/trust/MonotonicCounter.h` is an interface with no
+  backing implementation of its own. The bootloader **does** implement a
+  durable, confirmed A/B floor record — but that has not been exercised
+  through an actual hardware install/confirmation cycle. The currently
+  flashed experimental lab backend increments its counter in RAM and would
+  seed from that durable floor if a valid one is present, but the current
+  lab board pair has no qualified floor flashed, so on today's lab
+  hardware the counter is, in practice, RAM-only and does not survive a
+  reset. Do not describe anti-rollback as entirely unimplemented, and do
+  not describe it as durable on today's lab hardware — both are wrong.
 - Fleet-state probes and raw QSPI read/write results are evidence of
   protocol and flash-driver correctness — they are **not** evidence of a
   completed firmware installation. Do not conflate the two when reporting

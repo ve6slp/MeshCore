@@ -25,11 +25,13 @@ scope.
 **LoRa OTA is not production-ready either way.** The controls below let you
 observe status, change policy settings, and drive protocol-level test
 traffic on a companion-radio build. None of them can install a new firmware
-image on a device yet: the custom bootloader needed to install a staged
-image has source code and can be built, but the hand-off from the running
-application to that bootloader is incomplete, and installing firmware this
-way has not been proven on physical hardware. Do not rely on these commands
-to manage firmware on a network you care about.
+image on a device yet: the custom bootloader's boot marker and its
+SenseCAP flash profile are implemented and native-tested, and a full ARM
+bootloader package now builds and links, but the hand-off from the running
+application to that bootloader, and commissioning/installing it on
+physical hardware, are not qualified — no device has been through a real
+install this way. Do not rely on these commands to manage firmware on a
+network you care about.
 
 ## Build-time requirement
 
@@ -119,6 +121,16 @@ surface is documented, not as a claim that it works today.
   implemented enforcement mechanism today.
 - Unused OTA allowance expires at the end of its window; it does not carry
   over into a later burst.
+- **Known gap, 2026-09-30**: an airtime-budget stress run correctly
+  enforced the millisecond quota itself (71,851 of 72,000 ms used, no
+  overshoot) and correctly refused further OTA sends once the cap was
+  reached, but once the radio's shared outgoing-packet pool filled up with
+  queued OTA traffic, sending an ordinary self-advert failed outright
+  (`ERR_TABLE_FULL`) rather than being prioritized. So the duty-cycle
+  *time* budget is enforced, but ordinary traffic is not yet guaranteed to
+  keep working once sustained OTA load has filled the shared packet pool.
+  A firmware fix reserving pool capacity for non-OTA traffic is in
+  progress; this section will be updated once a clean re-run confirms it.
 
 See the [design document's duty-cycle section](lora_ota_design.md#duty-cycle-behaviour)
 for the full policy model.
@@ -132,14 +144,24 @@ for the full policy model.
 - `OTA_CTRL_GET_STATUS` accurately reflects internal protocol state and is
   useful for diagnosing lab or bench sessions.
 - A direct-mode radio lease correctly applies and automatically reverts
-  temporary radio parameters; this has been reconfirmed on repeated lab runs
-  over real RF at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5.
-- A signed firmware transfer over the wire protocol does **not** currently
-  work: the most recent lab run failed on a wire-descriptor byte-order bug,
-  and a separate chunk-size/serial-frame mismatch also blocks a full image
-  transfer. Neither is fixed yet. See the
+  temporary radio parameters; this was confirmed on repeated lab runs over
+  real RF at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5. The most recent
+  full-harness run did not re-confirm this: it stopped earlier, at a
+  nondeterministic `normal-traffic-precedence` check failure (see the
+  [developer guide](lora_ota_development.md#current-hardware-evidence)),
+  so treat this as last-known-good rather than currently reconfirmed.
+- A signed firmware transfer over the wire protocol now stages a complete
+  test image: as of 2026-09-30, an isolated run (`make
+  test-xiao-nrf52-ota-stage`) took a signed image descriptor through
+  authorization, all data chunks, and commit to a fully staged state on
+  `target` (the earlier wire-descriptor byte-order bug and chunk/serial-
+  frame size mismatch are both fixed). This run deliberately skips
+  normal-traffic precedence, the direct-mode lease, fleet-control probes,
+  and the duty-cycle test, so it is evidence for staging specifically, not
+  a full RF baseline pass, and it still does not install anything on the
+  device. See the
   [developer guide](lora_ota_development.md#current-hardware-evidence) for
-  specifics.
+  specifics and dates.
 - Nothing here yet results in an installed firmware update on a real device.
   Treat any OTA activity on hardware you rely on as experimental and
   reversible only by falling back to USB/BLE re-flashing.

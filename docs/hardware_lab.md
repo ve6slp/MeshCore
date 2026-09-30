@@ -123,6 +123,35 @@ built and tested separately and remains unproven end to end. See the
 for the current, dated evidence ledger and its explicit gaps before quoting
 any hardware result from this lab elsewhere.
 
+## Bootloader commissioning preflight
+
+The preflight is **read-only by default**, uses the stable `target` identity
+and never resets, flashes or power-cycles a board:
+
+```sh
+make inspect-xiao-nrf52-boot-journal
+```
+
+It requires the lab firmware's eight-sector read interface; older lab
+images refuse the request rather than returning a successful preflight.
+Each pass archives all 4,096 bytes of both floor sectors and the six
+command, state and confirmation sectors. Two passes must match. Dumps,
+SHA-256 hashes and device/application identity are recorded under
+`.tmp/ota-boot-preflight/`.
+
+The only nonempty floor allowed for historical lab cleanup is the exact
+37-byte diagnostic pattern at floor-A offsets 3–39, with every other byte
+erased. Floor-B and all transaction sectors must be entirely erased.
+Existing counters, unknown bytes, pending transactions or inconsistent
+reads stop the procedure; they must never be reinterpreted as counter zero.
+
+After reviewing that evidence and confirming its historical lab provenance,
+`make clean-xiao-nrf52-legacy-floor` explicitly approves cleanup of that
+single known floor-A sector. It re-reads the journal immediately before the
+request and archives two full post-cleanup passes. This is not routine
+maintenance and never authorizes erasing a valid floor or the wider journal.
+A passing preflight does **not** qualify the bootloader or prove an OTA install.
+
 ## Recovering an unresponsive board
 
 `make lab-reset-client` and `make lab-reset-target` send the companion

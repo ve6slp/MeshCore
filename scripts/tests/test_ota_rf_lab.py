@@ -43,6 +43,10 @@ class PrecedenceEvidenceTests(unittest.TestCase):
         evidence.check.side_effect = check
         with mock.patch.object(ota_rf_lab, "time", clock):
             ota_rf_lab.run_precedence_probe(client, target, self.public_key, evidence)
+        commands = [call.args[0] for call in client.command.call_args_list]
+        self.assertTrue(commands[0].startswith(bytes([ota_rf_lab.CMD_SET_ADVERT_NAME]) + b"OTA-LAB-CLIENT-"))
+        self.assertEqual(commands[1], bytes([ota_rf_lab.CMD_OTA_LAB, 0]))
+        self.assertEqual(commands[-1], bytes([ota_rf_lab.CMD_SET_ADVERT_NAME]) + b"OTA-LAB-CLIENT")
 
     def test_expected_normal_advert_before_ota_passes(self):
         self.run_fixture([self.own_advert, self.announcement])
