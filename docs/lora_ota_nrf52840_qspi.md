@@ -463,7 +463,8 @@ make validate-xiao-nrf52-qspi-hardware
 
 It runs against the `target` lab role, resolved to a stable
 `/dev/serial/by-id` path by `scripts/lab_device.py` from the serial pinned in
-`lab/devices.ini`. The firmware accepts only the `run` command and destructively touches only:
+`lab/devices.ini`. The firmware accepts only the `run` command. The
+historical hardware runs below used these destructive windows:
 
 - (historical) candidate test: `0x0C2000..0x0C6000` (16 KiB) -- this was the
   full-bank-era address of the lab firmware's destructive scratch probe,
@@ -471,9 +472,16 @@ It runs against the `target` lab role, resolved to a stable
   unaltered. It is superseded by the tail-safe relocated carve-out at
   `0x0A9000..0x0AD000` documented above; new qualification runs must target
   the relocated range, not this historical address.
-- journal test: `0x192000..0x194000` (8 KiB)
+- (historical) journal test: `0x192000..0x194000` (8 KiB) -- these are the
+  anti-rollback floor sectors, not safe scratch space. New qualification
+  runs must not erase or program them.
 
-Both are OTA-owned subregions below the LittleFS boundary at `0x194000`.
+The current candidate probe is `0x0A9000..0x0AD000` (16 KiB), and the
+current record-test scratch is `0x0AB000..0x0AD000` (8 KiB), including the
+deprecated `journalTestRegion()` alias. Both are candidate-owned image
+space, subject to the explicit maintenance authorization described above;
+neither is boot-journal storage. These relocated windows have not yet
+been qualified on hardware.
 The test never mounts `CustomLFS_QSPIFlash`, never formats the chip, and never
 addresses the LittleFS partition.
 
