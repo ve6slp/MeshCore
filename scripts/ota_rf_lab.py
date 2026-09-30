@@ -60,6 +60,8 @@ ROUTE_FLOOD = 1
 ROUTE_DIRECT = 2
 PAYLOAD_TYPE_LORA_OTA = 0x0C
 OTA_PRIORITY = 4
+OTA_CHUNK_BYTES = 128
+MAX_SERIAL_FRAME_SIZE = 176
 
 
 def utc_now():
@@ -123,7 +125,7 @@ class FramedSerial:
             self.fd = None
 
     def write_frame(self, payload):
-        if len(payload) > 176:
+        if len(payload) > MAX_SERIAL_FRAME_SIZE:
             raise ValueError(f"serial frame too large: {len(payload)}")
         frame = b"<" + struct.pack("<H", len(payload)) + payload
         offset = 0
@@ -254,6 +256,32 @@ def configure_node(node, name):
 
 def ota_envelope(message_type, campaign, session, attempt, payload=b"", namespace=0x4F54):
     return struct.pack(">HBBIIHBH", namespace, 1, message_type, campaign, session, attempt, 0, len(payload)) + payload
+
+
+def descriptor_fragment(image, security_counter):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    if not image or security_counter <= 0:
+        raise ValueError("a descriptor requires an image and a positive security counter")
+    descriptor = (
+        struct.pack(">HHBII", 0x5284, 1, 1, 0x27000, len(image)) +
+        hashlib.sha256(image).digest() +
+        struct.pack(">IIHHH", security_counter, 0, 1, 1, 1)
+    )
+    # This publicly reproducible fixture key authorizes lab staging only.
+    signature = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33))).sign(descriptor)
+    blob = descriptor + signature
+    return bytes([0, 1]) + struct.pack(">HH", len(blob), len(blob)) + blob
+
+
+def chunk_payload(image, chunk_index):
+    if chunk_index < 0:
+        raise ValueError("chunk index must not be negative")
+    offset = chunk_index * OTA_CHUNK_BYTES
+    data = image[offset:offset + OTA_CHUNK_BYTES]
+    if not data:
+        raise ValueError("chunk index is outside the image")
+    return struct.pack(">IH", chunk_index, len(data)) + data
 
 
 def send_ota(node, route, message_type, campaign, session=1, attempt=1, payload=b"", namespace=0x4F54):
@@ -391,19 +419,10 @@ def run_hardware_test(client, target, evidence, duty_timeout):
                    before=fleet_before_abort, after=fleet_after_abort)
 
     require_ok(target, bytes([CMD_OTA_CONTROL, OTA_ABORT]))
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
     image = bytes((index * 37 + 0x5A) & 0xFF for index in range(320))
     security_counter = 1
-    descriptor = (
-        struct.pack(">HHBII", 0x5284, 1, 1, 0x27000, len(image)) +
-        hashlib.sha256(image).digest() +
-        struct.pack(">IIHHH", security_counter, 0, 1, 1, 1)
-    )
-    signature = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33))).sign(descriptor)
-    descriptor_blob = descriptor + signature
-    descriptor_payload = bytes([0, 1]) + struct.pack(">HH", len(descriptor_blob), len(descriptor_blob)) + descriptor_blob
-    send_ota(client, ROUTE_DIRECT, OTA_DESCRIPTOR, 4001, payload=descriptor_payload)
+    send_ota(client, ROUTE_DIRECT, OTA_DESCRIPTOR, 4001,
+             payload=descriptor_fragment(image, security_counter))
     wait_ota_event(target, OTA_DESCRIPTOR)
     descriptor_status = status(target)
     evidence.check("signed-descriptor-accepted",
@@ -417,7 +436,7 @@ def run_hardware_test(client, target, evidence, duty_timeout):
     evidence.check("transfer-authorized", authorized_status["recv"] == 3,
                    status=authorized_status, receiver_state_receiving=3)
 
-    first_chunk = struct.pack(">IH", 0, 160) + image[:160]
+    first_chunk = chunk_payload(image, 0)
     send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=first_chunk)
     wait_ota_event(target, OTA_CHUNK)
     progress_before_resume = status(target)
@@ -425,9 +444,11 @@ def run_hardware_test(client, target, evidence, duty_timeout):
     send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=first_chunk)
     wait_ota_event(target, OTA_CHUNK)
     progress_after_resume = status(target)
-    second_chunk = struct.pack(">IH", 1, 160) + image[160:]
-    send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=second_chunk)
-    wait_ota_event(target, OTA_CHUNK)
+    chunk_count = (len(image) + OTA_CHUNK_BYTES - 1) // OTA_CHUNK_BYTES
+    for chunk_index in range(1, chunk_count):
+        send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001,
+                 payload=chunk_payload(image, chunk_index))
+        wait_ota_event(target, OTA_CHUNK)
     commit = struct.pack(">IBI", 4001, 1, security_counter)
     send_ota(client, ROUTE_DIRECT, OTA_COMMIT, 4001, payload=commit)
     wait_ota_event(target, OTA_COMMIT)

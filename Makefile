@@ -44,7 +44,7 @@ OTA_LAB_MONITOR_SECONDS ?= 60
 NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
 
 .PHONY: tmpdir test test-ota test-ota-protocol test-ota-runtime test-ota-storage \
-        test-ota-trust test-ota-boot test-ota-integration clean-ota-targets \
+        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
@@ -68,11 +68,11 @@ tmpdir:
 	@mkdir -p $(TMPDIR)
 
 ## Full native unit-test suite (pre-existing tests plus OTA).
-test: tmpdir
+test: tmpdir test-ota-lab-host
 	$(PLATFORMIO) test $(foreach e,$(NATIVE_TEST_ENVS),-e $(e))
 
 ## All OTA native tests.
-test-ota: tmpdir
+test-ota: tmpdir test-ota-lab-host
 	$(PLATFORMIO) test -e native -f '$(OTA_TEST_FILTER)'
 
 ## Per-layer OTA tests, for fast iteration on a single scope.
@@ -93,6 +93,9 @@ test-ota-boot: tmpdir
 
 test-ota-integration: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_integration'
+
+test-ota-lab-host: tmpdir
+	python3 -m unittest discover -s scripts/tests -p 'test_ota_rf_lab.py'
 
 ## Compile the OTA-capable firmware targets.
 build-ota-targets: tmpdir

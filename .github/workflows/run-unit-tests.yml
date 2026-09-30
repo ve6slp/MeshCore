@@ -19,6 +19,9 @@ jobs:
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
 
+      - name: Install OTA Host Test Dependencies
+        run: python3 -m pip install -r requirements-ota.txt
+
       - name: Run Unit Tests
         run: make test
 
