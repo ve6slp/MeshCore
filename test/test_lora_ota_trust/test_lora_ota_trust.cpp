@@ -16,6 +16,9 @@
 #include "ota/trust/TrustTypes.h"
 #include "ota/trust/CanonicalDescriptor.h"
 #include "ota/trust/DescriptorVerifier.h"
+#include "ota/trust/OtaHkdfSha256.h"
+#include "ota/trust/OtaAeadKeySchedule.h"
+#include "ota/runtime/OtaAeadFrame.h"
 
 #include "FakeMonotonicCounter.h"
 #include "Ed25519TestSigner.h"
@@ -441,6 +444,213 @@ TEST_F(DescriptorVerifierFixture, CommitCounterRejectsNonIncreasingValue) {
   // Attempting to commit the same value again must fail (not strictly
   // increasing), not silently no-op-succeed.
   EXPECT_FALSE(verifier_->commitCounter(descriptor));
+}
+
+// -----------------------------------------------------------------------
+// HKDF-SHA256 (RFC 5869) known-answer vectors -- proves the portable
+// OtaHkdfSha256.h reimplementation matches the published standard exactly.
+// -----------------------------------------------------------------------
+
+TEST(HkdfSha256, Rfc5869TestCase1BasicSha256) {
+  auto ikm = hexToBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+  auto salt = hexToBytes("000102030405060708090a0b0c");
+  auto info = hexToBytes("f0f1f2f3f4f5f6f7f8f9");
+  uint8_t okm[42];
+  ASSERT_TRUE(ota::trust::HkdfSha256::deriveKey(salt.data(), salt.size(), ikm.data(), ikm.size(), info.data(),
+                                                info.size(), okm, sizeof(okm)));
+  EXPECT_EQ(toHex(okm, sizeof(okm)),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+}
+
+TEST(HkdfSha256, Rfc5869TestCase2LongerInputsOutputs) {
+  auto ikm = hexToBytes(
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+      "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f");
+  auto salt = hexToBytes(
+      "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f"
+      "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+  auto info = hexToBytes(
+      "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+      "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+  uint8_t okm[82];
+  ASSERT_TRUE(ota::trust::HkdfSha256::deriveKey(salt.data(), salt.size(), ikm.data(), ikm.size(), info.data(),
+                                                info.size(), okm, sizeof(okm)));
+  EXPECT_EQ(toHex(okm, sizeof(okm)),
+            "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e0"
+            "9da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
+}
+
+TEST(HkdfSha256, Rfc5869TestCase3ZeroLengthSaltAndInfo) {
+  auto ikm = hexToBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+  uint8_t okm[42];
+  ASSERT_TRUE(ota::trust::HkdfSha256::deriveKey(nullptr, 0, ikm.data(), ikm.size(), nullptr, 0, okm, sizeof(okm)));
+  EXPECT_EQ(toHex(okm, sizeof(okm)),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+}
+
+// -----------------------------------------------------------------------
+// OtaAeadKeySchedule: direction separation, zero-secret rejection, and
+// group derivation determinism.
+// -----------------------------------------------------------------------
+
+TEST(OtaAeadKeySchedule, RejectsAllZeroSharedSecret) {
+  uint8_t zero_secret[32] = {0};
+  uint8_t pub_a[32], pub_b[32];
+  memset(pub_a, 0x11, sizeof(pub_a));
+  memset(pub_b, 0x22, sizeof(pub_b));
+  uint8_t key[32], nonce_prefix[8];
+  EXPECT_FALSE(ota::trust::OtaAeadKeySchedule::derivePairwise(zero_secret, pub_a, pub_b, key, nonce_prefix));
+}
+
+TEST(OtaAeadKeySchedule, DirectionsProduceDifferentKeyMaterial) {
+  uint8_t secret[32];
+  memset(secret, 0x77, sizeof(secret));
+  uint8_t pub_a[32], pub_b[32];
+  memset(pub_a, 0x11, sizeof(pub_a));
+  memset(pub_b, 0x22, sizeof(pub_b));
+
+  uint8_t key_ab[32], nonce_ab[8];
+  uint8_t key_ba[32], nonce_ba[8];
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::derivePairwise(secret, pub_a, pub_b, key_ab, nonce_ab));
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::derivePairwise(secret, pub_b, pub_a, key_ba, nonce_ba));
+  EXPECT_NE(0, memcmp(key_ab, key_ba, sizeof(key_ab)));
+  EXPECT_NE(0, memcmp(nonce_ab, nonce_ba, sizeof(nonce_ab)));
+}
+
+TEST(OtaAeadKeySchedule, SameInputsAreDeterministic) {
+  uint8_t secret[32];
+  memset(secret, 0x33, sizeof(secret));
+  uint8_t pub_a[32], pub_b[32];
+  memset(pub_a, 0x44, sizeof(pub_a));
+  memset(pub_b, 0x55, sizeof(pub_b));
+  uint8_t key1[32], nonce1[8], key2[32], nonce2[8];
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::derivePairwise(secret, pub_a, pub_b, key1, nonce1));
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::derivePairwise(secret, pub_a, pub_b, key2, nonce2));
+  EXPECT_EQ(0, memcmp(key1, key2, sizeof(key1)));
+  EXPECT_EQ(0, memcmp(nonce1, nonce2, sizeof(nonce1)));
+}
+
+TEST(OtaAeadKeySchedule, RejectsAllZeroGroupSecret) {
+  uint8_t zero_secret[32] = {0};
+  uint8_t publisher[32];
+  memset(publisher, 0x66, sizeof(publisher));
+  uint8_t digest[32];
+  memset(digest, 0x99, sizeof(digest));
+  uint8_t epoch[16];
+  memset(epoch, 0xAA, sizeof(epoch));
+  uint8_t key[32], nonce_prefix[8];
+  EXPECT_FALSE(ota::trust::OtaAeadKeySchedule::deriveGroup(zero_secret, publisher, 1, 2, 3, digest, 4, epoch, key,
+                                                           nonce_prefix));
+}
+
+TEST(OtaAeadKeySchedule, GroupDerivationIsDeterministicAndContextSensitive) {
+  uint8_t group_secret[32];
+  memset(group_secret, 0x21, sizeof(group_secret));
+  uint8_t publisher[32];
+  memset(publisher, 0x66, sizeof(publisher));
+  uint8_t digest[32];
+  memset(digest, 0x99, sizeof(digest));
+  uint8_t epoch[16];
+  memset(epoch, 0xAA, sizeof(epoch));
+
+  uint8_t key1[32], nonce1[8], key2[32], nonce2[8];
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::deriveGroup(group_secret, publisher, 1, 2, 3, digest, 4, epoch, key1,
+                                                          nonce1));
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::deriveGroup(group_secret, publisher, 1, 2, 3, digest, 4, epoch, key2,
+                                                          nonce2));
+  EXPECT_EQ(0, memcmp(key1, key2, sizeof(key1)));
+
+  // Changing the cohort id must change the derived key (context-sensitive).
+  uint8_t key3[32], nonce3[8];
+  ASSERT_TRUE(ota::trust::OtaAeadKeySchedule::deriveGroup(group_secret, publisher, 1, 2, 3, digest, 5, epoch, key3,
+                                                          nonce3));
+  EXPECT_NE(0, memcmp(key1, key3, sizeof(key1)));
+
+  const uint16_t selector_a = ota::trust::OtaAeadKeySchedule::deriveGroupSelector(publisher, 1, 2, 3, digest, 4, epoch);
+  const uint16_t selector_b = ota::trust::OtaAeadKeySchedule::deriveGroupSelector(publisher, 1, 2, 3, digest, 5, epoch);
+  EXPECT_NE(selector_a, selector_b);
+}
+
+// -----------------------------------------------------------------------
+// OtaAeadFrame: structural wire-frame bounds (155/156 accepted, 157
+// rejected; exact 178/179-byte payload boundary).
+// -----------------------------------------------------------------------
+
+TEST(OtaAeadFrame, AssociatedDataAcceptsExactMinAndMaxPlaintextBytes) {
+  uint8_t header3[meshcore::ota::runtime::kOtaAeadHeader3Bytes];
+  meshcore::ota::runtime::OtaAeadFrame::encodeHeader3Pairwise(0x12, 0x34, header3);
+  uint8_t ad[64];
+  size_t ad_len = 0;
+  EXPECT_TRUE(meshcore::ota::runtime::OtaAeadFrame::buildAssociatedData(
+      header3, 1, static_cast<uint16_t>(meshcore::ota::runtime::kOtaAeadMinPlaintextBytes), ad, sizeof(ad), &ad_len));
+  EXPECT_EQ(ad_len, meshcore::ota::runtime::OtaAeadFrame::associatedDataBytes());
+  EXPECT_TRUE(meshcore::ota::runtime::OtaAeadFrame::buildAssociatedData(
+      header3, 1, static_cast<uint16_t>(meshcore::ota::runtime::kOtaAeadMaxPlaintextBytes), ad, sizeof(ad), &ad_len));
+}
+
+TEST(OtaAeadFrame, AssociatedDataRejectsPlaintextLenOutsideBounds) {
+  uint8_t header3[meshcore::ota::runtime::kOtaAeadHeader3Bytes];
+  meshcore::ota::runtime::OtaAeadFrame::encodeHeader3Pairwise(0x12, 0x34, header3);
+  uint8_t ad[64];
+  size_t ad_len = 0;
+  EXPECT_FALSE(meshcore::ota::runtime::OtaAeadFrame::buildAssociatedData(
+      header3, 1, static_cast<uint16_t>(meshcore::ota::runtime::kOtaAeadMinPlaintextBytes - 1), ad, sizeof(ad),
+      &ad_len));
+  EXPECT_FALSE(meshcore::ota::runtime::OtaAeadFrame::buildAssociatedData(
+      header3, 1, static_cast<uint16_t>(meshcore::ota::runtime::kOtaAeadMaxPlaintextBytes + 1), ad, sizeof(ad),
+      &ad_len));
+}
+
+TEST(OtaAeadFrame, ParseAcceptsExact155And156BytePlaintextPayloads) {
+  // 155-byte plaintext payload => 23 + 155 = 178 total bytes.
+  std::vector<uint8_t> payload178(178, 0);
+  payload178[0] = static_cast<uint8_t>(meshcore::ota::runtime::OtaAeadForm::Pairwise);
+  auto parsed178 = meshcore::ota::runtime::OtaAeadFrame::parse(payload178.data(), payload178.size());
+  EXPECT_TRUE(parsed178.ok);
+  EXPECT_EQ(parsed178.ciphertext_len, 155u);
+
+  // 156-byte plaintext payload => 23 + 156 = 179 total bytes (max ceiling).
+  std::vector<uint8_t> payload179(179, 0);
+  payload179[0] = static_cast<uint8_t>(meshcore::ota::runtime::OtaAeadForm::Pairwise);
+  auto parsed179 = meshcore::ota::runtime::OtaAeadFrame::parse(payload179.data(), payload179.size());
+  EXPECT_TRUE(parsed179.ok);
+  EXPECT_EQ(parsed179.ciphertext_len, 156u);
+}
+
+TEST(OtaAeadFrame, ParseRejectsOneByteOver156PlaintextCeiling) {
+  // 157-byte plaintext payload => 23 + 157 = 180 total bytes: must reject.
+  std::vector<uint8_t> payload180(180, 0);
+  payload180[0] = static_cast<uint8_t>(meshcore::ota::runtime::OtaAeadForm::Pairwise);
+  auto parsed = meshcore::ota::runtime::OtaAeadFrame::parse(payload180.data(), payload180.size());
+  EXPECT_FALSE(parsed.ok);
+}
+
+TEST(OtaAeadFrame, ParseRejectsUnknownFormByte) {
+  std::vector<uint8_t> payload(178, 0);
+  payload[0] = 0x99;  // neither Pairwise (0xA1) nor Group (0xA2).
+  auto parsed = meshcore::ota::runtime::OtaAeadFrame::parse(payload.data(), payload.size());
+  EXPECT_FALSE(parsed.ok);
+}
+
+TEST(OtaAeadFrame, ParseRejectsTooShortAndTooLongPayloads) {
+  std::vector<uint8_t> too_short(meshcore::ota::runtime::kOtaAeadMinPayloadBytes - 1, 0);
+  too_short[0] = static_cast<uint8_t>(meshcore::ota::runtime::OtaAeadForm::Pairwise);
+  EXPECT_FALSE(meshcore::ota::runtime::OtaAeadFrame::parse(too_short.data(), too_short.size()).ok);
+
+  std::vector<uint8_t> too_long(meshcore::ota::runtime::kOtaAeadMaxPayloadBytes + 1, 0);
+  too_long[0] = static_cast<uint8_t>(meshcore::ota::runtime::OtaAeadForm::Pairwise);
+  EXPECT_FALSE(meshcore::ota::runtime::OtaAeadFrame::parse(too_long.data(), too_long.size()).ok);
+}
+
+TEST(OtaAeadFrame, ParseGroupFormDecodesSelectorAndSequence) {
+  std::vector<uint8_t> payload(178, 0);
+  meshcore::ota::runtime::OtaAeadFrame::encodeHeader3Group(0xBEEF, payload.data());
+  meshcore::ota::runtime::OtaAeadFrame::encodeSequence(0x01020304u, payload.data() + 3);
+  auto parsed = meshcore::ota::runtime::OtaAeadFrame::parse(payload.data(), payload.size());
+  ASSERT_TRUE(parsed.ok);
+  EXPECT_EQ(parsed.form, meshcore::ota::runtime::OtaAeadForm::Group);
+  EXPECT_EQ(parsed.group.selector, 0xBEEFu);
+  EXPECT_EQ(parsed.sequence, 0x01020304u);
 }
 
 int main(int argc, char** argv) {

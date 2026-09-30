@@ -10,6 +10,8 @@ export TMP = $(TMPDIR)
 NATIVE_TEST_ENVS ?= native native_kiss_modem
 
 OTA_TEST_FILTER ?= test_lora_ota_*
+OTA_CRYPTO_ENV ?= Xiao_nrf52_companion_radio_usb
+OTA_CRYPTO_LIBRARY ?= $(CURDIR)/.pio/libdeps/$(OTA_CRYPTO_ENV)/Crypto
 OTA_TARGET_ENVS ?= SenseCap_Solar_companion_radio_usb Xiao_S3_WIO_companion_radio_usb
 XIAO_NRF52_LAB_ENVS ?= Xiao_nrf52_companion_radio_usb
 
@@ -52,7 +54,7 @@ OTA_BOOT_PREFLIGHT_DIR ?= $(TMPDIR)/ota-boot-preflight/$(shell date -u +%Y%m%dT%
 NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
 
 .PHONY: tmpdir test test-ota test-ota-protocol test-ota-runtime test-ota-storage \
-        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host clean-ota-targets \
+        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host test-ota-aead-cipher clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
@@ -78,12 +80,12 @@ tmpdir:
 	@mkdir -p $(TMPDIR)
 
 ## Full native unit-test suite (pre-existing tests plus OTA).
-test: tmpdir test-ota-lab-host
+test: tmpdir test-ota-lab-host test-ota-aead-cipher
 	$(PLATFORMIO) test $(foreach e,$(NATIVE_TEST_ENVS),-e $(e))
 
 ## All OTA native tests.
-test-ota: tmpdir test-ota-lab-host
-	$(PLATFORMIO) test -e native -f '$(OTA_TEST_FILTER)'
+test-ota: tmpdir test-ota-lab-host test-ota-aead-cipher
+	$(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
 
 ## Per-layer OTA tests, for fast iteration on a single scope.
 test-ota-protocol: tmpdir
@@ -95,8 +97,19 @@ test-ota-runtime: tmpdir
 test-ota-storage: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_storage'
 
-test-ota-trust: tmpdir
+test-ota-trust: tmpdir test-ota-aead-cipher
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_trust'
+
+test-ota-aead-cipher: tmpdir
+	@test -f "$(OTA_CRYPTO_LIBRARY)/ChaChaPoly.h" || \
+	  { echo "Missing Crypto dependency: run $(PLATFORMIO) pkg install -e $(OTA_CRYPTO_ENV)" >&2; exit 1; }
+	@mkdir -p "$(TMPDIR)/ota-crypto-host"
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -UNDEBUG \
+	  -Isrc -I"$(OTA_CRYPTO_LIBRARY)" -DMESHCORE_OTA_CRYPTO_NATIVE=1 \
+	  test/test_lora_ota_trust/test_aead_cipher.cpp \
+	  $(foreach source,ChaChaPoly ChaCha Poly1305 AuthenticatedCipher Cipher Crypto,"$(OTA_CRYPTO_LIBRARY)/$(source).cpp") \
+	  -o "$(TMPDIR)/ota-crypto-host/test_aead_cipher"
+	"$(TMPDIR)/ota-crypto-host/test_aead_cipher"
 
 test-ota-boot: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_boot'

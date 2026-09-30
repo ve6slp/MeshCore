@@ -18,7 +18,8 @@ src/ota/
   protocol/   wire types, byte-stream codec, envelope, canonical descriptor
   runtime/    chunk geometry, receipt bitmap, session identity, receiver/
               coordinator/fleet state machines, radio-profile lease,
-              airtime limiter
+              airtime limiter, AEAD framing and durable sequence/replay
+              primitives
   storage/    CRC32, redundant journal, receipt map, storage manager over
               the QSPI layout
   trust/      SHA-256 and Ed25519 (vendored orlp/ed25519), fail-closed
@@ -49,6 +50,7 @@ make test-ota-protocol        # one layer at a time, for fast iteration
 make test-ota-runtime
 make test-ota-storage
 make test-ota-trust
+make test-ota-aead-cipher     # actual firmware Crypto library, not native mocks
 make test-ota-boot
 make test-ota-integration
 make test-ota-lab-host        # host-side unittest suite for lab scripts (below)
@@ -63,6 +65,36 @@ make verify-ota-software      # native tests + both build passes, in one gate
 `verify-ota-software` is explicitly a **software-only** qualification gate.
 Its own summary output says so: passing it means native tests are green and
 firmware links, not that any device can be updated.
+
+`test-ota-aead-cipher` links the installed firmware Crypto library's actual
+ChaCha20-Poly1305 implementation in a separate host executable, so ordinary
+native suites can retain their existing deterministic hash mocks. It
+checks the RFC 8439 known-answer vector, full-tag and associated-data
+tampering, plaintext quarantine, every allowed plaintext length, and the
+exact 28-byte associated-data / 179-byte maximum protected frame. It is a
+dependency of `test`, `test-ota`, and `test-ota-trust`. The default library
+comes from `Xiao_nrf52_companion_radio_usb`; a missing dependency fails
+explicitly with the corresponding PlatformIO package-install command.
+These checks do not qualify authenticated transport, durable replay
+protection, installation, or hardware.
+
+The native runtime suite also exercises the durable TX/RX primitives
+through 103 erase/body/marker/readback fault cases each, reconstructing
+fresh objects over the resulting NOR bytes. Corrupt or unreadable slots
+cannot fall back to older authorization, an RX watermark loaded at boot
+remains a permanent replay floor for that boot, and uncertain writes
+freeze the current instance. Both runtime constructors default to
+`OtaSequenceInitialization::RequireExisting`; their explicit
+`CommissionVirgin` mode requires independently verified commissioning
+facts from the caller, not merely blank records. The production transport
+and commissioning-store wiring are still pending.
+
+Combine native suite selectors in one invocation when working across
+layers, for example:
+
+```sh
+make test-ota OTA_TEST_FILTER='test_lora_ota_trust test_lora_ota_runtime'
+```
 
 `test-ota-lab-host` runs `python3 -m unittest discover -s scripts/tests` —
 real unit tests for the lab tooling itself (for example, the protected-

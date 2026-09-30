@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include "ota/runtime/OtaGeometry.h"
 #include "ota/runtime/OtaBitmap.h"
@@ -12,6 +13,12 @@
 #include "ota/runtime/OtaLeaseStateMachine.h"
 #include "ota/runtime/OtaAirtimeLimiter.h"
 #include "ota/runtime/OtaFleetStateMachine.h"
+#include "ota/runtime/OtaTxSequenceLedger.h"
+#include "ota/runtime/OtaRxReplayLedger.h"
+#include "ota/platform/FlashDevice.h"
+#include "ota/platform/FlashRegion.h"
+
+#include "../test_lora_ota_storage/FakeNorFlash.h"
 
 using namespace meshcore::ota::runtime;
 using meshcore::ota::protocol::OtaAirtimeCategory;
@@ -869,6 +876,473 @@ TEST(OtaFleetCensus, ResetClearsMembership) {
   census.reset();
   EXPECT_EQ(0u, census.memberCount());
   EXPECT_FALSE(census.allComplete());
+}
+
+// -----------------------------------------------------------------------
+// OtaTxSequenceLedger: durable, block-reserved, never-repeats, reboot
+// skips whole prior reserved block, never wraps past UINT32_MAX.
+// -----------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kLedgerEraseUnit = 64;
+constexpr uint32_t kLedgerRegionBytes = kLedgerEraseUnit * 2;
+}  // namespace
+
+TEST(OtaTxSequenceLedger, FirstAllocationOnBlankLedgerStartsAtOneAndReservesBlock) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaTxSequenceAllocator allocator(region, OtaSequenceInitialization::CommissionVirgin);
+  uint32_t seq = 0;
+  ASSERT_TRUE(allocator.allocate(&seq));
+  EXPECT_EQ(seq, 1u);
+  ASSERT_TRUE(allocator.allocate(&seq));
+  EXPECT_EQ(seq, 2u);
+}
+
+TEST(OtaTxSequenceLedger, SequenceNeverRepeatsAcrossManyAllocations) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaTxSequenceAllocator allocator(region, OtaSequenceInitialization::CommissionVirgin);
+  uint32_t last = 0;
+  for (int i = 0; i < 200; ++i) {
+    uint32_t seq = 0;
+    ASSERT_TRUE(allocator.allocate(&seq));
+    EXPECT_GT(seq, last);
+    last = seq;
+  }
+}
+
+TEST(OtaTxSequenceLedger, RebootSkipsWholeRemainderOfPriorReservedBlock) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  uint32_t seq = 0;
+  {
+    OtaTxSequenceAllocator allocator(region, OtaSequenceInitialization::CommissionVirgin);
+    ASSERT_TRUE(allocator.allocate(&seq));  // reserves block [1,64], issues 1.
+    EXPECT_EQ(seq, 1u);
+  }  // "reboot": allocator destroyed, only durable ledger state survives.
+  {
+    OtaTxSequenceAllocator allocator(region);
+    ASSERT_TRUE(allocator.allocate(&seq));
+    // Must skip the whole rest of [2..64] from the abandoned block and
+    // reserve a brand new one starting at 65.
+    EXPECT_EQ(seq, 65u);
+  }
+}
+
+TEST(OtaTxSequenceLedger, CorruptLedgerFailsClosedPermanently) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  // Program garbage (non-blank, invalid record) into slot 0 directly.
+  uint8_t garbage[kLedgerEraseUnit];
+  memset(garbage, 0x42, sizeof(garbage));
+  ASSERT_TRUE(ota::platform::isOk(flash.program(0, garbage, sizeof(garbage))));
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaTxSequenceAllocator allocator(region);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_FALSE(allocator.allocate(&seq));  // stays disabled, does not "recover".
+}
+
+TEST(OtaTxSequenceLedger, ExhaustionNearUint32MaxFailsClosedNeverWraps) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  // Directly seed the ledger record at the very top of the sequence space.
+  uint8_t record[OtaTxSequenceLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(0xFFFFFFFFu - 1u, record, sizeof(record)),
+            OtaTxSequenceLedgerRecord::kRecordBytes);
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  OtaTxSequenceAllocator allocator(region);
+  uint32_t seq = 0;
+  EXPECT_FALSE(allocator.allocate(&seq));  // reserving another block would overflow: refuse.
+}
+
+// -----------------------------------------------------------------------
+// OtaRxReplayLedger: durable watermark + bounded reorder window,
+// replay/duplicate rejection, fail-closed on corrupt state.
+// -----------------------------------------------------------------------
+
+TEST(OtaRxReplayLedger, FirstEverSequenceIsAdmittedAndDuplicateIsRejected) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaRxReplayLedger ledger(region, OtaSequenceInitialization::CommissionVirgin);
+  EXPECT_TRUE(ledger.admit(5));
+  EXPECT_FALSE(ledger.admit(5));  // exact duplicate: replay.
+}
+
+TEST(OtaRxReplayLedger, RejectsZeroSequence) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaRxReplayLedger ledger(region);
+  EXPECT_FALSE(ledger.admit(0));
+}
+
+TEST(OtaRxReplayLedger, AllowsBoundedReorderingWithinWindowButRejectsBeyondIt) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaRxReplayLedger ledger(region, OtaSequenceInitialization::CommissionVirgin);
+  ASSERT_TRUE(ledger.admit(100));
+  EXPECT_TRUE(ledger.admit(99));    // within the 64-wide reorder window: ok.
+  EXPECT_FALSE(ledger.admit(99));   // now a duplicate: reject.
+  EXPECT_FALSE(ledger.admit(30));   // 70 below watermark: outside window, reject.
+}
+
+TEST(OtaRxReplayLedger, WatermarkSurvivesRebootAndRejectsAtOrBelowIt) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  {
+    OtaRxReplayLedger ledger(region, OtaSequenceInitialization::CommissionVirgin);
+    ASSERT_TRUE(ledger.admit(50));
+  }  // "reboot": in-RAM reorder bitmap is lost, durable watermark is not.
+  {
+    OtaRxReplayLedger ledger(region);
+    EXPECT_FALSE(ledger.admit(50));  // at watermark: rejected even though bitmap reset.
+    EXPECT_FALSE(ledger.admit(10));  // below watermark: rejected.
+    EXPECT_TRUE(ledger.admit(51));   // strictly above watermark: newly admitted.
+  }
+}
+
+TEST(OtaRxReplayLedger, CorruptLedgerFailsClosedPermanently) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  uint8_t garbage[kLedgerEraseUnit];
+  memset(garbage, 0x5A, sizeof(garbage));
+  ASSERT_TRUE(ota::platform::isOk(flash.program(0, garbage, sizeof(garbage))));
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaRxReplayLedger ledger(region);
+  EXPECT_FALSE(ledger.admit(1));
+  EXPECT_FALSE(ledger.admit(2));
+}
+
+TEST(OtaRxReplayLedger, AdvancingAfterRebootNeverReopensOlderAdmissions) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  {
+    OtaRxReplayLedger ledger(region, OtaSequenceInitialization::CommissionVirgin);
+    ASSERT_TRUE(ledger.admit(50));
+    ASSERT_TRUE(ledger.admit(49));
+  }
+  OtaRxReplayLedger reconstructed(region);
+  ASSERT_TRUE(reconstructed.admit(51));
+  EXPECT_FALSE(reconstructed.admit(49));
+  EXPECT_FALSE(reconstructed.admit(50));
+  ASSERT_TRUE(reconstructed.admit(53));
+  EXPECT_TRUE(reconstructed.admit(52));
+  EXPECT_FALSE(reconstructed.admit(52));
+}
+
+TEST(OtaTxSequenceLedger, CorruptNewerSlotNeverFallsBackToPreviouslyIssuedBlock) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  uint32_t seq = 0;
+  {
+    OtaTxSequenceAllocator allocator(region, OtaSequenceInitialization::CommissionVirgin);
+    for (unsigned i = 0; i < 65; ++i) ASSERT_TRUE(allocator.allocate(&seq));
+    ASSERT_EQ(seq, 65u);
+  }
+  const uint8_t corrupt = 0;
+  ASSERT_TRUE(ota::platform::isOk(region.program(kLedgerEraseUnit, &corrupt, 1)));
+  OtaTxSequenceAllocator reconstructed(region);
+  seq = 0xA5A5A5A5;
+  EXPECT_FALSE(reconstructed.allocate(&seq));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+}
+
+TEST(OtaTxSequenceLedger, UnreadableNewerSlotNeverFallsBackToPreviouslyIssuedBlock) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  uint32_t seq = 0;
+  {
+    OtaTxSequenceAllocator allocator(region, OtaSequenceInitialization::CommissionVirgin);
+    for (unsigned i = 0; i < 65; ++i) ASSERT_TRUE(allocator.allocate(&seq));
+  }
+  flash.armFault({ota::test::FakeNorFlash::OpKind::Read,
+                  ota::test::FakeNorFlash::InjectionTiming::Before, flash.readOpCount() + 2, 0});
+  OtaTxSequenceAllocator reconstructed(region);
+  seq = 0xA5A5A5A5;
+  EXPECT_FALSE(reconstructed.allocate(&seq));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+}
+
+TEST(OtaRxReplayLedger, CorruptNewerSlotNeverReopensPreviouslyAdmittedSequence) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  {
+    OtaRxReplayLedger ledger(region, OtaSequenceInitialization::CommissionVirgin);
+    ASSERT_TRUE(ledger.admit(50));
+    ASSERT_TRUE(ledger.admit(51));
+  }
+  const uint8_t corrupt = 0;
+  ASSERT_TRUE(ota::platform::isOk(region.program(kLedgerEraseUnit, &corrupt, 1)));
+  OtaRxReplayLedger reconstructed(region);
+  EXPECT_FALSE(reconstructed.admit(51));
+}
+
+TEST(OtaTxSequenceLedger, Uint32MaxCannotWrapReconstructedAllocatorToZero) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  uint8_t record[OtaTxSequenceLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(UINT32_MAX, record, sizeof(record)),
+            sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  OtaTxSequenceAllocator allocator(region);
+  uint32_t seq = 0xA5A5A5A5;
+  EXPECT_FALSE(allocator.allocate(&seq));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+}
+
+TEST(OtaSequenceLedger, BlankDefaultsNeverAuthorizeIdentityReuse) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaTxSequenceAllocator tx(region);
+  OtaRxReplayLedger rx(region);
+  uint32_t seq = 0xA5A5A5A5;
+  EXPECT_FALSE(tx.allocate(&seq));
+  EXPECT_FALSE(rx.admit(1));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+  EXPECT_EQ(flash.eraseOpCount(), 0u);
+  EXPECT_EQ(flash.programOpCount(), 0u);
+}
+
+TEST(OtaSequenceLedger, LostCommissionedRecordsNeverBecomeVirginAfterReconstruction) {
+  ota::test::FakeNorFlash flash(2 * kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion txRegion(flash, 0, kLedgerRegionBytes);
+  ota::platform::FlashRegion rxRegion(flash, kLedgerRegionBytes, kLedgerRegionBytes);
+  {
+    OtaTxSequenceAllocator tx(txRegion, OtaSequenceInitialization::CommissionVirgin);
+    OtaRxReplayLedger rx(rxRegion, OtaSequenceInitialization::CommissionVirgin);
+    uint32_t seq = 0;
+    ASSERT_TRUE(tx.allocate(&seq));
+    ASSERT_TRUE(rx.admit(50));
+  }
+  ASSERT_TRUE(ota::platform::isOk(txRegion.eraseRange(0, kLedgerRegionBytes)));
+  ASSERT_TRUE(ota::platform::isOk(rxRegion.eraseRange(0, kLedgerRegionBytes)));
+  const auto erases = flash.eraseOpCount();
+  const auto programs = flash.programOpCount();
+  OtaTxSequenceAllocator tx(txRegion);
+  OtaRxReplayLedger rx(rxRegion);
+  uint32_t seq = 0xA5A5A5A5;
+  EXPECT_FALSE(tx.allocate(&seq));
+  EXPECT_FALSE(rx.admit(50));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+  EXPECT_EQ(flash.eraseOpCount(), erases);
+  EXPECT_EQ(flash.programOpCount(), programs);
+}
+
+TEST(OtaTxSequenceLedger, NullAllocationNeverReadsOrReserves) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  OtaTxSequenceAllocator tx(region, OtaSequenceInitialization::CommissionVirgin);
+  EXPECT_FALSE(tx.allocate(nullptr));
+  EXPECT_EQ(flash.readOpCount(), 0u);
+  EXPECT_EQ(flash.eraseOpCount(), 0u);
+  EXPECT_EQ(flash.programOpCount(), 0u);
+  uint32_t seq = 0;
+  ASSERT_TRUE(tx.allocate(&seq));
+  EXPECT_EQ(seq, 1u);
+}
+
+TEST(OtaTxSequenceLedger, LastBlockCanIssueUint32MaxOnlyOnceWithoutWrapping) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  uint8_t record[OtaTxSequenceLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(UINT32_MAX - 64, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, record, sizeof(record))));
+  OtaTxSequenceAllocator tx(region);
+  uint32_t seq = 0;
+  for (uint32_t i = 0; i < 64; ++i) {
+    ASSERT_TRUE(tx.allocate(&seq));
+    EXPECT_EQ(seq, UINT32_MAX - 63 + i);
+  }
+  seq = 0xA5A5A5A5;
+  EXPECT_FALSE(tx.allocate(&seq));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+  OtaTxSequenceAllocator reconstructed(region);
+  EXPECT_FALSE(reconstructed.allocate(&seq));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+}
+
+TEST(OtaSequenceLedger, PublicRecordAdvancesRejectZeroEqualAndLowerWithoutMutation) {
+  ota::test::FakeNorFlash flash(2 * kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion txRegion(flash, 0, kLedgerRegionBytes);
+  ota::platform::FlashRegion rxRegion(flash, kLedgerRegionBytes, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(txRegion, 64));
+  ASSERT_TRUE(OtaRxReplayLedgerRecord::advance(rxRegion, 100));
+  const auto erases = flash.eraseOpCount();
+  const auto programs = flash.programOpCount();
+  for (uint32_t value : {0u, 63u, 64u}) EXPECT_FALSE(OtaTxSequenceLedgerRecord::reserve(txRegion, value));
+  for (uint32_t value : {0u, 99u, 100u}) EXPECT_FALSE(OtaRxReplayLedgerRecord::advance(rxRegion, value));
+  EXPECT_EQ(flash.eraseOpCount(), erases);
+  EXPECT_EQ(flash.programOpCount(), programs);
+}
+
+TEST(OtaSequenceLedger, ChecksummedZeroRecordIsNotVirginEvenWithCommissioningPermission) {
+  ota::test::FakeNorFlash flash(2 * kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion txRegion(flash, 0, kLedgerRegionBytes);
+  ota::platform::FlashRegion rxRegion(flash, kLedgerRegionBytes, kLedgerRegionBytes);
+  uint8_t record[OtaTxSequenceLedgerRecord::kRecordBytes];
+  ASSERT_EQ(OtaTxSequenceLedgerRecord::serialize(0, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(txRegion.program(0, record, sizeof(record))));
+  ASSERT_EQ(OtaRxReplayLedgerRecord::serialize(0, record, sizeof(record)), sizeof(record));
+  ASSERT_TRUE(ota::platform::isOk(rxRegion.program(0, record, sizeof(record))));
+  OtaTxSequenceAllocator tx(txRegion, OtaSequenceInitialization::CommissionVirgin);
+  OtaRxReplayLedger rx(rxRegion, OtaSequenceInitialization::CommissionVirgin);
+  uint32_t seq = 0xA5A5A5A5;
+  EXPECT_FALSE(tx.allocate(&seq));
+  EXPECT_FALSE(rx.admit(1));
+  EXPECT_EQ(seq, 0xA5A5A5A5u);
+}
+
+TEST(OtaSequenceLedger, TransactionalWriterRejectsOverflowZeroMarkerAndSectorSpillBeforeMutation) {
+  ota::test::FakeNorFlash flash(kLedgerRegionBytes, kLedgerEraseUnit);
+  ota::platform::FlashRegion region(flash, 0, kLedgerRegionBytes);
+  ASSERT_TRUE(OtaTxSequenceLedgerRecord::reserve(region, 64));
+  const std::vector<uint8_t> before(flash.rawBuffer(), flash.rawBuffer() + flash.rawSize());
+  const auto erases = flash.eraseOpCount();
+  const auto programs = flash.programOpCount();
+  const uint8_t record[68] = {};
+  EXPECT_FALSE(ota::storage::writeOtaJournalRecordTransactional(region, 0, record, 20, UINT32_MAX, 21));
+  EXPECT_FALSE(ota::storage::writeOtaJournalRecordTransactional(region, 0, record, 20, 20, 0));
+  EXPECT_FALSE(ota::storage::writeOtaJournalRecordTransactional(region, 0, record, 68, 64, 4));
+  EXPECT_EQ(flash.eraseOpCount(), erases);
+  EXPECT_EQ(flash.programOpCount(), programs);
+  EXPECT_EQ(std::memcmp(flash.rawBuffer(), before.data(), before.size()), 0);
+}
+
+namespace {
+using LedgerOp = ota::test::FakeNorFlash::OpKind;
+using LedgerTiming = ota::test::FakeNorFlash::InjectionTiming;
+enum class LedgerRecovery { Existing, New, Unsafe };
+
+struct LedgerFaultCase {
+  LedgerOp op;
+  LedgerTiming timing;
+  uint32_t relative_count;
+  uint32_t partial_bytes;
+  LedgerRecovery recovery;
+};
+
+std::vector<LedgerFaultCase> ledgerFaultCases() {
+  std::vector<LedgerFaultCase> cases{
+      {LedgerOp::Erase, LedgerTiming::Before, 1, 0, LedgerRecovery::Existing},
+      {LedgerOp::Erase, LedgerTiming::After, 1, 0, LedgerRecovery::Existing},
+      {LedgerOp::Program, LedgerTiming::Before, 1, 0, LedgerRecovery::Existing},
+      {LedgerOp::Program, LedgerTiming::After, 1, 0, LedgerRecovery::Unsafe},
+      {LedgerOp::Program, LedgerTiming::Before, 2, 0, LedgerRecovery::Unsafe},
+      {LedgerOp::Program, LedgerTiming::After, 2, 0, LedgerRecovery::New},
+  };
+  for (uint32_t cut = 0; cut <= kLedgerEraseUnit; ++cut) {
+    cases.push_back({LedgerOp::Erase, LedgerTiming::Mid, 1, cut,
+                     cut == 0 || cut >= 20 ? LedgerRecovery::Existing : LedgerRecovery::Unsafe});
+  }
+  for (uint32_t cut = 0; cut <= 16; ++cut) {
+    cases.push_back({LedgerOp::Program, LedgerTiming::Mid, 1, cut,
+                     cut == 0 ? LedgerRecovery::Existing : LedgerRecovery::Unsafe});
+  }
+  for (uint32_t cut = 0; cut <= 4; ++cut) {
+    cases.push_back({LedgerOp::Program, LedgerTiming::Mid, 2, cut,
+                     cut == 4 ? LedgerRecovery::New : LedgerRecovery::Unsafe});
+  }
+  for (uint32_t read = 1; read <= 5; ++read) {
+    const auto recovery = read <= 2 ? LedgerRecovery::Existing :
+                          read == 3 ? LedgerRecovery::Unsafe : LedgerRecovery::New;
+    cases.push_back({LedgerOp::Read, LedgerTiming::Before, read, 0, recovery});
+    cases.push_back({LedgerOp::Read, LedgerTiming::After, read, 0, recovery});
+  }
+  return cases;
+}
+
+void armLedgerFault(ota::test::FakeNorFlash& flash, const LedgerFaultCase& fault) {
+  const uint32_t count = fault.op == LedgerOp::Erase ? flash.eraseOpCount() :
+                         fault.op == LedgerOp::Program ? flash.programOpCount() : flash.readOpCount();
+  flash.armFault({fault.op, fault.timing, count + fault.relative_count, fault.partial_bytes});
+}
+} // namespace
+
+TEST(OtaTxSequenceLedger, EveryEraseBodyMarkerAndReadbackCutFreezesUntilFreshReconstruction) {
+  const auto cases = ledgerFaultCases();
+  ASSERT_EQ(cases.size(), 103u);
+  for (const auto& fault : cases) {
+    SCOPED_TRACE(::testing::Message() << int(fault.op) << "/" << int(fault.timing)
+                                     << "/" << fault.relative_count << "/" << fault.partial_bytes);
+    ota::test::FakeNorFlash flash(4 * kLedgerEraseUnit, kLedgerEraseUnit, 4);
+    const std::vector<uint8_t> guard(kLedgerEraseUnit, 0x3C);
+    ASSERT_TRUE(ota::platform::isOk(flash.program(0, guard.data(), guard.size())));
+    ASSERT_TRUE(ota::platform::isOk(flash.program(3 * kLedgerEraseUnit, guard.data(), guard.size())));
+    ota::platform::FlashRegion region(flash, kLedgerEraseUnit, kLedgerRegionBytes);
+    OtaTxSequenceAllocator tx(region, OtaSequenceInitialization::CommissionVirgin);
+    uint32_t seq = 0;
+    for (uint32_t i = 0; i < 128; ++i) ASSERT_TRUE(tx.allocate(&seq));
+    ASSERT_EQ(seq, 128u);
+    const std::vector<uint8_t> latest(flash.rawBuffer() + 2 * kLedgerEraseUnit,
+                                     flash.rawBuffer() + 3 * kLedgerEraseUnit);
+    armLedgerFault(flash, fault);
+    seq = 0xA5A5A5A5;
+    ASSERT_FALSE(tx.allocate(&seq));
+    EXPECT_EQ(seq, 0xA5A5A5A5u);
+    const auto erases = flash.eraseOpCount();
+    const auto programs = flash.programOpCount();
+    const auto reads = flash.readOpCount();
+    flash.clearFault();
+    EXPECT_FALSE(tx.allocate(&seq));
+    EXPECT_EQ(seq, 0xA5A5A5A5u);
+    EXPECT_EQ(flash.eraseOpCount(), erases);
+    EXPECT_EQ(flash.programOpCount(), programs);
+    EXPECT_EQ(flash.readOpCount(), reads);
+    EXPECT_EQ(std::memcmp(flash.rawBuffer() + 2 * kLedgerEraseUnit, latest.data(), latest.size()), 0);
+    OtaTxSequenceAllocator reconstructed(region);
+    if (fault.recovery == LedgerRecovery::Unsafe) {
+      EXPECT_FALSE(reconstructed.allocate(&seq));
+      EXPECT_EQ(seq, 0xA5A5A5A5u);
+    } else {
+      ASSERT_TRUE(reconstructed.allocate(&seq));
+      EXPECT_EQ(seq, fault.recovery == LedgerRecovery::New ? 193u : 129u);
+    }
+    EXPECT_EQ(std::memcmp(flash.rawBuffer(), guard.data(), guard.size()), 0);
+    EXPECT_EQ(std::memcmp(flash.rawBuffer() + 3 * kLedgerEraseUnit, guard.data(), guard.size()), 0);
+  }
+}
+
+TEST(OtaRxReplayLedger, EveryEraseBodyMarkerAndReadbackCutFreezesEvenReorderedFrames) {
+  const auto cases = ledgerFaultCases();
+  ASSERT_EQ(cases.size(), 103u);
+  for (const auto& fault : cases) {
+    SCOPED_TRACE(::testing::Message() << int(fault.op) << "/" << int(fault.timing)
+                                     << "/" << fault.relative_count << "/" << fault.partial_bytes);
+    ota::test::FakeNorFlash flash(4 * kLedgerEraseUnit, kLedgerEraseUnit, 4);
+    const std::vector<uint8_t> guard(kLedgerEraseUnit, 0x3C);
+    ASSERT_TRUE(ota::platform::isOk(flash.program(0, guard.data(), guard.size())));
+    ASSERT_TRUE(ota::platform::isOk(flash.program(3 * kLedgerEraseUnit, guard.data(), guard.size())));
+    ota::platform::FlashRegion region(flash, kLedgerEraseUnit, kLedgerRegionBytes);
+    OtaRxReplayLedger rx(region, OtaSequenceInitialization::CommissionVirgin);
+    ASSERT_TRUE(rx.admit(50));
+    ASSERT_TRUE(rx.admit(100));
+    const std::vector<uint8_t> latest(flash.rawBuffer() + 2 * kLedgerEraseUnit,
+                                     flash.rawBuffer() + 3 * kLedgerEraseUnit);
+    armLedgerFault(flash, fault);
+    ASSERT_FALSE(rx.admit(150));
+    const auto erases = flash.eraseOpCount();
+    const auto programs = flash.programOpCount();
+    const auto reads = flash.readOpCount();
+    flash.clearFault();
+    EXPECT_FALSE(rx.admit(99));
+    EXPECT_FALSE(rx.admit(151));
+    EXPECT_EQ(flash.eraseOpCount(), erases);
+    EXPECT_EQ(flash.programOpCount(), programs);
+    EXPECT_EQ(flash.readOpCount(), reads);
+    EXPECT_EQ(std::memcmp(flash.rawBuffer() + 2 * kLedgerEraseUnit, latest.data(), latest.size()), 0);
+    OtaRxReplayLedger reconstructed(region);
+    if (fault.recovery == LedgerRecovery::Unsafe) {
+      EXPECT_FALSE(reconstructed.admit(151));
+    } else {
+      ASSERT_TRUE(reconstructed.load());
+      EXPECT_FALSE(reconstructed.admit(100));
+      EXPECT_FALSE(reconstructed.admit(50));
+      EXPECT_EQ(reconstructed.admit(150), fault.recovery == LedgerRecovery::Existing);
+      EXPECT_TRUE(reconstructed.admit(151));
+      EXPECT_FALSE(reconstructed.admit(50));
+    }
+    EXPECT_EQ(std::memcmp(flash.rawBuffer(), guard.data(), guard.size()), 0);
+    EXPECT_EQ(std::memcmp(flash.rawBuffer() + 3 * kLedgerEraseUnit, guard.data(), guard.size()), 0);
+  }
 }
 
 int main(int argc, char** argv) {
