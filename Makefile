@@ -59,6 +59,7 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
         lab-wait-client lab-wait-target \
         build-ota-targets build-ota-baseline-targets build-non-ota-targets \
         clean-xiao-nrf52-lab build-xiao-nrf52-lab build-xiao-nrf52-ota-lab upload-xiao-nrf52-client upload-xiao-nrf52-target upload-xiao-nrf52-lab \
+        flash-xiao-nrf52-client flash-xiao-nrf52-target flash-xiao-nrf52-lab \
         enter-xiao-nrf52-target-bootloader \
         install-xiao-nrf52-target-ota-bootloader \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
@@ -196,18 +197,27 @@ build-xiao-nrf52-ota-lab: tmpdir
 XIAO_NRF52_LAB_PACKAGE ?= .pio/build/Xiao_nrf52_companion_radio_usb/firmware.zip
 
 upload-xiao-nrf52-client: build-xiao-nrf52-lab
+	@$(MAKE) --no-print-directory flash-xiao-nrf52-client
+
+upload-xiao-nrf52-target: build-xiao-nrf52-lab
+	@$(MAKE) --no-print-directory flash-xiao-nrf52-target
+
+upload-xiao-nrf52-lab: upload-xiao-nrf52-client upload-xiao-nrf52-target
+
+## Flash an existing package without rebuilding the source.
+flash-xiao-nrf52-client: tmpdir
 	@mkdir -p $(OTA_LAB_ARTIFACT_DIR)
-	@$(LAB_DEVICE) flash client --package $(XIAO_NRF52_LAB_PACKAGE) \
+	@$(LAB_DEVICE) flash client --package "$(XIAO_NRF52_LAB_PACKAGE)" \
 	  > $(OTA_LAB_ARTIFACT_DIR)/flash-client.log 2>&1; \
 	  result=$$?; cat $(OTA_LAB_ARTIFACT_DIR)/flash-client.log; exit $$result
 
-upload-xiao-nrf52-target: build-xiao-nrf52-lab
+flash-xiao-nrf52-target: tmpdir
 	@mkdir -p $(OTA_LAB_ARTIFACT_DIR)
-	@$(LAB_DEVICE) flash target --package $(XIAO_NRF52_LAB_PACKAGE) \
+	@$(LAB_DEVICE) flash target --package "$(XIAO_NRF52_LAB_PACKAGE)" \
 	  > $(OTA_LAB_ARTIFACT_DIR)/flash-target.log 2>&1; \
 	  result=$$?; cat $(OTA_LAB_ARTIFACT_DIR)/flash-target.log; exit $$result
 
-upload-xiao-nrf52-lab: upload-xiao-nrf52-client upload-xiao-nrf52-target
+flash-xiao-nrf52-lab: flash-xiao-nrf52-client flash-xiao-nrf52-target
 
 enter-xiao-nrf52-target-bootloader: tmpdir
 	@$(LAB_DEVICE) bootloader target

@@ -61,6 +61,18 @@ of use makes that a non-event.
 | `make lab-power-cycle-<role>` | Cut and restore USB port power |
 | `make lab-wait-<role>` | Block until the board enumerates |
 | `make upload-xiao-nrf52-<role>` | Build and flash the companion lab firmware |
+| `make flash-xiao-nrf52-<role>` | Flash an existing companion package without rebuilding |
+
+For an immutable application snapshot, pass its package path explicitly:
+
+```sh
+make flash-xiao-nrf52-lab XIAO_NRF52_LAB_PACKAGE=/absolute/path/to/firmware.zip \
+  OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/snapshot-flash
+```
+
+Use an application-only DFU package. This flashes only the configured
+client and target without rebuilding concurrently edited source. Custom
+bootloader commissioning uses the separate guarded installer.
 
 ## Why these mechanisms
 
@@ -122,6 +134,16 @@ built and tested separately and remains unproven end to end. See the
 [LoRa OTA developer guide](lora_ota_development.md#current-hardware-evidence)
 for the current, dated evidence ledger and its explicit gaps before quoting
 any hardware result from this lab elsewhere.
+
+The latest stock-only integration qualification is **not passing**. Both
+authorized boards boot the frozen application and exchange ordinary radio
+traffic, but signed staging aborts before authorization. The independent
+2% pressure run stays within 71,663/72,000 ms while ordinary advert
+allocation still fails with `ERR_TABLE_FULL`. Earlier signed-staging
+results do not establish success for this newer artifact. Evidence is in
+`.tmp/ota-rf-lab/stock-floor-gated-qualification/` and
+`.tmp/ota-rf-lab/stock-floor-gated-airtime/`; neither run proves a firmware
+installation, reboot resume or completed multicast repair.
 
 ## Bootloader commissioning preflight
 
