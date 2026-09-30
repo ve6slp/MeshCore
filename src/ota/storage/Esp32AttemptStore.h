@@ -42,6 +42,16 @@ public:
                                             const Esp32AttemptRecord& /*next*/) const {
     return false;
   }
+
+  // Explicit qualified cancellation of this exact revoked active attempt,
+  // authenticated against current commissioned security, not its old grant.
+  // Positively exclude installer/trial ownership; unknown ownership is not
+  // authorization. Hold this permission and exclusive metadata ownership
+  // through the synchronous save. This NEVER authorizes consent restoration,
+  // progress, installation or a subsequent attempt. Unsupported fails closed.
+  virtual bool authorizeRevokedAbort(const Esp32AttemptRecord& /*revoked*/) const {
+    return false;
+  }
 };
 
 class Esp32AttemptCodec {
@@ -206,6 +216,57 @@ public:
     return save(next);
   }
 
+  // Metadata-only Revoked -> Aborted for Admitted/Erasing/Receiving ONLY.
+  // Freeze and match the ENTIRE winning checkpoint; change only its phase.
+  // Recheck validated security and the winning generation after callbacks,
+  // and require fresh inactive-slot/lease/boot/trial validation. Never retire
+  // Staged here, grant consent, advance progress or erase/program any image.
+  // Always leave flash unbound. A future campaign still requires its OWN
+  // explicit replaceTerminal authorization, fresh consent and SDK binding.
+  Esp32PersistenceResult abortRevoked(const Esp32AttemptRecord& expected_checkpoint) {
+    flash_.unbind();
+    const Esp32AttemptRecord expected = expected_checkpoint;
+    if (!Esp32AttemptCodec::valid(expected)) return {Esp32PersistenceStatus::InvalidArgument};
+    Esp32DurableBlob security;
+    auto loaded = securityReady(&security);
+    if (!loaded.ok()) return loaded;
+    Esp32DurableBlob stored;
+    loaded = blobs_.load(Esp32BlobKind::Attempt, stored);
+    if (!loaded.ok()) return loaded;
+    Esp32AttemptRecord current;
+    if (!Esp32AttemptCodec::decode(stored.payload, stored.size, current))
+      return {Esp32PersistenceStatus::Corrupt};
+    if (!sameCheckpoint(current, expected) || current.consent != Esp32ConsentState::Revoked ||
+        current.phase == Esp32StagingPhase::Staged || current.phase == Esp32StagingPhase::Aborted)
+      return {Esp32PersistenceStatus::Conflict};
+    if (stored.generation == UINT32_MAX) return {Esp32PersistenceStatus::GenerationExhausted};
+    const auto capacity = blobs_.capacity(Esp32AttemptCodec::kBytes);
+    if (!capacity.ok()) return capacity;
+    if (!policy_.authorizeRevokedAbort(current)) return {Esp32PersistenceStatus::OwnershipDenied};
+    const auto binding = bind(current);
+    flash_.unbind();
+    if (!binding.ok()) return binding;
+    // No policy callback after these reads: a callback must not invalidate
+    // the security it was authorized against or replace the winning record.
+    Esp32DurableBlob latest_security;
+    loaded = blobs_.load(Esp32BlobKind::Security, latest_security);
+    if (!loaded.ok()) return loaded;
+    if (latest_security.generation != security.generation ||
+        latest_security.size != security.size ||
+        memcmp(latest_security.payload, security.payload, security.size) != 0)
+      return {Esp32PersistenceStatus::Conflict};
+    Esp32DurableBlob latest;
+    loaded = blobs_.load(Esp32BlobKind::Attempt, latest);
+    if (!loaded.ok()) return loaded;
+    Esp32AttemptRecord latest_record;
+    if (!Esp32AttemptCodec::decode(latest.payload, latest.size, latest_record))
+      return {Esp32PersistenceStatus::Corrupt};
+    if (latest.generation != stored.generation || !sameCheckpoint(current, latest_record))
+      return {Esp32PersistenceStatus::Conflict};
+    current.phase = Esp32StagingPhase::Aborted;
+    return save(current);
+  }
+
   // Resume only reads metadata and rebinds a fresh inactive partition.
   // It never erases the slot or resets durable progress/consent.
   Esp32PersistenceResult resume(Esp32AttemptRecord& out) {
@@ -271,12 +332,13 @@ private:
            (from == Esp32StagingPhase::Receiving && to == Esp32StagingPhase::Staged);
   }
 
-  Esp32PersistenceResult securityReady() {
+  Esp32PersistenceResult securityReady(Esp32DurableBlob* validated = nullptr) {
     Esp32DurableBlob security;
     const auto loaded = blobs_.load(Esp32BlobKind::Security, security);
     if (!loaded.ok()) return loaded;
     if (!policy_.commissionedSecurityValid(security.payload, security.size))
       return {Esp32PersistenceStatus::Corrupt};
+    if (validated != nullptr) *validated = security;
     return {};
   }
 

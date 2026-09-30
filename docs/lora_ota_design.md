@@ -246,7 +246,15 @@ shared policy proves no installer or trial still owns it. Replacement
 never resets security/TX/RX history or erases candidate bytes, and does not
 repair corrupt or uncertain metadata.
 
-The bounded storage checkpoint passes 61 native cases and compiles for the
+Revoked active attempts cannot resume. A separate default-deny
+`abortRevoked()` transition can move an exact Admitted, Erasing or
+Receiving checkpoint to Aborted with explicit policy authorization and
+fresh security, metadata-generation and SDK ownership checks. It preserves
+revoked consent, all progress and immutable fields; it never retires Staged
+installer ownership, grants old consent or erases image bytes. A later
+replacement requires its own fresh authorization and consent.
+
+The bounded storage checkpoint passes 78 native cases and compiles for the
 actual XIAO S3/Wio environment. It is **not connected to the board receiver**:
 the update-ownership arbiter, commissioned security/AEAD ledger schemas and
 local-consent policy must be supplied by shared integration. Unreferenced
