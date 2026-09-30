@@ -196,7 +196,8 @@ reserved QSPI test partition.
 
 ## Implementation status for this repository
 
-The portable OTA core lives under `src/ota/` and is header-only:
+The portable OTA core lives under `src/ota/`. Most components are header-only;
+the ESP32 partition and NVS SDK boundaries have separate `.cpp` adapters:
 
 - `src/ota/protocol/` — wire types, byte stream codec, envelope, canonical
   descriptor, message set
@@ -218,6 +219,32 @@ and run via `make test`.
 The earlier `src/helpers/LoraOtaPolicy.h` planning prototype and its tests have
 been removed; `src/ota/runtime/` supersedes them.
 
+### ESP32-S3 storage checkpoint
+
+`Esp32FlashAdapter` now uses real IDF partition I/O, restricted to the
+freshly selected inactive application slot in the existing 8 MiB partition
+table. It rechecks running/boot selection, trial state, partition identity
+and exclusive updater ownership before each operation. The compatibility
+geometry-only constructor still refuses I/O. No bulk operation can address
+the running image, filesystem, NVS, otadata or bootloader.
+
+Dedicated `nvs/mesh_ota` primitives store versioned, big-endian CRC-protected
+blobs using nonwrapping generations, explicit provisioning and commit plus
+fresh readback. Missing commissioned security state, corrupt records,
+capacity failures and ambiguous durability are explicit refusals, never
+automatic NVS erasure or counter reset. Attempt records preserve the signed
+descriptor, controller/session binding, partition identity, consent and
+progress; resume does not erase the candidate.
+
+The bounded storage checkpoint passes 37 native cases and compiles for the
+actual XIAO S3/Wio environment. It is **not connected to the board receiver**:
+the update-ownership arbiter, commissioned security/AEAD ledger schemas and
+local-consent policy must be supplied by shared integration. Unreferenced
+SDK boundary objects are currently discarded by the linker. No boot
+selection or mark-valid call is implemented, and stock Arduino's early
+trial confirmation/watchdog behavior remains an installation blocker.
+No ESP32 hardware qualification is claimed.
+
 ### What this does not yet prove
 
 Software tests cannot qualify device behaviour. The following remain open
@@ -226,11 +253,13 @@ acceptance gates and are deliberately not claimed as done:
 - the stock Adafruit bootloader cannot consume a QSPI-staged image, so the
   application-side nRF52840 adapter does not by itself qualify installation
   or rollback
-- the ESP32 platform adapter has no `esp_flash`/partition glue
-- the monotonic anti-rollback counter is interface-only; no eFuse/UICR/NVS
-  backend exists
-- real radio behaviour, real flash timing, and power-loss rollback are
-  untested outside simulation
+- ESP32 partition/NVS primitives do not qualify receiver integration, trial
+  confirmation or installation
+- ESP32 security-counter and AEAD ledgers are not connected to those NVS
+  primitives; boot-enforced eFuse anti-rollback is not qualified
+- stock nRF RF staging and airtime fairness have hardware evidence (see
+  [the lab guide](hardware_lab.md)); actual installation, trial confirmation
+  and power-loss rollback remain unqualified
 
 ## Follow-up execution plan
 
