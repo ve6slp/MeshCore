@@ -134,6 +134,10 @@ make test-xiao-nrf52-ota-airtime       # same harness, airtime/duty-cycle stress
                                         # (skips normal-traffic precedence, direct-mode
                                         # lease, fleet-control probes, and signed staging)
 make validate-xiao-nrf52-qspi-hardware # run the on-target QSPI hardware test
+make test-xiao-ota-bootloader-tools    # host tests for installer and artifact tooling
+make verify-xiao-ota-boot-info-artifacts # check actual HEX/UF2 markers, keys and UF2 admissibility
+                                        # (XIAO_OTA_BOARD=xiao_nrf52840 default, or
+                                        # XIAO_OTA_BOARD=sensecap_solar_p1)
 ```
 
 `make test-xiao-nrf52-ota-airtime` exercises only the airtime/duty-cycle
@@ -142,9 +146,11 @@ budget check against whatever firmware is already flashed on `client` and
 current state of the source tree. It accepts the same `OTA_LAB_DUTY_TIMEOUT`
 override as `test-xiao-nrf52-ota-lab` (default 420 seconds) for longer
 stress runs, e.g. `make test-xiao-nrf52-ota-airtime OTA_LAB_DUTY_TIMEOUT=900`.
-As of this writing a longer stress run is in progress and this target is
-**not yet qualified** — do not cite a pass or fail result for it until one
-is confirmed.
+The recorded pressure run reached 71,851 of 72,000 ms permitted airtime,
+but ordinary advert allocation failed with `ERR_TABLE_FULL`. The airtime
+acceptance gate now also requires ordinary advert allocation and reception
+from the expected peer under pressure. A numerical quota pass alone is
+not a passing background-service result.
 
 `scripts/ota_rf_lab.py` drives both boards over serial, sends and waits for
 OTA envelopes and adverts, and writes machine-readable evidence
@@ -198,7 +204,6 @@ Verified:
   Evidence also carries explicit `install_or_boot_claim: false` and
   `reboot_resume_claim: false` flags — this pass is staging into QSPI
   only, not an install.
-
   **This was an isolated run and must not be read as a full RF baseline
   pass.** `test-xiao-nrf52-ota-stage` deliberately skips the
   normal-traffic-precedence probe, the direct-mode radio lease, the
@@ -208,25 +213,35 @@ Verified:
   recently failed its `normal-traffic-precedence` check
   **nondeterministically**: the command that queues the synthetic
   advert-then-OTA-announcement flood returned success, but no advert event
-  was observed on the receiving side within the check's window. The root
-  cause is unresolved — it could be a queueing, radio seen-hash, or PHY
-  timing issue, and none of those is confirmed — so do not describe
-  normal-traffic precedence, the direct-mode lease, or the fleet-control
-  probes as currently passing until the failure is root-caused and the
-  full harness is re-run clean.
+  was observed on the receiving side within the check's window. Identical
+  same-second adverts are legitimately deduplicated, so the host fixture
+  now uses fresh advert bytes and requires enqueue success. These host
+  corrections are not a hardware pass: normal-traffic precedence, the
+  direct-mode lease and fleet-control probes still require a clean rerun.
+- **Bootloader packaging/offline tooling gate** (`make
+  test-xiao-ota-bootloader-tools`, `make verify-xiao-ota-boot-info-artifacts`,
+  both `XIAO_OTA_BOARD=xiao_nrf52840` default and
+  `XIAO_OTA_BOARD=sensecap_solar_p1`): cached HEX/UF2 marker and key
+  checks, and full no-SWD UF2 family/address admissibility, have passed.
+  These are offline artifact checks — they do **not** exercise a custom
+  bootloader install on physical hardware, and no such install has
+  happened. Do not describe this gate as bootloader-install evidence.
 - The previous 160-byte OTA chunk size, which didn't fit the companion
   serial frame, has been replaced with a 128-byte chunk (fitting the
   184-byte `kOtaMaxFrameSize`, the 255-byte LoRa payload limit, and the
-  64-byte mesh path field). **A zero-hop raw chunk frame (155 bytes) does
-  fit the 176-byte companion serial frame.** An encrypted, full-path
-  (multi-hop) chunk does **not**: with the existing 2-byte cipher MAC it
-  costs 237 bytes, and with a 16-byte auth tag it costs 251 bytes — both
-  over the 176-byte serial limit, even though both fit comfortably under
-  the 255-byte RF payload limit (235 and 249 bytes respectively). An
-  autonomous cache engine that would let the runtime keep each serial
-  write at or under ~145 bytes to close this gap is a **proposed design**,
-  not an implemented or tested mechanism — do not describe chunked
-  full-route transfer over the current serial link as working.
+  64-byte mesh path field). The required strong transport uses a 16-byte tag, a
+  4-byte sequence number, and AES padding, with a 156-byte plaintext
+  ceiling that includes a 21-byte envelope. A 128-byte chunk therefore
+  becomes a 155-byte plaintext, a 179-byte payload once wrapped by the
+  strong transport, and up to 249 bytes on the wire in the worst-case
+  multi-hop RF path (64-byte path plus 4-byte scope) — under the
+  255-byte RF limit but over the 176-byte companion serial limit. Do not
+  use the smaller, weaker 2-byte MAC variant instead, and do not claim
+  the raw serial link can hold an encrypted, full-path frame at this
+  size. This is a transport budget, not proof of an integrated encrypted
+  transfer. The autonomous updater must cache bounded serial uploads and
+  construct authenticated RF frames locally; that production integration
+  is not yet qualified.
 
 **Fixed, previously failed** — a signed wire-descriptor transfer (`recv7`)
 failed in an earlier run. The root cause was a byte-order (little-endian
@@ -234,15 +249,45 @@ vs. big-endian) mismatch in how the descriptor was framed on the wire. As
 described above, the descriptor format is now defined and used as a single
 59-byte big-endian layout end to end, and the fix is exercised by both a
 new native C++ test in `test/test_lora_ota_protocol/` and the RF lab
-harness. A separate, older wire authentication scheme — command version 1,
-using a 71-byte little-endian descriptor — also exists; it has no
-connection to the durable floor/state/confirmation boot record (also
-called version 1), which is a distinct, independent on-flash record
-unaffected by this fix.
+harness. The on-flash command-version-2 bootloader record carrying this
+descriptor is 188 bytes; it is not a companion wire frame. Legacy install
+command version 1 uses an independently signed 71-byte little-endian
+descriptor. Command versions are separate from the durable state, floor
+and confirmation record versions: those remain version 1, with the state
+record exactly 152 bytes and the confirmation record 64 bytes.
+
+The install-attempt contract binds a 32-byte controller public key, a
+32-bit campaign ID, a 32-bit session ID, a 16-bit attempt ID and the
+descriptor's SHA-256 digest. A stable, full 64-bit nonce is reused for the
+same context; retrying a failed image requires a new explicitly
+consented attempt after recovery, with a counter above the confirmed
+floor. Receiving or staging
+group chunks does not by itself grant install authority — only an
+explicit, consented attempt can do that.
+
+**Boot-trial and confirmation acceptance criteria — design only, not yet
+implemented or proven.** The adopted (not yet built) contract for
+deciding whether a staged install becomes "Installed/Confirmed" is:
+health is only considered continuously good after 10 uninterrupted
+seconds following an actual readiness/image check (not a stub); any gap
+between health-loop iterations longer than 1 second restarts that
+10-second timer from zero. CRC/SHA verification during the loop is
+bounded and incremental — the ordinary health loop does not recompute a
+full image hash on every pass. The boot trial runs under a 60-second
+watchdog using reload-request register 0 (RR0), which the trial application
+must not feed. The application has a 45-second confirmation deadline.
+Confirmation requires writing and verifying the body before separately
+writing and verifying the final commit marker, followed by exactly one
+controlled reboot. The bootloader then persists and verifies the floor
+before the CONFIRMED state, recovering that transaction idempotently after
+interruption. Only once the floor, the state record, and the
+running image hash all subsequently match is an attempt considered
+Installed/Confirmed. None of this sequence has been exercised on
+hardware yet — treat it strictly as acceptance criteria to build and test
+against, not as a result.
 
 Not verified, and not to be represented as done in any documentation or
 release notes:
-
 - Full three-mode signed firmware transfer and install on real hardware.
   Signed staging (descriptor through commit) has now passed in an isolated
   run on `target`, but a confirmed clean pass of the full RF harness
