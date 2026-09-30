@@ -17,6 +17,13 @@
 #define COPY_CHUNK 256u
 
 static uint8_t io_buffer[COPY_CHUNK] __attribute__((aligned(4)));
+/*
+ * QSPI EasyDMA (NRF_QSPI->WRITE.SRC / READ.DST) can only address Data RAM on
+ * the nRF52840; it cannot DMA directly out of internal code flash. This
+ * staging buffer lets copy_internal_to_qspi() read a chunk of the running
+ * application (code flash) with the CPU first, then hand QSPI a RAM pointer.
+ */
+static uint8_t flash_stage_buffer[COPY_CHUNK] __attribute__((aligned(4)));
 
 static void qspi_wait(void) {
   while (NRF_QSPI->EVENTS_READY == 0) {}
@@ -114,37 +121,51 @@ static bool all_equal(const uint8_t a[32], const uint8_t b[32]) {
   return difference == 0;
 }
 
-static bool command_policy_valid(const xiao_ota_command_t *command,
+/*
+ * Authenticates and authorizes a command record of EITHER supported
+ * version and produces the normalized install intent. Version is
+ * determined at the structural-validity/decode step ONLY, from
+ * record_version -- there is no signature-format fallback or "try both"
+ * behaviour: v1 is checked exclusively against its own 71-byte
+ * little-endian descriptor and signature; v2 is checked exclusively
+ * against its own 59-byte big-endian wire descriptor and signature (the
+ * SAME bytes and signature the LoRa OTA transport already verified -- see
+ * xiao_ota_command_v2_t in xiao_ota_record.h). All non-cryptographic
+ * policy checks (target/role/address/counter/capability/extent/device)
+ * are shared in xiao_ota_install_command_policy_valid() so both versions
+ * are held to the exact same install policy.
+ */
+static bool command_policy_valid(const xiao_ota_command_any_t *any,
                                  uint32_t counter_floor,
-                                 uint32_t expected_active_extent) {
-  const xiao_ota_canonical_descriptor_t *d = &command->descriptor;
+                                 uint32_t expected_active_extent,
+                                 xiao_ota_install_command_t *out_intent) {
+  uint16_t version;
   const uint64_t device_address =
       ((uint64_t)NRF_FICR->DEVICEID[1] << 32) | NRF_FICR->DEVICEID[0];
-  const uint32_t image_size = d->image_size_bytes_le;
-  if (!xiao_ota_command_valid(command) ||
-      d->target_id_le != XIAO_OTA_TARGET_XIAO_NRF52840 ||
-      d->role_id_le != XIAO_OTA_ROLE_ANY ||
-      d->app_address_le != XIAO_OTA_APP_START ||
-      d->format_id_le != XIAO_OTA_DESCRIPTOR_FORMAT ||
-      d->key_id_le != XIAO_OTA_KEY_ID ||
-      d->algorithm_id_le != XIAO_OTA_ALGORITHM_ED25519 ||
-      (d->required_boot_capability_flags_le & XIAO_OTA_CAP_QSPI_INSTALL) == 0 ||
-      d->monotonic_counter_le <= counter_floor ||
-      image_size == 0 || image_size > XIAO_OTA_CANDIDATE_SIZE ||
-      (image_size & 3u) != 0 ||
-      command->active_image_extent == 0 ||
-      command->active_image_extent > XIAO_OTA_BACKUP_SIZE ||
-      (command->active_image_extent & 3u) != 0 ||
-      command->active_image_extent != expected_active_extent) {
+  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
+  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
+    if (!xiao_ota_command_valid(&any->v1)) return false;
+    if (!xiao_ota_install_command_from_v1(&any->v1, out_intent)) return false;
+    if (ed25519_verify(any->v1.signature_ed25519,
+                       (const unsigned char *)&any->v1.descriptor,
+                       sizeof(any->v1.descriptor),
+                       xiao_ota_lab_public_key_ed25519) != 1) {
+      return false;
+    }
+  } else if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
+    if (!xiao_ota_command_v2_valid(&any->v2)) return false;
+    if (!xiao_ota_install_command_from_v2(&any->v2, out_intent)) return false;
+    if (ed25519_verify(any->v2.signature_ed25519, any->v2.wire_descriptor,
+                       XIAO_OTA_WIRE_DESCRIPTOR_SIZE,
+                       xiao_ota_lab_public_key_ed25519) != 1) {
+      return false;
+    }
+  } else {
     return false;
   }
-  if (d->device_address_le != device_address &&
-      !(d->device_address_le == 0 && d->allow_broadcast_address == 1)) {
-    return false;
-  }
-  return ed25519_verify(command->signature_ed25519,
-                        (const unsigned char *)d, sizeof(*d),
-                        xiao_ota_lab_public_key_ed25519) == 1;
+  return xiao_ota_install_command_policy_valid(out_intent, counter_floor,
+                                               expected_active_extent,
+                                               device_address);
 }
 
 static bool read_pair(uint32_t a_address, uint32_t b_address, void *a, void *b,
@@ -216,18 +237,21 @@ static bool write_boot_settings(uint16_t bank_0, uint16_t bank_0_crc,
                 sizeof(settings)) == 0;
 }
 
-static uint32_t active_extent_from_settings(
-    const bootloader_settings_t *settings) {
-  if (settings->bank_0 != BANK_VALID_APP ||
-      settings->bank_0_crc == 0 ||
-      settings->bank_0_size == 0 ||
-      settings->bank_0_size > XIAO_OTA_APP_MAX_SIZE ||
-      crc16_compute((const uint8_t *)XIAO_OTA_APP_START,
-                    settings->bank_0_size, NULL) != settings->bank_0_crc) {
-    return XIAO_OTA_APP_MAX_SIZE;
+/* Thin wrapper: reads real internal flash (fresh CRC-16 recompute) and
+ * defers the fail-closed decision to xiao_ota_resolve_active_extent()
+ * (xiao_ota_record.c), which is what test_record.c exercises host-side. */
+static bool active_extent_from_settings(
+    const bootloader_settings_t *settings, uint32_t *out_extent) {
+  uint16_t recomputed_crc16 = 0xFFFFu;
+  if (settings->bank_0 == BANK_VALID_APP && settings->bank_0_size != 0 &&
+      settings->bank_0_size <= XIAO_OTA_APP_MAX_SIZE) {
+    recomputed_crc16 = crc16_compute((const uint8_t *)XIAO_OTA_APP_START,
+                                     settings->bank_0_size, NULL);
   }
-  return xiao_ota_safe_backup_extent(settings->bank_0_size,
-                                     XIAO_OTA_APP_MAX_SIZE);
+  return xiao_ota_resolve_active_extent(
+      settings->bank_0 == BANK_VALID_APP, settings->bank_0_crc,
+      settings->bank_0_size, recomputed_crc16, XIAO_OTA_APP_MAX_SIZE,
+      out_extent);
 }
 
 static bool copy_internal_to_qspi(xiao_ota_state_t *state) {
@@ -240,10 +264,10 @@ static bool copy_internal_to_qspi(xiao_ota_state_t *state) {
     qspi_erase_sector(XIAO_OTA_BACKUP_BASE + offset);
     while (offset < end) {
       uint32_t n = end - offset > COPY_CHUNK ? COPY_CHUNK : end - offset;
-      qspi_write(XIAO_OTA_BACKUP_BASE + offset,
-                 (const void *)(XIAO_OTA_APP_START + offset), n);
+      memcpy(flash_stage_buffer, (const void *)(XIAO_OTA_APP_START + offset), n);
+      qspi_write(XIAO_OTA_BACKUP_BASE + offset, flash_stage_buffer, n);
       qspi_read(XIAO_OTA_BACKUP_BASE + offset, io_buffer, n);
-      if (memcmp(io_buffer, (const void *)(XIAO_OTA_APP_START + offset), n) != 0)
+      if (memcmp(io_buffer, flash_stage_buffer, n) != 0)
         return false;
       offset += n;
     }
@@ -283,9 +307,10 @@ static void start_trial_watchdog(void) {
 }
 
 void xiao_ota_boot_process(void) {
-  xiao_ota_command_t command_a __attribute__((aligned(4)));
-  xiao_ota_command_t command_b __attribute__((aligned(4)));
-  xiao_ota_command_t command __attribute__((aligned(4)));
+  xiao_ota_command_any_t command_a __attribute__((aligned(4)));
+  xiao_ota_command_any_t command_b __attribute__((aligned(4)));
+  xiao_ota_command_any_t command __attribute__((aligned(4)));
+  xiao_ota_install_command_t intent __attribute__((aligned(4)));
   xiao_ota_state_t state_a __attribute__((aligned(4)));
   xiao_ota_state_t state_b __attribute__((aligned(4)));
   xiao_ota_state_t state __attribute__((aligned(4)));
@@ -296,8 +321,9 @@ void xiao_ota_boot_process(void) {
   xiao_ota_floor_t floor_b __attribute__((aligned(4)));
   xiao_ota_floor_t floor __attribute__((aligned(4)));
   uint8_t digest[32] __attribute__((aligned(4)));
-  bool have_state, have_floor, confirmed;
-  uint32_t expected_active_extent;
+  bool have_state, have_floor, confirmed, floor_trustworthy;
+  bool have_active_extent;
+  uint32_t expected_active_extent = 0;
   const bootloader_settings_t *boot_settings;
 
   /*
@@ -308,41 +334,71 @@ void xiao_ota_boot_process(void) {
 
   qspi_init();
   if (!read_pair(XIAO_OTA_COMMAND_A, XIAO_OTA_COMMAND_B, &command_a, &command_b,
-                 sizeof(command), (bool (*)(const void *))xiao_ota_command_valid,
-                 &command)) {
+                 sizeof(command), xiao_ota_command_any_valid, &command)) {
     memset(&command, 0, sizeof(command));
+  }
+  /* Structural-only decode (no signature check yet); zeroed on failure so
+   * downstream field reads below see 0, matching the pre-refactor behaviour
+   * of an all-zero `command` when read_pair() failed. */
+  if (!xiao_ota_install_command_decode(&command, &intent)) {
+    memset(&intent, 0, sizeof(intent));
   }
   have_state = read_pair(XIAO_OTA_STATE_A, XIAO_OTA_STATE_B, &state_a, &state_b,
                          sizeof(state), (bool (*)(const void *))xiao_ota_state_valid,
                          &state);
+  if (!have_state) memset(&state, 0, sizeof(state));
   have_floor = read_pair(XIAO_OTA_FLOOR_A, XIAO_OTA_FLOOR_B, &floor_a, &floor_b,
                          sizeof(floor), (bool (*)(const void *))xiao_ota_floor_valid,
                          &floor);
-  if (!have_floor) memset(&floor, 0, sizeof(floor));
+  if (!have_floor) {
+    /*
+     * Fail-closed distinction (see is_erased_bytes()): only a genuinely
+     * blank pair of floor slots (both fully erased, i.e. this device has
+     * never completed an OTA install) is safe to treat as "counter floor
+     * 0". Anything else that failed structural validation -- a torn
+     * write, bit rot, or leftover unrelated data from before OTA
+     * provisioning -- is floor damage, not "no floor yet", and must not
+     * silently reopen the anti-rollback counter at 0.
+     */
+    floor_trustworthy = xiao_ota_bytes_erased(&floor_a, sizeof(floor_a)) &&
+                        xiao_ota_bytes_erased(&floor_b, sizeof(floor_b));
+    memset(&floor, 0, sizeof(floor));
+  } else {
+    floor_trustworthy = true;
+  }
   bootloader_util_settings_get(&boot_settings);
-  expected_active_extent = floor.active_image_extent != 0
-                               ? floor.active_image_extent
-                               : active_extent_from_settings(boot_settings);
-  if (!have_state || state.phase == XIAO_OTA_PHASE_EMPTY ||
-      state.phase == XIAO_OTA_PHASE_CONFIRMED) {
-    if (!command_policy_valid(&command, floor.confirmed_counter_floor,
-                              expected_active_extent)) {
+  /* Always re-derive the active extent from what is actually in internal
+   * flash right now (fresh BANK_VALID_APP + nonzero bounded size + a
+   * recomputed CRC-16 over that exact extent) -- never from
+   * floor.active_image_extent, which only reflects whatever OTA install
+   * last completed and goes stale the moment a user reflashes a different
+   * image over USB/CDC without going through this bootloader at all.
+   * Missing/invalid fresh metadata fails closed (have_active_extent=false)
+   * rather than silently substituting a guessed extent. This does not
+   * touch floor.confirmed_counter_floor, which remains the sole
+   * anti-rollback authority regardless of bank-0 state. */
+  have_active_extent = active_extent_from_settings(boot_settings,
+                                                    &expected_active_extent);
+  if (xiao_ota_command_acceptable_phase(have_state, (xiao_ota_phase_t)state.phase)) {
+    if (!floor_trustworthy || !have_active_extent ||
+        !command_policy_valid(&command, floor.confirmed_counter_floor,
+                              expected_active_extent, &intent)) {
       return;
     }
-    hash_qspi(XIAO_OTA_CANDIDATE_BASE, command.descriptor.image_size_bytes_le, digest);
-    if (!all_equal(digest, command.descriptor.image_hash_sha256)) return;
-    hash_internal(XIAO_OTA_APP_START, command.active_image_extent, digest);
-    if (!all_equal(digest, command.active_image_hash_sha256)) return;
+    hash_qspi(XIAO_OTA_CANDIDATE_BASE, intent.image_size_bytes, digest);
+    if (!all_equal(digest, intent.image_hash_sha256)) return;
+    hash_internal(XIAO_OTA_APP_START, intent.active_image_extent, digest);
+    if (!all_equal(digest, intent.active_image_hash_sha256)) return;
     memset(&state, 0, sizeof(state));
-    state.transaction_nonce = command.transaction_nonce;
+    state.transaction_nonce = intent.transaction_nonce;
     state.phase = XIAO_OTA_PHASE_BACKUP_COPYING;
-    state.active_image_extent = command.active_image_extent;
-    state.candidate_counter = command.descriptor.monotonic_counter_le;
+    state.active_image_extent = intent.active_image_extent;
+    state.candidate_counter = intent.monotonic_counter;
     state.previous_bank_0 = boot_settings->bank_0;
     state.previous_bank_0_crc = boot_settings->bank_0_crc;
     state.previous_bank_0_size = boot_settings->bank_0_size;
-    memcpy(state.candidate_hash_sha256, command.descriptor.image_hash_sha256, 32);
-    memcpy(state.backup_hash_sha256, command.active_image_hash_sha256, 32);
+    memcpy(state.candidate_hash_sha256, intent.image_hash_sha256, 32);
+    memcpy(state.backup_hash_sha256, intent.active_image_hash_sha256, 32);
     persist_state(&state);
   }
 
@@ -356,19 +412,22 @@ void xiao_ota_boot_process(void) {
   }
   if (state.phase == XIAO_OTA_PHASE_BACKUP_READY ||
       state.phase == XIAO_OTA_PHASE_INSTALL_COPYING) {
-    if (!command_policy_valid(&command, floor.confirmed_counter_floor,
-                              expected_active_extent) ||
-        command.transaction_nonce != state.transaction_nonce ||
-        !all_equal(command.descriptor.image_hash_sha256,
-                   state.candidate_hash_sha256)) {
+    /* have_active_extent is re-checked explicitly (not just relying on the
+     * expected_active_extent==0 default) so a bank-0 metadata failure mid-
+     * transaction always rolls back, defense-in-depth alongside the
+     * initial acceptance gate above. */
+    if (!floor_trustworthy || !have_active_extent ||
+        !command_policy_valid(&command, floor.confirmed_counter_floor,
+                              expected_active_extent, &intent) ||
+        intent.transaction_nonce != state.transaction_nonce ||
+        !all_equal(intent.image_hash_sha256, state.candidate_hash_sha256)) {
       state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
       state.progress_bytes = 0;
       persist_state(&state);
     }
     if (state.phase != XIAO_OTA_PHASE_ROLLBACK_COPYING &&
         state.progress_bytes == 0) {
-      hash_qspi(XIAO_OTA_CANDIDATE_BASE,
-                command.descriptor.image_size_bytes_le, digest);
+      hash_qspi(XIAO_OTA_CANDIDATE_BASE, intent.image_size_bytes, digest);
       if (!all_equal(digest, state.candidate_hash_sha256)) {
         state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
         persist_state(&state);
@@ -378,20 +437,18 @@ void xiao_ota_boot_process(void) {
       state.phase = XIAO_OTA_PHASE_INSTALL_COPYING;
       persist_state(&state);
       if (!copy_qspi_to_internal(&state, XIAO_OTA_CANDIDATE_BASE,
-                                 command.descriptor.image_size_bytes_le)) {
+                                 intent.image_size_bytes)) {
         state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
         state.progress_bytes = 0;
         persist_state(&state);
       } else {
-        hash_internal(XIAO_OTA_APP_START,
-                      command.descriptor.image_size_bytes_le, digest);
+        hash_internal(XIAO_OTA_APP_START, intent.image_size_bytes, digest);
         if (!all_equal(digest, state.candidate_hash_sha256)) {
           state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
           state.progress_bytes = 0;
           persist_state(&state);
         } else {
-          const uint32_t candidate_size =
-              command.descriptor.image_size_bytes_le;
+          const uint32_t candidate_size = intent.image_size_bytes;
           const uint16_t candidate_crc =
               crc16_compute((const uint8_t *)XIAO_OTA_APP_START,
                             candidate_size, NULL);
@@ -421,7 +478,10 @@ void xiao_ota_boot_process(void) {
               xiao_ota_confirmation_matches(&state, &confirmation);
   if (state.phase == XIAO_OTA_PHASE_TRIAL_BOOT && confirmed) {
     floor.confirmed_counter_floor = state.candidate_counter;
-    floor.active_image_extent = command.descriptor.image_size_bytes_le;
+    /* Not read back for extent derivation above (see
+     * active_extent_from_settings()'s comment); kept only as a durable
+     * record of the size this install last committed. */
+    floor.active_image_extent = intent.image_size_bytes;
     memcpy(floor.confirmed_hash_sha256, state.candidate_hash_sha256, 32);
     persist_floor(&floor);
     state.phase = XIAO_OTA_PHASE_CONFIRMED;

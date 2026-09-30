@@ -97,30 +97,57 @@ Evidence:
 
 ## Implemented XIAO bootloader overlay
 
-`bootloader/xiao_nrf52840_ota/` now provides a reproducible overlay pinned to
-Adafruit_nRF52_Bootloader commit
-`c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`, native record/state recovery
-tests, OpenSSL signing/key tools, and Makefile fetch/build/package targets.
+`bootloader/xiao_nrf52840_ota/` provides a reproducible overlay pinned to
+Adafruit_nRF52_Bootloader commit `c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`.
+It includes native record and recovery tests, OpenSSL signing and key tools,
+and Makefile fetch/build/package targets. Full details, including how to
+build, package, sign, and install each artifact, live in the overlay's own
+`README.md`; this section gives the project-level summary.
 
-The preferred optimized profile preserves mandatory UF2 mass storage and CDC
-serial DFU, omits optional BLE DFU, and fits the stock 38 KiB bootloader slot.
-Its exact FLASH load footprint is 33,652 bytes (`86.48%`, 5,260 bytes free):
-33,020 bytes of code/rodata plus 632 bytes of initialized data. It retains
-the stock `0xF4000` UICR boot start, uses a compact TweetNaCl Ed25519 verifier,
-and is packaged as a bootloader-update UF2. The original BLE-enabled 66 KiB
-SWD build remains available and unchanged in behavior; its FLASH load footprint
-is 54,448 bytes.
-Exact commands and recovery artifact handling are in the overlay README.
-The commissioning sequence is: physically double-reset if software bootloader
-entry fails, run `make package-xiao-ota-bootloader-noswd`, run the guarded
-`make install-xiao-nrf52-target-ota-bootloader`, and retain the pinned stock
-recovery artifact produced by `make build-xiao-stock-bootloader`. The installer authorizes only serials declared in `lab/devices.ini`; it
-validates the stable `/dev/serial/by-id` bootloader identity, mounted-volume
-USB serial ancestry, and UF2 board ID without selecting a `ttyACM` number.
+The preferred profile keeps the mandatory USB UF2 mass storage and CDC serial
+DFU recovery paths, leaves out optional BLE DFU, and fits inside the stock
+38 KiB bootloader slot. Its FLASH load footprint is 34,612 bytes (88.95
+percent used, 4,300 bytes free): 33,980 bytes of code and read-only data,
+plus 632 bytes of initialized data. It keeps the stock `0xF4000` UICR boot
+start address, verifies signatures with a compact TweetNaCl-based Ed25519
+implementation, and is packaged as a bootloader-update UF2 file. The older
+BLE-enabled 66 KiB SWD build is still available and behaves the same as
+before; its FLASH load footprint is 54,448 bytes.
 
-The XIAO framework variant maps its QSPI logical pins to physical P0.21 SCK,
-P0.25 CS, P0.20 IO0, P0.24 IO1, P0.22 IO2, and P0.23 IO3. The overlay uses
-those physical values.
+The overlay also now bakes an immutable boot-info/capability marker
+(`xiao_ota_boot_info_t`, fixed address `0xFDC00`) into every build, and
+supports a build-time-selectable board-target profile (`--board
+{xiao_nrf52840,sensecap_solar_p1}` in `tools/prepare_upstream.py` and
+`tools/sign_image.py`) so the install-policy target check and the marker's
+`board_target_id` are never a hardcoded single value nor a wildcard match.
+`sensecap_solar_p1` is a real, distinct target id sharing the XIAO profile's
+checked QSPI pin mapping, but is explicitly **not physically qualified on
+any real SenseCAP hardware** -- see the overlay's `README.md` "Boot-info/
+capability marker" and "Board profiles" sections for the exact struct
+layout, address, and the end-to-end cross-board rejection proof.
+
+The commissioning sequence is: physically double-reset the board if software
+bootloader entry fails, run `make package-xiao-ota-bootloader-noswd`, run the
+guarded `make install-xiao-nrf52-target-ota-bootloader`, and keep the pinned
+stock recovery artifact produced by `make build-xiao-stock-bootloader`. The
+installer authorizes only serial numbers declared in `lab/devices.ini`. It
+checks the stable `/dev/serial/by-id` bootloader identity, the mounted
+volume's USB serial ancestry, and the UF2 board ID, and it never selects a
+device by `ttyACM` number.
+
+The XIAO framework variant maps its QSPI logical pins to physical `P0.21`
+(SCK), `P0.25` (CS), `P0.20` (IO0), `P0.24` (IO1), `P0.22` (IO2), and `P0.23`
+(IO3). The overlay uses those same physical pin assignments.
+
+**Lab and hardware gap:** this bootloader overlay has been software-tested
+(native unit tests) and confirmed to build and package to the sizes above,
+including the boot-info marker and the SenseCAP board profile (both proven
+by parsing the real compiled `.hex` output and independently recomputing
+their CRC-32 in Python, and by an end-to-end cross-board-rejection test, not
+just asserted). It has not yet been installed on the authorized lab target
+and has not yet performed a real signed install, trial boot, confirmation,
+or rollback on physical hardware. Treat it as ready for review and
+installation, not as already qualified in the field.
 
 ## Memory map
 
@@ -178,115 +205,201 @@ recognizes only the three OTA partitions and never mounts LittleFS.
 
 The bootloader is the root of trust.
 
-- signature algorithm: Ed25519, as implemented in `src/ota/trust/`
-  (vendored orlp/ed25519). The earlier draft specified ECDSA P-256; Ed25519
-  was chosen instead for its smaller, constant-size signatures and simpler
-  constant-time implementation on these MCUs. A QSPI-aware bootloader must
-  therefore verify Ed25519, not the stock signed-firmware facility's curve.
-- verification key: compiled into the bootloader configuration
-- signed fields: image bytes, image length, image SHA-256 hash, board family,
-  target/variant, role, application start address, manifest format id, key id,
-  signature algorithm id, firmware security counter, and the minimum
-  bootloader capability bitmask. This list is the canonical signed descriptor
-  serialised by `src/ota/trust/CanonicalDescriptor.h`; every install-relevant
-  wire field in `src/ota/protocol/OtaDescriptor.h` is covered by the
-  signature.
-- integrity: SHA-256 over the exact candidate image
-- anti-rollback: bootloader refuses a security counter less than or equal to
-  the highest confirmed counter
-- LoRa/group authentication authorizes transport but never substitutes for
-  bootloader signature verification
+- Signature algorithm: Ed25519, as implemented in `src/ota/trust/` (vendored
+  orlp/ed25519) and, for the no-SWD XIAO overlay, a compact TweetNaCl
+  implementation. An earlier draft of this design specified ECDSA P-256;
+  Ed25519 was chosen instead for its smaller, fixed-size signatures and its
+  simpler constant-time implementation on these microcontrollers. A
+  QSPI-aware bootloader must verify Ed25519, not the curve used by the stock
+  signed-firmware facility.
+- Verification key: compiled into the bootloader configuration.
+- Signed fields, command v1 (legacy, the bootloader's own canonical form):
+  image SHA-256 hash, target id, role id, device address, allow-broadcast
+  flag, required boot capability flags, security counter, image size in
+  bytes, application start address, and the format/key/algorithm ids. This
+  is the 71-byte layout serialized by `src/ota/trust/CanonicalDescriptor.h`
+  and reproduced exactly by
+  `bootloader/xiao_nrf52840_ota/include/xiao_ota_record.h`'s
+  `xiao_ota_canonical_descriptor_t`; `tools/sign_image.py` in that same
+  directory produces this signature offline, with the private key.
+- Signed fields, command v2 (current, closes the 59-vs-71-byte
+  incompatibility): the bootloader directly authenticates the LoRa
+  transport's own 59-byte big-endian canonical wire descriptor
+  (`src/ota/protocol/OtaDescriptor.h`'s `encodeOtaDescriptorCanonical()`:
+  board family/variant, role, application address, exact size, SHA-256,
+  security counter, minimum boot capability flags, format/key/algorithm
+  ids) and its Ed25519 signature -- the exact same bytes and signature the
+  transport itself already verifies (`src/helpers/ota/
+  OtaFirmwareBackend.h` / `DescriptorVerifier::verifyPolicy()`), never a
+  re-derived or re-signed form. `xiao_ota_boot.c` dispatches strictly on a
+  `record_version` field to exactly one of the two signature checks above;
+  there is no fallback or "either form" acceptance. The wire descriptor
+  carries no device-targeting field, so a command v2 install is always
+  broadcast-installable (device address/allow-broadcast are forced to
+  `0`/`1` after decoding, since neither is part of the signed bytes).
+  `tools/sign_image.py --command-version 2` produces this bundle; command
+  v1 (`--command-version 1`, the default, matching the existing
+  `make sign-xiao-ota-image` target unchanged) remains fully supported for
+  back-compat and real per-device targeting. See
+  `bootloader/xiao_nrf52840_ota/README.md`'s "Install command contract: v1
+  and v2" and "LoRa OTA transport bridge" sections for the exact field
+  layout and for what a durable application-side install bridge built
+  against command v2 still needs to implement (it is not implemented yet;
+  see "XIAO nRF52840 application-backend qualification" below).
+- Integrity: SHA-256 over the exact candidate image.
+- Anti-rollback: the bootloader refuses a security counter that is less than
+  or equal to the highest confirmed counter.
+- LoRa or group authentication authorizes the transport session, but it never
+  substitutes for the bootloader's own signature verification.
 
 The first production bootloader must be installed over SWD, USB, or the
-existing signed DFU path. LoRa OTA updates application images only. Bootloader
-and SoftDevice OTA are out of scope until a separate recovery-safe design is
-proven.
+existing signed DFU path. LoRa OTA updates application images only.
+Bootloader and SoftDevice OTA are out of scope until a separate,
+recovery-safe design is proven.
 
 ## Power-loss-safe install transaction
 
 The 32 KiB journal is divided into four pairs of independently erasable 4 KiB
-sectors with exact ownership:
+sectors, each with one exact owner:
 
 - install command A/B: `0x18C000`, `0x18D000`
 - boot transaction state A/B: `0x18E000`, `0x18F000`
 - trial confirmation A/B: `0x190000`, `0x191000`
 - anti-rollback floor A/B: `0x192000`, `0x193000`
 
-Records contain a format version, sequence number, state, image descriptors,
-completed 4 KiB page index, and CRC. A record is valid only when its final
-commit word has been programmed. These eight sectors are now wholly reserved
-for the bootloader/application install contract. Transport receipt bitmaps
-must be stored in the filesystem partition (or reconstructed) and may not
-share or erase the bootloader journal.
+Every record carries a magic value, format version, record length, sequence
+number, and a CRC-32 covering everything before it. A record counts as valid
+only once its final commit-marker word has been programmed, so a power cut
+partway through a write leaves the older, still-valid copy in charge. These
+eight sectors belong entirely to the bootloader/application install contract.
+Transport receipt bitmaps must live in the filesystem partition instead (or
+be rebuilt from other state); they may never share, or erase, the bootloader
+journal.
 
-States:
+The bootloader's implemented states, as defined in
+`bootloader/xiao_nrf52840_ota/include/xiao_ota_record.h`, are:
 
 1. `EMPTY`
-2. `CANDIDATE_RECEIVING`
-3. `CANDIDATE_READY`
-4. `BACKUP_COPYING`
-5. `BACKUP_READY`
-6. `INSTALL_COPYING`
-7. `TRIAL_BOOT`
-8. `CONFIRMED`
-9. `ROLLBACK_COPYING`
-10. `FAILED`
+2. `REQUESTED` (reserved; the current install flow moves straight from
+   `EMPTY`/`CONFIRMED` to `BACKUP_COPYING` once a valid command is found, so
+   this value is not produced by the flow below, but a valid record with
+   this phase is still recognized)
+3. `BACKUP_COPYING`
+4. `BACKUP_READY`
+5. `INSTALL_COPYING`
+6. `TRIAL_BOOT`
+7. `CONFIRMED`
+8. `ROLLBACK_COPYING`
+9. `FAILED`
 
 Install sequence:
 
-1. The application writes chunks only to the candidate bank and persists
+1. The application writes chunks to the candidate bank and tracks its own
    receipt progress.
-2. The application verifies the complete SHA-256 and requests installation.
-3. After reset, the bootloader independently verifies the candidate signature,
-   hash, board identity, address, size, and security counter.
-4. The bootloader copies the complete active application to the backup bank,
-   journaling and verifying each 4 KiB page.
-5. Only after the backup hash is verified may the bootloader erase internal
-   application pages.
-6. The bootloader copies and verifies the candidate page by page. Restarting
-   after power loss resumes from the journal.
-7. After whole-image verification, the bootloader records `TRIAL_BOOT`, starts
-   a 60-second watchdog, and boots the candidate. Trial firmware must not feed
-   or reconfigure it before committing confirmation.
-8. The application confirms only after filesystem mount, radio initialization,
-   and its normal loop are healthy.
-9. Confirmation is a CRC/commit-protected token containing the transaction
-   nonce, counter, and candidate hash. Three unconfirmed boots cause the
-   bootloader to restore and verify the backup. Confirmation durably advances
-   the anti-rollback floor. Candidate and backup remain preserved.
+2. The application verifies the complete SHA-256 of the staged candidate.
+3. Out of band, and only with the signing private key, someone produces a
+   signed install command -- command v1's 71-byte bootloader-canonical form,
+   or command v2's real 59-byte transport wire descriptor -- (see "Signed
+   image contract" above) and the application writes it durably to
+   the command journal sectors, then resets.
+4. On boot, the bootloader independently verifies the candidate's signature,
+   hash, target identity, address, size, and security counter before
+   touching anything else. The install size is capped at 708,608 bytes
+   (`XIAO_OTA_INSTALL_MAX_SIZE`, `0x27000..0xD4000`) regardless of command
+   version -- distinct from, and smaller than, the 811,008-byte backup/
+   active-image extent below, because installing a larger candidate could
+   erase into MeshCore v1.17's own internal filesystem region
+   (`0xD4000..0xED000`). See the overlay's `README.md` "Fixed: install-
+   command size cap..." section for the exact boundary proof.
+5. The bootloader copies the complete active application to the backup bank,
+   journaling and verifying each 4 KiB page as it goes.
+6. Only once the backup's hash is verified does the bootloader erase any
+   internal application page.
+7. The bootloader copies and verifies the candidate page by page. If power
+   is lost partway through, the next boot resumes from the journal rather
+   than starting over.
+8. Once the whole image is verified, the bootloader records `TRIAL_BOOT`,
+   starts a 60-second watchdog, and boots the candidate. Trial firmware must
+   not feed or reconfigure that watchdog before it commits confirmation.
+9. The application confirms only after its filesystem mount, radio
+   initialization, and its normal loop are all healthy.
+10. Confirmation is a CRC/commit-protected token containing the transaction
+    nonce, counter, and candidate hash. Three unconfirmed boots cause the
+    bootloader to restore and verify the backup. Confirmation durably
+    advances the anti-rollback floor. The candidate and backup images are
+    left in place, not erased.
 
 The transaction journals the previous upstream bank-0 validity, size, and
-CRC before erasing application flash. After candidate verification it writes
-the candidate size and CRC-16 to the pinned upstream bootloader settings before
-trial boot; rollback restores the prior values before returning to the old
-application. A legacy extent is trusted only when bank 0 is valid and its
-nonzero CRC-16 matches flash; otherwise a full `0x27000..0xED000` backup is
-required. Explicit UF2/CDC DFU reset requests bypass the OTA hook so upstream
-recovery can always consume GPREGRET.
+CRC before erasing any application flash. After the candidate is verified, the
+bootloader writes its size and CRC-16 to the pinned upstream bootloader
+settings before trial boot; rollback restores the prior values before
+returning to the old application. The active-image extent used for both
+backup sizing and command validation is *always* recomputed fresh from
+bank-0 metadata every boot (current `BANK_VALID_APP` marker, non-zero
+bounded size, and a live CRC-16 match against internal flash) -- a durable
+floor value left over from an earlier confirmed install is never consulted
+for this, so a later USB/CDC reflash cannot leave a stale extent trusted.
+Missing or invalid fresh bank-0 metadata fails closed (no command accepted,
+any in-flight transaction rolled back), never a guessed full-size fallback.
+Explicit UF2/CDC DFU reset requests
+bypass the OTA hook so upstream recovery can always consume GPREGRET.
 
 At no point is internal application flash erased unless both a verified
 candidate and a verified backup exist in QSPI.
 
+**Lab and hardware gap:** every step above is covered by native host tests
+(`bootloader/xiao_nrf52840_ota/tests/`), including simulated power loss at
+each commit boundary. None of it has yet been exercised on real XIAO
+hardware: no real signed install, trial boot, confirmation, or rollback has
+happened on a physical board. Step 3 also depends entirely on the "app
+bridge" described in `bootloader/xiao_nrf52840_ota/README.md`, which does not
+exist yet; without it, no application can currently reach step 3 at all. A
+code review of this transaction also caught four real correctness bugs, all
+now fixed: the backup step's QSPI write was sourcing internal code flash
+directly through EasyDMA, which the nRF52840 cannot do reliably; a device
+that rolled back once could never accept another signed install afterward;
+a corrupt (not erased) anti-rollback floor sector silently defaulted the
+floor counter to 0 instead of refusing new installs; and the active-image
+extent preferred a stale post-install floor value over freshly-verified
+bank-0 metadata, which a later USB/CDC reflash could leave disagreeing with
+reality. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Fixed" sections for the details.
+Separately, the real target board's floor-A sector currently holds
+leftover pre-commissioning diagnostic bytes from earlier hardware harness
+runs, not a genuine confirmed floor -- the third fix above means this now
+correctly fails closed (refuses new installs) rather than defaulting to
+counter 0, but the sector still needs a deliberate commissioning
+erase/re-provision before a real install can proceed on that board.
+
 ## Migration for the BLE-enabled 66 KiB fallback
 
-The preferred no-SWD build keeps `0xF4000` and does not consume `InternalFS`.
-Only the optional BLE-enabled fallback moves the bootloader start to `0xED000`
-and therefore requires this migration. Companion firmware may also have data
-in `ExtraFS`. That fallback migration must be staged:
+The preferred no-SWD build keeps `0xF4000` and does not touch `InternalFS`.
+Only the optional BLE-enabled fallback moves the bootloader start to
+`0xED000`, and only that build needs this migration. Companion firmware may
+also keep data in `ExtraFS`. That fallback migration must be staged as
+follows:
 
-1. Install a migration application with the existing bootloader.
+1. Install a migration application under the existing bootloader.
 2. Initialize only the QSPI LittleFS partition at `0x194000`.
-3. Copy identities, preferences, keys, contacts, channels, and queued data from
-   `InternalFS` and `ExtraFS`; read them back and verify them.
+3. Copy identities, preferences, keys, contacts, channels, and queued data
+   from `InternalFS` and `ExtraFS`, then read it all back and verify it.
 4. Write a redundant `storage_migrated` record inside the partitioned QSPI
-   filesystem, not in the bootloader-owned journal.
-5. Refuse bootloader replacement unless migration and QSPI JEDEC/erase/write
-   tests pass.
+   filesystem — never in the bootloader-owned journal.
+5. Refuse to replace the bootloader unless migration and the QSPI
+   JEDEC/erase/write self-tests all pass.
 6. Install the QSPI-capable bootloader through a recoverable local method.
-7. Install firmware that treats partitioned QSPI LittleFS as primary storage.
+7. Install firmware that treats the partitioned QSPI LittleFS as its primary
+   storage.
 
-The migration firmware must never format the complete QSPI device. Failure
-before step 6 leaves the original bootloader and internal data usable.
+The migration firmware must never format the whole QSPI device. If anything
+fails before step 6, the original bootloader and internal data are still
+usable.
+
+**Lab and hardware gap:** this migration path is a design only. No migration
+firmware has been written, and it has not been tried on the authorized lab
+boards. Anyone planning to move a device from the BLE-enabled 66 KiB build to
+the preferred no-SWD build should treat this as future work, not as a proven
+procedure.
 
 ## XIAO nRF52840 application-backend qualification
 
@@ -313,8 +426,7 @@ Both are OTA-owned subregions below the LittleFS boundary at `0x194000`.
 The test never mounts `CustomLFS_QSPIFlash`, never formats the chip, and never
 addresses the LittleFS partition.
 
-Hardware evidence captured on XIAO serial `3BE94917B92DC5E9`, a board that
-has since been retired from the lab:
+Hardware evidence captured on XIAO serial `3BE94917B92DC5E9`:
 
 - JEDEC `85:60:15`
 - geometry 2,097,152 bytes / 4,096-byte erase / byte-granular adapter writes
@@ -328,21 +440,45 @@ has since been retired from the lab:
 
 The first harness revision then exhausted the Arduino task stack while running
 an additional in-firmware `Journal` round trip. That redundant step was
-removed; journal-area erase/program/read coverage remains. The board then stopped
-enumerating entirely and was removed from the lab; the signed-image
-stage/readback firmware built successfully but was never flashed to it. The
-captured log is `.tmp/xiao-nrf52-qspi-3BE94917B92DC5E9.log`.
+removed; journal-area erase/program/read coverage remains. The board then
+temporarily stopped enumerating after a bad recovery attempt (see below); it
+has since returned to service as one of the two boards this project is
+authorized to touch (serial `3BE94917B92DC5E9`, alongside client board
+`4186AE911D94CDB1`). It has since passed a signed candidate stage/readback
+with real Ed25519 signature verification: an 8,192-byte signed candidate
+staged to QSPI, read back, and its image SHA-256 checked, using the rweather
+Ed25519 library, via `make validate-xiao-nrf52-qspi-hardware`. The captured
+log is `.tmp/xiao-nrf52-qspi-3BE94917B92DC5E9.log`.
 
-That loss was caused by recovering boards with the sysfs `authorized` toggle,
-which leaves the nRF52840 USB stack wedged (`can't set config #1, error -32`).
+That earlier enumeration loss was caused by recovering boards with the sysfs
+`authorized` toggle, which leaves the nRF52840 USB stack wedged (`can't set
+config #1, error -32`).
 Lab tooling now power-cycles the hub port with `uhubctl -f` instead, and never
 touches `authorized`; see `make lab-power-cycle-target`.
 
-Therefore the raw QSPI backend is hardware-validated, while the signed
-`StorageManager` stage/readback remains a hardware gap rather than a claimed
-pass. It must be re-run against the current `target` role board.
+**Important limits on what the passing test above proves:** staging an
+8 KiB signed candidate to QSPI, reading it back, and checking its SHA-256 and
+Ed25519 signature is not the same as a bootloader install. It proves the raw
+QSPI path, the signed-stage/readback path, and the signing/verification
+libraries work together on real hardware. It does not prove the bootloader
+itself has installed, trial-booted, confirmed, or rolled back a real image on
+this or any board -- that remains untested on hardware; see the "Lab and
+hardware gap" notes earlier in this document for exactly what is still
+missing. Do not read the pass above as evidence that installing this
+bootloader, or running an OTA install through it, is proven safe yet.
 
 ## Hardware acceptance gates
+
+The design is accepted only after all of these pass on the actual SenseCAP
+Solar:
+
+1. QSPI JEDEC ID is `85 60 15`; geometry is 2 MiB / 4 KiB / 256 B.
+2. Existing identity and configuration survive the storage migration.
+3. A signed candidate installs and confirms.
+4. Wrong-key, wrong-board, truncated, corrupt, and downgraded candidates are
+   rejected before internal flash erase.
+5. Power is removed at every journal state and several page boundaries; every
+   restart resumes or restores without SWD intervention.
 
 The design is accepted only after all of these pass on the actual SenseCAP
 Solar:

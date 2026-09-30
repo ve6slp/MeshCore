@@ -26,15 +26,20 @@ XIAO_NRF52_TARGET_SERIAL = $(shell $(LAB_DEVICE) serial target)
 XIAO_NRF52_QSPI_TEST_ENV ?= Xiao_nrf52_ota_qspi_hardware_test
 XIAO_NRF52_QSPI_EVIDENCE = $(TMPDIR)/xiao-nrf52-qspi-$(XIAO_NRF52_TARGET_SERIAL).log
 XIAO_OTA_UPSTREAM ?= $(TMPDIR)/Adafruit_nRF52_Bootloader
-XIAO_OTA_WORK ?= $(TMPDIR)/xiao_nrf52840_ota_upstream
-XIAO_OTA_NOSWD_WORK ?= $(TMPDIR)/xiao_nrf52840_ota_noswd_upstream
-XIAO_OTA_ARTIFACTS ?= $(TMPDIR)/xiao_nrf52840_ota_artifacts
+XIAO_OTA_WORK ?= $(TMPDIR)/$(XIAO_OTA_BOARD)_ota_upstream
+XIAO_OTA_NOSWD_WORK ?= $(TMPDIR)/$(XIAO_OTA_BOARD)_ota_noswd_upstream
+XIAO_OTA_ARTIFACTS ?= $(TMPDIR)/$(if $(filter sensecap_solar_p1,$(XIAO_OTA_BOARD)),sensecap_solar_p1_ota_artifacts,xiao_nrf52840_ota_artifacts)
 XIAO_OTA_PIN ?= c67f0bcf0fa8e841426335b1bbde91cda6ca1f50
 XIAO_OTA_SOURCE_DATE_EPOCH ?= 1779344629
 XIAO_OTA_PRIVATE_KEY ?= $(TMPDIR)/xiao-ota-keys/lab-ed25519-private.pem
 XIAO_OTA_IMAGE ?=
 XIAO_OTA_ACTIVE_IMAGE ?=
 XIAO_OTA_COUNTER ?= 1
+XIAO_OTA_COMMAND_VERSION ?= 2
+XIAO_OTA_BOARD ?= xiao_nrf52840
+XIAO_OTA_STEM = $(XIAO_OTA_BOARD)_ota
+VERIFY_OTA_BOOT_INFO = python3 bootloader/xiao_nrf52840_ota/tools/verify_boot_info_artifact.py \
+	--board "$(XIAO_OTA_BOARD)" --key-header bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h
 OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_DUTY_TIMEOUT ?= 420
 OTA_LAB_MONITOR_SECONDS ?= 60
@@ -54,14 +59,14 @@ NON_OTA_TARGET_ENVS ?= Heltec_v3_repeater RAK_4631_repeater
         enter-xiao-nrf52-target-bootloader \
         install-xiao-nrf52-target-ota-bootloader \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
-        monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
+        monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab test-xiao-nrf52-ota-stage test-xiao-nrf52-ota-airtime \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
         fetch-xiao-ota-bootloader provision-xiao-ota-lab-key \
         test-xiao-ota-bootloader build-xiao-stock-bootloader \
         build-xiao-ota-bootloader package-xiao-ota-bootloader \
         build-xiao-ota-bootloader-noswd package-xiao-ota-bootloader-noswd \
-        sign-xiao-ota-image verify-xiao-ota-bootloader \
+        sign-xiao-ota-image verify-xiao-ota-bootloader verify-xiao-ota-boot-info-artifacts \
         verify-ota-software clean-tmp
 
 tmpdir:
@@ -218,6 +223,12 @@ monitor-xiao-nrf52-ota-client: tmpdir
 test-xiao-nrf52-ota-lab: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --duty-timeout $(OTA_LAB_DUTY_TIMEOUT)
 
+test-xiao-nrf52-ota-stage: tmpdir
+	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --staging-only
+
+test-xiao-nrf52-ota-airtime: tmpdir
+	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --airtime-only --duty-timeout $(OTA_LAB_DUTY_TIMEOUT)
+
 build-xiao-nrf52-qspi-test: tmpdir
 	$(PLATFORMIO) run -e $(XIAO_NRF52_QSPI_TEST_ENV)
 
@@ -232,14 +243,15 @@ validate-xiao-nrf52-qspi-hardware: upload-xiao-nrf52-qspi-test run-xiao-nrf52-qs
 
 fetch-xiao-ota-bootloader: tmpdir
 	@if [ ! -d "$(XIAO_OTA_UPSTREAM)/.git" ]; then \
-	  git clone https://github.com/adafruit/Adafruit_nRF52_Bootloader.git "$(XIAO_OTA_UPSTREAM)"; \
+	  git clone --recursive https://github.com/adafruit/Adafruit_nRF52_Bootloader.git "$(XIAO_OTA_UPSTREAM)"; \
 	fi
 	@git -C "$(XIAO_OTA_UPSTREAM)" fetch --quiet origin "$(XIAO_OTA_PIN)"
 	@git -C "$(XIAO_OTA_UPSTREAM)" checkout --quiet --detach "$(XIAO_OTA_PIN)"
+	@git -C "$(XIAO_OTA_UPSTREAM)" submodule update --init --recursive --quiet
 	@test "$$(git -C "$(XIAO_OTA_UPSTREAM)" rev-parse HEAD)" = "$(XIAO_OTA_PIN)"
 
 provision-xiao-ota-lab-key: tmpdir
-	python3 bootloader/xiao_nrf52840_ota/tools/provision_lab_key.py
+	python3 bootloader/xiao_nrf52840_ota/tools/provision_lab_key.py --board "$(XIAO_OTA_BOARD)"
 
 test-xiao-ota-bootloader: tmpdir
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
@@ -262,8 +274,30 @@ test-xiao-ota-bootloader: tmpdir
 	  -Wl,--gc-sections \
 	  -o "$(TMPDIR)/xiao-ota-host/test_ed25519"
 	"$(TMPDIR)/xiao-ota-host/test_ed25519"
+	$(CC) -std=c11 -O2 -ffunction-sections -fdata-sections \
+	  -Wall -Wextra -Werror \
+	  -Ibootloader/xiao_nrf52840_ota/include \
+	  -Ibootloader/xiao_nrf52840_ota/third_party/tweetnacl \
+	  bootloader/xiao_nrf52840_ota/src/xiao_ota_record.c \
+	  bootloader/xiao_nrf52840_ota/src/xiao_ota_ed25519_tweetnacl.c \
+	  bootloader/xiao_nrf52840_ota/third_party/tweetnacl/tweetnacl.c \
+	  bootloader/xiao_nrf52840_ota/tests/test_descriptor_contract.c \
+	  -Wno-unused-function -Wno-sign-compare -Wno-shadow \
+	  -Wno-unterminated-string-initialization \
+	  -Wl,--gc-sections \
+	  -o "$(TMPDIR)/xiao-ota-host/test_descriptor_contract"
+	"$(TMPDIR)/xiao-ota-host/test_descriptor_contract"
+	$(CC) -std=c11 -Wall -Wextra -Werror \
+	  -Ibootloader/xiao_nrf52840_ota/include \
+	  -Ibootloader/xiao_nrf52840_ota/src \
+	  bootloader/xiao_nrf52840_ota/src/xiao_ota_record.c \
+	  bootloader/xiao_nrf52840_ota/src/xiao_ota_boot_info.c \
+	  bootloader/xiao_nrf52840_ota/tests/test_boot_info.c \
+	  -o "$(TMPDIR)/xiao-ota-host/test_boot_info"
+	"$(TMPDIR)/xiao-ota-host/test_boot_info"
 	python3 bootloader/xiao_nrf52840_ota/tests/test_source.py
 	python3 bootloader/xiao_nrf52840_ota/tests/test_install_uf2.py
+	python3 -m unittest discover -s bootloader/xiao_nrf52840_ota/tests -p 'test_tools.py'
 
 build-xiao-stock-bootloader: fetch-xiao-ota-bootloader
 	@$(MAKE) -C "$(XIAO_OTA_UPSTREAM)" BOARD=xiao_nrf52840_ble clean
@@ -279,7 +313,7 @@ build-xiao-stock-bootloader: fetch-xiao-ota-bootloader
 	  "$(XIAO_OTA_ARTIFACTS)/stock/xiao_nrf52840_ble_stock_$(XIAO_OTA_PIN)_update.uf2"
 
 build-xiao-ota-bootloader: fetch-xiao-ota-bootloader
-	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py
+	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py --board "$(XIAO_OTA_BOARD)" --work-dir "$(XIAO_OTA_WORK)"
 	@$(MAKE) -C "$(XIAO_OTA_WORK)" BOARD=xiao_nrf52840_ble clean
 	@out="$$( $(MAKE) -s --no-print-directory -C "$(XIAO_OTA_WORK)" BOARD=xiao_nrf52840_ble print-OUT_NAME | sed 's/^OUT_NAME = //' )"; \
 	  SOURCE_DATE_EPOCH="$(XIAO_OTA_SOURCE_DATE_EPOCH)" $(MAKE) -C "$(XIAO_OTA_WORK)" BOARD=xiao_nrf52840_ble \
@@ -294,13 +328,15 @@ build-xiao-ota-bootloader: fetch-xiao-ota-bootloader
 package-xiao-ota-bootloader: build-xiao-ota-bootloader
 	@mkdir -p "$(XIAO_OTA_ARTIFACTS)/custom"
 	@cp "$$(find "$(XIAO_OTA_WORK)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name '*_nosd.hex' | head -1)" \
-	  "$(XIAO_OTA_ARTIFACTS)/custom/xiao_nrf52840_ota_nosd.hex"
+	  "$(XIAO_OTA_ARTIFACTS)/custom/$(XIAO_OTA_STEM)_nosd.hex"
 	@cp "$$(find "$(XIAO_OTA_WORK)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name 'update-*_nosd.uf2' | head -1)" \
-	  "$(XIAO_OTA_ARTIFACTS)/custom/xiao_nrf52840_ota_update.uf2"
+	  "$(XIAO_OTA_ARTIFACTS)/custom/$(XIAO_OTA_STEM)_update.uf2"
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom/$(XIAO_OTA_STEM)_nosd.hex"
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom/$(XIAO_OTA_STEM)_update.uf2"
 	@sha256sum "$(XIAO_OTA_ARTIFACTS)"/custom/*
 
 build-xiao-ota-bootloader-noswd: fetch-xiao-ota-bootloader
-	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py --no-ble
+	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py --no-ble --board "$(XIAO_OTA_BOARD)" --work-dir "$(XIAO_OTA_NOSWD_WORK)"
 	@$(MAKE) -C "$(XIAO_OTA_NOSWD_WORK)" BOARD=xiao_nrf52840_ble clean
 	@out="$$( $(MAKE) -s --no-print-directory -C "$(XIAO_OTA_NOSWD_WORK)" BOARD=xiao_nrf52840_ble print-OUT_NAME | sed 's/^OUT_NAME = //' )"; \
 	  SOURCE_DATE_EPOCH="$(XIAO_OTA_SOURCE_DATE_EPOCH)" $(MAKE) -C "$(XIAO_OTA_NOSWD_WORK)" BOARD=xiao_nrf52840_ble \
@@ -315,26 +351,37 @@ build-xiao-ota-bootloader-noswd: fetch-xiao-ota-bootloader
 package-xiao-ota-bootloader-noswd: build-xiao-ota-bootloader-noswd
 	@mkdir -p "$(XIAO_OTA_ARTIFACTS)/custom-noswd"
 	@cp "$$(find "$(XIAO_OTA_NOSWD_WORK)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name '*_nosd.hex' | head -1)" \
-	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/xiao_nrf52840_ota_noswd.hex"
+	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.hex"
 	@cp "$$(find "$(XIAO_OTA_NOSWD_WORK)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name 'update-*_nosd.uf2' | head -1)" \
-	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/xiao_nrf52840_ota_noswd_update.uf2"
+	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
 	@cp "$$(find "$(XIAO_OTA_NOSWD_WORK)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name '*.out.map' | head -1)" \
-	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/xiao_nrf52840_ota_noswd.map"
+	  "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.map"
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.hex"
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
 	@sha256sum "$(XIAO_OTA_ARTIFACTS)"/custom-noswd/*
 
 ## Install only the packaged no-SWD custom bootloader UF2 on the authorized XIAO.
 ## Put the board in XIAO-BOOT mode first; this target never selects a ttyACM path.
 install-xiao-nrf52-target-ota-bootloader: package-xiao-ota-bootloader-noswd
+	@if [ "$(XIAO_OTA_BOARD)" != xiao_nrf52840 ]; then \
+	  echo "refusing non-XIAO bootloader profile on the authorized XIAO target" >&2; exit 1; \
+	fi
 	python3 bootloader/xiao_nrf52840_ota/tools/install_uf2.py \
 	  --serial "$(XIAO_NRF52_TARGET_SERIAL)" \
 	  --boot-port "$(XIAO_NRF52_BOOT_PORT)" \
-	  --artifact "$(XIAO_OTA_ARTIFACTS)/custom-noswd/xiao_nrf52840_ota_noswd_update.uf2"
+	  --artifact "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
+
+verify-xiao-ota-boot-info-artifacts: tmpdir
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd.hex"
+	$(VERIFY_OTA_BOOT_INFO) "$(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2"
 
 sign-xiao-ota-image: provision-xiao-ota-lab-key
 	@test -n "$(XIAO_OTA_IMAGE)" && test -n "$(XIAO_OTA_ACTIVE_IMAGE)"
 	python3 bootloader/xiao_nrf52840_ota/tools/sign_image.py \
 	  --image "$(XIAO_OTA_IMAGE)" --active-image "$(XIAO_OTA_ACTIVE_IMAGE)" \
 	  --private-key "$(XIAO_OTA_PRIVATE_KEY)" --counter "$(XIAO_OTA_COUNTER)" \
+	  --command-version "$(XIAO_OTA_COMMAND_VERSION)" \
+	  --board "$(XIAO_OTA_BOARD)" \
 	  --output-dir "$(XIAO_OTA_ARTIFACTS)/signed-counter-$(XIAO_OTA_COUNTER)"
 
 verify-xiao-ota-bootloader: test-xiao-ota-bootloader package-xiao-ota-bootloader package-xiao-ota-bootloader-noswd

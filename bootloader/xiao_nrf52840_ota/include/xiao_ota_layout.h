@@ -6,6 +6,27 @@
 #define XIAO_OTA_APP_END               UINT32_C(0x000ED000)
 #define XIAO_OTA_APP_MAX_SIZE          (XIAO_OTA_APP_END - XIAO_OTA_APP_START)
 
+/*
+ * v1.17's actual internal application code region is only
+ * 0x27000..0xD4000 (708,608 bytes); 0xD4000..0xED000 is where v1.17's own
+ * internal filesystem (LittleFS/ExtraFS) lives today. XIAO_OTA_APP_MAX_SIZE/
+ * XIAO_OTA_CANDIDATE_SIZE/XIAO_OTA_BACKUP_SIZE intentionally span the FULL
+ * 0x27000..0xED000 extent, because BACKING UP that many bytes -- a
+ * protective read+copy of whatever is really there -- is always safe
+ * regardless of what lives past 0xD4000. INSTALLING a candidate that large
+ * is not safe: nothing else in the wire contract stops it from
+ * erasing/overwriting into the filesystem region. XIAO_OTA_INSTALL_MAX_SIZE
+ * caps the candidate/install size actually accepted by install-command
+ * policy validation to the real v1.17 code region only, until an explicit
+ * filesystem-relocation migration proves the FS no longer lives past this
+ * boundary -- no such migration-complete signal exists yet, so this is the
+ * unconditional default. This is a safety cap, not a wire-format change:
+ * no schema, role/target/format field changes.
+ */
+#define XIAO_OTA_INSTALL_ALLOWED_END   UINT32_C(0x000D4000)
+#define XIAO_OTA_INSTALL_MAX_SIZE      \
+  (XIAO_OTA_INSTALL_ALLOWED_END - XIAO_OTA_APP_START)
+
 #define XIAO_OTA_CANDIDATE_BASE        UINT32_C(0x000000)
 #define XIAO_OTA_CANDIDATE_SIZE        UINT32_C(0x0C6000)
 #define XIAO_OTA_BACKUP_BASE           UINT32_C(0x0C6000)

@@ -23,6 +23,10 @@ SECTIONS
     PROVIDE(__stop_fs_data = .);
   } = 0
   .bootloaderConfig : { KEEP(*(.bootloaderConfig)) } > BOOTLOADER_CONFIG
+  /* Immutable boot-info/capability marker, fixed at XIAO_OTA_BOOT_INFO_ADDRESS
+   * (0xFDC00, see include/xiao_ota_boot_info.h) -- 1KiB clear of the stock
+   * .bootloaderConfig CF2 table above and 1KiB clear of the region end below. */
+  .xiao_ota_boot_info 0xFDC00 : { KEEP(*(.xiao_ota_boot_info)) } > BOOTLOADER_CONFIG
   .bootloaderSettings(NOLOAD) : { } > BOOTLOADER_SETTINGS
   .uicrBootStartAddress : { KEEP(*(.uicrBootStartAddress)) } > UICR_BOOTLOADER
   .mbrParamsPage(NOLOAD) : { } > MBR_PARAMS_PAGE
@@ -30,5 +34,12 @@ SECTIONS
   .dbl_reset(NOLOAD) : { } > DBL_RESET
   .noinit(NOLOAD) : { } > NOINIT
 }
+
+ASSERT(ADDR(.xiao_ota_boot_info) == 0xFDC00,
+       "xiao_ota_boot_info must sit at the documented fixed XIAO_OTA_BOOT_INFO_ADDRESS")
+ASSERT(ADDR(.bootloaderConfig) + SIZEOF(.bootloaderConfig) <= 0xFDC00,
+       "stock .bootloaderConfig CF2 table has grown into the xiao_ota_boot_info marker")
+ASSERT(ADDR(.xiao_ota_boot_info) + SIZEOF(.xiao_ota_boot_info) <= 0xFE000,
+       "xiao_ota_boot_info overflows the 2KiB BOOTLOADER_CONFIG region")
 
 INCLUDE "nrf_common.ld"

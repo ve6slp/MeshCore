@@ -22,14 +22,20 @@ der = subprocess.check_output([
 if der[:12].hex() != "302a300506032b6570032100" or len(der) != 44:
     raise SystemExit("unexpected Ed25519 SubjectPublicKeyInfo encoding")
 raw = der[-32:]
+hexed = [f"0x{x:02x}" for x in raw]
 rows = []
 for i in range(0, 32, 8):
-    rows.append("    " + ", ".join(f"0x{x:02x}" for x in raw[i:i + 8]) + ",")
+    row = ", ".join(hexed[i:i + 8])
+    if i + 8 < 32:
+        row += ","
+    rows.append("    " + row + (" \\" if i + 8 < 32 else ""))
 HEADER.write_text(
     "#pragma once\n\n#include <stdint.h>\n\n"
     "/* Lab-only public key. The private half is generated under .tmp and is never committed. */\n"
+    "#define XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES \\\n"
+    + "\n".join(rows) + "\n\n"
     "static const uint8_t xiao_ota_lab_public_key_ed25519[32] = {\n"
-    + "\n".join(rows) + "\n};\n"
+    "    XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES,\n};\n"
 )
 print(f"private key: {PRIVATE}")
 print(f"public key:  {PUBLIC}")

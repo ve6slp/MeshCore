@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "xiao_ota_layout.h"
+
 uint32_t xiao_ota_crc32(const void *data, size_t length) {
   const uint8_t *bytes = (const uint8_t *)data;
   uint32_t crc = UINT32_C(0xFFFFFFFF);
@@ -34,9 +36,22 @@ uint32_t xiao_ota_safe_backup_extent(uint32_t bank_0_size,
   return bank_0_size <= app_region_size ? bank_0_size : app_region_size;
 }
 
+bool xiao_ota_resolve_active_extent(bool bank_0_marker_valid,
+                                    uint16_t bank_0_crc, uint32_t bank_0_size,
+                                    uint16_t recomputed_crc16,
+                                    uint32_t app_region_size,
+                                    uint32_t *out_extent) {
+  if (!bank_0_marker_valid || bank_0_crc == 0 || bank_0_size == 0 ||
+      bank_0_size > app_region_size || recomputed_crc16 != bank_0_crc) {
+    return false;
+  }
+  *out_extent = xiao_ota_safe_backup_extent(bank_0_size, app_region_size);
+  return true;
+}
+
 static bool record_valid(const void *record, size_t size, uint32_t magic,
-                         uint16_t record_bytes, size_t crc_offset,
-                         size_t commit_offset) {
+                         uint16_t expected_version, uint16_t record_bytes,
+                         size_t crc_offset, size_t commit_offset) {
   const uint8_t *bytes = (const uint8_t *)record;
   uint32_t stored_crc;
   uint32_t commit;
@@ -46,7 +61,8 @@ static bool record_valid(const void *record, size_t size, uint32_t magic,
   memcpy(&stored_crc, bytes + crc_offset, sizeof(stored_crc));
   memcpy(&commit, bytes + commit_offset, sizeof(commit));
   return memcmp(bytes, &magic, sizeof(magic)) == 0 &&
-         bytes[4] == XIAO_OTA_FORMAT_VERSION && bytes[5] == 0 &&
+         bytes[4] == (uint8_t)expected_version &&
+         bytes[5] == (uint8_t)(expected_version >> 8) &&
          bytes[6] == (uint8_t)record_bytes && bytes[7] == (uint8_t)(record_bytes >> 8) &&
          commit == XIAO_OTA_COMMIT_MARKER &&
          stored_crc == xiao_ota_crc32(record, crc_offset);
@@ -54,27 +70,224 @@ static bool record_valid(const void *record, size_t size, uint32_t magic,
 
 bool xiao_ota_command_valid(const xiao_ota_command_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
-                      sizeof(*record), offsetof(xiao_ota_command_t, crc32),
+                      XIAO_OTA_COMMAND_VERSION_LEGACY_V1, sizeof(*record),
+                      offsetof(xiao_ota_command_t, crc32),
                       offsetof(xiao_ota_command_t, commit_marker));
+}
+
+bool xiao_ota_command_v2_valid(const xiao_ota_command_v2_t *record) {
+  return record_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
+                      XIAO_OTA_COMMAND_VERSION_WIRE_V2, sizeof(*record),
+                      offsetof(xiao_ota_command_v2_t, crc32),
+                      offsetof(xiao_ota_command_v2_t, commit_marker));
+}
+
+/*
+ * Dispatches on record_version (offset 4) ONLY -- there is no fallback/OR
+ * between versions and no version is ever accepted against the other
+ * version's validity/size rule. `record` must point to storage at least
+ * sizeof(xiao_ota_command_any_t) bytes (both xiao_ota_command_valid() and
+ * xiao_ota_command_v2_valid() read exactly sizeof(their own struct) from
+ * it, which xiao_ota_command_any_t guarantees is available).
+ */
+bool xiao_ota_command_any_valid(const void *record) {
+  uint16_t version;
+  if (record == NULL) return false;
+  memcpy(&version, (const uint8_t *)record + 4, sizeof(version));
+  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
+    return xiao_ota_command_valid((const xiao_ota_command_t *)record);
+  }
+  if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
+    return xiao_ota_command_v2_valid((const xiao_ota_command_v2_t *)record);
+  }
+  return false;
 }
 
 bool xiao_ota_state_valid(const xiao_ota_state_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
-                      sizeof(*record), offsetof(xiao_ota_state_t, crc32),
+                      XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                      offsetof(xiao_ota_state_t, crc32),
                       offsetof(xiao_ota_state_t, commit_marker)) &&
          record->phase <= XIAO_OTA_PHASE_FAILED;
 }
 
 bool xiao_ota_confirmation_valid(const xiao_ota_confirmation_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_CONFIRM_MAGIC,
-                      sizeof(*record), offsetof(xiao_ota_confirmation_t, crc32),
+                      XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                      offsetof(xiao_ota_confirmation_t, crc32),
                       offsetof(xiao_ota_confirmation_t, commit_marker));
 }
 
 bool xiao_ota_floor_valid(const xiao_ota_floor_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_FLOOR_MAGIC,
-                      sizeof(*record), offsetof(xiao_ota_floor_t, crc32),
+                      XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                      offsetof(xiao_ota_floor_t, crc32),
                       offsetof(xiao_ota_floor_t, commit_marker));
+}
+
+bool xiao_ota_bytes_erased(const void *data, size_t length) {
+  const uint8_t *bytes = (const uint8_t *)data;
+  size_t i;
+  for (i = 0; i < length; ++i) {
+    if (bytes[i] != 0xFFu) return false;
+  }
+  return true;
+}
+
+static void put_be16(uint8_t *dst, uint16_t v) {
+  dst[0] = (uint8_t)(v >> 8);
+  dst[1] = (uint8_t)v;
+}
+
+static uint16_t get_be16(const uint8_t *src) {
+  return (uint16_t)(((uint16_t)src[0] << 8) | src[1]);
+}
+
+static void put_be32(uint8_t *dst, uint32_t v) {
+  dst[0] = (uint8_t)(v >> 24);
+  dst[1] = (uint8_t)(v >> 16);
+  dst[2] = (uint8_t)(v >> 8);
+  dst[3] = (uint8_t)v;
+}
+
+static uint32_t get_be32(const uint8_t *src) {
+  return ((uint32_t)src[0] << 24) | ((uint32_t)src[1] << 16) |
+         ((uint32_t)src[2] << 8) | (uint32_t)src[3];
+}
+
+void xiao_ota_wire_descriptor_encode(const xiao_ota_wire_descriptor_t *d,
+                                     uint8_t out[XIAO_OTA_WIRE_DESCRIPTOR_SIZE]) {
+  size_t pos = 0;
+  put_be16(out + pos, d->board_family); pos += 2;
+  put_be16(out + pos, d->board_variant); pos += 2;
+  out[pos] = d->role; pos += 1;
+  put_be32(out + pos, d->app_address); pos += 4;
+  put_be32(out + pos, d->exact_size_bytes); pos += 4;
+  memcpy(out + pos, d->sha256, 32); pos += 32;
+  put_be32(out + pos, d->security_counter); pos += 4;
+  put_be32(out + pos, d->min_boot_capabilities); pos += 4;
+  put_be16(out + pos, d->format_id); pos += 2;
+  put_be16(out + pos, d->key_id); pos += 2;
+  put_be16(out + pos, d->algorithm_id); pos += 2;
+}
+
+bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_SIZE],
+                                     xiao_ota_wire_descriptor_t *out) {
+  uint8_t reencoded[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
+  size_t pos = 0;
+  out->board_family = get_be16(in + pos); pos += 2;
+  out->board_variant = get_be16(in + pos); pos += 2;
+  out->role = in[pos]; pos += 1;
+  out->app_address = get_be32(in + pos); pos += 4;
+  out->exact_size_bytes = get_be32(in + pos); pos += 4;
+  memcpy(out->sha256, in + pos, 32); pos += 32;
+  out->security_counter = get_be32(in + pos); pos += 4;
+  out->min_boot_capabilities = get_be32(in + pos); pos += 4;
+  out->format_id = get_be16(in + pos); pos += 2;
+  out->key_id = get_be16(in + pos); pos += 2;
+  out->algorithm_id = get_be16(in + pos); pos += 2;
+  xiao_ota_wire_descriptor_encode(out, reencoded);
+  return memcmp(reencoded, in, XIAO_OTA_WIRE_DESCRIPTOR_SIZE) == 0;
+}
+
+bool xiao_ota_install_command_from_v1(const xiao_ota_command_t *cmd,
+                                      xiao_ota_install_command_t *out) {
+  const xiao_ota_canonical_descriptor_t *d = &cmd->descriptor;
+  memset(out, 0, sizeof(*out));
+  out->transaction_nonce = cmd->transaction_nonce;
+  out->target_id = d->target_id_le;
+  out->role_id = d->role_id_le;
+  out->device_address = d->device_address_le;
+  out->allow_broadcast_address = d->allow_broadcast_address;
+  out->required_boot_capability_flags = d->required_boot_capability_flags_le;
+  out->monotonic_counter = d->monotonic_counter_le;
+  out->image_size_bytes = d->image_size_bytes_le;
+  out->app_address = d->app_address_le;
+  out->format_id = d->format_id_le;
+  out->key_id = d->key_id_le;
+  out->algorithm_id = d->algorithm_id_le;
+  memcpy(out->image_hash_sha256, d->image_hash_sha256, 32);
+  out->active_image_extent = cmd->active_image_extent;
+  memcpy(out->active_image_hash_sha256, cmd->active_image_hash_sha256, 32);
+  return true;
+}
+
+bool xiao_ota_install_command_from_v2(const xiao_ota_command_v2_t *cmd,
+                                      xiao_ota_install_command_t *out) {
+  xiao_ota_wire_descriptor_t w;
+  memset(out, 0, sizeof(*out));
+  if (!xiao_ota_wire_descriptor_decode(cmd->wire_descriptor, &w)) return false;
+  out->transaction_nonce = cmd->transaction_nonce;
+  out->target_id = ((uint32_t)w.board_family << 16) | w.board_variant;
+  out->role_id = w.role;
+  /*
+   * The wire descriptor has no per-device targeting field: normalize v2 to
+   * always-broadcast. These two fields are NOT part of the signed 59
+   * bytes, so this is a fixed, non-attacker-controlled normalization, not
+   * a policy relaxation of anything the signature covers.
+   */
+  out->device_address = 0;
+  out->allow_broadcast_address = 1;
+  out->required_boot_capability_flags = w.min_boot_capabilities;
+  out->monotonic_counter = w.security_counter;
+  out->image_size_bytes = w.exact_size_bytes;
+  out->app_address = w.app_address;
+  out->format_id = w.format_id;
+  out->key_id = w.key_id;
+  out->algorithm_id = w.algorithm_id;
+  memcpy(out->image_hash_sha256, w.sha256, 32);
+  out->active_image_extent = cmd->active_image_extent;
+  memcpy(out->active_image_hash_sha256, cmd->active_image_hash_sha256, 32);
+  return true; /* w.role is uint8_t, so role<=255 always holds by construction. */
+}
+
+bool xiao_ota_install_command_decode(const xiao_ota_command_any_t *any,
+                                     xiao_ota_install_command_t *out) {
+  uint16_t version;
+  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
+  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
+    return xiao_ota_install_command_from_v1(&any->v1, out);
+  }
+  if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
+    return xiao_ota_install_command_from_v2(&any->v2, out);
+  }
+  memset(out, 0, sizeof(*out));
+  return false;
+}
+
+bool xiao_ota_install_command_policy_valid(const xiao_ota_install_command_t *cmd,
+                                           uint32_t counter_floor,
+                                           uint32_t expected_active_extent,
+                                           uint64_t this_device_address) {
+  if (cmd == NULL) return false;
+  /* Checked against this build's compiled-in board profile, never a
+   * wildcard/"matches anything" value -- see XIAO_OTA_BOARD_TARGET. */
+  if (cmd->target_id != XIAO_OTA_BOARD_TARGET) return false;
+  if (cmd->role_id != XIAO_OTA_ROLE_ANY) return false;
+  if (cmd->app_address != XIAO_OTA_APP_START) return false;
+  if (cmd->format_id != XIAO_OTA_DESCRIPTOR_FORMAT) return false;
+  if (cmd->key_id != XIAO_OTA_KEY_ID) return false;
+  if (cmd->algorithm_id != XIAO_OTA_ALGORITHM_ED25519) return false;
+  if ((cmd->required_boot_capability_flags & XIAO_OTA_CAP_QSPI_INSTALL) == 0) return false;
+  if (cmd->monotonic_counter <= counter_floor) return false;
+  /* Candidate/install size capped to XIAO_OTA_INSTALL_MAX_SIZE (708,608
+   * bytes, 0x27000..0xD4000), not the full XIAO_OTA_CANDIDATE_SIZE
+   * (811,008 bytes, 0x27000..0xED000): 0xD4000..0xED000 is where v1.17's
+   * own internal filesystem lives today, and letting an otherwise-valid
+   * install erase/overwrite into it would be unsafe. This does not change
+   * XIAO_OTA_CANDIDATE_SIZE/XIAO_OTA_BACKUP_SIZE, which remain correct as
+   * the full-extent bound for the QSPI staging slot and for the
+   * always-safe backup/active-image-reference size below. */
+  if (cmd->image_size_bytes == 0 || cmd->image_size_bytes > XIAO_OTA_INSTALL_MAX_SIZE) return false;
+  if ((cmd->image_size_bytes & 3u) != 0) return false;
+  if (cmd->active_image_extent == 0 || cmd->active_image_extent > XIAO_OTA_BACKUP_SIZE) return false;
+  if ((cmd->active_image_extent & 3u) != 0) return false;
+  if (cmd->active_image_extent != expected_active_extent) return false;
+  if (cmd->device_address != this_device_address &&
+      !(cmd->device_address == 0 && cmd->allow_broadcast_address == 1)) {
+    return false;
+  }
+  return true;
 }
 
 const void *xiao_ota_newest_valid(const void *a, const void *b, size_t size,
@@ -122,4 +335,21 @@ xiao_ota_phase_t xiao_ota_recovery_phase(const xiao_ota_state_t *state,
     default:
       return (xiao_ota_phase_t)state->phase;
   }
+}
+
+/*
+ * True when the boot flow may accept a newly written, validly signed install
+ * command and start a fresh install transaction. EMPTY/no-state (nothing has
+ * ever run) and CONFIRMED (the last install finished cleanly) always accept.
+ * FAILED also accepts: it is only reached after a completed rollback whose
+ * restored bank_0 settings and image hash were independently verified before
+ * FAILED was persisted (see xiao_ota_boot_process()), so the device is
+ * already running known-good code -- refusing new commands here would
+ * permanently disable OTA after a single rejected/interrupted candidate.
+ * Every other phase means a transaction is mid-flight and must run to
+ * completion (or force_recovery()) before a new command can be considered.
+ */
+bool xiao_ota_command_acceptable_phase(bool have_state, xiao_ota_phase_t phase) {
+  return !have_state || phase == XIAO_OTA_PHASE_EMPTY ||
+         phase == XIAO_OTA_PHASE_CONFIRMED || phase == XIAO_OTA_PHASE_FAILED;
 }
