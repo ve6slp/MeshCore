@@ -255,6 +255,19 @@ selection or mark-valid call is implemented, and stock Arduino's early
 trial confirmation/watchdog behavior remains an installation blocker.
 No ESP32 hardware qualification is claimed.
 
+### Deterministic install-attempt identity
+
+`otaInstallAttemptNonce()` derives the first eight hash bytes as BE64 from
+`"MeshCore/OTA/install-attempt/v1"` (no NUL), controller32, campaignBE32,
+sessionBE32, attemptBE16 and SHA256(canonical59). Independent known-answer
+vectors pin the domain, byte order and each binding component. Retries of
+the same binding are deterministic.
+
+This portable primitive does not authenticate a controller or grant local
+consent. The durable attempt owner must retain the complete immutable
+binding, reject zero/colliding nonces and preserve replay history. Board
+wiring and persistent ownership remain separate acceptance gates.
+
 ### What this does not yet prove
 
 Software tests cannot qualify device behaviour. The following remain open
