@@ -224,6 +224,9 @@ existing local identity; no additional owner key is supplied in the USB
 request. A local cache must not become an install command for the uploader.
 CacheSeal validates it for transmission; target admission separately checks
 that same signer against the target's live administrator policy.
+Reupload does not override ownership: an active candidate can be restarted
+only by its original owner, for the same image content and cache or install
+purpose. A different image or owner requires an explicit abort first.
 
 Start modes are direct 0, directed 1 and background 2. Direct requires one
 target, channel 255 and a frequency with a 250..60,000 ms lease. Directed
@@ -250,6 +253,49 @@ establish a remote observation made after the wait began, with the expected
 manifest, counter, scope and complete nonzero block counts. A status query
 may honestly report FAILED; a fresh failure for the current candidate ends
 a mutating wait. COMMIT acceptance does not prove a reboot or confirmation.
+
+### Boot lifecycle and subsequent updates
+
+USB status, the ordinary text CLI and requested-manifest RF census use the
+same read-only boot view. On ESP32, signed provenance can be in the running
+slot while writable staging belongs to the inactive slot. Reading that
+provenance does not attach the running slot as staging or change candidate
+metadata. An active newer candidate or local cache retains precedence.
+`Installed` requires the matching original signature, image hash, counter,
+nonce and confirmed boot evidence with a known version floor; a COMMIT
+acknowledgement alone is insufficient.
+
+On nRF52840, the next authorized BEGIN may replace a committed candidate
+only after matching terminal boot evidence proves a confirmed install or
+completed rollback. An active trial, unknown outcome, mismatched provenance
+or failed reception does not release the slot. The new image must still
+pass admission, including the version floor, before an erase begins.
+
+On ESP32, startup retires only authenticated, obsolete inactive-slot
+selection metadata covered by the durable floor. It preserves the original
+provenance and bitmap and does not erase image bytes. A normal USB reflash
+can leave a healthy running image without matching OTA provenance. That
+known, unproven state is distinct from a storage error: preserve the floor,
+do not report `Installed`, and allow normal candidate admission where safe.
+Trial, unknown SDK state and actual I/O failures remain protected.
+
+### Radio packet geometry
+
+All three modes use the dedicated, unencrypted MeshCore OTA payload type
+`0x0C`, with Ed25519 authentication. They do not put bulk blocks inside an
+encrypted group-message envelope. The canonical descriptor is 59 bytes;
+admission is 156 bytes, or 164 bytes with the production target tag.
+A signed block uses `99 + dataLength` bytes, with at most 84 data bytes:
+183 payload bytes in total.
+
+Serialization adds two header bytes and the path, plus four bytes for a
+scoped flood. A full block is 185 bytes at zero hops, at most 249 bytes
+with a 64-byte path, or 253 bytes with scoped flooding. The generic payload
+limit is 184 bytes and the raw radio limit is 255 bytes; the largest
+supported scoped packet is 254 bytes. Native tests exercise actual Mesh
+packet construction and Dispatcher serialization at these boundaries.
+These are software geometry results, not measured radio throughput or a
+campaign-duration guarantee.
 
 The old raw sender, fixed-key fixture, command-66 mode/duty helpers and
 binary journal cleanup have been removed from the host workflow. Existing

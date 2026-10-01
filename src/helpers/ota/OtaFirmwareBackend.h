@@ -613,6 +613,35 @@ inline bool verifyEsp32RunningCandidate(
          std::memcmp(actual, descriptor.sha256, sizeof(actual)) == 0;
 }
 
+// CandidateStore skips unreadable records. Proof/recovery must instead
+// remember every I/O failure and forbid subsequent mutation in that scan.
+class Esp32OtaIoGuard final : public ::ota::platform::FlashDevice {
+public:
+  explicit Esp32OtaIoGuard(::ota::platform::FlashDevice& device) : device_(device) {}
+  uint32_t totalSizeBytes() const override { return device_.totalSizeBytes(); }
+  uint32_t eraseUnitBytes() const override { return device_.eraseUnitBytes(); }
+  uint32_t programUnitBytes() const override { return device_.programUnitBytes(); }
+  bool failed() const { return !::ota::platform::isOk(failure_); }
+  ::ota::platform::FlashStatus read(uint32_t offset, uint8_t* out, uint32_t len) const override {
+    return failed() ? failure_ : observe(device_.read(offset, out, len));
+  }
+  ::ota::platform::FlashStatus program(uint32_t offset, const uint8_t* data, uint32_t len) override {
+    return failed() ? failure_ : observe(device_.program(offset, data, len));
+  }
+  ::ota::platform::FlashStatus eraseSector(uint32_t offset) override {
+    return failed() ? failure_ : observe(device_.eraseSector(offset));
+  }
+private:
+  ::ota::platform::FlashStatus observe(::ota::platform::FlashStatus status) const {
+    if (!::ota::platform::isOk(status)) failure_ = status;
+    return status;
+  }
+  ::ota::platform::FlashDevice& device_;
+  mutable ::ota::platform::FlashStatus failure_ = ::ota::platform::FlashStatus::Ok;
+};
+
+enum class Esp32RunningProof : uint8_t { Verified, NotProven, Refused, IoError };
+
 class Esp32OtaLease final : public ::ota::storage::Esp32UpdateOwner {
 public:
   bool claimStorage() {
@@ -653,9 +682,11 @@ public:
   // The implementation MUST use esp_ota_set_boot_partition(), which validates
   // the app and writes redundant CRC-protected otadata with state NEW.
   virtual bool selectBoot(const ::ota::storage::Esp32PartitionIdentity& partition) = 0;
-  // Fresh SDK VALID, signed running provenance/whole-image hash, and an
-  // existing durable floor exactly equal to that running counter.
-  virtual bool confirmedRunningCounter(uint32_t& counter) = 0;
+  // Verified requires SDK VALID and signed running provenance/whole SHA.
+  // NotProven requires readable, stable non-trial SDK/flash context.
+  virtual Esp32RunningProof runningProof(uint32_t& counter) = 0;
+  virtual bool readConfirmedFloor(uint32_t& counter, bool& found) = 0;
+  virtual bool saveConfirmedFloor(uint32_t counter) = 0;
 };
 
 class Esp32OtaTrustProvider final : public meshcore::ota::runtime::IOtaTrustProvider {
@@ -784,8 +815,15 @@ public:
                                                    : InstallOutcome::SelectionUncertain;
   }
   bool recoverUnsuccessfulSelection() {
+    Esp32OtaIoGuard checked(flash_);
+    ::ota::platform::FlashRegion checked_metadata(checked, metadata_.baseOffset(), metadata_.sizeBytes());
+    Store checked_store(checked_metadata);
+    const auto refuseIo = [&]() {
+      if (flash_.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk) io_fault_ = true;
+      return false;
+    };
     Store::Snapshot s;
-    if (!store_.load(s)) return false;
+    if (!checked_store.load(s) || checked.failed()) return refuseIo();
     if (s.phase != Store::Phase::Committed && s.phase != Store::Phase::Failed) return true;
     meshcore::ota::protocol::OtaDescriptor d;
     const auto phase = s.phase;
@@ -795,27 +833,37 @@ public:
           meshcore::ota::protocol::OtaDescriptorCodecResult::Ok) return false;
       if (d.securityCounter > policy_.confirmedCounter) return true;
     }
-    if (!verifyEsp32CandidateProvenance(store_, policy_, signatures_, s, d, phase)) return false;
+    if (!verifyEsp32CandidateProvenance(checked_store, policy_, signatures_, s, d, phase) ||
+        checked.failed()) return refuseIo();
     uint8_t marker[4];
     // This read revalidates boot==running and absence of NEW/PENDING_VERIFY:
     // only the safe previous application can retire a failed trial.
-    if (!::ota::platform::isOk(metadata_.read(kSelectionMarkerOffset, marker, 4))) return false;
+    if (!::ota::platform::isOk(checked_metadata.read(kSelectionMarkerOffset, marker, 4))) return refuseIo();
     bool attempted = false;
     for (uint8_t byte : marker) attempted |= byte != 0xff;
     if (d.securityCounter <= policy_.confirmedCounter) {
-      uint32_t running_counter = 0;
-      if (std::memcmp(marker, kSelectionMarker, sizeof(marker)) != 0 ||
-          !install_.confirmedRunningCounter(running_counter) ||
-          running_counter != policy_.confirmedCounter) return false;
+      if (std::memcmp(marker, kSelectionMarker, sizeof(marker)) != 0) return false;
+      uint32_t floor = 0, running_counter = 0;
+      bool found = false;
+      if (!install_.readConfirmedFloor(floor, found)) { io_fault_ = true; return false; }
+      if (!found || floor != policy_.confirmedCounter) return false;
+      const auto proof = install_.runningProof(running_counter);
+      if (proof == Esp32RunningProof::IoError) { io_fault_ = true; return false; }
+      if (proof == Esp32RunningProof::Refused ||
+          (proof == Esp32RunningProof::Verified && running_counter != floor)) return false;
+      uint32_t latest = 0;
+      if (!install_.readConfirmedFloor(latest, found)) { io_fault_ = true; return false; }
+      if (!found || latest != floor) return false;
       // A/B alternation leaves the older successful app's signed record in
-      // the inactive slot. Retire only that proven floor-covered record;
-      // preserve its identity until a newly authorized BEGIN resets it.
+      // the inactive slot, including after a USB reflash without tail/NVS
+      // erasure. Retire only that authenticated floor-covered record.
       s.phase = Store::Phase::Idle;
     } else {
       if (!attempted) return true;
       s.phase = Store::Phase::Failed;
     }
-    return store_.append(s);
+    if (!checked_store.append(s) || checked.failed()) return refuseIo();
+    return true;
   }
   bool storageIoFaultObserved() const { return io_fault_; }
 

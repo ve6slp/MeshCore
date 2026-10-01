@@ -210,6 +210,8 @@ public:
   static void otaSelfIdSignThunk(void* ctx, const uint8_t* message, size_t message_len, uint8_t signature_out[64]);
   static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore);
   static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
+  static bool otaBootCandidateThunk(void* ctx, const mesh::ota::OtaBootLifecycleEvidence& boot,
+                                    ::ota::storage::OtaCandidateStore::Snapshot& out);
   static bool otaSendThunk(void* ctx, mesh::ota::OtaRfRoute route, const uint8_t target[32],
                             const uint8_t* frame, size_t len, meshcore::ota::protocol::OtaAirtimeCategory category);
 #endif

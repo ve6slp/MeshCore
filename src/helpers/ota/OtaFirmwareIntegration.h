@@ -155,7 +155,13 @@ public:
     rf_ctx_ = ctx; rf_sign_ = sign; rf_radio_change_ = change; normal_freq_khz_ = normal_freq_khz;
   }
   using BootLifecycleFn = bool (*)(void*, OtaBootLifecycleEvidence&);
-  void attachBootLifecycle(void* ctx, BootLifecycleFn fn) { boot_ctx_ = ctx; boot_lifecycle_ = fn; }
+  // The board verifies signed provenance and live boot/slot identity before returning a read-only snapshot.
+  using BootCandidateFn = bool (*)(void*, const OtaBootLifecycleEvidence&,
+                                  ::ota::storage::OtaCandidateStore::Snapshot&);
+  void attachBootLifecycle(void* ctx, BootLifecycleFn fn, BootCandidateFn candidate_fn = nullptr) {
+    boot_ctx_ = ctx; boot_lifecycle_ = fn; boot_candidate_ = candidate_fn;
+    lean_.attachTerminalCheck(this, &terminalCandidateThunk);
+  }
   OtaBootLifecycleEvidence bootLifecycle() const {
     OtaBootLifecycleEvidence out;
     if (boot_lifecycle_ && !boot_lifecycle_(boot_ctx_, out)) out = OtaBootLifecycleEvidence();
@@ -174,25 +180,60 @@ public:
     }
   }
   usb::UsbOtaPhase reportedPhase() const {
-    return reportedPhase(bootLifecycle());
+    return readback().phase;
   }
-  usb::UsbOtaPhase reportedPhase(const OtaBootLifecycleEvidence& boot) const {
+  struct Readback {
+    OtaLeanReceiver::Status snapshot;
+    usb::UsbOtaPhase phase = usb::UsbOtaPhase::Unknown;
+    bool bootCandidate = false;
+  };
+
+  Readback readback() const {
+    return readback(lean_.status().localCache ? OtaBootLifecycleEvidence() : bootLifecycle());
+  }
+
+  Readback readback(const OtaBootLifecycleEvidence& boot, const uint8_t* manifest_hash = nullptr) const {
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    Readback out;
     const auto st = lean_.status();
-    if (!st.valid) return usb::UsbOtaPhase::Unknown;
-    if (st.localCache) return st.phase == ::ota::storage::OtaCandidateStore::Phase::Ready ?
-                                usb::UsbOtaPhase::CacheSealed : candidatePhase(st.phase);
-    if (boot.transactionNonce == st.transactionNonce && boot.transactionNonce && boot.counter == st.counter) {
-      if (boot.phase == usb::UsbOtaPhase::Failed) return usb::UsbOtaPhase::Failed;
-      if ((boot.phase == usb::UsbOtaPhase::Trial || boot.phase == usb::UsbOtaPhase::Installed) &&
-          !std::memcmp(boot.imageHash, st.imageHash, 32)) {
-        uint8_t canonical[59], signature[64];
-        if (lean_.exportCandidateForUpload(canonical, signature) &&
-            lean_.verifySignature(st.ownerPublicKey, canonical, sizeof(canonical), signature) &&
-            (boot.phase == usb::UsbOtaPhase::Trial ||
-             (boot.imageVerified && boot.floorKnown && boot.confirmedFloor == st.counter))) return boot.phase;
+    if (st.valid && (!manifest_hash || !std::memcmp(manifest_hash, st.manifestHash, 32))) {
+      out.snapshot = st;
+      out.phase = phaseForCandidate(st, boot);
+      const bool superseded = boot.phase == usb::UsbOtaPhase::Installed && boot.imageVerified &&
+                              boot.floorKnown && boot.confirmedFloor >= st.counter;
+      if (st.localCache || st.counter > boot.counter ||
+          ((st.phase == Phase::Receiving || st.phase == Phase::Verifying || st.phase == Phase::Ready) &&
+           !superseded) ||
+          (boot.transactionNonce && boot.transactionNonce == st.transactionNonce &&
+           boot.counter == st.counter && !std::memcmp(boot.imageHash, st.imageHash, 32) &&
+           out.phase == boot.phase)) return out;
+    }
+    ::ota::storage::OtaCandidateStore::Snapshot candidate;
+    if (boot_candidate_ && boot_candidate_(boot_ctx_, boot, candidate) &&
+        validBootCandidate(boot, candidate)) {
+      const auto snapshot = OtaLeanReceiver::snapshotStatus(candidate);
+      if (!manifest_hash || !std::memcmp(manifest_hash, snapshot.manifestHash, 32)) {
+        out.snapshot = snapshot;
+        out.phase = boot.phase == usb::UsbOtaPhase::Unknown ? usb::UsbOtaPhase::CommitPending : boot.phase;
+        out.bootCandidate = true;
       }
     }
-    return candidatePhase(st.phase);
+    return out;
+  }
+  void fillUsbReadback(usb::UsbOtaReply& reply) const {
+    const auto view = readback();
+    const auto& st = view.snapshot;
+    if (!st.valid) return;
+    reply.flags |= usb::kReplyFlagSnapshotValid;
+    reply.phase = view.phase;
+    std::memcpy(reply.manifestHash, st.manifestHash, sizeof(reply.manifestHash));
+    reply.durableReceivedBlocks = st.receivedBlocks;
+    reply.totalBlocks = st.totalBlocks;
+    reply.counter = st.counter;
+    reply.statusAgeMs = 0;
+  }
+  usb::UsbOtaPhase reportedPhase(const OtaBootLifecycleEvidence& boot) const {
+    return readback(boot).phase;
   }
   bool directActive() const { return direct_active_; }
   bool directPending() const { return direct_pending_; }
@@ -514,6 +555,77 @@ public:
   }
 
 private:
+  static bool terminalCandidateThunk(void* ctx, const ::ota::storage::OtaCandidateStore::Snapshot& candidate) {
+    return static_cast<OtaFirmwareIntegration*>(ctx)->terminalCandidate(candidate);
+  }
+  bool terminalCandidate(const ::ota::storage::OtaCandidateStore::Snapshot& candidate) const {
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    if (!candidate.valid || candidate.localCache ||
+        (candidate.phase != Phase::Committed && candidate.phase != Phase::Ready && candidate.phase != Phase::Failed) ||
+        !validCandidateGeometry(candidate, candidate.phase != Phase::Failed) ||
+        !lean_.verifySignature(candidate.ownerPublicKey, candidate.canonical, sizeof(candidate.canonical),
+                               candidate.signature)) return false;
+    const auto boot = bootLifecycle();
+    if (boot.phase != usb::UsbOtaPhase::Installed && boot.phase != usb::UsbOtaPhase::Failed) return false;
+    if (validBootCandidate(boot, candidate, true)) return true;
+    // A verified newer running install can supersede an old inactive COMMITTED record.
+    if (candidate.phase != Phase::Committed || !boot_candidate_ ||
+        boot.phase != usb::UsbOtaPhase::Installed || !boot.imageVerified || !boot.floorKnown ||
+        boot.confirmedFloor != boot.counter ||
+        OtaLeanReceiver::snapshotStatus(candidate).counter >= boot.counter) return false;
+    ::ota::storage::OtaCandidateStore::Snapshot running;
+    return boot_candidate_(boot_ctx_, boot, running) && validBootCandidate(boot, running);
+  }
+  static bool validBootCandidate(const OtaBootLifecycleEvidence& boot,
+                                 const ::ota::storage::OtaCandidateStore::Snapshot& candidate,
+                                 bool retiring = false) {
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    const bool failed = boot.phase == usb::UsbOtaPhase::Failed;
+    if (!candidate.valid || candidate.localCache ||
+        (candidate.phase != (failed ? Phase::Failed : Phase::Committed) &&
+         !(retiring && (candidate.phase == Phase::Ready || (failed && candidate.phase == Phase::Committed)))) ||
+        !boot.transactionNonce ||
+        (failed ? boot.imageVerified : !boot.imageVerified) ||
+        (!failed && boot.phase != usb::UsbOtaPhase::Trial && boot.phase != usb::UsbOtaPhase::Installed &&
+         boot.phase != usb::UsbOtaPhase::Unknown)) return false;
+    if (!validCandidateGeometry(candidate, !failed || (retiring && candidate.phase != Phase::Failed))) return false;
+    const auto st = OtaLeanReceiver::snapshotStatus(candidate);
+    return st.counter != 0 && st.counter == boot.counter && st.transactionNonce == boot.transactionNonce &&
+           !std::memcmp(st.imageHash, boot.imageHash, 32) &&
+           (boot.phase != usb::UsbOtaPhase::Installed ||
+            (boot.floorKnown && boot.confirmedFloor == st.counter));
+  }
+  static bool validCandidateGeometry(const ::ota::storage::OtaCandidateStore::Snapshot& candidate, bool complete) {
+    meshcore::ota::protocol::OtaDescriptor descriptor;
+    if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(candidate.canonical, sizeof(candidate.canonical),
+          descriptor) != meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
+        descriptor.formatId != 1 || descriptor.algorithmId != 1 || descriptor.keyId == 0 ||
+        descriptor.appAddress == 0 || descriptor.exactSizeBytes == 0 ||
+        descriptor.exactSizeBytes > ::ota::storage::OtaCandidateStore::kMaxBlocks * kOtaBlockMaxDataBytes ||
+        candidate.exactSizeBytes != descriptor.exactSizeBytes ||
+        candidate.totalBlocks != (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1u) / kOtaBlockMaxDataBytes ||
+        candidate.receivedBlocks > candidate.totalBlocks ||
+        (complete && candidate.receivedBlocks != candidate.totalBlocks)) return false;
+    return true;
+  }
+  usb::UsbOtaPhase phaseForCandidate(const OtaLeanReceiver::Status& st,
+                                    const OtaBootLifecycleEvidence& boot) const {
+    if (!st.valid) return usb::UsbOtaPhase::Unknown;
+    if (st.localCache) return st.phase == ::ota::storage::OtaCandidateStore::Phase::Ready ?
+                                usb::UsbOtaPhase::CacheSealed : candidatePhase(st.phase);
+    if (boot.transactionNonce == st.transactionNonce && boot.transactionNonce && boot.counter == st.counter) {
+      if (boot.phase == usb::UsbOtaPhase::Failed) return usb::UsbOtaPhase::Failed;
+      if ((boot.phase == usb::UsbOtaPhase::Trial || boot.phase == usb::UsbOtaPhase::Installed) &&
+          !std::memcmp(boot.imageHash, st.imageHash, 32)) {
+        uint8_t canonical[59], signature[64];
+        if (lean_.exportCandidateForUpload(canonical, signature) &&
+            lean_.verifySignature(st.ownerPublicKey, canonical, sizeof(canonical), signature) &&
+            (boot.phase == usb::UsbOtaPhase::Trial ||
+             (boot.imageVerified && boot.floorKnown && boot.confirmedFloor == st.counter))) return boot.phase;
+      }
+    }
+    return candidatePhase(st.phase);
+  }
   static constexpr size_t kDescriptorFragmentHeaderSize = 1 + 1 + 2 + 2;
 
   enum class LeanControlResult { NotControlFrame, Handled, Rejected };
@@ -588,10 +700,13 @@ private:
       }
       case kOtaCensusPollKind: {
         if (frame_len != kOtaCensusPollBytes || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
-        auto st = lean_.status();
-        if (!st.valid || st.localCache || std::memcmp(frame + 1, lean_.targetPublicKey(), 32)) return LeanControlResult::Handled;
-        const bool pending = std::memcmp(frame + 33, st.manifestHash, 32) != 0;
+        if (std::memcmp(frame + 1, lean_.targetPublicKey(), 32)) return LeanControlResult::Handled;
+        const auto boot = bootLifecycle();
+        const auto view = readback(boot, frame + 33);
+        auto st = view.snapshot;
+        const bool pending = !st.valid;
         if (pending && !lean_.pendingReuploadStatus(frame + 33, st)) return LeanControlResult::Handled;
+        if (st.localCache) return LeanControlResult::Handled;
         if (pending_control_frame_valid_) return LeanControlResult::Handled;
         OtaCensusReport r;
         std::memcpy(r.reporter, lean_.targetPublicKey(), 32);
@@ -600,12 +715,13 @@ private:
         if (r.first >= st.totalBlocks) return LeanControlResult::Rejected;
         for (size_t bit = 0; bit < kOtaCensusWindowBlocks; ++bit) {
           const uint32_t index = static_cast<uint32_t>(r.first) + bit;
-          if (!pending && index < st.totalBlocks && lean_.isBlockReceived(index)) r.bitmap[bit / 8] |= 1u << (bit % 8);
+          if (!pending && index < st.totalBlocks &&
+              (view.bootCandidate ? st.receivedBlocks == st.totalBlocks : lean_.isBlockReceived(index)))
+            r.bitmap[bit / 8] |= 1u << (bit % 8);
         }
         r.received = st.receivedBlocks; r.total = st.totalBlocks;
         r.phase = static_cast<uint8_t>(st.phase); r.generation = st.generation;
-        const auto boot = bootLifecycle();
-        r.lifecyclePhase = pending ? usb::UsbOtaPhase::Aborted : reportedPhase(boot);
+        r.lifecyclePhase = pending ? usb::UsbOtaPhase::Aborted : view.phase;
         r.floorKnown = boot.floorKnown; r.confirmedFloor = boot.confirmedFloor;
         r.counter = st.counter;
         pending_control_frame_len_ = encodeOtaCensusReport(r, pending_control_frame_, sizeof(pending_control_frame_));
@@ -1212,6 +1328,7 @@ private:
   void* rf_ctx_ = nullptr;
   void* boot_ctx_ = nullptr;
   BootLifecycleFn boot_lifecycle_ = nullptr;
+  BootCandidateFn boot_candidate_ = nullptr;
   SignFn rf_sign_ = nullptr;
   RadioChangeFn rf_radio_change_ = nullptr;
   uint32_t normal_freq_khz_ = 0, direct_freq_khz_ = 0;

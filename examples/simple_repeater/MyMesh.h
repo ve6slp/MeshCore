@@ -335,6 +335,8 @@ public:
   static void otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]);
   static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore);
   static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
+  static bool otaBootCandidateThunk(void* ctx, const mesh::ota::OtaBootLifecycleEvidence& boot,
+                                    ::ota::storage::OtaCandidateStore::Snapshot& out);
 #endif
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
   bool isOtaAdminKey(const uint8_t key[32]) const;

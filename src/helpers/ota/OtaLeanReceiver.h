@@ -19,6 +19,7 @@ class OtaLeanReceiver {
 public:
   using Result = usb::UsbOtaResult;
   using AdminCheckFn = bool (*)(void*, const uint8_t[32]);
+  using TerminalCheckFn = bool (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&);
 
   struct Status {
     bool valid = false;
@@ -37,6 +38,7 @@ public:
   void attachTrustProvider(meshcore::ota::runtime::IOtaTrustProvider* provider) { trust_provider_ = provider; }
   void attachStagingSink(meshcore::ota::runtime::IOtaStagingSink* sink) { staging_sink_ = sink; tryResumeSink(); }
   void attachOwnerSignatureVerifier(const ::ota::trust::SignatureVerifier* verifier) { owner_signature_verifier_ = verifier; }
+  void attachTerminalCheck(void* ctx, TerminalCheckFn fn) { terminal_ctx_ = ctx; terminal_check_ = fn; }
 
   void attachCandidateStore(::ota::storage::OtaCandidateStore* store) {
     store_ = store;
@@ -144,26 +146,30 @@ public:
   }
 
   Status status() const {
+    return snapshotStatus(candidate_);
+  }
+
+  static Status snapshotStatus(const ::ota::storage::OtaCandidateStore::Snapshot& candidate) {
     Status out;
-    out.valid = candidate_.valid;
-    out.localCache = candidate_.localCache;
-    out.phase = candidate_.phase;
-    out.receivedBlocks = candidate_.receivedBlocks;
-    out.totalBlocks = candidate_.totalBlocks;
-    out.generation = candidate_.sessionId;
-    std::memcpy(out.ownerPublicKey, candidate_.ownerPublicKey, sizeof(out.ownerPublicKey));
-    if (candidate_.valid) {
+    out.valid = candidate.valid;
+    out.localCache = candidate.localCache;
+    out.phase = candidate.phase;
+    out.receivedBlocks = candidate.receivedBlocks;
+    out.totalBlocks = candidate.totalBlocks;
+    out.generation = candidate.sessionId;
+    std::memcpy(out.ownerPublicKey, candidate.ownerPublicKey, sizeof(out.ownerPublicKey));
+    if (candidate.valid) {
       meshcore::ota::runtime::OtaSessionId session;
-      session.campaignId = candidate_.campaignId;
-      session.sessionId = candidate_.sessionId;
-      session.attemptId = candidate_.attemptId;
-      out.transactionNonce = meshcore::ota::runtime::otaInstallAttemptNonce(candidate_.ownerPublicKey, session,
-                                                                          candidate_.canonical);
-      out.counter = usb::getBE32(candidate_.canonical + 45);
-      computeOtaManifestHash(candidate_.canonical, out.manifestHash);
+      session.campaignId = candidate.campaignId;
+      session.sessionId = candidate.sessionId;
+      session.attemptId = candidate.attemptId;
+      out.transactionNonce = meshcore::ota::runtime::otaInstallAttemptNonce(candidate.ownerPublicKey, session,
+                                                                          candidate.canonical);
+      out.counter = usb::getBE32(candidate.canonical + 45);
+      computeOtaManifestHash(candidate.canonical, out.manifestHash);
       meshcore::ota::protocol::OtaDescriptor descriptor;
-      if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(candidate_.canonical,
-            sizeof(candidate_.canonical), descriptor) == meshcore::ota::protocol::OtaDescriptorCodecResult::Ok) {
+      if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(candidate.canonical,
+            sizeof(candidate.canonical), descriptor) == meshcore::ota::protocol::OtaDescriptorCodecResult::Ok) {
         std::memcpy(out.imageHash, descriptor.sha256, sizeof(out.imageHash));
       }
     }
@@ -200,21 +206,29 @@ public:
         candidate_.localCache == local_cache &&
         std::memcmp(candidate_.ownerPublicKey, owner_public_key, 32) == 0 &&
         std::memcmp(candidate_.canonical, canonical, sizeof(candidate_.canonical)) == 0;
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    const bool terminal = candidate_.valid && !candidate_.localCache &&
+        (candidate_.phase == Phase::Committed || candidate_.phase == Phase::Ready || candidate_.phase == Phase::Failed) &&
+        terminal_check_ && terminal_check_(terminal_ctx_, candidate_);
     if (!reupload && same_candidate &&
-        (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Receiving ||
-         candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Ready ||
-         candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed)) {
+        (candidate_.phase == Phase::Receiving || candidate_.phase == Phase::Verifying ||
+         candidate_.phase == Phase::Ready || (candidate_.phase == Phase::Committed && !terminal))) {
       candidate_.receivedBlocks = store_->countReceived(candidate_.totalBlocks);
       return Result::Ok;
     }
-    if (!reupload && candidate_.valid && !same_candidate && candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Idle) {
-      return Result::Busy;
+    if (candidate_.valid && candidate_.phase != Phase::Idle && !terminal) {
+      const bool same_content_owner = candidate_.localCache == local_cache &&
+          !std::memcmp(candidate_.ownerPublicKey, owner_public_key, 32) &&
+          !std::memcmp(status().imageHash, descriptor.sha256, 32);
+      if (candidate_.phase == Phase::Aborted) {
+        if (!reupload) return same_candidate ? Result::Denied : Result::Busy;
+      } else {
+        if (!same_content_owner) return Result::Busy;
+        if (!reupload) return Result::Denied;
+      }
     }
-    if (!reupload && candidate_.valid && candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted) {
-      return Result::Denied;
-    }
-    if (commit_started_ || (candidate_.valid &&
-        candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed)) return Result::TooLate;
+    if (!terminal && (commit_started_ || (candidate_.valid && candidate_.phase == Phase::Committed)))
+      return Result::TooLate;
 
     const auto begin_result = staging_sink_->beginSession(descriptor);
     if (begin_result == meshcore::ota::runtime::IOtaStagingSink::Result::Rejected) return Result::Busy;
@@ -239,6 +253,8 @@ public:
     candidate_ = next;
     pending_reupload_ = false;
     seal_pending_ = false;
+    commit_started_ = false;
+    commit_sink_done_ = false;
     staging_sink_->onVerifiedWireDescriptor(candidate_.canonical, sizeof(candidate_.canonical),
                                             candidate_.signature, sizeof(candidate_.signature));
     meshcore::ota::runtime::OtaSessionId session;
@@ -502,6 +518,8 @@ private:
   ::ota::storage::OtaCandidateStore::Snapshot candidate_{};
   void* admin_ctx_ = nullptr;
   AdminCheckFn admin_check_ = nullptr;
+  void* terminal_ctx_ = nullptr;
+  TerminalCheckFn terminal_check_ = nullptr;
   uint8_t target_public_key_[32] = {0};
   bool have_target_public_key_ = false;
   bool seal_pending_ = false;

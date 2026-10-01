@@ -80,7 +80,9 @@ public:
     return esp_ota_get_boot_partition() == app &&
            esp_ota_get_state_partition(app, &state) == ESP_OK && state == ESP_OTA_IMG_NEW;
   }
-  bool confirmedRunningCounter(uint32_t& counter) override;
+  Esp32RunningProof runningProof(uint32_t& counter) override;
+  bool readConfirmedFloor(uint32_t& counter, bool& found) override;
+  bool saveConfirmedFloor(uint32_t counter) override;
 };
 
 // Read-only proof from the RUNNING slot, including its candidate provenance.
@@ -142,24 +144,14 @@ bool readFloor(uint32_t& out, bool* found = nullptr) {
   return err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND;
 }
 
-bool VendorInstallApi::confirmedRunningCounter(uint32_t& counter) {
-  counter = 0;
-  uint32_t floor = 0;
-  bool found = false;
-  if (!readFloor(floor, &found)) { storage_fault = true; return false; }
+Esp32RunningProof VendorInstallApi::runningProof(uint32_t& counter) {
   ReadOnlyAppReader reader;
-  ::ota::platform::FlashRegion running_image(reader, 0, Esp32OtaPolicy::kCandidateBytes);
-  ::ota::platform::FlashRegion running_metadata(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
-  OtaCandidateStore running_store(running_metadata);
   ::ota::storage::Esp32IdfPartitionApi sdk;
-  uint32_t verified = 0;
-  if (!verifyEsp32ConfirmedRunningCounter(sdk, running_store, running_image, policy, signatures,
-                                         found, floor, verified)) return false;
-  uint32_t latest = 0;
-  if (!readFloor(latest, &found)) { storage_fault = true; return false; }
-  if (!found || latest != verified) return false;
-  counter = verified;
-  return true;
+  return readEsp32RunningProof(sdk, reader, policy, signatures, counter);
+}
+
+bool VendorInstallApi::readConfirmedFloor(uint32_t& counter, bool& found) {
+  return readFloor(counter, &found);
 }
 
 bool saveFloor(uint32_t counter) {
@@ -172,6 +164,8 @@ bool saveFloor(uint32_t counter) {
   nvs_close(handle);
   return ok && readFloor(floor) && floor >= counter;
 }
+
+bool VendorInstallApi::saveConfirmedFloor(uint32_t counter) { return saveFloor(counter); }
 
 bool runningCandidateCounter(uint32_t& counter, bool& have_candidate) {
   have_candidate = false;
@@ -192,12 +186,6 @@ bool runningCandidateCounter(uint32_t& counter, bool& have_candidate) {
   counter = d.securityCounter;
   have_candidate = true;
   return true;
-}
-
-bool reconcileRunningFloor() {
-  uint32_t counter = 0;
-  bool have_candidate = false;
-  return runningCandidateCounter(counter, have_candidate) && (!have_candidate || saveFloor(counter));
 }
 
 class VendorTrialPlatform final : public Esp32TrialPlatform {
@@ -299,29 +287,80 @@ bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
     floor_known = false;
   }
   ReadOnlyAppReader running;
-  ::ota::platform::FlashRegion running_image(running, 0, Esp32OtaPolicy::kCandidateBytes);
-  ::ota::platform::FlashRegion running_metadata(running, Esp32OtaPolicy::kCandidateBytes, 8192);
+  Esp32OtaIoGuard checked_running(running);
+  ::ota::platform::FlashRegion running_image(checked_running, 0, Esp32OtaPolicy::kCandidateBytes);
+  ::ota::platform::FlashRegion running_metadata(checked_running, Esp32OtaPolicy::kCandidateBytes, 8192);
   OtaCandidateStore running_store(running_metadata);
-  if (!readEsp32BootLifecycle(state, running_store, running_image, policy, signatures,
-                             floor_known, floor, out)) return false;
+  if (!readEsp32BootLifecycle(state, running_store, running_image, running_metadata, policy, signatures,
+                             floor_known, floor, out) || checked_running.failed()) {
+    if (checked_running.failed()) storage_fault = true;
+    out = OtaBootLifecycleEvidence();
+    return false;
+  }
   Esp32ImageState latest;
   if (!trial_platform.runningState(latest) || latest != state) {
     out = OtaBootLifecycleEvidence();
     return false;
   }
   const auto* next = esp_ota_get_next_update_partition(nullptr);
+  if (next == nullptr || next == esp_ota_get_running_partition()) {
+    out = OtaBootLifecycleEvidence();
+    return false;
+  }
   esp_ota_img_states_t next_state;
-  if (next != nullptr && next != esp_ota_get_running_partition() &&
-      esp_ota_get_state_partition(next, &next_state) == ESP_OK &&
+  const auto next_result = esp_ota_get_state_partition(next, &next_state);
+  if (next_result != ESP_OK && next_result != ESP_ERR_NOT_FOUND) {
+    storage_fault = true;
+    out = OtaBootLifecycleEvidence();
+    return false;
+  }
+  if ((state == Esp32ImageState::Valid || state == Esp32ImageState::Undefined) && next_result == ESP_OK &&
       (next_state == ESP_OTA_IMG_ABORTED || next_state == ESP_OTA_IMG_INVALID)) {
+    ::ota::storage::Esp32IdfPartitionApi sdk;
+    ::ota::storage::Esp32PartitionSnapshot context;
+    if (sdk.inspect(context) != ::ota::storage::kEsp32Ok) {
+      storage_fault = true;
+      out = OtaBootLifecycleEvidence();
+      return false;
+    }
+    if (!esp32ClosedFailedSelectionContext(context) || resolveApp(context.next) != next) {
+      out = OtaBootLifecycleEvidence();
+      return false;
+    }
     ReadOnlyAppReader failed(false);
-    ::ota::platform::FlashRegion failed_image(failed, 0, Esp32OtaPolicy::kCandidateBytes);
-    ::ota::platform::FlashRegion failed_metadata(failed, Esp32OtaPolicy::kCandidateBytes, 8192);
+    Esp32OtaIoGuard checked_failed(failed);
+    ::ota::platform::FlashRegion failed_image(checked_failed, 0, Esp32OtaPolicy::kCandidateBytes);
+    ::ota::platform::FlashRegion failed_metadata(checked_failed, Esp32OtaPolicy::kCandidateBytes, 8192);
     OtaCandidateStore failed_store(failed_metadata);
     OtaBootLifecycleEvidence failure;
-    if (readEsp32BootLifecycle(static_cast<Esp32ImageState>(next_state), failed_store, failed_image,
-                              policy, signatures, floor_known, floor, failure, true) &&
-        failure.transactionNonce != 0) out = failure;
+    const bool verified = readEsp32BootLifecycle(static_cast<Esp32ImageState>(next_state), failed_store,
+        failed_image, failed_metadata, policy, signatures, floor_known, floor, failure, true, &context);
+    if (checked_failed.failed()) {
+      storage_fault = true;
+      out = OtaBootLifecycleEvidence();
+      return false;
+    }
+    if (verified && failure.transactionNonce != 0) {
+      ::ota::storage::Esp32PartitionSnapshot after;
+      if (sdk.inspect(after) != ::ota::storage::kEsp32Ok) {
+        storage_fault = true;
+        out = OtaBootLifecycleEvidence();
+        return false;
+      }
+      if (!esp32SameClosedFailedSelectionContext(context, after)) {
+        out = OtaBootLifecycleEvidence();
+        return false;
+      }
+      esp_ota_img_states_t latest_state;
+      const auto latest_result = esp_ota_get_state_partition(next, &latest_state);
+      if (latest_result != ESP_OK || latest_state != next_state ||
+          next != esp_ota_get_next_update_partition(nullptr)) {
+        if (latest_result != ESP_OK && latest_result != ESP_ERR_NOT_FOUND) storage_fault = true;
+        out = OtaBootLifecycleEvidence();
+        return false;
+      }
+      out = failure;
+    }
   }
   return true;
 }
@@ -336,6 +375,15 @@ bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence& expect
   const esp_err_t state_result = esp_ota_get_state_partition(app, &state);
   if (state_result == ESP_ERR_NOT_FOUND && !failed) state = ESP_OTA_IMG_UNDEFINED;
   else if (state_result != ESP_OK) return false;
+  ::ota::storage::Esp32IdfPartitionApi sdk;
+  ::ota::storage::Esp32PartitionSnapshot context;
+  if (failed) {
+    if (sdk.inspect(context) != ::ota::storage::kEsp32Ok) {
+      storage_fault = true;
+      return false;
+    }
+    if (!esp32ClosedFailedSelectionContext(context) || resolveApp(context.next) != app) return false;
+  }
   uint32_t floor = 0;
   bool floor_known = false;
   if (!readFloor(floor, &floor_known)) {
@@ -343,11 +391,16 @@ bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence& expect
     return false;
   }
   ReadOnlyAppReader reader(!failed);
-  ::ota::platform::FlashRegion provenance(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
+  Esp32OtaIoGuard checked(reader);
+  ::ota::platform::FlashRegion provenance(checked, Esp32OtaPolicy::kCandidateBytes, 8192);
   OtaCandidateStore boot_store(provenance);
   OtaCandidateStore::Snapshot candidate;
-  if (!readEsp32BootCandidate(expected, static_cast<Esp32ImageState>(state), boot_store,
-                             policy, signatures, floor_known, floor, candidate)) return false;
+  if (!readEsp32BootCandidate(expected, static_cast<Esp32ImageState>(state), boot_store, provenance,
+                             policy, signatures, floor_known, floor, candidate, failed ? &context : nullptr) ||
+      checked.failed()) {
+    if (checked.failed()) storage_fault = true;
+    return false;
+  }
   esp_ota_img_states_t latest;
   const esp_err_t latest_result = esp_ota_get_state_partition(app, &latest);
   if (latest_result == ESP_ERR_NOT_FOUND && !failed) latest = ESP_OTA_IMG_UNDEFINED;
@@ -355,6 +408,14 @@ bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence& expect
   if (latest != state ||
       app != (failed ? esp_ota_get_next_update_partition(nullptr) : esp_ota_get_running_partition()))
     return false;
+  if (failed) {
+    ::ota::storage::Esp32PartitionSnapshot after;
+    if (sdk.inspect(after) != ::ota::storage::kEsp32Ok) {
+      storage_fault = true;
+      return false;
+    }
+    if (!esp32SameClosedFailedSelectionContext(context, after)) return false;
+  }
   out = candidate;
   return true;
 }
@@ -377,47 +438,11 @@ void otaBoardReleaseOrdinaryFirmwareUpdate() { lease.releaseOrdinaryUpdater(); }
 
 bool configureCompanionFirmwareOtaBackend(OtaFirmwareIntegration& target) {
   earlyTrialGuard();
-  if (trial.activeOrUnknown()) {
-    capability = "OTA_DISABLED: ESP trial or unknown";
-    return false;
-  }
-  if (!reconcileRunningFloor() || !readFloor(policy.confirmedCounter)) {
-    storage_fault = true;
-    capability = "OTA_DISABLED: ESP confirmed floor unreadable";
-    return false;
-  }
-  if (!lease.claimStorage() || !::ota::platform::isOk(flash.bind(Esp32OtaPolicy::kSlotBytes))) {
-    capability = "OTA_DISABLED: ESP partition or updater ownership";
-    return false;
-  }
-  OtaCandidateStore::Snapshot s;
-  bool existing = store.load(s);
-  if (!existing) {
-    uint8_t first[4];
-    if (!::ota::platform::isOk(metadata.read(0, first, sizeof(first))) ||
-        first[0] != 0xff || first[1] != 0xff || first[2] != 0xff || first[3] != 0xff) {
-      storage_fault = true;
-      capability = "OTA_DISABLED: ESP candidate metadata damaged";
-      return false;
-    }
-  }
-  if (existing && (s.phase == OtaCandidateStore::Phase::Committed ||
-                   s.phase == OtaCandidateStore::Phase::Failed)) {
-    if (!sink.recoverUnsuccessfulSelection() || !store.load(s)) {
-      storage_fault = true;
-      capability = "OTA_DISABLED: ESP install recovery unreadable";
-      return false;
-    }
-  }
-  target.attachTrustProvider(&trust);
-  target.attachLeanSignatureVerifier(&signatures);
-  target.attachStagingSink(&sink);
-  target.attachCandidateStore(&store);
+  const auto outcome = configureEsp32OtaBackend(target, trial.activeOrUnknown(), vendor_install, policy,
+                                               flash, lease, store, sink, trust, signatures, capability);
+  if (outcome == Esp32ConfigureOutcome::IoError) storage_fault = true;
+  if (outcome != Esp32ConfigureOutcome::Configured) return false;
   integration = &target;
-  capability = "INSTALL_CAPABLE: ESP-IDF A/B rollback";
-  if (!existing || s.phase == OtaCandidateStore::Phase::Idle ||
-      s.phase == OtaCandidateStore::Phase::Aborted || s.phase == OtaCandidateStore::Phase::Failed)
-    lease.releaseStorage();
   return true;
 }
 

@@ -27,6 +27,7 @@ public:
   mutable uint32_t inspectCalls = 0;
   uint32_t inspectErrorCall = 0;
   uint32_t readErrorPartition = 0;
+  uint32_t readErrorCall = 0;
   Esp32SdkError inspectError = kEsp32Ok;
   Esp32SdkError readError = kEsp32Ok;
   Esp32SdkError eraseError = kEsp32Ok;
@@ -59,6 +60,7 @@ public:
   Esp32SdkError read(const Esp32PartitionIdentity& p, uint32_t offset,
                     uint8_t* out, uint32_t len) const override {
     ++readCalls;
+    if (readErrorCall != 0 && readCalls == readErrorCall) return -1;
     if (readErrorPartition == p.address) return -1;
     if (readError != kEsp32Ok) return readError;
     if (!valid(p, offset, len)) return kEsp32InvalidArgument;

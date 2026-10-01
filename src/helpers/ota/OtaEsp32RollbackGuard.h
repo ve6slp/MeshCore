@@ -8,53 +8,165 @@
 #include <stdint.h>
 #include <ota/storage/Esp32PartitionApi.h>
 #include <helpers/ota/OtaFirmwareBackend.h>
+#include <helpers/ota/OtaFirmwareIntegration.h>
 #include <helpers/ota/OtaRfFrames.h>
 #include <ota/runtime/OtaInstallAttemptIdentity.h>
 
 namespace mesh {
 namespace ota {
 
-inline bool verifyEsp32ConfirmedRunningCounter(
-    ::ota::storage::Esp32PartitionApi& sdk, ::ota::storage::OtaCandidateStore& store,
-    ::ota::platform::FlashRegion& image, const Esp32OtaPolicy& policy,
-    const ::ota::trust::SignatureVerifier& signatures, bool floor_known, uint32_t floor,
-    uint32_t& out) {
+inline Esp32RunningProof readEsp32RunningProof(
+    ::ota::storage::Esp32PartitionApi& sdk, ::ota::platform::FlashDevice& reader,
+    const Esp32OtaPolicy& policy, const ::ota::trust::SignatureVerifier& signatures, uint32_t& out) {
   using namespace ::ota::storage;
   out = 0;
   Esp32PartitionSnapshot before;
-  if (!floor_known || floor == 0 || sdk.inspect(before) != kEsp32Ok ||
-      !Esp32S3PartitionLayout::matches(before)) return false;
+  if (sdk.inspect(before) != kEsp32Ok) return Esp32RunningProof::IoError;
+  if (!Esp32S3PartitionLayout::matches(before)) return Esp32RunningProof::Refused;
   const bool running0 = esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(2));
   if ((!running0 && !esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(3))) ||
       !esp32PartitionEquals(before.boot, before.running) ||
       !esp32PartitionEquals(before.next, Esp32S3PartitionLayout::entry(running0 ? 3 : 2)) ||
-      before.appStates[running0 ? 0 : 1] != Esp32ImageState::Valid) return false;
+      (before.appStates[running0 ? 0 : 1] != Esp32ImageState::Valid &&
+       before.appStates[running0 ? 0 : 1] != Esp32ImageState::Undefined)) return Esp32RunningProof::Refused;
   for (const auto state : before.appStates)
     if (state != Esp32ImageState::Valid && state != Esp32ImageState::Undefined &&
-        state != Esp32ImageState::Aborted && state != Esp32ImageState::Invalid) return false;
+        state != Esp32ImageState::Aborted && state != Esp32ImageState::Invalid) return Esp32RunningProof::Refused;
+  Esp32OtaIoGuard checked(reader);
+  ::ota::platform::FlashRegion image(checked, 0, Esp32OtaPolicy::kCandidateBytes);
+  ::ota::platform::FlashRegion metadata(checked, Esp32OtaPolicy::kCandidateBytes, 8192);
+  OtaCandidateStore store(metadata);
+  if (!image.isValid() || !store.isValid()) return Esp32RunningProof::Refused;
   OtaCandidateStore::Snapshot snapshot;
   meshcore::ota::protocol::OtaDescriptor descriptor;
-  if (!verifyEsp32RunningCandidate(store, image, policy, signatures, snapshot, descriptor) ||
-      descriptor.securityCounter != floor) return false;
+  const bool verified = verifyEsp32RunningCandidate(store, image, policy, signatures, snapshot, descriptor);
+  if (checked.failed()) return Esp32RunningProof::IoError;
   Esp32PartitionSnapshot after;
-  if (sdk.inspect(after) != kEsp32Ok || !Esp32S3PartitionLayout::matches(after) ||
+  if (sdk.inspect(after) != kEsp32Ok) return Esp32RunningProof::IoError;
+  if (!Esp32S3PartitionLayout::matches(after) ||
       !esp32PartitionEquals(after.running, before.running) ||
       !esp32PartitionEquals(after.boot, before.boot) ||
       !esp32PartitionEquals(after.next, before.next) ||
-      after.appStates[0] != before.appStates[0] || after.appStates[1] != before.appStates[1]) return false;
+      after.appStates[0] != before.appStates[0] || after.appStates[1] != before.appStates[1])
+    return Esp32RunningProof::Refused;
+  if (!verified || before.appStates[running0 ? 0 : 1] != Esp32ImageState::Valid)
+    return Esp32RunningProof::NotProven;
   out = descriptor.securityCounter;
-  return true;
+  return Esp32RunningProof::Verified;
+}
+
+enum class Esp32ConfigureOutcome : uint8_t { Configured, Refused, IoError };
+
+inline Esp32ConfigureOutcome configureEsp32OtaBackend(
+    OtaFirmwareIntegration& target, bool trial_or_unknown, Esp32OtaInstallApi& install,
+    Esp32OtaPolicy& policy, ::ota::platform::Esp32FlashAdapter& flash, Esp32OtaLease& lease,
+    ::ota::storage::OtaCandidateStore& store, Esp32OtaStagingSink& sink, Esp32OtaTrustProvider& trust,
+    const ::ota::trust::SignatureVerifier& signatures, const char*& capability) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  using Outcome = Esp32ConfigureOutcome;
+  if (trial_or_unknown) {
+    capability = "OTA_DISABLED: ESP trial or unknown";
+    return Outcome::Refused;
+  }
+  uint32_t running_counter = 0;
+  const auto proof = install.runningProof(running_counter);
+  if (proof == Esp32RunningProof::Refused || proof == Esp32RunningProof::IoError) {
+    capability = "OTA_DISABLED: ESP running context unavailable";
+    return proof == Esp32RunningProof::IoError ? Outcome::IoError : Outcome::Refused;
+  }
+  bool floor_found = false;
+  if ((proof == Esp32RunningProof::Verified && !install.saveConfirmedFloor(running_counter)) ||
+      !install.readConfirmedFloor(policy.confirmedCounter, floor_found)) {
+    capability = "OTA_DISABLED: ESP confirmed floor unreadable";
+    return Outcome::IoError;
+  }
+  if (!lease.claimStorage() || !::ota::platform::isOk(flash.bind(Esp32OtaPolicy::kSlotBytes))) {
+    capability = "OTA_DISABLED: ESP partition or updater ownership";
+    return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+        ? Outcome::IoError : Outcome::Refused;
+  }
+  Esp32OtaIoGuard checked(flash);
+  ::ota::platform::FlashRegion metadata(checked, Esp32OtaPolicy::kCandidateBytes, 8192);
+  Store checked_store(metadata);
+  Store::Snapshot snapshot;
+  const bool existing = checked_store.load(snapshot);
+  if (checked.failed()) {
+    capability = "OTA_DISABLED: ESP candidate metadata unreadable";
+    return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+        ? Outcome::IoError : Outcome::Refused;
+  }
+  if (!existing) {
+    uint8_t first[4];
+    if (!::ota::platform::isOk(metadata.read(0, first, sizeof(first)))) {
+      capability = "OTA_DISABLED: ESP candidate metadata unreadable";
+      return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+          ? Outcome::IoError : Outcome::Refused;
+    }
+    if (first[0] != 0xff || first[1] != 0xff || first[2] != 0xff || first[3] != 0xff) {
+      capability = "OTA_DISABLED: ESP candidate metadata damaged";
+      return Outcome::Refused;
+    }
+  }
+  if (existing && (snapshot.phase == Store::Phase::Committed || snapshot.phase == Store::Phase::Failed)) {
+    if (!sink.recoverUnsuccessfulSelection() || !checked_store.load(snapshot) || checked.failed()) {
+      capability = "OTA_DISABLED: ESP install recovery refused";
+      return sink.storageIoFaultObserved() ||
+             flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+          ? Outcome::IoError : Outcome::Refused;
+    }
+  }
+  target.attachTrustProvider(&trust);
+  target.attachLeanSignatureVerifier(&signatures);
+  target.attachStagingSink(&sink);
+  target.attachCandidateStore(&store);
+  capability = "INSTALL_CAPABLE: ESP-IDF A/B rollback";
+  if (!existing || snapshot.phase == Store::Phase::Idle ||
+      snapshot.phase == Store::Phase::Aborted || snapshot.phase == Store::Phase::Failed) lease.releaseStorage();
+  return Outcome::Configured;
+}
+
+// ABORTED/INVALID can outlive new raw staging. Failed alone is not a
+// completed transaction; require its durable COMMIT selection attempt.
+inline bool esp32SelectionAttemptRecorded(::ota::platform::FlashRegion& metadata) {
+  uint8_t marker[sizeof(Esp32OtaStagingSink::kSelectionMarker)];
+  return ::ota::platform::isOk(metadata.read(Esp32OtaStagingSink::kSelectionMarkerOffset, marker, sizeof(marker))) &&
+         std::memcmp(marker, Esp32OtaStagingSink::kSelectionMarker, sizeof(marker)) == 0;
+}
+
+inline bool esp32ClosedFailedSelectionContext(const ::ota::storage::Esp32PartitionSnapshot& context) {
+  using namespace ::ota::storage;
+  if (!Esp32S3PartitionLayout::matches(context)) return false;
+  const bool running0 = esp32PartitionEquals(context.running, Esp32S3PartitionLayout::entry(2));
+  if ((!running0 && !esp32PartitionEquals(context.running, Esp32S3PartitionLayout::entry(3))) ||
+      !esp32PartitionEquals(context.boot, context.running) ||
+      !esp32PartitionEquals(context.next, Esp32S3PartitionLayout::entry(running0 ? 3 : 2))) return false;
+  const auto running = context.appStates[running0 ? 0 : 1];
+  const auto inactive = context.appStates[running0 ? 1 : 0];
+  return (running == Esp32ImageState::Valid || running == Esp32ImageState::Undefined) &&
+         (inactive == Esp32ImageState::Aborted || inactive == Esp32ImageState::Invalid);
+}
+
+inline bool esp32SameClosedFailedSelectionContext(
+    const ::ota::storage::Esp32PartitionSnapshot& before,
+    const ::ota::storage::Esp32PartitionSnapshot& after) {
+  return esp32ClosedFailedSelectionContext(before) && esp32ClosedFailedSelectionContext(after) &&
+         ::ota::storage::esp32PartitionEquals(before.running, after.running) &&
+         ::ota::storage::esp32PartitionEquals(before.next, after.next) &&
+         before.appStates[0] == after.appStates[0] && before.appStates[1] == after.appStates[1];
 }
 
 inline bool readEsp32BootCandidate(
     const OtaBootLifecycleEvidence& expected, ::ota::storage::Esp32ImageState state,
-    ::ota::storage::OtaCandidateStore& store, const Esp32OtaPolicy& policy,
+    ::ota::storage::OtaCandidateStore& store, ::ota::platform::FlashRegion& metadata, const Esp32OtaPolicy& policy,
     const ::ota::trust::SignatureVerifier& signatures, bool floor_known, uint32_t floor,
-    ::ota::storage::OtaCandidateStore::Snapshot& out) {
+    ::ota::storage::OtaCandidateStore::Snapshot& out,
+    const ::ota::storage::Esp32PartitionSnapshot* closed_context = nullptr) {
   using State = ::ota::storage::Esp32ImageState;
   using Phase = usb::UsbOtaPhase;
   out = ::ota::storage::OtaCandidateStore::Snapshot();
   const bool failed = expected.phase == Phase::Failed;
+  if (failed && (closed_context == nullptr || !esp32ClosedFailedSelectionContext(*closed_context) ||
+      closed_context->appStates[closed_context->next.subtype - 0x10] != state)) return false;
   if (expected.transactionNonce == 0 || expected.counter == 0 ||
       (failed && (expected.imageVerified || (state != State::Aborted && state != State::Invalid))) ||
       (!failed && !expected.imageVerified)) return false;
@@ -69,6 +181,7 @@ inline bool readEsp32BootCandidate(
                                      failed ? ::ota::storage::OtaCandidateStore::Phase::Failed :
                                               ::ota::storage::OtaCandidateStore::Phase::Committed))
     return false;
+  if (failed && !esp32SelectionAttemptRecorded(metadata)) return false;
   meshcore::ota::runtime::OtaSessionId session;
   session.campaignId = snapshot.campaignId;
   session.sessionId = snapshot.sessionId;
@@ -86,12 +199,16 @@ inline bool readEsp32BootCandidate(
 
 inline bool readEsp32BootLifecycle(
     ::ota::storage::Esp32ImageState state, ::ota::storage::OtaCandidateStore& store,
-    ::ota::platform::FlashRegion& image, const Esp32OtaPolicy& policy,
+    ::ota::platform::FlashRegion& image, ::ota::platform::FlashRegion& metadata, const Esp32OtaPolicy& policy,
     const ::ota::trust::SignatureVerifier& signatures, bool floor_known, uint32_t floor,
-    OtaBootLifecycleEvidence& out, bool failed_candidate = false) {
+    OtaBootLifecycleEvidence& out, bool failed_candidate = false,
+    const ::ota::storage::Esp32PartitionSnapshot* closed_context = nullptr) {
   using State = ::ota::storage::Esp32ImageState;
   using Phase = usb::UsbOtaPhase;
   out = OtaBootLifecycleEvidence();
+  if (failed_candidate &&
+      (closed_context == nullptr || !esp32ClosedFailedSelectionContext(*closed_context) ||
+       closed_context->appStates[closed_context->next.subtype - 0x10] != state)) return false;
   if (state != State::Valid && state != State::PendingVerify && state != State::Aborted &&
       state != State::Invalid && state != State::Undefined) return false;
   if (failed_candidate && state != State::Aborted && state != State::Invalid) return false;
@@ -102,8 +219,9 @@ inline bool readEsp32BootLifecycle(
   ::ota::storage::OtaCandidateStore::Snapshot snapshot;
   meshcore::ota::protocol::OtaDescriptor descriptor;
   const bool verified = failed_candidate ?
-      verifyEsp32CandidateProvenance(store, policy, signatures, snapshot, descriptor,
-                                    ::ota::storage::OtaCandidateStore::Phase::Failed) :
+      (verifyEsp32CandidateProvenance(store, policy, signatures, snapshot, descriptor,
+                                     ::ota::storage::OtaCandidateStore::Phase::Failed) &&
+       esp32SelectionAttemptRecorded(metadata)) :
       verifyEsp32RunningCandidate(store, image, policy, signatures, snapshot, descriptor);
   if (!verified) return true;
   meshcore::ota::runtime::OtaSessionId session;

@@ -14,6 +14,8 @@ __attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleE
   return false;
 }
 __attribute__((weak)) bool otaBoardBootLifecycleVerificationPending() { return false; }
+__attribute__((weak)) bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence&,
+                                                    ::ota::storage::OtaCandidateStore::Snapshot&) { return false; }
 #include <helpers/ota/OtaRfFrames.h>
 #include <helpers/ota/OtaRfUploader.h>
 #if MESHCORE_LORA_OTA
@@ -1221,7 +1223,7 @@ void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool al
   if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
   getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSelfIdSignThunk, &MyMesh::otaRadioChangeThunk,
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
-  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk);
+  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
   configureCompanionFirmwareOtaBackend(getOtaIntegration());
 #endif
 
@@ -1413,8 +1415,9 @@ void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
 #if MESHCORE_LORA_OTA
   auto& integration = getOtaIntegration();
   const auto boot = integration.bootLifecycle();
+  const auto view = integration.readback(boot);
   mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
-                                         integration.reportedPhase(boot), integration.leanReceiver().status().counter);
+                                         view.phase, view.snapshot.counter);
 #else
   snprintf(reply, reply_size, "OTA unsupported");
 #endif
@@ -1493,6 +1496,10 @@ bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore
 bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
   return otaBoardGetBootLifecycle(out);
 }
+bool MyMesh::otaBootCandidateThunk(void*, const mesh::ota::OtaBootLifecycleEvidence& boot,
+                                  ::ota::storage::OtaCandidateStore::Snapshot& out) {
+  return otaBoardReadBootCandidate(boot, out);
+}
 
 bool MyMesh::otaSendThunk(void* ctx, mesh::ota::OtaRfRoute route, const uint8_t target[32],
                           const uint8_t* frame, size_t len, meshcore::ota::protocol::OtaAirtimeCategory category) {
@@ -1558,15 +1565,7 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
     }
   };
   auto fillLocalSnapshot = [&]() {
-    const auto snap = lean.status();
-    if (!snap.valid) return;
-    reply.flags |= kReplyFlagSnapshotValid;
-    reply.phase = getOtaIntegration().reportedPhase();
-    std::memcpy(reply.manifestHash, snap.manifestHash, kHashBytes);
-    reply.durableReceivedBlocks = snap.receivedBlocks;
-    reply.totalBlocks = snap.totalBlocks;
-    reply.counter = snap.counter;
-    reply.statusAgeMs = 0;
+    getOtaIntegration().fillUsbReadback(reply);
   };
 
   switch (static_cast<UsbOtaOp>(op)) {

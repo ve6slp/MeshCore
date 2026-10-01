@@ -11,6 +11,8 @@ __attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleE
   return false;
 }
 __attribute__((weak)) bool otaBoardBootLifecycleVerificationPending() { return false; }
+__attribute__((weak)) bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence&,
+                                                    ::ota::storage::OtaCandidateStore::Snapshot&) { return false; }
 __attribute__((weak)) bool otaBoardApplyRfProfile(float, float, uint8_t, uint8_t) { return false; }
 // Weak-defaulted in examples/companion_radio/MyMesh.cpp, strong-overridden
 // in variants/*/Ota*Backend.cpp -- that TU is never linked into THIS
@@ -1075,7 +1077,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
   getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
-  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk);
+  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
 #endif
 }
 
@@ -1134,8 +1136,9 @@ void MyMesh::rollbackFirmwareOta() {
 void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
   auto& integration = getOtaIntegration();
   const auto boot = integration.bootLifecycle();
+  const auto view = integration.readback(boot);
   mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
-                                         integration.reportedPhase(boot), integration.leanReceiver().status().counter);
+                                         view.phase, view.snapshot.counter);
 }
 #endif
 
@@ -1346,6 +1349,10 @@ bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore
 }
 bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
   return otaBoardGetBootLifecycle(out);
+}
+bool MyMesh::otaBootCandidateThunk(void*, const mesh::ota::OtaBootLifecycleEvidence& boot,
+                                  ::ota::storage::OtaCandidateStore::Snapshot& out) {
+  return otaBoardReadBootCandidate(boot, out);
 }
 #endif
 

@@ -595,10 +595,10 @@ public:
       memcpy(expected_hash_, ::ota::storage::XiaoOtaStateReader::installedHashSha256(record), 32);
       if (evidence_.transactionNonce && state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax) {
         evidence_.phase = usb::UsbOtaPhase::Failed;
-        finished_ = true;
-        return;
-      }
-      if (!evidence_.transactionNonce ||
+        memcpy(candidate_hash_, ::ota::storage::XiaoOtaStateReader::candidateHashSha256(record), 32);
+        memcpy(expected_hash_, record + 76, 32);  // Existing boot-state backup hash.
+        expected_extent_ = ::ota::storage::XiaoOtaStateReader::activeImageExtent(record);
+      } else if (!evidence_.transactionNonce ||
           memcmp(expected_hash_, ::ota::storage::XiaoOtaStateReader::candidateHashSha256(record), 32)) {
         finished_ = true; return;
       }
@@ -608,9 +608,8 @@ public:
         finished_ = true;
         return;
       }
-      if (state_phase_ != ::ota::storage::XiaoOtaStateReader::kPhaseConfirmed) {
-        if (state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax)
-          evidence_.phase = usb::UsbOtaPhase::Failed;
+      if (state_phase_ != ::ota::storage::XiaoOtaStateReader::kPhaseConfirmed &&
+          state_phase_ != ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax) {
         finished_ = true;
         return;
       }
@@ -629,8 +628,11 @@ public:
     hasher_.update(image_ + offset_, chunk);
     offset_ += chunk;
     if (offset_ != image_extent_) return;
-    hasher_.finish(evidence_.imageHash);
-    evidence_.imageVerified = memcmp(evidence_.imageHash, expected_hash_, 32) == 0;
+    hasher_.finish(running_hash_);
+    if (state_phase_ != ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax) {
+      memcpy(evidence_.imageHash, running_hash_, 32);
+      evidence_.imageVerified = memcmp(evidence_.imageHash, expected_hash_, 32) == 0;
+    }
     finished_ = true;
   }
 
@@ -646,6 +648,13 @@ public:
         out.imageVerified && out.floorKnown && out.confirmedFloor == out.counter &&
         floor_extent == image_extent_ && memcmp(floor_hash, out.imageHash, 32) == 0)
       out.phase = usb::UsbOtaPhase::Installed;
+    if (state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax && finished_ && image_ &&
+        image_extent_ && offset_ == image_extent_ &&
+        ((image_extent_ == expected_extent_ && !memcmp(running_hash_, expected_hash_, 32)) ||
+         (out.floorKnown && out.confirmedFloor > out.counter && floor_extent == image_extent_ &&
+          !memcmp(floor_hash, running_hash_, 32)))) {
+      memcpy(out.imageHash, candidate_hash_, 32);
+    }
     return true;
   }
   bool pending() const { return !finished_; }
@@ -659,8 +668,10 @@ private:
   ::ota::trust::Sha256 hasher_;
   OtaBootLifecycleEvidence evidence_;
   uint8_t expected_hash_[32] = {};
+  uint8_t candidate_hash_[32] = {}, running_hash_[32] = {};
   const uint8_t* image_ = nullptr;
   uint32_t image_extent_ = 0, offset_ = 0, state_phase_ = 0;
+  uint32_t expected_extent_ = 0;
   bool loaded_ = false, finished_ = false;
 };
 

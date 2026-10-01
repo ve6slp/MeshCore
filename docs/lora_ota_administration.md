@@ -37,6 +37,12 @@ does not hand the staging slot to a competing uploader. Once a committed
 install has begun, local boot recovery completes it or restores the previous
 image; a radio abort is no longer the recovery mechanism.
 
+After a confirmed install or completed rollback, a subsequent update can
+reuse the staging slot once the device proves the previous boot transaction
+has ended. A trial or uncertain outcome remains protected. A failed
+reception still belongs to its original owner; failure is not permission
+for another administrator to take over.
+
 ## Signed host workflow
 
 These experimental host commands use the companion's existing MeshCore
@@ -108,6 +114,9 @@ To abort before commit, use `make ota-lab-abort` with the target key and
 original `OTA_UPLOAD_IMAGE`. Abort identifies the firmware content hash,
 not its manifest hash. An explicit reupload uses
 `OTA_UPLOAD_REUPLOAD=1`; changing the manifest does not bypass an abort.
+Reupload is not a force-overwrite option. An active candidate must retain
+the same owner, image content and cache or install purpose. Abort an
+obsolete candidate explicitly before replacing it with different content.
 Unavailable, denied, failed or malformed replies stop the host command
 explicitly. Firmware transport and physical recovery qualification remain
 incomplete; these commands must not be treated as a deployment result.
