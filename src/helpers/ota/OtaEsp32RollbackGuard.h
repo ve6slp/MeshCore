@@ -14,6 +14,38 @@
 namespace mesh {
 namespace ota {
 
+inline bool verifyEsp32ConfirmedRunningCounter(
+    ::ota::storage::Esp32PartitionApi& sdk, ::ota::storage::OtaCandidateStore& store,
+    ::ota::platform::FlashRegion& image, const Esp32OtaPolicy& policy,
+    const ::ota::trust::SignatureVerifier& signatures, bool floor_known, uint32_t floor,
+    uint32_t& out) {
+  using namespace ::ota::storage;
+  out = 0;
+  Esp32PartitionSnapshot before;
+  if (!floor_known || floor == 0 || sdk.inspect(before) != kEsp32Ok ||
+      !Esp32S3PartitionLayout::matches(before)) return false;
+  const bool running0 = esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(2));
+  if ((!running0 && !esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(3))) ||
+      !esp32PartitionEquals(before.boot, before.running) ||
+      !esp32PartitionEquals(before.next, Esp32S3PartitionLayout::entry(running0 ? 3 : 2)) ||
+      before.appStates[running0 ? 0 : 1] != Esp32ImageState::Valid) return false;
+  for (const auto state : before.appStates)
+    if (state != Esp32ImageState::Valid && state != Esp32ImageState::Undefined &&
+        state != Esp32ImageState::Aborted && state != Esp32ImageState::Invalid) return false;
+  OtaCandidateStore::Snapshot snapshot;
+  meshcore::ota::protocol::OtaDescriptor descriptor;
+  if (!verifyEsp32RunningCandidate(store, image, policy, signatures, snapshot, descriptor) ||
+      descriptor.securityCounter != floor) return false;
+  Esp32PartitionSnapshot after;
+  if (sdk.inspect(after) != kEsp32Ok || !Esp32S3PartitionLayout::matches(after) ||
+      !esp32PartitionEquals(after.running, before.running) ||
+      !esp32PartitionEquals(after.boot, before.boot) ||
+      !esp32PartitionEquals(after.next, before.next) ||
+      after.appStates[0] != before.appStates[0] || after.appStates[1] != before.appStates[1]) return false;
+  out = descriptor.securityCounter;
+  return true;
+}
+
 inline bool readEsp32BootCandidate(
     const OtaBootLifecycleEvidence& expected, ::ota::storage::Esp32ImageState state,
     ::ota::storage::OtaCandidateStore& store, const Esp32OtaPolicy& policy,

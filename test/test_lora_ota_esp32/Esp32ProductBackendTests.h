@@ -24,10 +24,17 @@ using InstallOutcome = Esp32OtaStagingSink::InstallOutcome;
 
 class InstallModel final : public Esp32OtaInstallApi {
 public:
-  explicit InstallModel(Esp32PartitionModel& sdk) : sdk(sdk) {}
+  InstallModel(Esp32PartitionModel& sdk, const Esp32OtaPolicy& policy,
+               const ::ota::trust::SignatureVerifier& signatures)
+      : sdk(sdk), policy(policy), signatures(signatures) {}
   Esp32PartitionModel& sdk;
+  const Esp32OtaPolicy& policy;
+  const ::ota::trust::SignatureVerifier& signatures;
   uint32_t imageChecks = 0, selections = 0;
   bool imageValid = true, selectionFails = false, selectionTorn = false;
+  bool floorKnown = false, floorReadable = true, finalFloorReadable = true;
+  uint32_t floor = 0, finalFloor = UINT32_MAX;
+  bool confirmedRunningCounter(uint32_t& counter) override;
   bool validateImage(const Esp32PartitionIdentity& partition, uint32_t exact_bytes) override {
     ++imageChecks;
     return imageValid && esp32PartitionEquals(partition, sdk.snapshot.next) &&
@@ -52,7 +59,8 @@ public:
   uint32_t programUnitBytes() const override { return 1; }
   FlashStatus read(uint32_t offset, uint8_t* out, uint32_t len) const override {
     ++sdk_.readCalls;
-    if (sdk_.readError != kEsp32Ok) return FlashStatus::IoError;
+    if (sdk_.readError != kEsp32Ok || sdk_.readErrorPartition == partition_.address)
+      return FlashStatus::IoError;
     if (offset > partition_.size || len > partition_.size - offset || (out == nullptr && len != 0))
       return FlashStatus::OutOfRange;
     if (len != 0) std::memcpy(out, sdk_.bytes.data() + partition_.address + offset, len);
@@ -65,6 +73,22 @@ private:
   Esp32PartitionIdentity partition_;
 };
 
+bool InstallModel::confirmedRunningCounter(uint32_t& counter) {
+  counter = 0;
+  if (!floorReadable) return false;
+  ReadOnlyAppModel reader(sdk, sdk.snapshot.running);
+  FlashRegion image(reader, 0, Esp32OtaPolicy::kCandidateBytes);
+  FlashRegion metadata(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
+  OtaCandidateStore running(metadata);
+  uint32_t verified = 0;
+  if (!verifyEsp32ConfirmedRunningCounter(sdk, running, image, policy, signatures,
+                                         floorKnown, floor, verified)) return false;
+  if (!finalFloorReadable || !floorKnown ||
+      (finalFloor == UINT32_MAX ? floor : finalFloor) != verified) return false;
+  counter = verified;
+  return true;
+}
+
 class Esp32Product : public ::testing::Test {
 protected:
   Esp32PartitionModel sdk;
@@ -76,7 +100,7 @@ protected:
   Esp32OtaPolicy policy{0};
   Esp32OtaTrustProvider trust{policy, candidate};
   ::ota::trust::Ed25519SignatureVerifier signatures;
-  InstallModel install{sdk};
+  InstallModel install{sdk, policy, signatures};
   Esp32OtaStagingSink sink{flash, lease, candidate, metadata, store, trust, policy, signatures, install};
   OtaFirmwareIntegration integration;
   uint8_t seed[32] = {0x17, 0x29, 0x53, 0x81};
@@ -126,30 +150,101 @@ protected:
     ASSERT_EQ(Result::Ok, receiver().begin(owner.publicKey(), canonical, signature, false, false));
   }
   void receive() {
+    receive(integration);
+  }
+  void receive(OtaFirmwareIntegration& flow) {
     for (size_t offset = 0; offset < image.size(); offset += kOtaBlockMaxDataBytes) {
       const size_t take = std::min(kOtaBlockMaxDataBytes, image.size() - offset);
-      ASSERT_EQ(Result::Ok, receiver().putBlock(static_cast<uint16_t>(offset / kOtaBlockMaxDataBytes),
-                                               image.data() + offset, take));
+      ASSERT_EQ(Result::Ok, flow.leanReceiver().putBlock(static_cast<uint16_t>(offset / kOtaBlockMaxDataBytes),
+                                                       image.data() + offset, take));
     }
   }
   void ready(bool reupload = false) {
-    ASSERT_EQ(Result::Ok, receiver().begin(owner.publicKey(), canonical, signature, reupload, false));
+    ready(integration, reupload);
+  }
+  void ready(OtaFirmwareIntegration& flow, bool reupload = false) {
+    ASSERT_EQ(Result::Ok, flow.leanReceiver().begin(owner.publicKey(), canonical, signature, reupload, false));
     ASSERT_FALSE(HasFatalFailure());
-    receive();
+    receive(flow);
     ASSERT_FALSE(HasFatalFailure());
-    ASSERT_EQ(Result::Pending, receiver().requestSeal());
-    integration.loop();
+    ASSERT_EQ(Result::Pending, flow.leanReceiver().requestSeal());
+    flow.loop();
     OtaCandidateStore::Snapshot durable;
     ASSERT_TRUE(store.load(durable));
     ASSERT_EQ(OtaCandidateStore::Phase::Ready, durable.phase);
-    ASSERT_EQ(OtaCandidateStore::Phase::Ready, receiver().status().phase);
+    ASSERT_EQ(OtaCandidateStore::Phase::Ready, flow.leanReceiver().status().phase);
   }
   Result commit() {
+    return commit(integration);
+  }
+  Result commit(OtaFirmwareIntegration& flow) {
     uint8_t hash[32], message[usb::kCommitSignedBytes], commit_signature[64];
     computeOtaManifestHash(canonical, hash);
     const size_t len = usb::buildCommitSignedMessage(target, hash, descriptor.securityCounter, message);
     owner.sign(message, len, commit_signature);
-    return receiver().commit(descriptor.securityCounter, commit_signature);
+    return flow.leanReceiver().commit(descriptor.securityCounter, commit_signature);
+  }
+  void successiveInstall(uint32_t counter) {
+    image[1] = static_cast<uint8_t>(counter);
+    descriptor.securityCounter = counter;
+    ::ota::trust::Sha256::hash(image.data(), image.size(), descriptor.sha256);
+    signDescriptor();
+    ASSERT_TRUE(lease.claimStorage());
+    ASSERT_EQ(FlashStatus::Ok, flash.bind(Esp32OtaPolicy::kSlotBytes));
+    Esp32OtaStagingSink cold_sink(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+    OtaCandidateStore::Snapshot previous;
+    if (store.load(previous)) ASSERT_TRUE(cold_sink.recoverUnsuccessfulSelection());
+    OtaFirmwareIntegration cold;
+    attachTo(cold, cold_sink);
+    ready(cold);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(Result::Ok, commit(cold));
+    ASSERT_EQ(InstallOutcome::Selected, cold_sink.activateDurableCommit());
+    rebootIntoCandidate(Esp32ImageState::PendingVerify);
+    OtaBootLifecycleEvidence trial_evidence;
+    ASSERT_TRUE(lifecycle(false, 0, trial_evidence));
+    ASSERT_TRUE(trial_evidence.imageVerified);
+    ASSERT_EQ(usb::UsbOtaPhase::Trial, trial_evidence.phase);
+    sdk.snapshot.appStates[sdk.snapshot.running.subtype - 0x10] = Esp32ImageState::Valid;
+    policy.confirmedCounter = counter;
+    install.floorKnown = true;
+    install.floor = counter;
+    OtaBootLifecycleEvidence installed;
+    ASSERT_TRUE(lifecycle(true, counter, installed));
+    ASSERT_EQ(usb::UsbOtaPhase::Installed, installed.phase);
+    ASSERT_EQ(cold.leanReceiver().status().transactionNonce, installed.transactionNonce);
+  }
+  void twoSuccessfulInstalls() {
+    const uint32_t baseline_metadata = sdk.snapshot.running.address + Esp32OtaPolicy::kCandidateBytes;
+    std::fill(sdk.bytes.begin() + baseline_metadata, sdk.bytes.begin() + baseline_metadata + 8192, 0xff);
+    successiveInstall(1);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(0x340000u, sdk.snapshot.running.address);
+    successiveInstall(2);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(0x10000u, sdk.snapshot.running.address);
+    ASSERT_EQ(FlashStatus::Ok, flash.bind(Esp32OtaPolicy::kSlotBytes));
+  }
+  void expectRecoveryRefusal(Esp32OtaStagingSink& recovery) {
+    const auto before = sdk.bytes;
+    const auto writes = sdk.writeCalls;
+    const auto erases = sdk.erasedOffsets;
+    const auto selections = install.selections;
+    EXPECT_FALSE(recovery.recoverUnsuccessfulSelection());
+    EXPECT_EQ(before, sdk.bytes);
+    EXPECT_EQ(writes, sdk.writeCalls);
+    EXPECT_EQ(erases, sdk.erasedOffsets);
+    EXPECT_EQ(selections, install.selections);
+  }
+  void alterStoredProvenance(const Esp32PartitionIdentity& partition, uint32_t byte) {
+    const uint32_t base = partition.address + Esp32OtaPolicy::kCandidateBytes;
+    for (uint32_t slot = 0; slot < OtaCandidateStore::kRecordSlots; ++slot) {
+      auto* record = sdk.bytes.data() + base + slot * OtaCandidateStore::kRecordBytes;
+      if (record[0] == 0xff) continue;
+      record[byte] ^= 1;
+      const uint32_t crc = Crc32::computeFinalized(record, 184);
+      for (uint32_t i = 0; i < 4; ++i) record[184 + i] = static_cast<uint8_t>(crc >> (8 * i));
+    }
   }
   void expectWriteRevalidationRefusal(Esp32FlashAdapter::Refusal refusal) {
     const auto before = sdk.bytes;
@@ -197,6 +292,297 @@ protected:
                                   provenance, policy, signatures, floor_known, floor, out);
   }
 };
+
+TEST_F(Esp32Product, ThreeSuccessiveInstallsReuseConfirmedInactiveSlotWithoutBusy) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  OtaCandidateStore::Snapshot old;
+  ASSERT_TRUE(store.load(old));
+  ASSERT_EQ(OtaCandidateStore::Phase::Committed, old.phase);
+  ASSERT_EQ(1u, usb::getBE32(old.canonical + 45));
+  uint8_t marker[4];
+  ASSERT_EQ(FlashStatus::Ok, metadata.read(Esp32OtaStagingSink::kSelectionMarkerOffset, marker, sizeof(marker)));
+  ASSERT_EQ(0, std::memcmp(marker, Esp32OtaStagingSink::kSelectionMarker, sizeof(marker)));
+  successiveInstall(3);
+  ASSERT_FALSE(HasFatalFailure());
+  EXPECT_EQ(3u, install.selections);
+  EXPECT_EQ(3u, policy.confirmedCounter);
+  EXPECT_EQ(0x340000u, sdk.snapshot.running.address);
+}
+
+TEST_F(Esp32Product, RetirementPreservesSignedIdentityAndBitmapWithoutErasingEitherImage) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  OtaCandidateStore::Snapshot original, retired;
+  ASSERT_TRUE(store.load(original));
+  const auto identity = OtaLeanReceiver::snapshotStatus(original);
+  const auto before = sdk.bytes;
+  const auto erases = sdk.erasedOffsets;
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+  ASSERT_TRUE(store.load(retired));
+  EXPECT_EQ(OtaCandidateStore::Phase::Idle, retired.phase);
+  EXPECT_EQ(original.sequence + 1, retired.sequence);
+  EXPECT_EQ(0, std::memcmp(original.canonical, retired.canonical, sizeof(original.canonical)));
+  EXPECT_EQ(0, std::memcmp(original.signature, retired.signature, sizeof(original.signature)));
+  EXPECT_EQ(0, std::memcmp(original.ownerPublicKey, retired.ownerPublicKey, sizeof(original.ownerPublicKey)));
+  EXPECT_EQ(identity.transactionNonce, OtaLeanReceiver::snapshotStatus(retired).transactionNonce);
+  EXPECT_EQ(original.receivedBlocks, retired.receivedBlocks);
+  EXPECT_EQ(erases, sdk.erasedOffsets);
+  const uint32_t new_record = sdk.snapshot.next.address + Esp32OtaPolicy::kCandidateBytes +
+                             original.sequence * OtaCandidateStore::kRecordBytes;
+  EXPECT_TRUE(std::equal(before.begin(), before.begin() + new_record, sdk.bytes.begin()));
+  EXPECT_TRUE(std::equal(before.begin() + new_record + OtaCandidateStore::kRecordBytes, before.end(),
+                        sdk.bytes.begin() + new_record + OtaCandidateStore::kRecordBytes));
+  const auto writes = sdk.writeCalls;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+  EXPECT_EQ(writes, sdk.writeCalls);
+  EXPECT_EQ(2u, install.selections);
+}
+
+TEST_F(Esp32Product, RetirementAlsoHandlesPreviouslyMisclassifiedFloorCoveredFailedRecord) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  OtaCandidateStore::Snapshot previous;
+  ASSERT_TRUE(store.load(previous));
+  previous.phase = OtaCandidateStore::Phase::Failed;
+  ASSERT_TRUE(store.append(previous));
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+  ASSERT_TRUE(store.load(previous));
+  EXPECT_EQ(OtaCandidateStore::Phase::Idle, previous.phase);
+  successiveInstall(3);
+  ASSERT_FALSE(HasFatalFailure());
+  EXPECT_EQ(3u, install.selections);
+}
+
+TEST_F(Esp32Product, RetirementRequiresKnownReadableUnchangedExactConfirmedFloor) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  install.floorKnown = false;
+  expectRecoveryRefusal(recovery);
+  install.floorKnown = true;
+  install.floorReadable = false;
+  expectRecoveryRefusal(recovery);
+  install.floorReadable = true;
+  install.finalFloorReadable = false;
+  expectRecoveryRefusal(recovery);
+  install.finalFloorReadable = true;
+  for (const uint32_t floor : {0u, 1u, 3u}) {
+    install.floor = floor;
+    expectRecoveryRefusal(recovery);
+  }
+  install.floor = 2;
+  install.finalFloor = 3;
+  expectRecoveryRefusal(recovery);
+  install.finalFloor = UINT32_MAX;
+  policy.confirmedCounter = 1;
+  expectRecoveryRefusal(recovery);
+  policy.confirmedCounter = 2;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+}
+
+TEST_F(Esp32Product, RetirementRefusesRunningInactiveReadAndSdkInspectionErrors) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  sdk.readError = -1;
+  expectRecoveryRefusal(recovery);
+  sdk.readError = kEsp32Ok;
+  sdk.readErrorPartition = sdk.snapshot.running.address;
+  expectRecoveryRefusal(recovery);
+  sdk.readErrorPartition = sdk.snapshot.next.address;
+  expectRecoveryRefusal(recovery);
+  sdk.readErrorPartition = 0;
+  sdk.inspectError = -1;
+  expectRecoveryRefusal(recovery);
+  sdk.inspectError = kEsp32Ok;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+}
+
+TEST_F(Esp32Product, RetirementRefusesPendingUnknownInvalidRunningAndChangedBootState) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  const auto stable = sdk.snapshot;
+  for (size_t slot = 0; slot < 2; ++slot) {
+    for (const auto state : {Esp32ImageState::New, Esp32ImageState::PendingVerify,
+                             static_cast<Esp32ImageState>(0x7f)}) {
+      sdk.snapshot.appStates[slot] = state;
+      expectRecoveryRefusal(recovery);
+      sdk.snapshot = stable;
+    }
+  }
+  for (const auto state : {Esp32ImageState::Undefined, Esp32ImageState::Invalid, Esp32ImageState::Aborted}) {
+    sdk.snapshot.appStates[0] = state;
+    expectRecoveryRefusal(recovery);
+    sdk.snapshot = stable;
+  }
+  sdk.snapshot.boot = sdk.snapshot.next;
+  expectRecoveryRefusal(recovery);
+  sdk.snapshot = stable;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+}
+
+TEST_F(Esp32Product, ConfirmedRunningProofRechecksSdkAfterHashAndZerosOutputOnFailure) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  ReadOnlyAppModel reader(sdk, sdk.snapshot.running);
+  FlashRegion running_image(reader, 0, Esp32OtaPolicy::kCandidateBytes);
+  FlashRegion running_metadata(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
+  OtaCandidateStore running(running_metadata);
+  uint32_t counter = 99;
+  sdk.inspectErrorCall = sdk.inspectCalls + 2;
+  EXPECT_FALSE(verifyEsp32ConfirmedRunningCounter(sdk, running, running_image, policy, signatures,
+                                                true, 2, counter));
+  EXPECT_EQ(0u, counter);
+  sdk.inspectErrorCall = 0;
+  ASSERT_TRUE(verifyEsp32ConfirmedRunningCounter(sdk, running, running_image, policy, signatures,
+                                               true, 2, counter));
+  EXPECT_EQ(2u, counter);
+}
+
+TEST_F(Esp32Product, RetirementRehashesRunningImageAndVerifiesBothOriginalSignatures) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = sdk.bytes;
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  sdk.bytes[sdk.snapshot.running.address + 7] ^= 1;
+  expectRecoveryRefusal(recovery);
+  sdk.bytes = original;
+  alterStoredProvenance(sdk.snapshot.running, 120);
+  expectRecoveryRefusal(recovery);
+  sdk.bytes = original;
+  alterStoredProvenance(sdk.snapshot.next, 120);
+  expectRecoveryRefusal(recovery);
+  sdk.bytes = original;
+  alterStoredProvenance(sdk.snapshot.next, 88);
+  expectRecoveryRefusal(recovery);
+  sdk.bytes = original;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+}
+
+TEST_F(Esp32Product, RetirementNeverRelaxesIncompleteSelectionMarkerActivePhaseOrLocalCache) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = sdk.bytes;
+  Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  const uint32_t marker = sdk.snapshot.next.address + Esp32OtaPolicy::kCandidateBytes +
+                          Esp32OtaStagingSink::kSelectionMarkerOffset;
+  std::fill(sdk.bytes.begin() + marker, sdk.bytes.begin() + marker + 4, 0xff);
+  expectRecoveryRefusal(recovery);
+  sdk.bytes[marker] = Esp32OtaStagingSink::kSelectionMarker[0];
+  expectRecoveryRefusal(recovery);
+  sdk.bytes = original;
+  OtaCandidateStore::Snapshot snapshot;
+  ASSERT_TRUE(store.load(snapshot));
+  snapshot.localCache = true;
+  ASSERT_TRUE(store.append(snapshot));
+  expectRecoveryRefusal(recovery);
+  snapshot.phase = OtaCandidateStore::Phase::Failed;
+  ASSERT_TRUE(store.append(snapshot));
+  const auto failed_cache = sdk.bytes;
+  const auto cache_writes = sdk.writeCalls;
+  ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+  EXPECT_EQ(failed_cache, sdk.bytes);
+  EXPECT_EQ(cache_writes, sdk.writeCalls);
+  ASSERT_TRUE(store.load(snapshot));
+  EXPECT_TRUE(snapshot.localCache);
+  EXPECT_EQ(OtaCandidateStore::Phase::Failed, snapshot.phase);
+  for (const auto phase : {OtaCandidateStore::Phase::Receiving, OtaCandidateStore::Phase::Verifying,
+                           OtaCandidateStore::Phase::Ready, OtaCandidateStore::Phase::Aborted}) {
+    sdk.bytes = original;
+    ASSERT_TRUE(store.load(snapshot));
+    snapshot.phase = phase;
+    ASSERT_TRUE(store.append(snapshot));
+    const auto before = sdk.bytes;
+    const auto writes = sdk.writeCalls;
+    ASSERT_TRUE(recovery.recoverUnsuccessfulSelection());
+    EXPECT_EQ(before, sdk.bytes);
+    EXPECT_EQ(writes, sdk.writeCalls);
+  }
+}
+
+TEST_F(Esp32Product, InterruptedRetirementRemainsRecoverableWithoutErasingOrSelecting) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = sdk.bytes;
+  const auto erases = sdk.erasedOffsets;
+  for (const auto timing : {FaultTiming::Before, FaultTiming::Torn, FaultTiming::After}) {
+    sdk.bytes = original;
+    Esp32OtaStagingSink recovery(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+    sdk.writeFault = timing;
+    sdk.tornBytes = 2;
+    sdk.writeErrorCall = sdk.writeCalls + 2;  // The appended Idle record's commit marker.
+    EXPECT_FALSE(recovery.recoverUnsuccessfulSelection());
+    EXPECT_EQ(erases, sdk.erasedOffsets);
+    EXPECT_EQ(2u, install.selections);
+    sdk.writeFault = FaultTiming::None;
+    sdk.writeErrorCall = 0;
+    Esp32OtaStagingSink rebooted(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+    ASSERT_TRUE(rebooted.recoverUnsuccessfulSelection());
+    OtaCandidateStore::Snapshot retired;
+    ASSERT_TRUE(store.load(retired));
+    EXPECT_EQ(OtaCandidateStore::Phase::Idle, retired.phase);
+    EXPECT_EQ(InstallOutcome::None, rebooted.activateDurableCommit());
+    EXPECT_EQ(2u, install.selections);
+  }
+}
+
+TEST_F(Esp32Product, NewerRolledBackTrialIsNotRetiredAndAuthenticatedRetryCanInstall) {
+  twoSuccessfulInstalls();
+  ASSERT_FALSE(HasFatalFailure());
+  Esp32OtaStagingSink third(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  ASSERT_TRUE(third.recoverUnsuccessfulSelection());
+  image[1] = 3;
+  descriptor.securityCounter = 3;
+  ::ota::trust::Sha256::hash(image.data(), image.size(), descriptor.sha256);
+  signDescriptor();
+  OtaFirmwareIntegration receiving;
+  attachTo(receiving, third);
+  ready(receiving);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(Result::Ok, commit(receiving));
+  const auto attempted = receiving.leanReceiver().status();
+  ASSERT_EQ(InstallOutcome::Selected, third.activateDurableCommit());
+  const auto previous = sdk.snapshot.running;
+  rebootIntoCandidate(Esp32ImageState::PendingVerify);
+  const auto failed = sdk.snapshot.running;
+  sdk.snapshot.running = previous;
+  sdk.snapshot.next = failed;
+  sdk.snapshot.boot = previous;
+  sdk.snapshot.appStates[failed.subtype - 0x10] = Esp32ImageState::Aborted;
+  ASSERT_EQ(FlashStatus::Ok, flash.bind(Esp32OtaPolicy::kSlotBytes));
+  Esp32OtaStagingSink rollback(flash, lease, candidate, metadata, store, trust, policy, signatures, install);
+  ASSERT_TRUE(rollback.recoverUnsuccessfulSelection());
+  OtaCandidateStore::Snapshot record;
+  ASSERT_TRUE(store.load(record));
+  ASSERT_EQ(OtaCandidateStore::Phase::Failed, record.phase);
+  EXPECT_EQ(attempted.transactionNonce, OtaLeanReceiver::snapshotStatus(record).transactionNonce);
+  EXPECT_EQ(0, std::memcmp(signature, record.signature, sizeof(signature)));
+  EXPECT_EQ(0, std::memcmp(canonical, record.canonical, sizeof(canonical)));
+  EXPECT_EQ(2u, install.floor);
+  EXPECT_EQ(InstallOutcome::None, rollback.activateDurableCommit());
+  OtaFirmwareIntegration retry;
+  attachTo(retry, rollback);
+  const auto writes = sdk.writeCalls;
+  const auto erases = sdk.erasedOffsets;
+  admin = false;
+  EXPECT_EQ(Result::Denied, retry.leanReceiver().begin(owner.publicKey(), canonical, signature, true, false));
+  admin = true;
+  uint8_t bad_signature[64];
+  std::memcpy(bad_signature, signature, sizeof(signature));
+  bad_signature[0] ^= 1;
+  EXPECT_EQ(Result::Denied, retry.leanReceiver().begin(owner.publicKey(), canonical, bad_signature, true, false));
+  EXPECT_EQ(writes, sdk.writeCalls);
+  EXPECT_EQ(erases, sdk.erasedOffsets);
+  ready(retry, true);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(Result::Ok, commit(retry));
+  EXPECT_EQ(InstallOutcome::Selected, rollback.activateDurableCommit());
+  EXPECT_EQ(4u, install.selections);
+}
 
 TEST_F(Esp32Product, CandidateProjectionReadsRunningRecordWithoutMutatingReceiverOrFlash) {
   ready();

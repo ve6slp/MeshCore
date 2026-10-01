@@ -653,6 +653,9 @@ public:
   // The implementation MUST use esp_ota_set_boot_partition(), which validates
   // the app and writes redundant CRC-protected otadata with state NEW.
   virtual bool selectBoot(const ::ota::storage::Esp32PartitionIdentity& partition) = 0;
+  // Fresh SDK VALID, signed running provenance/whole-image hash, and an
+  // existing durable floor exactly equal to that running counter.
+  virtual bool confirmedRunningCounter(uint32_t& counter) = 0;
 };
 
 class Esp32OtaTrustProvider final : public meshcore::ota::runtime::IOtaTrustProvider {
@@ -783,15 +786,35 @@ public:
   bool recoverUnsuccessfulSelection() {
     Store::Snapshot s;
     if (!store_.load(s)) return false;
-    if (s.phase != Store::Phase::Committed) return true;
+    if (s.phase != Store::Phase::Committed && s.phase != Store::Phase::Failed) return true;
+    meshcore::ota::protocol::OtaDescriptor d;
+    const auto phase = s.phase;
+    if (phase == Store::Phase::Failed) {
+      if (s.localCache) return true;
+      if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(s.canonical, sizeof(s.canonical), d) !=
+          meshcore::ota::protocol::OtaDescriptorCodecResult::Ok) return false;
+      if (d.securityCounter > policy_.confirmedCounter) return true;
+    }
+    if (!verifyEsp32CandidateProvenance(store_, policy_, signatures_, s, d, phase)) return false;
     uint8_t marker[4];
     // This read revalidates boot==running and absence of NEW/PENDING_VERIFY:
     // only the safe previous application can retire a failed trial.
     if (!::ota::platform::isOk(metadata_.read(kSelectionMarkerOffset, marker, 4))) return false;
     bool attempted = false;
     for (uint8_t byte : marker) attempted |= byte != 0xff;
-    if (!attempted) return true;
-    s.phase = Store::Phase::Failed;
+    if (d.securityCounter <= policy_.confirmedCounter) {
+      uint32_t running_counter = 0;
+      if (std::memcmp(marker, kSelectionMarker, sizeof(marker)) != 0 ||
+          !install_.confirmedRunningCounter(running_counter) ||
+          running_counter != policy_.confirmedCounter) return false;
+      // A/B alternation leaves the older successful app's signed record in
+      // the inactive slot. Retire only that proven floor-covered record;
+      // preserve its identity until a newly authorized BEGIN resets it.
+      s.phase = Store::Phase::Idle;
+    } else {
+      if (!attempted) return true;
+      s.phase = Store::Phase::Failed;
+    }
     return store_.append(s);
   }
   bool storageIoFaultObserved() const { return io_fault_; }

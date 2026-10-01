@@ -80,6 +80,7 @@ public:
     return esp_ota_get_boot_partition() == app &&
            esp_ota_get_state_partition(app, &state) == ESP_OK && state == ESP_OTA_IMG_NEW;
   }
+  bool confirmedRunningCounter(uint32_t& counter) override;
 };
 
 // Read-only proof from the RUNNING slot, including its candidate provenance.
@@ -139,6 +140,26 @@ bool readFloor(uint32_t& out, bool* found = nullptr) {
   nvs_close(handle);
   if (found != nullptr) *found = err == ESP_OK;
   return err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND;
+}
+
+bool VendorInstallApi::confirmedRunningCounter(uint32_t& counter) {
+  counter = 0;
+  uint32_t floor = 0;
+  bool found = false;
+  if (!readFloor(floor, &found)) { storage_fault = true; return false; }
+  ReadOnlyAppReader reader;
+  ::ota::platform::FlashRegion running_image(reader, 0, Esp32OtaPolicy::kCandidateBytes);
+  ::ota::platform::FlashRegion running_metadata(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
+  OtaCandidateStore running_store(running_metadata);
+  ::ota::storage::Esp32IdfPartitionApi sdk;
+  uint32_t verified = 0;
+  if (!verifyEsp32ConfirmedRunningCounter(sdk, running_store, running_image, policy, signatures,
+                                         found, floor, verified)) return false;
+  uint32_t latest = 0;
+  if (!readFloor(latest, &found)) { storage_fault = true; return false; }
+  if (!found || latest != verified) return false;
+  counter = verified;
+  return true;
 }
 
 bool saveFloor(uint32_t counter) {
@@ -380,7 +401,8 @@ bool configureCompanionFirmwareOtaBackend(OtaFirmwareIntegration& target) {
       return false;
     }
   }
-  if (existing && s.phase == OtaCandidateStore::Phase::Committed) {
+  if (existing && (s.phase == OtaCandidateStore::Phase::Committed ||
+                   s.phase == OtaCandidateStore::Phase::Failed)) {
     if (!sink.recoverUnsuccessfulSelection() || !store.load(s)) {
       storage_fault = true;
       capability = "OTA_DISABLED: ESP install recovery unreadable";
@@ -393,7 +415,8 @@ bool configureCompanionFirmwareOtaBackend(OtaFirmwareIntegration& target) {
   target.attachCandidateStore(&store);
   integration = &target;
   capability = "INSTALL_CAPABLE: ESP-IDF A/B rollback";
-  if (!existing || s.phase == OtaCandidateStore::Phase::Aborted || s.phase == OtaCandidateStore::Phase::Failed)
+  if (!existing || s.phase == OtaCandidateStore::Phase::Idle ||
+      s.phase == OtaCandidateStore::Phase::Aborted || s.phase == OtaCandidateStore::Phase::Failed)
     lease.releaseStorage();
   return true;
 }

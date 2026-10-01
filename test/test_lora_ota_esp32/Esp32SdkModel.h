@@ -24,10 +24,14 @@ public:
   std::vector<uint32_t> erasedOffsets;
   uint32_t writeCalls = 0;
   mutable uint32_t readCalls = 0;
+  mutable uint32_t inspectCalls = 0;
+  uint32_t inspectErrorCall = 0;
+  uint32_t readErrorPartition = 0;
   Esp32SdkError inspectError = kEsp32Ok;
   Esp32SdkError readError = kEsp32Ok;
   Esp32SdkError eraseError = kEsp32Ok;
   FaultTiming writeFault = FaultTiming::None;
+  uint32_t writeErrorCall = 0;
   uint32_t tornBytes = 0;
   Esp32SdkError writeError = -1;  // ESP_FAIL
 
@@ -46,6 +50,8 @@ public:
   }
 
   Esp32SdkError inspect(Esp32PartitionSnapshot& out) const override {
+    ++inspectCalls;
+    if (inspectErrorCall != 0 && inspectCalls == inspectErrorCall) return -1;
     if (inspectError != kEsp32Ok) return inspectError;
     out = snapshot;
     return kEsp32Ok;
@@ -53,6 +59,7 @@ public:
   Esp32SdkError read(const Esp32PartitionIdentity& p, uint32_t offset,
                     uint8_t* out, uint32_t len) const override {
     ++readCalls;
+    if (readErrorPartition == p.address) return -1;
     if (readError != kEsp32Ok) return readError;
     if (!valid(p, offset, len)) return kEsp32InvalidArgument;
     memcpy(out, bytes.data() + p.address + offset, len);
@@ -62,11 +69,12 @@ public:
                      const uint8_t* data, uint32_t len) override {
     ++writeCalls;
     if (!valid(p, offset, len)) return kEsp32InvalidArgument;
-    if (writeFault == FaultTiming::Before) return writeError;
-    const uint32_t applied = writeFault == FaultTiming::Torn ? std::min(tornBytes, len) : len;
+    const auto fault = writeErrorCall == 0 || writeErrorCall == writeCalls ? writeFault : FaultTiming::None;
+    if (fault == FaultTiming::Before) return writeError;
+    const uint32_t applied = fault == FaultTiming::Torn ? std::min(tornBytes, len) : len;
     // IDF does not diagnose a 0->1 request; physical NOR simply ANDs it.
     for (uint32_t i = 0; i < applied; ++i) bytes[p.address + offset + i] &= data[i];
-    return writeFault == FaultTiming::None ? kEsp32Ok : writeError;
+    return fault == FaultTiming::None ? kEsp32Ok : writeError;
   }
   Esp32SdkError erase(const Esp32PartitionIdentity& p, uint32_t offset, uint32_t len) override {
     if (!valid(p, offset, len) || offset % 4096 != 0 || len != 4096) return kEsp32InvalidArgument;
