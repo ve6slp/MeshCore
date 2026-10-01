@@ -76,6 +76,19 @@ OTA_UPLOAD_WAIT_READY ?= 0
 OTA_UPLOAD_ADMIN_ENABLED ?=
 OTA_UPLOAD_COMMAND = python3 scripts/ota_uploader.py \
 	--artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --timeout "$(OTA_UPLOAD_TIMEOUT)"
+OTA_SIGNED_LAB_MODE ?= $(OTA_UPLOAD_MODE)
+OTA_SIGNED_LAB_DUTY ?= $(OTA_UPLOAD_DUTY_MILLI_PERCENT)
+OTA_SIGNED_LAB_CHANNEL ?= $(OTA_UPLOAD_CHANNEL)
+OTA_SIGNED_LAB_COUNTER ?= $(OTA_UPLOAD_COUNTER)
+OTA_SIGNED_LAB_TIMEOUT ?= 259200
+OTA_SIGNED_LAB_REBOOT_TIMEOUT ?= 120
+OTA_SIGNED_LAB_TRIAL_TIMEOUT ?= 30
+OTA_SIGNED_LAB_INSTALL_TIMEOUT ?= 300
+OTA_SIGNED_LAB_IMAGE_SHA256 ?=
+OTA_SIGNED_LAB_PROVENANCE ?=
+OTA_SIGNED_LAB_COMMISSIONING ?=
+OTA_SIGNED_LAB_READY_RECORD ?=
+OTA_SIGNED_LAB_EXTRA ?=
 
 # Representative non-OTA targets, used to prove the OTA build-filter and
 # platformio.ini changes did not regress platforms that never enable OTA.
@@ -103,6 +116,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
         ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-admin \
+        qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
         build-xiao-nrf52-archive generate-ota-lab-archive-key \
@@ -355,6 +369,30 @@ ota-lab-abort: tmpdir
 
 ota-lab-admin: tmpdir
 	$(OTA_UPLOAD_COMMAND) admin --target "$(OTA_UPLOAD_TARGET)" --enabled "$(OTA_UPLOAD_ADMIN_ENABLED)"
+
+qualify-xiao-nrf52-signed-stage: tmpdir
+	python3 scripts/ota_signed_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" \
+	  --timeout "$(OTA_SIGNED_LAB_TIMEOUT)" stage \
+	  --manifest "$(OTA_UPLOAD_MANIFEST)" --image "$(OTA_UPLOAD_IMAGE)" \
+	  --image-sha256 "$(OTA_SIGNED_LAB_IMAGE_SHA256)" \
+	  --counter "$(OTA_SIGNED_LAB_COUNTER)" \
+	  --provenance "$(OTA_SIGNED_LAB_PROVENANCE)" \
+	  --commissioning-evidence "$(OTA_SIGNED_LAB_COMMISSIONING)" \
+	  --mode "$(OTA_SIGNED_LAB_MODE)" --channel "$(OTA_SIGNED_LAB_CHANNEL)" \
+	  --duty-milli-percent "$(OTA_SIGNED_LAB_DUTY)" $(OTA_SIGNED_LAB_EXTRA)
+
+qualify-xiao-nrf52-signed-commit: tmpdir
+	python3 scripts/ota_signed_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" \
+	  --timeout "$(OTA_SIGNED_LAB_TIMEOUT)" commit --qualified-commit \
+	  --ready-record "$(OTA_SIGNED_LAB_READY_RECORD)" \
+	  --manifest "$(OTA_UPLOAD_MANIFEST)" --image "$(OTA_UPLOAD_IMAGE)" \
+	  --image-sha256 "$(OTA_SIGNED_LAB_IMAGE_SHA256)" \
+	  --counter "$(OTA_SIGNED_LAB_COUNTER)" \
+	  --provenance "$(OTA_SIGNED_LAB_PROVENANCE)" \
+	  --commissioning-evidence "$(OTA_SIGNED_LAB_COMMISSIONING)" \
+	  --reboot-timeout "$(OTA_SIGNED_LAB_REBOOT_TIMEOUT)" \
+	  --trial-timeout "$(OTA_SIGNED_LAB_TRIAL_TIMEOUT)" \
+	  --install-timeout "$(OTA_SIGNED_LAB_INSTALL_TIMEOUT)"
 
 build-xiao-nrf52-qspi-test: tmpdir
 	$(PLATFORMIO) run -e $(XIAO_NRF52_QSPI_TEST_ENV)

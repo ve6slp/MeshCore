@@ -119,6 +119,80 @@ assumptions. `make test-xiao-nrf52-ota-lab` continues to refuse
 qualification before opening either port: paired configuration and mocked
 host tests are not an end-to-end OTA result.
 
+### Signed full-image qualification
+
+`qualify-xiao-nrf52-signed-stage` and
+`qualify-xiao-nrf52-signed-commit` exercise the signed production workflow,
+not the retired raw sender. They require reviewed role-specific artifacts,
+completed commissioning and the companion's existing administrator
+permission on the target. They do not install a bootloader, grant
+permissions, reset a board or bypass a conflicting candidate.
+
+Select the expected BIN hash from the immutable artifact inventory and a
+planned counter above the observed floor. Each invocation needs a new
+artifact directory. For example, with the shell variables below set to
+actual reviewed artifacts and completed evidence:
+
+```sh
+make qualify-xiao-nrf52-signed-stage \
+  OTA_UPLOAD_IMAGE="$image" OTA_UPLOAD_MANIFEST="$manifest" \
+  OTA_SIGNED_LAB_IMAGE_SHA256="$reviewed_image_hash" \
+  OTA_SIGNED_LAB_COUNTER="$counter" \
+  OTA_SIGNED_LAB_PROVENANCE="$artifact_inventory" \
+  OTA_SIGNED_LAB_COMMISSIONING="$commissioning_capture" \
+  OTA_SIGNED_LAB_MODE=directed OTA_LAB_ARTIFACT_DIR="$stage_dir"
+```
+
+The evidence references are recorded strings, not authenticated receipts
+or a new commissioning authority. They cannot substitute for actual board
+observations. The runner independently reads current identity, settings,
+ACL and floor. It captures `baseline.json` before candidate installation
+and writes `ready.json` only after fresh, complete READY. Stage never
+commits. The original public-key baseline was not captured; these
+readbacks do not prove recovery of the lost original application.
+
+Commit is deliberately separate:
+
+```sh
+make qualify-xiao-nrf52-signed-commit \
+  OTA_UPLOAD_IMAGE="$image" OTA_UPLOAD_MANIFEST="$manifest" \
+  OTA_SIGNED_LAB_IMAGE_SHA256="$reviewed_image_hash" \
+  OTA_SIGNED_LAB_COUNTER="$counter" \
+  OTA_SIGNED_LAB_PROVENANCE="$artifact_inventory" \
+  OTA_SIGNED_LAB_COMMISSIONING="$commissioning_capture" \
+  OTA_SIGNED_LAB_READY_RECORD="$stage_dir/ready.json" \
+  OTA_LAB_ARTIFACT_DIR="$commit_dir"
+```
+
+Use identical candidate and evidence inputs. The runner requires fresh
+READY, observes a firmware-initiated disconnect and re-enumeration, then
+checks candidate-bound remote Trial and Installed, the verified running
+hash, counter and confirmed floor, and preserved identity, settings and
+ACL. Missing remote reboot is a blocked outcome, not repaired by a USB
+reset. Denied or uncertain COMMIT is not installation success.
+
+Remote Trial observation is a stricter lab criterion than normal COMMIT.
+A short trial can be missed at 2% airtime; that leaves lifecycle
+observation incomplete, rather than proving installation failed. The
+runner never fabricates or forces a trial.
+
+Select `OTA_SIGNED_LAB_MODE=direct` for 908525 kHz and 60-second leases;
+firmware owns restoration and renewal. Background requires an existing
+configured channel through `OTA_SIGNED_LAB_CHANNEL`. The default share
+is 2%, with a 72-hour host timeout, not a completion guarantee. A
+supervised full-image smoke run requires both
+`OTA_SIGNED_LAB_DUTY=100000` and
+`OTA_SIGNED_LAB_EXTRA=--supervised-full-image-smoke`; it is not 2%
+acceptance. To resume the same candidate, pass
+`OTA_SIGNED_LAB_EXTRA='--baseline-record /path/to/prior/baseline.json'`.
+Different local-cache content still requires an independent, explicit
+abort, not force-overwrite.
+
+The runner does not establish measured airtime, physical multihop, fleet
+contention or power-cut recovery. Its tests and recipes do not close the
+firmware recovery or remote-reboot review gates, or constitute a hardware
+result.
+
 The repeater transport also reads `get acl`, whose output has no closing
 marker. It waits for the echoed reply to a following `get role` command
 instead of treating a quiet serial port as a complete ACL. An in-memory
