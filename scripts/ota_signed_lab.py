@@ -48,10 +48,10 @@ Stage writes baseline.json BEFORE caching and ready.json ONLY after fresh,
 full-image READY, with no COMMIT. Resume a timed-out attempt using the same
 inputs and --baseline-record path/to/baseline.json; evidence and durable progress
 are preserved. Conflicts fail, never force-overwrite. A different local cache
-needs an independently explicit local ABORT; the uploader's local-ABORT CLI
-contract is pending owner clarification, so this runner offers no replacement.
-No --reupload flag: even same-owner/content/purpose ABORTed candidates need
-separate operator recovery.
+needs an independently explicit ota_uploader.py abort-cache first. Only a fresh,
+valid LOCAL ABORTED snapshot consistent with the companion lifecycle enables
+CacheBegin reupload=1, after writing the new baseline. All other caches remain
+locked to their candidate. This runner never sends ABORT and has no override.
 
 Commit consumes ready.json, rechecks identities/config/ACL/floor and fresh READY,
 then sends exactly one explicit COMMIT. It observes USB disconnect/re-enumeration
@@ -59,7 +59,9 @@ and application-managed trial/confirmation reboot(s), never requests a reset.
 Fresh remote Trial AND Installed, bound to the actual target/manifest/counter
 (signed provenance checked by the application), PLUS verified running
 SHA256/counter/floor are required; COMMIT ACK and physical text Trial alone are
-not proof. Missing fresh remote Trial fails full lifecycle qualification.
+not proof. Missing fresh remote Trial does not stop Installed/preservation/peer
+evidence collection: installed.json records remote_trial_not_observed and
+remote_install_qualified=false, then the strict qualification command fails.
 Reboot/trial/install timeouts are HOST observation bounds, not claimed device
 capabilities. A target that does not reboot after remote COMMIT is explicitly
 BLOCKED within --reboot-timeout (default 120s); no USB reset fallback exists.
@@ -305,7 +307,18 @@ class Pair:
         raise TimeoutError("target did not observably disconnect and re-enumerate before deadline")
 
 
-def capture(pair, candidate, evidence, deadline):
+def aborted_local_cache(local, client_boot, since):
+    require(local.result == ota.Result.OK and local.valid and local.target == ota.LOCAL_TARGET
+            and not local.flags & ota.REMOTE and local.phase == ota.Phase.ABORTED
+            and local.fresh_since(since, time.monotonic()) and local.manifest_hash != bytes(32)
+            and local.counter > 0 and local.total > 0,
+            "local ABORT is missing, stale, unproven or wrong-scope; no replacement permitted")
+    require(client_boot["boot"] not in ("trial", "failed") and client_boot["phase"] == "aborted"
+            and client_boot["counter"] == local.counter,
+            "local ABORT snapshot disagrees with companion lifecycle; no replacement permitted")
+
+
+def capture(pair, candidate, evidence, deadline, uploader=None):
     client = lab.serializable_app_info(lab.companion_info(pair.client))
     target = lab.repeater_info(pair.target)
     require(client["pubkey"] != target["pubkey"], "client and target public keys collide")
@@ -320,13 +333,23 @@ def capture(pair, candidate, evidence, deadline):
     require(client_frame[:1] == b"\x1d", "companion lifecycle readback unavailable")
     client_boot = boot_status(client_frame[1:].decode("ascii"))
     require(client_boot["boot"] not in ("trial", "failed")
-            and client_boot["phase"] not in ("trial", "commit-pending", "failed", "aborted"),
+            and client_boot["phase"] not in ("trial", "commit-pending", "failed"),
             "companion current trial/candidate prevents qualification")
     status = target_status(pair.target, evidence, deadline)
     check_floor(status, candidate)
+    local = None
+    if uploader is not None:
+        since = time.monotonic()
+        local = uploader.status(timeout=uploader.remaining(deadline))
+        if local.phase == ota.Phase.ABORTED or client_boot["phase"] == "aborted":
+            aborted_local_cache(local, client_boot, since)
+    require(client_boot["phase"] != "aborted" or local is not None,
+            "companion current trial/candidate prevents qualification")
     baseline = {"version": RECORD_VERSION, "kind": "baseline", "serials": APPROVED,
                 "candidate": candidate.metadata, "client": client, "target": target,
                 "acl": acl, "floor": status["floor"], "target_status": status,
+                "client_status": client_boot,
+                "local_cache_before": None if local is None else local.summary(),
                 "captured_at": lab.utc_now(), "original_public_key_baseline_captured": False}
     evidence.log("baseline_capture", **baseline)
     return baseline
@@ -382,24 +405,35 @@ def fresh_candidate(uploader, candidate, target_key, deadline):
 
 def stage(pair, uploader, candidate, args, evidence, deadline):
     body, requested = profile(args)
-    baseline = capture(pair, candidate, evidence, deadline)
+    baseline = capture(pair, candidate, evidence, deadline, uploader=uploader)
     if args.baseline_record:
         preserved(read_record(args.baseline_record, "baseline"), baseline)
     write_record(evidence.directory / "baseline.json", baseline)
     target_key = bytes.fromhex(baseline["target"]["pubkey"])
+    since = time.monotonic()
     local = uploader.status(timeout=uploader.remaining(deadline))
-    if local.valid:
+    captured = baseline["local_cache_before"]
+    reupload = bool(captured and captured["phase"] == "ABORTED")
+    if reupload:
+        aborted_local_cache(local, baseline["client_status"], since)
+        require(captured is not None and all(captured[field] == local.summary()[field] for field in
+                ("phase", "target", "hash", "counter", "received", "total", "remote")),
+                "local ABORT changed after baseline capture; no replacement permitted")
+        evidence.log("explicit_local_abort_observed", previous=local.summary(), reupload=True,
+                     abort_sent=False)
+    elif local.valid:
         bound_snapshot(local, candidate, ota.LOCAL_TARGET)
         require(local.phase in (ota.Phase.ERASING, ota.Phase.RECEIVING,
                                 ota.Phase.VERIFYING, ota.Phase.CACHE_SEALED),
                 "local cache cannot be safely resumed; no ABORT/reupload attempted")
     if baseline["target_status"]["phase"] in ACTIVE_PHASES:
-        require(local.valid, "existing target candidate cannot be bound without the same local cache")
+        require(local.valid and not reupload,
+                "existing target candidate cannot be bound without the same local cache")
         fresh_candidate(uploader, candidate, target_key, deadline)
     evidence.log("campaign_requested", **requested, measured_duty_evidence_available=False,
                  direct_sf5_observed=False, automatic_lease_renewal_observed=False)
     cache = uploader.cache(candidate.canonical, candidate.image,
-                           bytes.fromhex(baseline["client"]["pubkey"]), deadline, reupload=False)
+                           bytes.fromhex(baseline["client"]["pubkey"]), deadline, reupload=reupload)
     bound_snapshot(cache, candidate, ota.LOCAL_TARGET, complete=True)
     since = time.monotonic()
     uploader.start([target_key], body, args.mode, deadline)
@@ -422,6 +456,34 @@ def stage(pair, uploader, candidate, args, evidence, deadline):
     return record
 
 
+def remote_trial(uploader, candidate, target_key, since, deadline):
+    while time.monotonic() < deadline:
+        observed = uploader.status(target_key, timeout=uploader.remaining(deadline))
+        now = time.monotonic()
+        if observed.valid:
+            require(observed.target == target_key and observed.flags & ota.REMOTE,
+                    "remote Trial observation has the wrong scope")
+        if observed.fresh_since(since, now):
+            bound_snapshot(observed, candidate, target_key)
+            require(observed.phase not in (ota.Phase.FAILED, ota.Phase.ABORTED),
+                    "remote candidate failed/ABORTed during trial observation")
+            require(observed.phase in (ota.Phase.READY, ota.Phase.COMMIT_PENDING,
+                                       ota.Phase.TRIAL, ota.Phase.INSTALLED),
+                    "unexpected remote phase during postcommit trial observation")
+            if observed.phase in (ota.Phase.TRIAL, ota.Phase.INSTALLED):
+                bound_snapshot(observed, candidate, target_key, complete=True)
+                return observed
+        time.sleep(min(max(0.1, observed.retry_after_ms / 1000), max(0, deadline - now)))
+    return None
+
+
+def incomplete_trial(evidence, reason, observed=None):
+    evidence.summary["measurements"]["trial_observation_incomplete"] = {
+        "reason": reason, "remote": None if observed is None else observed.summary()}
+    evidence.log("trial_observation_incomplete",
+                 **evidence.summary["measurements"]["trial_observation_incomplete"])
+
+
 def observe_install(pair, uploader, candidate, target_key, evidence, deadline,
                     reboot_timeout=120, trial_timeout=30, install_timeout=300):
     deadline = min(deadline, time.monotonic() + install_timeout)
@@ -435,6 +497,7 @@ def observe_install(pair, uploader, candidate, target_key, evidence, deadline,
             "remote install blocked: receiver did not reboot/disconnect/re-enumerate after remote COMMIT; "
             "no USB reset issued; manual USB reboot would be assisted commissioning only") from exc
     trial = None
+    trial_attempted = False
     while time.monotonic() < deadline:
         try:
             status = target_status(pair.target, evidence, deadline)
@@ -450,25 +513,21 @@ def observe_install(pair, uploader, candidate, target_key, evidence, deadline,
         if status["boot"] == "trial":
             bound_trial = status["phase"] == "trial" and status["counter"] == candidate.counter
             evidence.log("trial_boot_observed", candidate_binding_available=bound_trial, **status)
-            if bound_trial and trial is None:
+            if bound_trial and not trial_attempted:
+                trial_attempted = True
                 since = time.monotonic()
-                try:
-                    remote_trial = uploader.wait_phase(
-                        target_key, ota.Phase.TRIAL, candidate.manifest_hash, candidate.counter,
-                        since, min(deadline, since + trial_timeout))
-                except TimeoutError as exc:
-                    evidence.summary["measurements"]["outcome"] = "blocked_fresh_remote_trial_unavailable"
-                    raise QualificationError(
-                        "fresh remote Trial unavailable; physical text Trial alone does not qualify remote install") from exc
-                bound_snapshot(remote_trial, candidate, target_key, complete=True)
-                require(remote_trial.phase == ota.Phase.TRIAL
-                        and remote_trial.fresh_since(since, time.monotonic()),
-                        "remote Trial is stale or has the wrong phase; remote install not qualified")
-                trial = remote_trial.summary()
-                evidence.summary["measurements"]["trial"] = {
-                    "remote": trial, "physical_text": status, "candidate": candidate.metadata}
-                evidence.log("fresh_remote_trial_verified",
-                             **evidence.summary["measurements"]["trial"])
+                observed = remote_trial(uploader, candidate, target_key, since,
+                                        min(deadline, since + trial_timeout))
+                if observed is None:
+                    incomplete_trial(evidence, "no_fresh_remote_trial_before_observation_bound")
+                elif observed.phase == ota.Phase.INSTALLED:
+                    incomplete_trial(evidence, "remote_already_installed", observed)
+                else:
+                    trial = observed.summary()
+                    evidence.summary["measurements"]["trial"] = {
+                        "remote": trial, "physical_text": status, "candidate": candidate.metadata}
+                    evidence.log("fresh_remote_trial_verified",
+                                 **evidence.summary["measurements"]["trial"])
         if status["phase"] == "installed":
             require(status["boot"] == "confirmed" and status["verified"]
                     and status["image"] == candidate.metadata["image_sha256"]
@@ -486,8 +545,8 @@ def observe_install(pair, uploader, candidate, target_key, evidence, deadline,
                 "trial_observed": trial is not None, "remote_trial": trial,
                 "signed_provenance_scope": "application_checked_remote_Installed"}
             evidence.log("running_install_verified", **evidence.summary["measurements"]["installed"])
-            require(trial is not None,
-                    "Installed verified but fresh remote Trial not observed; lifecycle qualification incomplete")
+            if trial is None and "trial_observation_incomplete" not in evidence.summary["measurements"]:
+                incomplete_trial(evidence, "local_trial_not_observed_or_not_candidate_bound")
             return status
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     raise TimeoutError("no proven running Installed/counter/floor before deadline")
@@ -518,16 +577,22 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
             "identity/name/radio/path readbacks changed across installation")
     require(acl == before["acl"], "complete ADMIN ACL did not survive installation reboot")
     ordinary_peer(pair, target_key, evidence, min(deadline, time.monotonic() + 30))
+    trial = evidence.summary["measurements"]["installed"]["remote_trial"]
+    qualified = trial is not None
+    result = "running_installed_lifecycle_and_peer_verified" if qualified else "remote_trial_not_observed"
     outcome = {"version": RECORD_VERSION, "kind": "installed", "serials": APPROVED,
                "candidate": candidate.metadata, "profile": record["profile"], "lifecycle": installed,
+               "remote_installed": evidence.summary["measurements"]["installed"]["remote"],
+               "outcome": result, "trial_observation_incomplete": not qualified,
                "identity_config_acl_preserved": True, "ordinary_peer_received": True,
-               "trial_observed": True,
-               "remote_trial": evidence.summary["measurements"]["trial"]["remote"],
-               "usb_reset_sent": False, "remote_install_qualified": True,
+               "trial_observed": qualified, "remote_trial": trial,
+               "usb_reset_sent": False, "remote_install_qualified": qualified,
                "measured_duty_evidence_available": False,
                "multihop_fleet_powercut_qualified": False}
     write_record(evidence.directory / "installed.json", outcome)
-    evidence.summary["measurements"]["outcome"] = "running_installed_lifecycle_and_peer_verified"
+    evidence.summary["measurements"]["outcome"] = result
+    require(qualified, "running install/preservation/peer verified but fresh remote Trial not observed; "
+            "remote_install_qualified=false; completed evidence preserved in installed.json")
     return outcome
 
 

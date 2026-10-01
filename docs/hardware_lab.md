@@ -175,6 +175,10 @@ Remote Trial observation is a stricter lab criterion than normal COMMIT.
 A short trial can be missed at 2% airtime; that leaves lifecycle
 observation incomplete, rather than proving installation failed. The
 runner never fabricates or forces a trial.
+It still collects Installed, hash, floor and preservation evidence in
+`installed.json`, then reports `remote_trial_not_observed` with
+`remote_install_qualified` false. A failed qualification is not permission
+to commit the already-installed candidate again.
 
 Select `OTA_SIGNED_LAB_MODE=direct` for 908525 kHz and 60-second leases;
 firmware owns restoration and renewal. Background requires an existing
@@ -187,6 +191,10 @@ acceptance. To resume the same candidate, pass
 `OTA_SIGNED_LAB_EXTRA='--baseline-record /path/to/prior/baseline.json'`.
 Different local-cache content still requires an independent, explicit
 abort, not force-overwrite.
+After that abort, stage requires fresh local ABORTED evidence consistent
+with the companion's lifecycle before and after baseline capture. Only
+then does it explicitly restart the cache. An active conflicting cache,
+missing evidence or a changed snapshot remains a refusal.
 
 The runner does not establish measured airtime, physical multihop, fleet
 contention or power-cut recovery. Its tests and recipes do not close the

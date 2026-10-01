@@ -148,6 +148,7 @@ class CampaignFixture:
         self.ready_reply = reply(candidate, ota.Phase.READY)
         self.error = None
         self.phase_requests = []
+        self.remote_lifecycle = None
 
     def remaining(self, deadline):
         return min(10, deadline - signed.time.monotonic())
@@ -156,6 +157,11 @@ class CampaignFixture:
         self.ops.append(ota.Op.STATUS)
         if self.local_valid:
             phase = ota.Phase.CACHE_SEALED if target == ota.LOCAL_TARGET else ota.Phase[self.pair.target.phase.upper()]
+            if target != ota.LOCAL_TARGET and self.remote_lifecycle:
+                phase = self.remote_lifecycle[0]
+                if len(self.remote_lifecycle) > 1:
+                    self.remote_lifecycle.pop(0)
+                self.phase_requests.append(phase)
             return reply(self.candidate, phase, target=target)
         return ota.decode_reply(bytes([31, 1, ota.Op.STATUS, 0, 0, 0]) + bytes(64)
                                 + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0))
@@ -190,7 +196,124 @@ class CampaignFixture:
             f"boot=trial phase=trial floor=0 counter={self.candidate.counter} verified=0 image=unknown",
             f"boot=confirmed phase=installed floor={self.candidate.counter} "
             f"counter={self.candidate.counter} verified=1 image={self.candidate.metadata['image_sha256']}"]
+        self.remote_lifecycle = [ota.Phase.TRIAL, ota.Phase.INSTALLED]
         return self.ready_reply
+
+
+class ProductTarget(Target):
+    def __init__(self, companion):
+        super().__init__(companion)
+        self.installed = None
+
+    def command(self, command, **kwargs):
+        if command == "ota status" and self.installed is not None:
+            self.commands.append(command)
+            return (f"boot=confirmed phase={self.phase} floor={self.floor} counter={self.counter} "
+                    f"verified=1 image={hashlib.sha256(self.installed.image).hexdigest()}")
+        return super().command(command, **kwargs)
+
+
+class ProductCompanion(Companion):
+    """In-memory wire/storage peer for the real Uploader, with real signing."""
+
+    def __init__(self):
+        super().__init__()
+        self.target = ProductTarget(self)
+        self.local = self.target_candidate = None
+        self.local_phase = ota.Phase.UNKNOWN
+        self.owner = self.public_key
+        self.purpose = "cache"
+        self.blocks = {}
+        self.packets = []
+        self.baseline_path = None
+        self.status_mutator = None
+
+    def empty_reply(self, op, result, target):
+        remote = target != ota.LOCAL_TARGET and op != ota.Op.ADD_TARGET
+        return (bytes([31, 1, op, result, 0, ota.REMOTE if remote else 0])
+                + target + bytes(32) + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0))
+
+    def snapshot_reply(self, op, result, target, candidate, phase):
+        if candidate is None:
+            return self.empty_reply(op, result, target)
+        total = candidate.blocks
+        received = len(self.blocks) if target == ota.LOCAL_TARGET else total
+        digest = hashlib.sha256(candidate.image).digest() if op == ota.Op.ABORT else candidate.manifest_hash
+        remote = target != ota.LOCAL_TARGET and op != ota.Op.ADD_TARGET
+        return (bytes([31, 1, op, result, phase, 1 | (ota.REMOTE if remote else 0)])
+                + target + digest + struct.pack(">HHIII", received, total, candidate.counter, 0, 0))
+
+    def write_frame(self, packet):
+        self.packets.append(packet)
+        assert packet[0] == 66
+        op, body = ota.Op(packet[1]), packet[2:]
+        target, result = ota.LOCAL_TARGET, ota.Result.OK
+        if op == ota.Op.STATUS:
+            target = body
+        elif op == ota.Op.CACHE_BEGIN:
+            assert len(packet) == 158
+            if self.baseline_path is not None:
+                assert self.baseline_path.exists(), "candidate mutation preceded baseline capture"
+            flags, owner, canonical, signature = packet[2], packet[3:35], packet[35:94], packet[94:]
+            assert owner == self.public_key
+            self.signer.public_key().verify(signature, canonical)
+            if self.local is not None and self.local_phase != ota.Phase.ABORTED:
+                same = self.local.canonical == canonical and self.owner == owner and self.purpose == "cache"
+                if flags or not same:
+                    result = ota.Result.BUSY
+            elif self.local_phase == ota.Phase.ABORTED and flags != 1:
+                result = ota.Result.DENIED
+            if result == ota.Result.OK:
+                if self.local is None or self.local.canonical != canonical or flags:
+                    self.local = signed.Candidate(canonical, bytes(struct.unpack_from(">I", canonical, 9)[0]),
+                                                  {"counter": struct.unpack_from(">I", canonical, 45)[0]})
+                    self.blocks = {}
+                    self.local_phase = ota.Phase.RECEIVING
+                self.owner, self.purpose = owner, "cache"
+        elif op == ota.Op.CACHE_PUT:
+            index, length = struct.unpack_from(">HB", body)
+            assert len(body[3:]) == length
+            self.blocks[index] = body[3:]
+        elif op == ota.Op.CACHE_SEAL:
+            image = b"".join(self.blocks[i] for i in range(len(self.blocks)))
+            ota.validate_image(self.local.canonical, image)
+            self.local = signed.Candidate(self.local.canonical, image, self.local.metadata)
+            self.local_phase = ota.Phase.CACHE_SEALED
+            self.boot = (f"boot=unknown phase=cache-sealed floor=unknown counter={self.local.counter} "
+                         "verified=0 image=unknown").encode()
+        elif op == ota.Op.ABORT:
+            assert len(packet) == 66 and body[:32] == ota.LOCAL_TARGET
+            assert body[32:] == hashlib.sha256(self.local.image).digest()
+            self.local_phase = ota.Phase.ABORTED
+            self.boot = (f"boot=unknown phase=aborted floor=unknown counter={self.local.counter} "
+                         "verified=0 image=unknown").encode()
+        elif op == ota.Op.ADD_TARGET:
+            target = body
+            assert body == self.target.key
+        elif op == ota.Op.START:
+            assert self.baseline_path.exists()
+            self.target_candidate = self.local
+            self.target.phase, self.target.counter = "ready", self.local.counter
+        elif op == ota.Op.COMMIT:
+            target = body[:32]
+            assert target == self.target.key
+            assert body[32:64] == self.target_candidate.manifest_hash
+            assert struct.unpack_from(">I", body, 64)[0] == self.target_candidate.counter
+            self.target.installed = self.target_candidate
+            self.target.phase = "installed"
+            self.target.counter = self.target.floor = self.target_candidate.counter
+        else:
+            raise AssertionError(f"unexpected wire opcode {op}")
+        if op == ota.Op.COMMIT or result != ota.Result.OK:
+            response = self.empty_reply(op, result, target)
+        elif op == ota.Op.STATUS and target != ota.LOCAL_TARGET:
+            phase = ota.Phase[self.target.phase.upper()]
+            response = self.snapshot_reply(op, result, target, self.target_candidate, phase)
+        else:
+            response = self.snapshot_reply(op, result, target, self.local, self.local_phase)
+        if self.status_mutator and op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
+            response = self.status_mutator(response)
+        self.pending.append((signed.time.monotonic(), response))
 
 
 class SignedLabTests(unittest.TestCase):
@@ -236,6 +359,166 @@ class SignedLabTests(unittest.TestCase):
         evidence = lab.Evidence(args.artifact_dir)
         self.addCleanup(evidence.events.close)
         return args, evidence
+
+    def product_pair(self, counter=6):
+        node = ProductCompanion()
+        pair = SimpleNamespace(client=node, target=node.target, reenumerate=mock.Mock(), close=mock.Mock())
+        uploader = ota.Uploader(node, self.evidence)
+        image, canonical = image_manifest(counter=counter)
+        uploader.cache(canonical, image, node.public_key, self.clock.now + 300)
+        return node, pair, uploader
+
+    def candidate_inputs(self, counter, image=None):
+        image, canonical = image_manifest(counter=counter, image=image)
+        self.image_path.write_bytes(image)
+        self.manifest_path.write_bytes(canonical)
+        self.args.counter, self.args.image_sha256 = counter, hashlib.sha256(image).hexdigest()
+        return signed.load_candidate(self.args)
+
+    def product_stage(self, node, pair, uploader, candidate, label):
+        evidence = lab.Evidence(self.directory / label)
+        self.addCleanup(evidence.events.close)
+        uploader.evidence = evidence
+        node.baseline_path = evidence.directory / "baseline.json"
+        return signed.stage(pair, uploader, candidate, self.args, evidence, self.clock.now + 300)
+
+    def test_real_uploader_replaces_only_explicitly_zero_aborted_cache(self):
+        for different_content in (False, True):
+            with self.subTest(different_content=different_content):
+                node, pair, uploader = self.product_pair()
+                old = node.local
+                uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(old.image).digest())
+                abort = node.packets[-1]
+                self.assertEqual(abort[:34], bytes([66, ota.Op.ABORT]) + bytes(32))
+                image = old.image[:-1] + b"\x66" if different_content else old.image
+                candidate = self.candidate_inputs(7, image)
+                before = len(node.packets)
+                record = self.product_stage(node, pair, uploader, candidate, f"aborted-{different_content}")
+                campaign = node.packets[before:]
+                begin = next(packet for packet in campaign if packet[1] == ota.Op.CACHE_BEGIN)
+                self.assertEqual(len(begin), 158)
+                self.assertEqual(begin[2], 1)
+                self.assertEqual(begin[3:35], node.public_key)
+                self.assertEqual(begin[35:94], candidate.canonical)
+                node.signer.public_key().verify(begin[94:], candidate.canonical)
+                self.assertEqual(record["local_cache_before"]["phase"], "ABORTED")
+                self.assertEqual(record["local_cache_before"]["hash"], old.manifest_hash.hex())
+                self.assertEqual(record["ready"]["counter"], 7)
+                self.assertFalse(record["auto_commit"])
+                self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in campaign])
+                self.assertNotIn(ota.Op.COMMIT, [packet[1] for packet in campaign])
+
+    def test_real_uploader_sequential_modes_and_rising_counters_use_operator_abort_only(self):
+        node, pair, uploader = self.product_pair()
+        for mode, counter in (("direct", 7), ("directed", 8), ("background", 9)):
+            with self.subTest(mode=mode):
+                uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(node.local.image).digest())
+                candidate = self.candidate_inputs(counter)
+                self.args.mode, self.args.channel = mode, 2 if mode == "background" else 255
+                before = len(node.packets)
+                record = self.product_stage(node, pair, uploader, candidate, mode)
+                campaign = node.packets[before:]
+                begin = next(packet for packet in campaign if packet[1] == ota.Op.CACHE_BEGIN)
+                self.assertEqual(begin[2], 1)
+                self.assertEqual(record["ready"]["counter"], counter)
+                self.assertEqual(record["floor"], counter - 1 if counter > 7 else 0)
+                self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in campaign])
+                self.assertNotIn(ota.Op.COMMIT, [packet[1] for packet in campaign])
+                # Explicit operator COMMIT in the model, never sent by stage().
+                uploader.commit(pair.target.key, candidate.canonical, self.clock.now + 300)
+                self.assertEqual(node.target.floor, counter)
+
+    def test_local_abort_proof_missing_stale_wrong_scope_or_counter_is_refused(self):
+        for defect in ("missing", "stale", "scope", "counter", "hash", "total", "phase", "cli-failed"):
+            with self.subTest(defect=defect):
+                node, pair, uploader = self.product_pair()
+                uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(node.local.image).digest())
+                if defect == "cli-failed":
+                    node.boot = node.boot.replace(b"phase=aborted", b"phase=failed")
+                else:
+                    def corrupt(frame, defect=defect):
+                        if defect == "missing":
+                            return node.empty_reply(ota.Op.STATUS, ota.Result.OK, ota.LOCAL_TARGET)
+                        data = bytearray(frame)
+                        if defect == "stale":
+                            struct.pack_into(">I", data, 78, 1000)
+                        elif defect == "scope":
+                            data[5] |= ota.REMOTE
+                        elif defect == "counter":
+                            struct.pack_into(">I", data, 74, 5)
+                        elif defect == "hash":
+                            data[38:70] = bytes(32)
+                        elif defect == "total":
+                            data[70:74] = bytes(4)
+                        elif defect == "phase":
+                            data[4] = ota.Phase.CACHE_SEALED
+                        return bytes(data)
+                    node.status_mutator = corrupt
+                before = len(node.packets)
+                with self.assertRaises(signed.QualificationError):
+                    self.product_stage(node, pair, uploader, self.candidate, "refused-" + defect)
+                self.assertNotIn(ota.Op.CACHE_BEGIN, [packet[1] for packet in node.packets[before:]])
+                self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in node.packets[before:]])
+
+    def test_local_abort_must_remain_consistent_after_fresh_baseline(self):
+        node, pair, uploader = self.product_pair()
+        uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(node.local.image).digest())
+        calls = 0
+
+        def changed(frame):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                frame = frame[:38] + b"\xbb" * 32 + frame[70:]
+            return frame
+
+        node.status_mutator = changed
+        before = len(node.packets)
+        with self.assertRaisesRegex(signed.QualificationError, "ABORT changed after baseline"):
+            self.product_stage(node, pair, uploader, self.candidate, "abort-changed")
+        self.assertTrue(node.baseline_path.exists())
+        self.assertNotIn(ota.Op.CACHE_BEGIN, [packet[1] for packet in node.packets[before:]])
+
+    def test_local_abort_proof_disappearing_after_baseline_stays_refused(self):
+        node, pair, uploader = self.product_pair()
+        uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(node.local.image).digest())
+        calls = 0
+
+        def missing(frame):
+            nonlocal calls
+            calls += 1
+            return frame if calls == 1 else node.empty_reply(ota.Op.STATUS, ota.Result.OK, ota.LOCAL_TARGET)
+
+        node.status_mutator = missing
+        before = len(node.packets)
+        with self.assertRaisesRegex(signed.QualificationError, "ABORT is missing"):
+            self.product_stage(node, pair, uploader, self.candidate, "abort-disappeared")
+        self.assertTrue(node.baseline_path.exists())
+        self.assertNotIn(ota.Op.CACHE_BEGIN, [packet[1] for packet in node.packets[before:]])
+
+    def test_nonaborted_owner_content_counter_and_purpose_remain_locked(self):
+        for conflict in ("counter", "content", "owner", "purpose"):
+            with self.subTest(conflict=conflict):
+                node, pair, uploader = self.product_pair(counter=7)
+                candidate = self.candidate
+                if conflict == "counter":
+                    candidate = self.candidate_inputs(8)
+                elif conflict == "content":
+                    candidate = self.candidate_inputs(7, node.local.image[:-1] + b"x")
+                elif conflict == "owner":
+                    node.owner = b"\xaa" * 32
+                else:
+                    node.purpose = "remote-install"
+                before = len(node.packets)
+                with self.assertRaises(ota.UploaderError):
+                    self.product_stage(node, pair, uploader, candidate, "locked-" + conflict)
+                campaign = node.packets[before:]
+                for packet in campaign:
+                    if packet[1] == ota.Op.CACHE_BEGIN:
+                        self.assertEqual(packet[2], 0)
+                self.assertNotIn(ota.Op.CACHE_PUT, [packet[1] for packet in campaign])
+                self.assertNotIn(ota.Op.START, [packet[1] for packet in campaign])
+                self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in campaign])
 
     def test_all_three_modes_use_actual_identity_full_image_and_never_commit(self):
         for mode, channel in (("directed", 255), ("direct", 255), ("background", 2)):
@@ -399,21 +682,151 @@ class SignedLabTests(unittest.TestCase):
         self.assertIn('"usb_reset_sent": false', self.output.getvalue())
 
     def test_physical_text_trial_without_fresh_remote_trial_cannot_qualify_install(self):
-        self.target.lifecycle = ["boot=trial phase=trial floor=0 counter=7 verified=0 image=unknown"]
-        self.uploader.wait_phase = mock.Mock(side_effect=TimeoutError("no fresh TRIAL report"))
-        with self.assertRaisesRegex(signed.QualificationError, "physical text Trial alone"):
-            signed.observe_install(self.pair, self.uploader, self.candidate,
-                                   TARGET_KEY, self.evidence, self.deadline)
-        self.assertEqual(self.uploader.wait_phase.call_args.args[1], ota.Phase.TRIAL)
-        self.assertNotIn("installed", self.evidence.summary["measurements"])
+        args, evidence = self.prepare_commit()
+        original = self.uploader.commit
+
+        def missed(*values):
+            ack = original(*values)
+            self.uploader.status = mock.Mock(return_value=reply(self.candidate, ota.Phase.READY))
+            return ack
+
+        self.uploader.commit = missed
+        with self.assertRaisesRegex(signed.QualificationError, "completed evidence preserved"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        outcome = json.loads((evidence.directory / "installed.json").read_text())
+        self.assertEqual(outcome["outcome"], "remote_trial_not_observed")
+        self.assertFalse(outcome["remote_install_qualified"])
+        self.assertTrue(outcome["identity_config_acl_preserved"])
+        self.assertTrue(outcome["ordinary_peer_received"])
 
     def test_stale_remote_trial_is_not_a_lifecycle_proof(self):
-        self.target.lifecycle = ["boot=trial phase=trial floor=0 counter=7 verified=0 image=unknown"]
-        self.uploader.wait_phase = mock.Mock(return_value=reply(self.candidate, ota.Phase.TRIAL, age=60000))
-        with self.assertRaisesRegex(signed.QualificationError, "remote Trial is stale"):
-            signed.observe_install(self.pair, self.uploader, self.candidate,
-                                   TARGET_KEY, self.evidence, self.deadline)
-        self.assertNotIn("trial", self.evidence.summary["measurements"])
+        args, evidence = self.prepare_commit()
+        original = self.uploader.commit
+
+        def stale(*values):
+            ack = original(*values)
+            self.uploader.status = mock.Mock(return_value=reply(self.candidate, ota.Phase.TRIAL, age=60000))
+            return ack
+
+        self.uploader.commit = stale
+        with self.assertRaisesRegex(signed.QualificationError, "remote_install_qualified=false"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        self.assertNotIn("trial", evidence.summary["measurements"])
+        self.assertFalse(evidence.summary["measurements"]["installed"]["trial_observed"])
+
+    def test_remote_already_installed_at_two_percent_collects_all_proofs_before_gap(self):
+        args, evidence = self.prepare_commit()
+        original = self.uploader.commit
+
+        def instant(*values):
+            ack = original(*values)
+            self.uploader.remote_lifecycle = [ota.Phase.INSTALLED]
+            return ack
+
+        self.uploader.commit = instant
+        with self.assertRaisesRegex(signed.QualificationError, "completed evidence preserved"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        outcome = json.loads((evidence.directory / "installed.json").read_text())
+        self.assertEqual(outcome["profile"]["duty_milli_percent"], 2000)
+        self.assertEqual(outcome["outcome"], "remote_trial_not_observed")
+        self.assertTrue(outcome["trial_observation_incomplete"])
+        self.assertFalse(outcome["remote_install_qualified"])
+        self.assertIsNone(outcome["remote_trial"])
+        self.assertEqual(outcome["remote_installed"]["phase"], "INSTALLED")
+        self.assertEqual(outcome["lifecycle"]["floor"], self.candidate.counter)
+        self.assertTrue(outcome["identity_config_acl_preserved"])
+        self.assertTrue(outcome["ordinary_peer_received"])
+        self.assertEqual(evidence.summary["measurements"]["trial_observation_incomplete"]["reason"],
+                         "remote_already_installed")
+        self.assertEqual(self.uploader.ops.count(ota.Op.COMMIT), 1)
+
+    def test_local_unobserved_trial_also_collects_all_installed_and_preservation_proofs(self):
+        args, evidence = self.prepare_commit()
+        original = self.uploader.commit
+
+        def instant(*values):
+            ack = original(*values)
+            self.target.lifecycle.pop(0)
+            return ack
+
+        self.uploader.commit = instant
+        with self.assertRaisesRegex(signed.QualificationError, "remote_install_qualified=false"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        outcome = json.loads((evidence.directory / "installed.json").read_text())
+        self.assertFalse(outcome["trial_observed"])
+        self.assertTrue(outcome["ordinary_peer_received"])
+        self.assertTrue(outcome["identity_config_acl_preserved"])
+
+    def test_trial_observation_io_denied_and_failed_are_not_missed_timing(self):
+        self.uploader.status = mock.Mock()
+        for error in (TimeoutError("no matching OTA reply for STATUS"),
+                      OSError(5, "storage I/O"), ota.UploaderError("STATUS: DENIED")):
+            with self.subTest(error=error):
+                self.uploader.status.side_effect = error
+                with self.assertRaises(type(error)):
+                    signed.remote_trial(self.uploader, self.candidate, TARGET_KEY,
+                                        self.clock.now, self.deadline)
+        self.uploader.status.side_effect = None
+        self.uploader.status.return_value = reply(self.candidate, ota.Phase.FAILED)
+        with self.assertRaisesRegex(signed.QualificationError, "failed/ABORTed"):
+            signed.remote_trial(self.uploader, self.candidate, TARGET_KEY, self.clock.now, self.deadline)
+        self.assertNotIn("trial_observation_incomplete", self.evidence.summary["measurements"])
+
+    def test_incomplete_trial_still_refuses_wrong_installed_counter_hash_or_floor(self):
+        for defect in ("counter", "hash", "floor"):
+            with self.subTest(defect=defect):
+                status = (f"boot=confirmed phase=installed floor=7 counter=7 verified=1 "
+                          f"image={self.candidate.metadata['image_sha256']}")
+                if defect == "counter":
+                    status = status.replace("counter=7", "counter=8")
+                elif defect == "floor":
+                    status = status.replace("floor=7", "floor=0")
+                else:
+                    status = status.replace(self.candidate.metadata["image_sha256"], "aa" * 32)
+                self.target.lifecycle = [status]
+                with self.assertRaisesRegex(signed.QualificationError, "actual immutable running image"):
+                    signed.observe_install(self.pair, self.uploader, self.candidate,
+                                           TARGET_KEY, self.evidence, self.deadline)
+        self.assertNotIn("installed", self.evidence.summary["measurements"])
+
+    def test_incomplete_trial_does_not_mask_acl_or_peer_failure(self):
+        for failure in ("acl", "peer", "identity", "config"):
+            with self.subTest(failure=failure):
+                self.target.phase, self.target.counter = "ready", 7
+                self.target.lifecycle = None
+                args = signed.parser().parse_args(
+                    ["--artifact-dir", str(self.directory / ("bad-" + failure)), "commit", "--qualified-commit",
+                     "--ready-record", str(self.evidence.directory / "ready.json")] + self.arguments)
+                if not args.ready_record.exists():
+                    self.target.phase, self.target.counter = "unknown", 0
+                    self.run_stage()
+                evidence = lab.Evidence(args.artifact_dir)
+                self.addCleanup(evidence.events.close)
+                original = CampaignFixture.commit.__get__(self.uploader)
+
+                def instant(*values):
+                    ack = original(*values)
+                    self.uploader.remote_lifecycle = [ota.Phase.INSTALLED]
+                    return ack
+
+                self.uploader.commit = instant
+                if failure == "acl":
+                    with mock.patch.object(self.target, "get_acl", side_effect=[dict(self.target.acl), {}]):
+                        with self.assertRaisesRegex(signed.QualificationError, "ACL did not survive"):
+                            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+                elif failure == "peer":
+                    with mock.patch.object(signed, "ordinary_peer", side_effect=TimeoutError("missing peer")):
+                        with self.assertRaisesRegex(TimeoutError, "missing peer"):
+                            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+                else:
+                    before_info = lab.repeater_info(self.target)
+                    after_info = dict(before_info)
+                    after_info["pubkey" if failure == "identity" else "name"] = (
+                        (b"\xbb" * 32).hex() if failure == "identity" else "changed-after-install")
+                    with mock.patch.object(lab, "repeater_info", side_effect=[before_info, after_info]):
+                        with self.assertRaisesRegex(signed.QualificationError, "readbacks changed across"):
+                            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+                self.assertFalse((evidence.directory / "installed.json").exists())
 
     def test_production_denied_or_uncertain_commit_never_observes_or_requests_a_reboot(self):
         args, evidence = self.prepare_commit()
@@ -467,9 +880,8 @@ class SignedLabTests(unittest.TestCase):
         self.target.lifecycle = [
             "boot=confirmed phase=installed floor=7 counter=7 verified=1 image="
             + self.candidate.metadata["image_sha256"]]
-        with self.assertRaisesRegex(signed.QualificationError, "Trial not observed"):
-            signed.observe_install(self.pair, self.uploader, self.candidate,
-                                   TARGET_KEY, self.evidence, self.deadline)
+        signed.observe_install(self.pair, self.uploader, self.candidate,
+                               TARGET_KEY, self.evidence, self.deadline)
         self.assertFalse(self.evidence.summary["measurements"]["installed"]["trial_observed"])
 
     def test_role_resolution_refuses_pine_before_opening_either_port(self):
@@ -537,7 +949,7 @@ class SignedLabTests(unittest.TestCase):
         with self.assertRaisesRegex(ota.UploaderError, "unknown OTA reply"):
             signed.stage(self.pair, ota.Uploader(self.client, self.evidence), self.candidate,
                          self.args, self.evidence, self.deadline)
-        self.assertEqual([packet[1] for packet in sent], [ota.Op.STATUS, ota.Op.CACHE_BEGIN])
+        self.assertEqual([packet[1] for packet in sent], [ota.Op.STATUS, ota.Op.STATUS, ota.Op.CACHE_BEGIN])
         self.assertTrue((self.evidence.directory / "baseline.json").exists())
         self.assertFalse((self.evidence.directory / "ready.json").exists())
 
