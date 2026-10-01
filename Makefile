@@ -115,7 +115,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         install-xiao-nrf52-target-ota-bootloader flash-xiao-nrf52-target-ota-bootloader \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
-        ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-admin \
+        ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-abort-cache ota-lab-admin \
         qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
@@ -366,6 +366,9 @@ ota-lab-commit: tmpdir
 
 ota-lab-abort: tmpdir
 	$(OTA_UPLOAD_COMMAND) abort --target "$(OTA_UPLOAD_TARGET)" --image "$(OTA_UPLOAD_IMAGE)"
+
+ota-lab-abort-cache: tmpdir
+	$(OTA_UPLOAD_COMMAND) abort-cache --image "$(OTA_UPLOAD_IMAGE)"
 
 ota-lab-admin: tmpdir
 	$(OTA_UPLOAD_COMMAND) admin --target "$(OTA_UPLOAD_TARGET)" --enabled "$(OTA_UPLOAD_ADMIN_ENABLED)"

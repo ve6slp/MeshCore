@@ -121,6 +121,20 @@ Unavailable, denied, failed or malformed replies stop the host command
 explicitly. Firmware transport and physical recovery qualification remain
 incomplete; these commands must not be treated as a deployment result.
 
+The companion also retains one local upload cache. Before using different
+image content, abort that cache explicitly with the **old cached BIN**:
+
+```sh
+make ota-lab-abort-cache OTA_UPLOAD_IMAGE="$old_cached_image"
+```
+
+This uses the same signed abort operation with a zero target to select the
+local cache. The companion signs with its existing identity and aborts
+locally; it sends no radio abort and does not cancel any remote candidate.
+Abort the remote target separately when that is intended. A denied,
+mismatched or unavailable local abort is an error, not permission to
+overwrite the cache.
+
 ## Build-time requirement
 
 LoRa OTA is compiled in only when `MESHCORE_LORA_OTA` is enabled for a

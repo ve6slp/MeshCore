@@ -281,8 +281,8 @@ class Uploader:
             Op.COMMIT, target + manifest_hash + struct.pack(">I", counter), target, self.remaining(deadline)))
 
     def abort(self, target, image_hash):
-        if len(target) != 32 or target == LOCAL_TARGET or len(image_hash) != 32:
-            raise ValueError("abort requires a full target identity and image SHA-256")
+        if len(target) != 32 or len(image_hash) != 32:
+            raise ValueError("abort requires a target identity or local cache and image SHA-256")
         return self.require_accepted(self.exchange(Op.ABORT, target + image_hash, target))
 
 
@@ -311,6 +311,8 @@ def parser():
     abort = commands.add_parser("abort")
     abort.add_argument("--target", required=True, type=full_key)
     abort.add_argument("--image", required=True, type=Path)
+    abort_cache = commands.add_parser("abort-cache", help="explicitly abort the companion's local cache")
+    abort_cache.add_argument("--image", required=True, type=Path)
     admin = commands.add_parser("admin")
     admin.add_argument("--target", required=True, type=full_key)
     admin.add_argument("--enabled", required=True, type=int, choices=(0, 1))
@@ -334,7 +336,7 @@ def main():
             arguments.error("select at most 32 distinct targets")
         if args.mode != "background" and len(args.target) != 1:
             arguments.error("direct and directed modes require exactly one target")
-    elif args.command == "abort" and not image:
+    elif args.command in ("abort", "abort-cache") and not image:
         arguments.error("--image must not be empty")
     evidence = lab.Evidence(args.artifact_dir)
     node = None
@@ -358,6 +360,8 @@ def main():
             reply = uploader.commit(args.target, canonical, deadline)
         elif args.command == "abort":
             reply = uploader.abort(args.target, hashlib.sha256(image).digest())
+        elif args.command == "abort-cache":
+            reply = uploader.abort(LOCAL_TARGET, hashlib.sha256(image).digest())
         elif args.command == "admin":
             reply = uploader.require_accepted(uploader.exchange(
                 Op.SET_ADMIN, args.target + bytes([args.enabled]), args.target))

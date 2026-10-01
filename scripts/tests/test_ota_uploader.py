@@ -287,6 +287,13 @@ class LifecycleTests(unittest.TestCase):
         self.uploader.abort(TARGET, image_hash)
         self.uploader.exchange.assert_called_once_with(ota.Op.ABORT, TARGET + image_hash, TARGET)
 
+    def test_local_cache_abort_uses_zero_target_and_content_hash(self):
+        image_hash = hashlib.sha256(self.image).digest()
+        self.uploader.abort(ota.LOCAL_TARGET, image_hash)
+        self.uploader.exchange.assert_called_once_with(
+            ota.Op.ABORT, ota.LOCAL_TARGET + image_hash, ota.LOCAL_TARGET)
+        self.assertNotEqual(image_hash, self.manifest_hash)
+
     def test_old_ready_is_not_accepted_as_fresh_completion(self):
         clock = mock.Mock()
         clock.now = 100
@@ -518,6 +525,24 @@ class CliLifecycleTests(unittest.TestCase):
                          [bytes([66, ota.Op.ABORT]) + TARGET + hashlib.sha256(self.image).digest()])
         self.node.close.assert_called_once()
         self.evidence.finish.assert_called_once_with(None)
+
+    def test_explicit_cache_abort_does_not_address_a_remote_target(self):
+        self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        self.assertEqual(self.sent_payloads(),
+                         [bytes([66, ota.Op.ABORT]) + ota.LOCAL_TARGET
+                          + hashlib.sha256(self.image).digest()])
+        self.node.command.assert_not_called()
+        self.node.close.assert_called_once()
+        self.assertFalse(self.evidence.log.call_args.kwargs["remote"])
+        self.assertEqual(self.evidence.log.call_args.kwargs["phase"], ota.Phase.ABORTED.name)
+
+    def test_denied_local_cache_abort_is_not_success(self):
+        self.results[ota.Op.ABORT] = ota.Result.DENIED
+        with self.assertRaisesRegex(ota.UploaderError, "DENIED"):
+            self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        self.assertEqual([payload[1] for payload in self.sent_payloads()], [ota.Op.ABORT])
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+        self.node.close.assert_called_once()
 
     def test_admin_permission_requires_a_durable_ok_not_pending(self):
         self.run_cli(["admin", "--target", TARGET.hex(), "--enabled", "1"])

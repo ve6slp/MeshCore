@@ -215,7 +215,7 @@ length encoding. Multi-byte fields inside the OTA payload are big-endian.
 | AddTarget | `0x13` | full target PK32 |
 | Start | `0x14` | mode8, channel8, frequencyKHz32, leaseMs16, dutyMilliPercent32 |
 | Commit | `0x15` | target PK32, manifestHash32, counter32 |
-| Abort | `0x16` | target PK32, imageHash32 |
+| Abort | `0x16` | target PK32, imageHash32; all-zero target selects local cache |
 | Status | `0x17` | target PK32; all zero selects the local cache |
 | SetContactAdmin | `0x18` | target PK32, enabled8 |
 
@@ -229,6 +229,9 @@ that same signer against the target's live administrator policy.
 Reupload does not override ownership: an active candidate can be restarted
 only by its original owner, for the same image content and cache or install
 purpose. A different image or owner requires an explicit abort first.
+`make ota-lab-abort-cache` selects the local cache with zero target32 and
+the old image's content hash. The companion binds its internally signed
+abort to its own full identity and applies it locally, without RF traffic.
 
 Start modes are direct 0, directed 1 and background 2. Direct requires one
 target, channel 255 and a frequency with a 250..60,000 ms lease. Directed
