@@ -209,7 +209,7 @@ length encoding. Multi-byte fields inside the OTA payload are big-endian.
 
 | Operation | Value | Body after command and operation |
 | --- | --- | --- |
-| CacheBegin | `0x10` | flags1, canonical59, signature64 |
+| CacheBegin | `0x10` | flags1, ownerPK32, canonical59, signature64 |
 | CachePut | `0x11` | blockIndex16, exactLength8, data1..84 |
 | CacheSeal | `0x12` | none |
 | AddTarget | `0x13` | full target PK32 |
@@ -219,9 +219,11 @@ length encoding. Multi-byte fields inside the OTA payload are big-endian.
 | Status | `0x17` | target PK32; all zero selects the local cache |
 | SetContactAdmin | `0x18` | target PK32, enabled8 |
 
-CacheBegin flag 1 means explicit reupload. Its signer is the companion's
-existing local identity; no additional owner key is supplied in the USB
-request. A local cache must not become an install command for the uploader.
+CacheBegin flag 1 means explicit reupload. Its 32-byte owner public key is
+the companion's existing local identity, read from normal self-info. The
+complete command is 158 bytes, including command and operation; the public
+key is not a new OTA identity or private-key export. A local cache must not
+become an install command for the uploader.
 CacheSeal validates it for transmission; target admission separately checks
 that same signer against the target's live administrator policy.
 Reupload does not override ownership: an active candidate can be restarted

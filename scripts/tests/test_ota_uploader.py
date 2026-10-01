@@ -76,6 +76,22 @@ class ReplyTests(unittest.TestCase):
         self.assertFalse(decoded.fresh_since(99, 100))
         self.assertTrue(decoded.fresh_since(99, 105))
 
+    def test_commit_ack_without_snapshot_cannot_echo_unverified_progress(self):
+        acknowledgement = frame(
+            op=ota.Op.COMMIT, result=ota.Result.PENDING, phase=ota.Phase.UNKNOWN,
+            flags=ota.REMOTE, manifest_hash=bytes(32), received=0, total=0,
+            counter=0, age=ota.AGE_UNKNOWN)
+        decoded = ota.decode_reply(acknowledgement)
+        self.assertEqual(decoded.target, TARGET)
+        self.assertFalse(decoded.valid)
+        self.assertFalse(decoded.fresh_since(0, 100))
+        for offset in (4, 38, 70, 72, 74, 78):
+            with self.subTest(offset=offset):
+                changed = bytearray(acknowledgement)
+                changed[offset] ^= 1
+                with self.assertRaises(ota.UploaderError):
+                    ota.decode_reply(changed)
+
 
 class RequestTests(unittest.TestCase):
     def test_manifest_exact_size_and_image_digest_are_checked(self):
@@ -187,7 +203,8 @@ class LifecycleTests(unittest.TestCase):
         sign.assert_called_once_with(self.node, self.canonical, TARGET, deadline=deadline)
         calls = self.uploader.exchange.call_args_list
         self.assertEqual(calls[0].args[:2],
-                         (ota.Op.CACHE_BEGIN, b"\x01" + self.canonical + b"\x5a" * 64))
+                         (ota.Op.CACHE_BEGIN, b"\x01" + TARGET + self.canonical + b"\x5a" * 64))
+        self.assertEqual(2 + len(calls[0].args[1]), 158)
         self.assertEqual(calls[1].args[:2], (ota.Op.CACHE_PUT, b"\x00\x00\x54" + self.image[:84]))
         self.assertEqual(calls[2].args[:2], (ota.Op.CACHE_PUT, b"\x00\x01\x10" + self.image[84:]))
         self.assertEqual(calls[3].args, (ota.Op.CACHE_SEAL,))
@@ -250,6 +267,19 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.uploader.commit(TARGET, self.canonical, time.monotonic() + 10)
         self.uploader.exchange.assert_not_called()
+
+    def test_commit_acceptance_without_snapshot_is_not_installation(self):
+        acknowledgement = ota.decode_reply(frame(
+            op=ota.Op.COMMIT, result=ota.Result.PENDING, phase=ota.Phase.UNKNOWN,
+            flags=ota.REMOTE, manifest_hash=bytes(32), received=0, total=0,
+            counter=0, age=ota.AGE_UNKNOWN))
+        self.uploader.wait_phase = mock.Mock(return_value=self.good)
+        self.uploader.exchange.return_value = acknowledgement
+        self.assertEqual(self.uploader.commit(TARGET, self.canonical, time.monotonic() + 10),
+                         acknowledgement)
+        self.uploader.wait_phase.assert_called_once()
+        self.assertFalse(acknowledgement.valid)
+        self.assertEqual(acknowledgement.phase, ota.Phase.UNKNOWN)
 
     def test_abort_uses_image_hash_not_manifest_hash(self):
         image_hash = hashlib.sha256(self.image).digest()
@@ -451,8 +481,10 @@ class CliLifecycleTests(unittest.TestCase):
                     arguments += ["--channel", "2", "--target", OTHER_TARGET.hex()]
                 self.run_cli(arguments)
                 payloads = self.sent_payloads()
-                self.assertEqual(payloads[0], bytes([66, ota.Op.CACHE_BEGIN, 0]) + self.canonical
+                self.assertEqual(payloads[0], bytes([66, ota.Op.CACHE_BEGIN, 0])
+                                 + self.public_key + self.canonical
                                  + self.private_key.sign(self.canonical))
+                self.assertEqual(len(payloads[0]), 158)
                 self.assertEqual(payloads[1:3],
                                  [bytes([66, ota.Op.CACHE_PUT]) + b"\x00\x00\x54" + self.image[:84],
                                   bytes([66, ota.Op.CACHE_PUT]) + b"\x00\x01\x10" + self.image[84:]])

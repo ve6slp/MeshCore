@@ -22,53 +22,28 @@ LoRa OTA is under active development and is **not** a supported way to update
 your node's firmware today. Treat everything below as a preview of an
 in-progress feature, not a how-to.
 
-The signed, single-candidate implementation is replacing the earlier
-experimental lab path. The results below belong to that earlier path and
-must not be read as qualification of the replacement.
+The current software implements signed transfer in all three modes, durable
+staging, explicit per-device commit and recoverable installation. It reuses
+MeshCore administrator identities rather than a separate OTA signing system.
+Software tests cover repeated updates, failed-trial recovery and refusal of
+competing candidates. These results are not physical acceptance.
 
-What was verified on earlier lab hardware:
+Hardware qualification remains incomplete: no node has completed a
+LoRa-delivered install, trial confirmation or rollback with this
+implementation. Its 2% airtime policy and ordinary mesh service must still
+be verified together on the radio. Routed delivery through intermediate
+nodes and fleet contention also need hardware beyond the two-node bench.
 
-- The XIAO nRF52840 + SX1262 boards can send and receive OTA protocol
-  packets and adverts over the radio in both directions. A temporary
-  high-speed direct-mode radio setting, automatic revert, ordinary-traffic
-  priority over OTA traffic, and fleet-mode state changes have all been
-  confirmed in earlier lab runs. Pressure tests also exposed a packet-pool
-  failure that was fixed and passed a later run. The replacement must
-  repeat those checks.
-- The XIAO nRF52840's external QSPI flash chip has been read, erased, and
-  written directly and correctly. A small signed test image has also been
-  taken through a full radio transfer — signed descriptor, authorization,
-  every data chunk, and commit — and staged correctly into flash, in a
-  test run that specifically checked only this staging path (not the
-  traffic-priority, direct-lease, or fleet-control behaviour above).
-
-What has **not** been verified:
-
-- All three modes working together end to end.
-- The replacement has not been driven to its airtime limit while verifying
-  ordinary service. Earlier tests reached the quota and exposed a full
-  packet pool; a later run passed after a queue-capacity fix. Neither
-  result qualifies the new signed receiver.
-- Sending a target node an image over the mesh (routed delivery to an
-  out-of-reach node) has not been tested yet.
-- Actually installing a received, signed firmware image on a device. The
-  radio transfer and flash-staging steps above have passed, but nothing
-  yet turns a staged image into a running update on the board.
-- No board has installed and booted a new firmware image delivered this way.
-  The custom bootloader's boot marker and its SenseCAP flash profile are
-  implemented and tested in software, and a full bootloader package now
-  builds, but the hand-off from the running application to that bootloader,
-  and installing/commissioning it on a physical device, have not been
-  proven yet.
-- No target board is qualified for production OTA installs yet.
+Earlier lab firmware demonstrated radio transfers and external-flash
+staging, but that transport has been retired. Those captures do not qualify
+the current implementation. No target board is ready for production OTA
+installs.
 
 This feature is being developed on its own branch and has not been merged
 into the main MeshCore codebase or any release.
 
-In short: a signed **test** image has been staged over the radio and
-verified end to end in the lab, but a real signed firmware image install,
-and all three modes working together, are not yet qualified. See the
-[developer guide](lora_ota_development.md) for specifics. Continue to
+See the [developer guide](lora_ota_development.md) for the dated evidence
+and outstanding acceptance gates. Continue to
 update your node's firmware the way you always have — the MeshCore Flasher,
 or `start ota` over USB/BLE — until this changes.
 
@@ -98,6 +73,9 @@ commit and stop reception of that image until an explicit restart.
 Once installation starts, the bootloader must recover from interruption or
 restore the previous image if the trial fails. These are required behaviours;
 they remain unverified end to end on physical hardware.
+After the device proves that install or rollback has finished, a subsequent
+authorized update can reuse the staging slot. An uncertain boot outcome
+does not allow another upload to overwrite it.
 
 ## Terminology you may see
 

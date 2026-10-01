@@ -240,7 +240,7 @@ class Uploader:
         counter = struct.unpack_from(">I", canonical, 45)[0]
         since = time.monotonic()
         reply = self.require_accepted(self.exchange(
-            Op.CACHE_BEGIN, bytes([int(reupload)]) + canonical + signature,
+            Op.CACHE_BEGIN, bytes([int(reupload)]) + owner_public_key + canonical + signature,
             timeout=self.remaining(deadline)))
         if reply.result == Result.PENDING:
             self.wait_phase(LOCAL_TARGET, Phase.RECEIVING, manifest_hash, counter, since, deadline)

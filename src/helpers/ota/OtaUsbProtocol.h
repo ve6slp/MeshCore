@@ -69,7 +69,7 @@ enum class UsbOtaOp : uint8_t {
 };
 
 // CACHE_BEGIN flags byte (request body byte 0).
-constexpr uint8_t kCacheBeginFlagReupload = 0x01; // explicit discard-and-restart of any existing/resumable cache contents.
+constexpr uint8_t kCacheBeginFlagReupload = 0x01; // explicit restart; active owner/content/purpose checks still apply.
 
 // START mode byte (request body byte 0).
 constexpr uint8_t kStartModeDirect     = 0; // off-frequency direct high-speed negotiation; exactly 1 selected target.
