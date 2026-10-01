@@ -61,18 +61,16 @@
  * This specific bootloader binary's compiled role identity: 0 (companion)
  * or 1 (repeater). This is a build-time-fixed, non-wildcard identity
  * exactly like XIAO_OTA_BOARD_TARGET above -- a role-1 binary accepts ONLY
- * role-1 install commands (xiao_ota_install_command_static_identity_valid())
- * and ONLY a role-1 genesis floor-activation receipt
- * (floor_activation_receipt_binds_floor()), never role 0, and vice versa.
- * There is no runtime role inference from the monotonic counter, a prior
- * receipt, or any other persisted state, and no "accepts either role"
- * build: exactly one of {0, 1} is compiled in, checked below by
- * _Static_assert. Defaults to 0 (companion) so every existing build,
- * signed artifact, and test that predates role support keeps behaving
- * identically. XIAO_OTA_ROLE_ANY (above) is kept as the historical wire
- * constant for the companion role's own value (0) -- it was never
- * actually a wildcard in the live policy check, and still is not; it must
- * never be redefined to 1 or reinterpreted as "matches any role".
+ * role-1 install commands (xiao_ota_install_command_static_identity_valid()),
+ * never role 0, and vice versa. There is no runtime role inference from
+ * persisted state, and no "accepts either role" build: exactly one of
+ * {0, 1} is compiled in, checked below by _Static_assert. Defaults to 0
+ * (companion) so every existing build, signed artifact, and test that
+ * predates role support keeps behaving identically. XIAO_OTA_ROLE_ANY
+ * (above) is kept as the historical wire constant for the companion role's
+ * own value (0) -- it was never actually a wildcard in the live policy
+ * check, and still is not; it must never be redefined to 1 or
+ * reinterpreted as "matches any role".
  */
 #ifndef XIAO_OTA_COMPILED_ROLE_ID
 #define XIAO_OTA_COMPILED_ROLE_ID UINT32_C(0)
@@ -82,12 +80,20 @@ _Static_assert(XIAO_OTA_COMPILED_ROLE_ID == 0u || XIAO_OTA_COMPILED_ROLE_ID == 1
               "(repeater) -- no other role is implemented or accepted, and "
               "there is no wildcard/any-role build.");
 
-/* Command record versions (xiao_ota_command_t.record_version /
- * xiao_ota_command_v2_t.record_version). NOT the same field as
- * XIAO_OTA_FORMAT_VERSION, which is the fixed version for state/
- * confirmation/floor records and must never change. */
-#define XIAO_OTA_COMMAND_VERSION_LEGACY_V1 1u
-#define XIAO_OTA_COMMAND_VERSION_WIRE_V2   2u
+/* Command record version (xiao_ota_command_v2_t.record_version). NOT the
+ * same field as XIAO_OTA_FORMAT_VERSION, which is the fixed version for
+ * state/confirmation/floor records and must never change. The legacy
+ * 71-byte little-endian command format (record_version 1) has been
+ * removed: this is an unreleased lab prototype with no external deployed
+ * artifacts, so there is no compatibility obligation to keep it. Every
+ * install command is the transport's own 59-byte big-endian canonical
+ * wire descriptor + 64-byte Ed25519 signature, reused byte-for-byte from
+ * src/ota/protocol/OtaDescriptor.h, PLUS the 32-byte app-admitted signer
+ * public key that authenticates it (added at record_version 3: the prior
+ * record_version 2 shape, with no admitted-key field and a compile-time
+ * fixed trust anchor instead, is also retired -- same no-deployed-
+ * artifacts rationale). */
+#define XIAO_OTA_COMMAND_VERSION_CURRENT   3u
 #define XIAO_OTA_COMMIT_MARKER         UINT32_C(0x434F4D54)
 /* NOR flash program operations only ever clear bits (1 -> 0); a genuinely
  * erased 4-byte marker field therefore always reads back as all-1s. Any
@@ -119,41 +125,6 @@ typedef enum {
 #else
 #define XIAO_OTA_PACKED
 #endif
-
-/*
- * The descriptor prefix is byte-for-byte compatible with
- * ota::trust::CanonicalDescriptor::serialize(): all integers are little
- * endian and the signature covers exactly these 71 bytes.
- */
-typedef struct XIAO_OTA_PACKED {
-  uint8_t image_hash_sha256[32];
-  uint32_t target_id_le;
-  uint32_t role_id_le;
-  uint64_t device_address_le;
-  uint8_t allow_broadcast_address;
-  uint32_t required_boot_capability_flags_le;
-  uint32_t monotonic_counter_le;
-  uint32_t image_size_bytes_le;
-  uint32_t app_address_le;
-  uint16_t format_id_le;
-  uint16_t key_id_le;
-  uint16_t algorithm_id_le;
-} xiao_ota_canonical_descriptor_t;
-
-typedef struct XIAO_OTA_PACKED {
-  uint32_t magic;
-  uint16_t record_version;
-  uint16_t record_bytes;
-  uint32_t sequence;
-  uint64_t transaction_nonce;
-  xiao_ota_canonical_descriptor_t descriptor;
-  uint8_t signature_ed25519[64];
-  uint32_t active_image_extent;
-  uint8_t active_image_hash_sha256[32];
-  uint8_t reserved;
-  uint32_t crc32;
-  uint32_t commit_marker;
-} xiao_ota_command_t;
 
 /*
  * Portable codec for the LoRa OTA transport's canonical signed descriptor
@@ -215,26 +186,56 @@ bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_S
                                      xiao_ota_wire_descriptor_t *out);
 
 /*
- * Command v2: authenticates the transport's own 59-byte canonical wire
- * descriptor and Ed25519 signature directly -- the SAME bytes and the SAME
- * signature the LoRa OTA transport already verified (see
- * src/helpers/ota/OtaFirmwareBackend.h /
+ * Command: the sole supported install-command format. Authenticates the
+ * transport's own 59-byte canonical wire descriptor and Ed25519
+ * signature directly -- the SAME bytes and the SAME signature the LoRa
+ * OTA transport already verified (see src/helpers/ota/OtaFirmwareBackend.h /
  * src/ota/trust/DescriptorVerifier.h), never re-derived or re-signed into
  * another form. The wire descriptor carries no per-device targeting field,
- * so a v2 command is always installable on any device that otherwise
+ * so a command is always installable on any device that otherwise
  * matches target/role/app_address/counter/capability policy (see
  * xiao_ota_install_command_policy_valid(); device_address is forced to 0
- * and allow_broadcast_address to 1 when decoding a v2 command --
+ * and allow_broadcast_address to 1 when decoding a command --
  * xiao_ota_install_command_from_v2() -- those two fields are NOT signed
  * input, so they can never be attacker-influenced).
+ *
+ * admitted_signer_public_key_ed25519 is the Ed25519 public key the
+ * CURRENTLY RUNNING (trusted) app already verified the manifest signer
+ * against, using the app's own pre-existing MeshCore admin-identity trust
+ * mechanism (entirely outside this bootloader -- there is no separate
+ * bootloader-side ACL/issuer/grant/attestation hierarchy and no shared
+ * admin private key here). The app durably snapshots this key, alongside
+ * the signed manifest, into the command record at the explicit COMMIT
+ * step. The bootloader's job is narrower: re-verify that
+ * signature_ed25519 is a valid Ed25519 signature over wire_descriptor
+ * under EXACTLY this embedded key (cryptographic self-consistency of the
+ * durable record), plus the existing anti-rollback/model/size/geometry
+ * checks -- it does NOT independently judge whether this key "is an
+ * admin"; that decision was already made, once, by the running app
+ * before COMMIT. This is the documented local-failure trust boundary
+ * (protects against accidental corruption of the durable record across a
+ * power-fail, not against a physical attacker with direct flash-write
+ * access -- see xiao_ota_install_command_policy_valid()'s doc-comment and
+ * the counter-floor anti-replay check, which is what actually prevents a
+ * stale command -- signed under a previously-admitted but since-rotated
+ * key -- from being reinstalled).
+ *
+ * The legacy 71-byte little-endian v1 command format, and the prior
+ * record_version 2 shape (same 59-byte wire descriptor, but with a
+ * compile-time fixed trust anchor instead of this field), have both been
+ * removed (unreleased lab prototype, no external deployed artifacts to
+ * stay compatible with); "v2"/"_v2" naming on the struct/function names
+ * below is kept only to avoid a pointless mechanical rename of every call
+ * site, not because another version exists.
  */
 typedef struct XIAO_OTA_PACKED {
   uint32_t magic;
-  uint16_t record_version; /* always XIAO_OTA_COMMAND_VERSION_WIRE_V2 (2) */
+  uint16_t record_version; /* always XIAO_OTA_COMMAND_VERSION_CURRENT (3) */
   uint16_t record_bytes;
   uint32_t sequence;
   uint64_t transaction_nonce;
   uint8_t wire_descriptor[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
+  uint8_t admitted_signer_public_key_ed25519[32];
   uint8_t signature_ed25519[64];
   uint32_t active_image_extent;
   uint8_t active_image_hash_sha256[32];
@@ -243,20 +244,16 @@ typedef struct XIAO_OTA_PACKED {
   uint32_t commit_marker;
 } xiao_ota_command_v2_t;
 
-/* Sized to hold either command record version; used to read/validate a
- * command slot generically before its version is known. */
-typedef union XIAO_OTA_PACKED {
-  xiao_ota_command_t v1;
-  xiao_ota_command_v2_t v2;
-} xiao_ota_command_any_t;
+/* Alias kept so existing call sites that read/validate a command slot
+ * generically (before its bytes are known-good) keep working unchanged;
+ * there is only one command record type now. */
+typedef xiao_ota_command_v2_t xiao_ota_command_any_t;
 
 /*
- * Version-neutral, fully decoded install intent. Populated from either
- * xiao_ota_command_t (v1, legacy 71-byte little-endian descriptor) or
- * xiao_ota_command_v2_t (v2, transport's 59-byte big-endian wire
- * descriptor) so that all downstream policy checks
- * (xiao_ota_install_command_policy_valid()) are written exactly once and
- * apply identically to both, regardless of signed-message format.
+ * Fully decoded install intent, populated from xiao_ota_command_v2_t
+ * (the transport's 59-byte big-endian wire descriptor) so all downstream
+ * policy checks (xiao_ota_install_command_policy_valid()) are written
+ * exactly once.
  */
 typedef struct {
   uint64_t transaction_nonce;
@@ -277,18 +274,13 @@ typedef struct {
 } xiao_ota_install_command_t;
 
 bool xiao_ota_command_v2_valid(const xiao_ota_command_v2_t *record);
-/* record must point to XIAO_OTA_COMMAND_ANY-sized storage; dispatches on the
- * record_version field (offset 4) to xiao_ota_command_valid() (version 1)
- * or xiao_ota_command_v2_valid() (version 2) with no other fallback. */
+/* record must point to XIAO_OTA_COMMAND_ANY-sized storage. Equivalent to
+ * xiao_ota_command_v2_valid() (kept as a distinct name since callers use
+ * it generically, before deciding to trust the record at all). */
 bool xiao_ota_command_any_valid(const void *record);
-/* Pure structural decode, no signature check. Returns false (leaving *out
- * zeroed) only if the wire descriptor bytes are not canonical
- * (xiao_ota_wire_descriptor_decode() failure); v1 decode never fails. */
-bool xiao_ota_install_command_from_v1(const xiao_ota_command_t *cmd,
-                                      xiao_ota_install_command_t *out);
 bool xiao_ota_install_command_from_v2(const xiao_ota_command_v2_t *cmd,
                                       xiao_ota_install_command_t *out);
-/* Dispatches by record_version, as xiao_ota_command_any_valid() does. */
+/* Equivalent to xiao_ota_install_command_from_v2(). */
 bool xiao_ota_install_command_decode(const xiao_ota_command_any_t *any,
                                      xiao_ota_install_command_t *out);
 /*
@@ -309,19 +301,19 @@ bool xiao_ota_install_command_decode(const xiao_ota_command_any_t *any,
  * without requiring it to also satisfy a floor/extent context it was
  * never evaluated against in the first place. Does NOT verify the
  * Ed25519 signature -- callers must do that separately over the exact
- * version-appropriate signed bytes before trusting this result.
+ * signed bytes, under the command's own admitted_signer_public_key_
+ * ed25519, before trusting this result.
  */
 bool xiao_ota_install_command_static_identity_valid(
     const xiao_ota_install_command_t *cmd, uint64_t this_device_address);
 /*
- * All non-cryptographic install policy checks, identical for v1 and v2:
- * everything xiao_ota_install_command_static_identity_valid() checks,
- * PLUS the two context-dependent checks only meaningful against THIS
- * boot's live admission state: anti-rollback counter vs. durable floor,
- * and active (backup) image extent match against the currently-installed
- * extent. Does NOT verify the Ed25519 signature -- callers must do that
- * separately over the exact version-appropriate signed bytes before
- * trusting this result.
+ * All non-cryptographic install policy checks: everything
+ * xiao_ota_install_command_static_identity_valid() checks, PLUS the two
+ * context-dependent checks only meaningful against THIS boot's live
+ * admission state: anti-rollback counter vs. durable floor, and active
+ * (backup) image extent match against the currently-installed extent.
+ * Does NOT verify the Ed25519 signature -- callers must do that
+ * separately over the exact signed bytes before trusting this result.
  */
 bool xiao_ota_install_command_policy_valid(const xiao_ota_install_command_t *cmd,
                                            uint32_t counter_floor,
@@ -373,334 +365,6 @@ typedef struct XIAO_OTA_PACKED {
   uint32_t crc32;
   uint32_t commit_marker;
 } xiao_ota_floor_t;
-
-/*
- * ROOT-APPROVED ABI (BootFloorActivationReceiptV1) -- this is the frozen,
- * cross-layer-agreed wire contract (386 bytes total); every offset below
- * is pinned by a _Static_assert immediately after the struct so a future
- * accidental reordering/insertion is a build failure, not a silent drift.
- * An upstream/host-tooling implementation (e.g. Python) MUST produce
- * byte-identical output at every one of these exact offsets.
- *
- * Lives in a dedicated 512-byte-MAX window at a FIXED offset 0x100 inside
- * EACH existing floor sector (XIAO_OTA_FLOOR_A/B, xiao_ota_layout.h) --
- * i.e. XIAO_OTA_FLOOR_A+0x100 / XIAO_OTA_FLOOR_B+0x100, entirely separate
- * from (and never overlapping) the 60-byte xiao_ota_floor_t record at
- * offset 0 of that same sector. Does not expand the floor sector, the
- * no-SWD slot, the softdevice region, or the FS map -- the window is
- * carved entirely out of already-reserved, already-unused sector space.
- *
- * This receipt PROVES provenance for a floor value that is ALREADY
- * DURABLY PERSISTED (an actual, fully-committed xiao_ota_floor_t body,
- * XIAO_OTA_PAIR_FOUND), never a self-contained instruction to reseed one
- * from nothing: xiao_ota_boot_io.c only ever trusts a committed
- * genesis floor==0 record when a receipt verifies AND its
- * baseline_hash_sha256/baseline_extent independently match THAT EXACT
- * PERSISTED floor body's own fields (never a fresh live-hardware
- * re-derivation standing in for a persisted record -- a live match
- * alone is explicitly NOT proof a floor was ever durably provisioned).
- * A genuinely MISSING floor pair (no body in either slot) is ALWAYS
- * untrustworthy, with no exception, even given a verifying receipt and
- * even given a live hardware match: a receipt is provenance for a
- * PRESENT, matching body, never a reseed trigger. original_sdk28_digest
- * remains checked against a fresh read of the CURRENT settings page (it
- * has no persisted counterpart inside the 60-byte floor record itself),
- * a corroborating freshness check layered on top of an already-durable
- * floor, never a substitute for one.
- *
- * Verification split (never conflated):
- *   - THIS bootloader (C) verifies: the Ed25519 signature (over a
- *     SHA-256 digest of XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN
- *     concatenated with the canonical body -- a digest, not the raw
- *     concatenation, so the existing hardened ed25519_verify() message-
- *     length cap, sized for the 71-byte legacy descriptor, never needs
- *     widening for this unrelated record type); hw_uid against this
- *     device's own compiled/FICR identity; target/profile/layout_id/
- *     current_role against THIS binary's own compiled qualification
- *     (current_role must equal XIAO_OTA_COMPILED_ROLE_ID, i.e. the role
- *     this exact binary was built for -- a role0->1 runtime TRANSITION
- *     of an already-committed floor is still an explicitly unimplemented
- *     outcome; this only governs which role a brand-new, never-yet-
- *     committed genesis floor may certify); and that activation_floor/baseline_hash_sha256/
- *     baseline_extent match the ALREADY-PERSISTED floor body being
- *     vouched for.
- *   - host/app tooling is responsible for checking local_public_key /
- *     consent_owner_public_key against whatever actual authority root it
- *     trusts, and for cross-checking prepared_root_digest against
- *     whatever it actually prepared -- this bootloader carries those
- *     fields as opaque signed bytes (bound by the signature so they can
- *     never be tampered with in transit) but does NOT itself read or
- *     validate any filesystem/manifest content; it has none.
- *     prepared_root_digest is a digest over a FIXED, PRE-ACTIVATION
- *     object (whatever was actually prepared before this receipt ever
- *     existed) -- it must never include this receipt itself or any
- *     other post-activation bytes, which would create an unresolvable
- *     hash-of-itself cycle; host/app tooling is solely responsible for
- *     defining and checking that fixed pre-activation object.
- *
- * `profile` identifies a specific board/connectivity PROFILE (an actual
- * identity, e.g. XIAO_OTA_FLOOR_ACTIVATION_PROFILE_XIAO_USB /
- * _SENSECAP_USB below), never a capability bitmask -- capability
- * validation (e.g. XIAO_OTA_CAP_QSPI_INSTALL, used by the unrelated
- * install-command descriptor) is a logically separate mechanism.
- *
- * boot_counter_domain is a FIXED literal tag (never derived from role,
- * public key, or layout) purely so this receipt type can never be
- * silently repurposed to authorize something other than the anti-
- * rollback boot counter/floor by changing an unrelated field elsewhere.
- *
- * hw_uid is the device's FULL 64-bit FICR unique id, never truncated:
- * (uint64_t)NRF_FICR->DEVICEID[1] << 32 | NRF_FICR->DEVICEID[0] (see
- * hw_device_address() in xiao_ota_boot.c, the only producer of this
- * value) -- DEVICEID[1] is the high 32 bits, DEVICEID[0] the low 32
- * bits of the resulting 64-bit value, stored here as a canonical
- * LITTLE-ENDIAN uint64_t wire field. External (host-tooling) producers
- * that display/exchange this same identity as an 8-byte BIG-ENDIAN hex
- * string (the human-readable board-serial format, e.g.
- * "3BE94917B92DC5E9") MUST explicitly BIG-ENDIAN-DECODE that string into
- * the 64-bit value and then serialize it little-endian here -- NEVER a
- * raw byte-for-byte memcpy of the BE display bytes into this LE field,
- * which would silently byte-reverse it.
- *
- * key_fingerprint is the FULL 32-byte SHA-256 digest of the trusted
- * Ed25519 public key (never truncated to a shorter prefix).
- *
- * Wire/serialization convention -- explicit, not an implicit "native
- * struct happens to be LE" assumption: every multi-byte integer field is
- * CANONICAL LITTLE-ENDIAN; byte-array fields (keys, digests, signature)
- * are opaque byte sequences with no endianness of their own and are
- * copied verbatim. This bootloader and its native host tests both build
- * for genuinely little-endian targets (nRF52840 Cortex-M4, x86_64), so
- * the raw packed struct layout below already IS this wire contract with
- * zero extra encode/decode step required in C -- the
- * _Static_assert(XIAO_OTA_HOST_IS_LITTLE_ENDIAN) immediately below turns
- * that fact into a checked, explicit build-time guarantee rather than a
- * silent assumption. Any OTHER (e.g. big-endian host, or a host whose
- * toolchain does not define __BYTE_ORDER__/__ORDER_LITTLE_ENDIAN__)
- * producer of these bytes MUST NOT reuse this struct's raw memory image
- * directly -- it must serialize every multi-byte field little-endian,
- * field-by-field in the declaration order below, with NO inter-field
- * padding (XIAO_OTA_PACKED), exactly matching the named
- * XIAO_OTA_FLOOR_ACTIVATION_OFF_* offsets, to be byte-identical to what
- * this bootloader reads, CRCs, and verifies. tools/sign_image.py and
- * tools/prepare_upstream.py already follow this exact discipline
- * (explicit struct.pack("<...") little-endian format codes) for the
- * existing 71-byte install-command/descriptor wire types; any new
- * host-side producer of this receipt type should follow the same
- * pattern.
- */
-#define XIAO_OTA_FLOOR_ACTIVATION_MAGIC UINT32_C(0x58464152) /* "XFAR" */
-#define XIAO_OTA_FLOOR_ACTIVATION_RECORD_VERSION 1u
-#define XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET UINT32_C(0x100)
-#define XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE UINT32_C(0x200) /* 512 B */
-#define XIAO_OTA_BOOT_COUNTER_DOMAIN UINT32_C(0x424F4F54)         /* "BOOT" */
-#define XIAO_OTA_FLOOR_ACTIVATION_LAYOUT_ID 1u
-/* Historical companion-role genesis value (still 0, unchanged): kept only
- * because it is the long-established value for every pre-existing role-0
- * receipt/artifact. The live check in floor_activation_receipt_binds_
- * floor() no longer compares current_role against this literal -- it
- * compares against THIS binary's own compiled XIAO_OTA_COMPILED_ROLE_ID
- * (0 or 1), of which this constant is simply the companion-role case. */
-#define XIAO_OTA_FLOOR_ACTIVATION_ROLE_GENESIS UINT32_C(0)
-#define XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN \
-  "MeshCore/OTA/publisher-floor-activation/v1"
-#define XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN \
-  (sizeof(XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN) - 1u)
-
-/*
- * PROPOSED profile-identity constants (`profile` field): board/
- * connectivity identity, never a capability bitmask. Sent to
- * cross-layer Authority for confirmation before interop; the compiled
- * mapping below (which value THIS binary requires of an incoming
- * receipt) follows XIAO_OTA_BOARD_TARGET so it can never silently drift
- * from the board this binary was actually built for.
- */
-#define XIAO_OTA_FLOOR_ACTIVATION_PROFILE_XIAO_USB UINT32_C(1)
-#define XIAO_OTA_FLOOR_ACTIVATION_PROFILE_SENSECAP_USB UINT32_C(2)
-#if XIAO_OTA_BOARD_TARGET == XIAO_OTA_TARGET_XIAO_NRF52840
-#define XIAO_OTA_FLOOR_ACTIVATION_COMPILED_PROFILE \
-  XIAO_OTA_FLOOR_ACTIVATION_PROFILE_XIAO_USB
-#elif XIAO_OTA_BOARD_TARGET == XIAO_OTA_TARGET_SENSECAP_SOLAR_P1
-#define XIAO_OTA_FLOOR_ACTIVATION_COMPILED_PROFILE \
-  XIAO_OTA_FLOOR_ACTIVATION_PROFILE_SENSECAP_USB
-#endif
-
-/* Named per-field offsets -- the explicit "pure C wire contract" pinned
- * below by _Static_assert(offsetof(...) == ...) for every field. */
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_MAGIC 0u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_RECORD_VERSION 4u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_RECORD_BYTES 6u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_BOOT_COUNTER_DOMAIN 8u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_HW_UID 12u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_LOCAL_PUBLIC_KEY 20u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_CONSENT_OWNER_PUBLIC_KEY 52u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_TARGET 84u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_PROFILE 88u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_LAYOUT_ID 92u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_CURRENT_ROLE 96u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_KEY_ID 100u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_KEY_FINGERPRINT 102u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_HOST_TXN_ID 134u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_AUTHORITY_TXN_DIGEST 150u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_MANIFEST_DIGEST 182u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_PREPARED_ROOT_DIGEST 214u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_ACTIVATION_FLOOR 246u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_BASELINE_HASH_SHA256 250u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_BASELINE_EXTENT 282u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_ORIGINAL_SDK28_DIGEST 286u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_CRC32 318u
-#define XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519 322u
-/* Signed/CRCed body length: magic..crc32 inclusive, i.e. everything
- * strictly before the signature field. */
-#define XIAO_OTA_FLOOR_ACTIVATION_SIGNED_BODY_BYTES 322u
-#define XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES 386u
-
-typedef struct XIAO_OTA_PACKED {
-  uint32_t magic;
-  uint16_t record_version;
-  uint16_t record_bytes;
-  uint32_t boot_counter_domain; /* always XIAO_OTA_BOOT_COUNTER_DOMAIN */
-  uint64_t hw_uid;               /* this device's full FICR unique id, LE */
-  uint8_t local_public_key[32];       /* host/app-verified, opaque to C */
-  uint8_t consent_owner_public_key[32]; /* host/app-verified, opaque to C */
-  uint32_t target;       /* XIAO_OTA_TARGET_*, checked against compiled build */
-  uint32_t profile;      /* XIAO_OTA_FLOOR_ACTIVATION_PROFILE_* identity */
-  uint32_t layout_id;    /* XIAO_OTA_FLOOR_ACTIVATION_LAYOUT_ID */
-  uint32_t current_role; /* must equal this build's XIAO_OTA_COMPILED_ROLE_ID */
-  uint16_t key_id;
-  uint8_t key_fingerprint[32]; /* full SHA-256(trusted pubkey) */
-  uint8_t host_txn_id[16];
-  uint8_t authority_txn_digest[32];
-  uint8_t manifest_digest[32];
-  uint8_t prepared_root_digest[32];
-  uint32_t activation_floor; /* explicit; genesis activation always 0 */
-  uint8_t baseline_hash_sha256[32];
-  uint32_t baseline_extent;
-  uint8_t original_sdk28_digest[32];
-  uint32_t crc32; /* over magic..original_sdk28_digest, i.e. everything
-                   * above; signature below covers this field too. */
-  uint8_t signature_ed25519[64];
-} xiao_ota_floor_activation_receipt_t;
-
-#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
-#define XIAO_OTA_HOST_IS_LITTLE_ENDIAN \
-  (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-_Static_assert(XIAO_OTA_HOST_IS_LITTLE_ENDIAN,
-              "BootFloorActivationReceiptV1's raw packed struct layout is "
-              "only a valid little-endian wire encoding on a genuinely "
-              "little-endian build target");
-#endif
-
-#define XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(field, off)                 \
-  _Static_assert(offsetof(xiao_ota_floor_activation_receipt_t, field) ==   \
-                    (off),                                                  \
-                "BootFloorActivationReceiptV1 wire offset drift: " #field)
-
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(magic,
-                                        XIAO_OTA_FLOOR_ACTIVATION_OFF_MAGIC);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    record_version, XIAO_OTA_FLOOR_ACTIVATION_OFF_RECORD_VERSION);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    record_bytes, XIAO_OTA_FLOOR_ACTIVATION_OFF_RECORD_BYTES);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    boot_counter_domain, XIAO_OTA_FLOOR_ACTIVATION_OFF_BOOT_COUNTER_DOMAIN);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(hw_uid,
-                                        XIAO_OTA_FLOOR_ACTIVATION_OFF_HW_UID);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    local_public_key, XIAO_OTA_FLOOR_ACTIVATION_OFF_LOCAL_PUBLIC_KEY);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    consent_owner_public_key,
-    XIAO_OTA_FLOOR_ACTIVATION_OFF_CONSENT_OWNER_PUBLIC_KEY);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(target,
-                                        XIAO_OTA_FLOOR_ACTIVATION_OFF_TARGET);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    profile, XIAO_OTA_FLOOR_ACTIVATION_OFF_PROFILE);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    layout_id, XIAO_OTA_FLOOR_ACTIVATION_OFF_LAYOUT_ID);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    current_role, XIAO_OTA_FLOOR_ACTIVATION_OFF_CURRENT_ROLE);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    key_id, XIAO_OTA_FLOOR_ACTIVATION_OFF_KEY_ID);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    key_fingerprint, XIAO_OTA_FLOOR_ACTIVATION_OFF_KEY_FINGERPRINT);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    host_txn_id, XIAO_OTA_FLOOR_ACTIVATION_OFF_HOST_TXN_ID);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    authority_txn_digest, XIAO_OTA_FLOOR_ACTIVATION_OFF_AUTHORITY_TXN_DIGEST);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    manifest_digest, XIAO_OTA_FLOOR_ACTIVATION_OFF_MANIFEST_DIGEST);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    prepared_root_digest, XIAO_OTA_FLOOR_ACTIVATION_OFF_PREPARED_ROOT_DIGEST);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    activation_floor, XIAO_OTA_FLOOR_ACTIVATION_OFF_ACTIVATION_FLOOR);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    baseline_hash_sha256, XIAO_OTA_FLOOR_ACTIVATION_OFF_BASELINE_HASH_SHA256);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    baseline_extent, XIAO_OTA_FLOOR_ACTIVATION_OFF_BASELINE_EXTENT);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    original_sdk28_digest,
-    XIAO_OTA_FLOOR_ACTIVATION_OFF_ORIGINAL_SDK28_DIGEST);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(crc32,
-                                        XIAO_OTA_FLOOR_ACTIVATION_OFF_CRC32);
-XIAO_OTA_FLOOR_ACTIVATION_OFFSET_ASSERT(
-    signature_ed25519, XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519);
-
-_Static_assert(offsetof(xiao_ota_floor_activation_receipt_t,
-                        signature_ed25519) ==
-                  XIAO_OTA_FLOOR_ACTIVATION_SIGNED_BODY_BYTES,
-              "BootFloorActivationReceiptV1 signed-body length drift");
-_Static_assert(sizeof(xiao_ota_floor_activation_receipt_t) ==
-                  XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES,
-              "BootFloorActivationReceiptV1 total size drift");
-_Static_assert(sizeof(xiao_ota_floor_activation_receipt_t) <=
-                  XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE,
-              "floor activation receipt must fit the reserved 512B window");
-
-/*
- * XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES (386) is the canonical WIRE
- * size: exactly what is parsed, CRCed ([0, 318)), and hashed/signed
- * ([0, 322)) -- never the physical transfer size.
- *
- * 386 is NOT a multiple of 4. The real NRF_QSPI peripheral's
- * READ.CNT/WRITE.CNT hardware registers (see hw_qspi_read()/
- * hw_qspi_write() in xiao_ota_boot.c, which program them directly from
- * the requested transfer length with no rounding of their own) require
- * that length to be a multiple of 4 bytes; issuing a 386-byte transfer
- * against the real chip is a hardware-invalid transfer that a plain
- * host-side memcpy-backed test double cannot detect. Every actual QSPI
- * read/program of this record MUST therefore move exactly
- * XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES (388 -- 386 rounded up to
- * the next multiple of 4) bytes, from/to a 4-byte-ALIGNED buffer; the
- * trailing 2 physical-only padding bytes are never part of the wire
- * format and are NEVER parsed, CRCed, or hashed -- a producer MUST leave
- * them at the erased-flash sentinel value (0xFF), and a reader MUST
- * simply discard them after copying only the first TOTAL_BYTES into the
- * canonical struct. The already-reserved 512B window comfortably fits
- * this 388-byte physical transfer with no layout change.
- */
-#define XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES 388u
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES % 4u == 0u,
-              "floor activation physical transfer must be word-multiple");
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES >=
-                  XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES,
-              "floor activation physical transfer must cover the wire size");
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES -
-                      XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES <
-                  4u,
-              "floor activation physical padding must be the minimal round-up");
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES <=
-                  XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE,
-              "floor activation physical transfer must fit the 512B window");
-
-/* Pure structural check: magic/version/bytes/CRC only -- no signature, no
- * device/compiled-qualification binding. Mirrors record_body_valid()'s
- * contract (see xiao_ota_record.c) for every other record type; this
- * record has no commit_marker field of its own (it is written once by
- * external provisioning tooling, never mutated in place afterwards) so a
- * torn/partial write simply fails this check -- the same fail-closed
- * outcome a missing/absent receipt produces. */
-bool xiao_ota_floor_activation_receipt_body_valid(
-    const xiao_ota_floor_activation_receipt_t *record);
 
 #define XIAO_OTA_SIDECAR_MAGIC UINT32_C(0x58534944) /* "XSID" */
 
@@ -762,7 +426,6 @@ bool xiao_ota_resolve_active_extent(bool bank_0_marker_valid,
                                     uint16_t recomputed_crc16,
                                     uint32_t app_region_size,
                                     uint32_t *out_extent);
-bool xiao_ota_command_valid(const xiao_ota_command_t *record);
 bool xiao_ota_state_valid(const xiao_ota_state_t *record);
 bool xiao_ota_confirmation_valid(const xiao_ota_confirmation_t *record);
 bool xiao_ota_floor_valid(const xiao_ota_floor_t *record);

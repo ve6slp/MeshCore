@@ -7,7 +7,7 @@
 // `_ota_identity_confirmed_loaded_`). Exactly ONE instance per MyMesh,
 // constructed once, fed REAL outcomes from begin()'s/main.cpp's identity
 // resolution and every ordinary persisted-write/read call site; consumed
-// read-only by OtaBoardBaselineMeasurementSource and tickOtaTrialHealth().
+// read-only by tickOtaTrialHealth().
 //
 // Arduino-independent, plain C++ -- natively testable (see
 // test/test_lora_ota_storage/test_ota_firmware_service.cpp).

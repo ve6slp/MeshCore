@@ -55,7 +55,16 @@ template <typename File, typename Host, typename Filter, typename Contact = Cont
 inline bool writeAllContacts(File& file, Host* host, Filter filter) {
   uint32_t idx = 0;
   Contact c;
-  uint8_t unused = 0;
+  // This byte used to be a pure zero-filled "unused" pad. It is now a
+  // per-record FORMAT MARKER: 1 means "this record was written by code
+  // that understands privileged bits above the legacy telemetry mask in
+  // `flags` (e.g. the OTA-admin bit) and `flags` should be trusted as-
+  // is"; 0 (only ever produced by an OLDER build that never wrote this
+  // marker at all, i.e. a short/legacy file) means "any such privileged
+  // bit must be stripped on load" -- see readAllContacts() below. Every
+  // CURRENT write always stamps 1; the only way a 0 reaches disk is an
+  // old binary that predates this marker ever existing.
+  uint8_t format_marker = 1;
 
   while (host->getContactForSave(idx, c)) {
     if (filter && !filter(c)) {
@@ -66,7 +75,7 @@ inline bool writeAllContacts(File& file, Host* host, Filter filter) {
     success = success && writeExact(file, (uint8_t *)&c.name, 32);
     success = success && writeExact(file, &c.type, 1);
     success = success && writeExact(file, &c.flags, 1);
-    success = success && writeExact(file, &unused, 1);
+    success = success && writeExact(file, &format_marker, 1);
     success = success && writeExact(file, (uint8_t *)&c.sync_since, 4);
     success = success && writeExact(file, (uint8_t *)&c.out_path_len, 1);
     success = success && writeExact(file, (uint8_t *)&c.last_advert_timestamp, 4);
@@ -134,12 +143,20 @@ inline bool writeAllChannels(File& file, Host* host) {
 // directly into `c.id.pub_key` (a plain byte array on both the real
 // `mesh::Identity` and native fake types), so no `mesh::Identity`
 // constructor call is needed here.
+// `legacy_privileged_flag_mask` identifies bit(s) in `flags` that only a
+// format-marker==1 record may legitimately carry (production default:
+// 0x10, the companion CONTACT_FLAG_OTA_ADMIN bit -- see MyMesh.cpp). A
+// record stamped with format_marker==0 -- which only an older build that
+// predates this marker can produce -- has those bit(s) forced OFF before
+// ever reaching the host, so stale/undefined on-disk bits from a legacy
+// file can never silently grant a privilege that did not exist when the
+// file was written.
 template <typename File, typename Host, typename Contact = ContactInfo>
-inline bool readAllContacts(File& file, Host* host) {
+inline bool readAllContacts(File& file, Host* host, uint8_t legacy_privileged_flag_mask = 0x10) {
   bool full = false;
   while (!full) {
     Contact c;
-    uint8_t unused;
+    uint8_t format_marker;
 
     // A `read()` returning 0 is only a genuine, clean end-of-file if the
     // file's own position/size provenance agrees there is truly nothing
@@ -159,7 +176,7 @@ inline bool readAllContacts(File& file, Host* host) {
     bool success = (file.read((uint8_t *)&c.name, 32) == 32);
     success = success && (file.read(&c.type, 1) == 1);
     success = success && (file.read(&c.flags, 1) == 1);
-    success = success && (file.read(&unused, 1) == 1);
+    success = success && (file.read(&format_marker, 1) == 1);
     success = success && (file.read((uint8_t *)&c.sync_since, 4) == 4);
     success = success && (file.read((uint8_t *)&c.out_path_len, 1) == 1);
     success = success && (file.read((uint8_t *)&c.last_advert_timestamp, 4) == 4);
@@ -169,6 +186,13 @@ inline bool readAllContacts(File& file, Host* host) {
     success = success && (file.read((uint8_t *)&c.gps_lon, 4) == 4);
 
     if (!success) return false;  // genuine fault: partial record after first field.
+
+    if (format_marker == 0) {
+      // Legacy/short record predating this marker: strip any bit this
+      // build considers privilege-bearing rather than trust whatever
+      // garbage/undefined value happens to be on disk there.
+      c.flags &= (uint8_t)~legacy_privileged_flag_mask;
+    }
 
     if (!host->onContactLoaded(c)) full = true;
   }

@@ -2,9 +2,9 @@
 
 ## What this is
 
-LoRa OTA is a firmware-update capability being built into MeshCore so that a
-node can eventually receive a new firmware image over the radio, without a
-USB cable. It is designed around three modes:
+LoRa OTA is an experimental firmware-update capability in MeshCore. It
+transfers an application image over the radio rather than through a USB
+cable. It has three modes:
 
 - **Direct** — a technician with a radio close to the node pushes an update
   at a short, high-speed profile.
@@ -12,8 +12,9 @@ USB cable. It is designed around three modes:
   the existing mesh path.
 - **Background fleet** — a coordinator announces an update to many nodes at
   once, and eligible devices pull it down in the background over 24–72 hours,
-  using only a small, configurable share of airtime (2% by default) so it
-  never competes with your normal traffic.
+  using only a small, configurable share of airtime (2% by default) to leave
+  capacity for normal traffic. Transfer time depends on image size, radio
+  settings, relays and loss; 24–72 hours is a planning window, not a deadline.
 
 ## Current availability: not ready for production use
 
@@ -21,16 +22,19 @@ LoRa OTA is under active development and is **not** a supported way to update
 your node's firmware today. Treat everything below as a preview of an
 in-progress feature, not a how-to.
 
-What has been verified on lab hardware so far:
+The signed, single-candidate implementation is replacing the earlier
+experimental lab path. The results below belong to that earlier path and
+must not be read as qualification of the replacement.
+
+What was verified on earlier lab hardware:
 
 - The XIAO nRF52840 + SX1262 boards can send and receive OTA protocol
   packets and adverts over the radio in both directions. A temporary
   high-speed direct-mode radio setting, automatic revert, ordinary-traffic
   priority over OTA traffic, and fleet-mode state changes have all been
-  confirmed in earlier lab runs, but the most recent full test run did not
-  re-confirm the traffic-priority check — it stopped there, and the cause
-  is unresolved, so treat this as previously verified rather than
-  currently reconfirmed.
+  confirmed in earlier lab runs. Pressure tests also exposed a packet-pool
+  failure that was fixed and passed a later run. The replacement must
+  repeat those checks.
 - The XIAO nRF52840's external QSPI flash chip has been read, erased, and
   written directly and correctly. A small signed test image has also been
   taken through a full radio transfer — signed descriptor, authorization,
@@ -41,14 +45,10 @@ What has been verified on lab hardware so far:
 What has **not** been verified:
 
 - All three modes working together end to end.
-- The airtime budget has now been driven to its configured limit in a
-  dedicated lab run (used 71,851 of 72,000 ms, no overshoot), but that
-  same run then failed: once OTA traffic had queued up to the cap, an
-  attempt to send an ordinary self-advert failed outright, because the
-  shared radio-packet pool was full of queued OTA sends. So while the
-  airtime quota itself was enforced correctly, this run does **not** show
-  that ordinary traffic keeps working once OTA has driven the radio queue
-  to its limit — that is now a known gap, being addressed in firmware.
+- The replacement has not been driven to its airtime limit while verifying
+  ordinary service. Earlier tests reached the quota and exposed a full
+  packet pool; a later run passed after a queue-capacity fix. Neither
+  result qualifies the new signed receiver.
 - Sending a target node an image over the mesh (routed delivery to an
   out-of-reach node) has not been tested yet.
 - Actually installing a received, signed firmware image on a device. The
@@ -78,20 +78,38 @@ or `start ota` over USB/BLE — until this changes.
 | --- | --- |
 | Seeed Studio XIAO nRF52840 + SX1262 | Lab-validated radio and raw flash behaviour; firmware install unproven |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
-| Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | Build support only; no hardware validation yet |
+| Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
 | Heltec v3/v4 | Not started |
+
+## What an update should do
+
+Your existing firmware keeps serving the mesh while a new image downloads.
+The node accepts updates only from an administrator it already trusts, holds
+one candidate at a time, and resumes durable progress after a restart.
+Duplicates do not write flash again; a bad packet does not discard the
+working firmware or the valid blocks already received.
+
+After receiving and checking the entire image, the node waits in `READY`.
+It does not reboot just because the last block arrived. The original
+administrator must explicitly commit the update to that device, allowing
+fleet upgrades to be sequenced. Any trusted administrator may abort before
+commit and stop reception of that image until an explicit restart.
+
+Once installation starts, the bootloader must recover from interruption or
+restore the previous image if the trial fails. These are required behaviours;
+they remain unverified end to end on physical hardware.
 
 ## Terminology you may see
 
 - **Direct mode**: a short-lived, faster radio profile used only for the
   update session, then reverted automatically.
-- **Fleet mode**: the admission/signed-descriptor → multicast pass →
-  census → cohort/selective repair → re-census → per-member commit
+- **Fleet mode**: the signed-manifest admission → multicast pass →
+  census → selective repair → re-census → validation → per-member commit
   sequence used for background updates across many nodes.
 - **Duty cycle budget**: the percentage of airtime OTA traffic is allowed to
-  use; by design, normal MeshCore traffic always takes priority (a known
-  gap in enforcing this under sustained OTA load is being fixed — see the
-  [administrator guide](lora_ota_administration.md#duty-cycle-policy-in-practice)).
+  use; normal MeshCore traffic must retain priority and queue capacity
+  under sustained OTA load — see the
+  [administrator guide](lora_ota_administration.md#duty-cycle-policy-in-practice).
 - **Rollback**: if a new image fails to start up correctly, the device is
   meant to restore the previous working image automatically. This is part of
   the design and is not yet proven end-to-end on hardware.

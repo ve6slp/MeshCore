@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Generate a repo-local lab Ed25519 key and explicitly update the public header."""
+"""Generate (or reuse) a private Ed25519 keypair as an OFFLINE TEST FIXTURE
+ONLY, under .tmp (never committed), for local/manual signing workflows that
+need to pass a --private-key to tools/sign_image.py (e.g. bench packaging
+dry runs, manual lab testing).
+
+This tool does NOT read or write any compiled header, does NOT provision or
+rotate the boot-info marker's reference_signer_public_key_ed25519 placeholder
+(include/xiao_ota_public_key.h, a fixed value committed in source control --
+see that header's own comment), and establishes no "default trust" key of
+any kind. It makes no claim about what key a real MeshCore admin uses or
+what the bootloader will accept on-device: that is always decided per
+install command via admitted_signer_public_key_ed25519 (xiao_ota_record.h),
+snapshotted by the already-trusted running app at COMMIT time. A real
+production app/host never exports a private key to a tool like this at
+all -- it signs entirely through the existing companion protocol (host
+CMD33 start / CMD34 raw message bytes / CMD35 finish, returning only the
+signature), never handing raw private-key material to disk or to this
+script.
+"""
 
 from pathlib import Path
 import subprocess
@@ -8,36 +26,27 @@ ROOT = Path(__file__).resolve().parents[3]
 KEY_DIR = ROOT / ".tmp" / "xiao-ota-keys"
 PRIVATE = KEY_DIR / "lab-ed25519-private.pem"
 PUBLIC = KEY_DIR / "lab-ed25519-public.pem"
-HEADER = ROOT / "bootloader" / "xiao_nrf52840_ota" / "include" / "xiao_ota_public_key.h"
 
-KEY_DIR.mkdir(parents=True, exist_ok=True)
-if not PRIVATE.exists():
-    subprocess.check_call(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(PRIVATE)])
-subprocess.check_call([
-    "openssl", "pkey", "-in", str(PRIVATE), "-pubout", "-out", str(PUBLIC)
-])
-der = subprocess.check_output([
-    "openssl", "pkey", "-pubin", "-in", str(PUBLIC), "-outform", "DER"
-])
-if der[:12].hex() != "302a300506032b6570032100" or len(der) != 44:
-    raise SystemExit("unexpected Ed25519 SubjectPublicKeyInfo encoding")
-raw = der[-32:]
-hexed = [f"0x{x:02x}" for x in raw]
-rows = []
-for i in range(0, 32, 8):
-    row = ", ".join(hexed[i:i + 8])
-    if i + 8 < 32:
-        row += ","
-    rows.append("    " + row + (" \\" if i + 8 < 32 else ""))
-HEADER.write_text(
-    "#pragma once\n\n#include <stdint.h>\n\n"
-    "/* Lab-only public key. The private half is generated under .tmp and is never committed. */\n"
-    "#define XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES \\\n"
-    + "\n".join(rows) + "\n\n"
-    "static const uint8_t xiao_ota_lab_public_key_ed25519[32] = {\n"
-    "    XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES,\n};\n"
-)
-print(f"private key: {PRIVATE}")
-print(f"public key:  {PUBLIC}")
-print(f"updated:     {HEADER}")
 
+def main() -> int:
+    KEY_DIR.mkdir(parents=True, exist_ok=True)
+    if not PRIVATE.exists():
+        subprocess.check_call(
+            ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(PRIVATE)]
+        )
+    subprocess.check_call(
+        ["openssl", "pkey", "-in", str(PRIVATE), "-pubout", "-out", str(PUBLIC)]
+    )
+    print(f"private key fixture (offline/test only): {PRIVATE}")
+    print(f"public key fixture  (offline/test only): {PUBLIC}")
+    print(
+        "Pass PRIVATE to sign_image.py's --private-key explicitly for local "
+        "signing/testing. This script never touches any compiled header and "
+        "provisions no runtime trust: production signing uses the existing "
+        "host companion protocol (CMD33/34/35), never a private-key export."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

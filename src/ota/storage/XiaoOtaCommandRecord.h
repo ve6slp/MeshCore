@@ -382,42 +382,225 @@ private:
   }
 };
 
+// Fields for the bootloader's CURRENT (and, per the bootloader owner, now
+// SOLE) accepted install-command format: xiao_ota_command_v2_t at
+// record_version 3 (bootloader/xiao_nrf52840_ota/include/xiao_ota_record.h
+// -- "v2"/"_v2" naming on that struct is kept only to avoid a mechanical
+// rename, not because a newer struct name exists). Identical to
+// XiaoOtaCommandV2Fields except for one inserted field:
+// `admitted_signer_public_key_ed25519` -- the Ed25519 public key the
+// CURRENTLY RUNNING app already verified the manifest signer against via
+// its own existing MeshCore admin-identity trust mechanism (see
+// OtaFirmwareStorageSink::onAuthorizedSession()'s `controller` parameter,
+// which is this exact key, captured once per authenticated/authorized
+// attempt and threaded through unchanged to commit()). There is no
+// compile-time-fixed trust anchor anymore (the bootloader owner's record_
+// version 2 shape, which had one, has itself been retired) -- the
+// bootloader re-verifies signature_ed25519 over wire_descriptor under
+// EXACTLY this embedded key at install time.
+struct XiaoOtaCommandV3Fields {
+  uint32_t sequence = 0;
+  uint64_t transaction_nonce = 0;
+  uint8_t wire_descriptor[59] = {};
+  uint8_t admitted_signer_public_key_ed25519[32] = {};
+  uint8_t signature_ed25519[64] = {};
+  uint32_t active_image_extent = 0;
+  uint8_t active_image_hash_sha256[32] = {};
+};
+
+// Byte-exact codec and power-loss-safe A/B writer for
+// xiao_ota_command_v2_t at record_version
+// XIAO_OTA_COMMAND_VERSION_CURRENT (3). Structurally a sibling of
+// XiaoOtaCommandRecordV2: same magic/CRC/commit-marker discipline, same
+// A/B alternation, same FlashRegion sector geometry -- the only
+// difference is the inserted 32-byte admitted-signer-key field and the
+// resulting overall size (220 vs 188 bytes). V1/V2 remain defined above
+// for any still-referencing test/legacy code, but per the bootloader
+// owner's current source (not merely a chat claim -- see
+// XIAO_OTA_COMMAND_VERSION_CURRENT's doc-comment, which states BOTH the
+// legacy 71-byte v1 format AND the no-admitted-key record_version-2 shape
+// have been retired) V3 is the only format an actual bootloader build
+// will currently accept.
+class XiaoOtaCommandRecordV3 {
+public:
+  static constexpr uint32_t kMagic = XiaoOtaCommandRecord::kMagic;
+  static constexpr uint32_t kCommitMarker = XiaoOtaCommandRecord::kCommitMarker;
+  static constexpr uint16_t kRecordVersion = 3u;  // XIAO_OTA_COMMAND_VERSION_CURRENT
+  static constexpr uint32_t kWireDescriptorBytes = 59u;  // XIAO_OTA_WIRE_DESCRIPTOR_SIZE
+  static constexpr uint32_t kSignerKeyBytes = 32u;
+  static constexpr uint32_t kSignatureBytes = 64u;
+  static constexpr uint32_t kHashBytes = 32u;
+
+  // magic(4) + record_version(2) + record_bytes(2) + sequence(4) +
+  // nonce(8) + wire_descriptor(59) + admitted_signer_public_key(32) +
+  // signature(64) + active_image_extent(4) + active_image_hash(32) +
+  // reserved(1) + crc32(4) + commit_marker(4) = 220.
+  static constexpr uint32_t kRecordBytes = 4 + 2 + 2 + 4 + 8 + kWireDescriptorBytes + kSignerKeyBytes +
+                                            kSignatureBytes + 4 + kHashBytes + 1 + 4 + 4;  // = 220
+  static constexpr uint32_t kCrcOffset = kRecordBytes - 8;           // 212
+  static constexpr uint32_t kCommitMarkerOffset = kRecordBytes - 4;  // 216
+
+  static bool regionIsValid(const platform::FlashRegion& region) {
+    return region.isValid() && region.sizeBytes() == (2u * region.eraseUnitBytes()) &&
+           region.eraseUnitBytes() >= kRecordBytes;
+  }
+
+  static uint32_t serialize(const XiaoOtaCommandV3Fields& fields, uint8_t* out, uint32_t out_len) {
+    if (out == nullptr || out_len < kRecordBytes) {
+      return 0;
+    }
+    uint32_t pos = 0;
+    putU32(out + pos, kMagic);
+    pos += 4;
+    putU16(out + pos, kRecordVersion);
+    pos += 2;
+    putU16(out + pos, static_cast<uint16_t>(kRecordBytes));
+    pos += 2;
+    putU32(out + pos, fields.sequence);
+    pos += 4;
+    putU64(out + pos, fields.transaction_nonce);
+    pos += 8;
+
+    memcpy(out + pos, fields.wire_descriptor, kWireDescriptorBytes);
+    pos += kWireDescriptorBytes;
+
+    memcpy(out + pos, fields.admitted_signer_public_key_ed25519, kSignerKeyBytes);
+    pos += kSignerKeyBytes;
+
+    memcpy(out + pos, fields.signature_ed25519, kSignatureBytes);
+    pos += kSignatureBytes;
+
+    putU32(out + pos, fields.active_image_extent);
+    pos += 4;
+    memcpy(out + pos, fields.active_image_hash_sha256, kHashBytes);
+    pos += kHashBytes;
+
+    out[pos] = 0;  // reserved
+    pos += 1;
+
+    const uint32_t crc = Crc32::computeFinalized(out, kCrcOffset);
+    putU32(out + pos, crc);
+    pos += 4;
+
+    putU32(out + pos, kCommitMarker);
+    pos += 4;
+
+    return pos;  // == kRecordBytes
+  }
+
+  static bool isValidRecord(const uint8_t* record, uint32_t len) {
+    if (record == nullptr || len != kRecordBytes) {
+      return false;
+    }
+    if (getU32(record) != kMagic) return false;
+    if (record[4] != static_cast<uint8_t>(kRecordVersion) || record[5] != 0) return false;
+    if (getU16(record + 6) != static_cast<uint16_t>(kRecordBytes)) return false;
+    if (getU32(record + kCommitMarkerOffset) != kCommitMarker) return false;
+    const uint32_t stored_crc = getU32(record + kCrcOffset);
+    return stored_crc == Crc32::computeFinalized(record, kCrcOffset);
+  }
+
+  static bool writeNext(platform::FlashRegion& region, const XiaoOtaCommandV3Fields& fields,
+                        uint32_t* out_sequence_written = nullptr);
+
+  // Same fail-closed rationale as XiaoOtaCommandRecordV2::readNewest().
+  static bool readNewest(const platform::FlashRegion& region, uint8_t out_record[kRecordBytes]);
+
+  static uint32_t descriptorMonotonicCounter(const uint8_t* record) {
+    constexpr uint32_t kDescriptorStart = 20u;
+    constexpr uint32_t kCounterOffsetInDescriptor = 2 + 2 + 1 + 4 + 4 + 32;  // = 45
+    return getBE32(record + kDescriptorStart + kCounterOffsetInDescriptor);
+  }
+
+  static constexpr uint32_t kWireDescriptorOffset = 20u;
+  // Admitted-signer key immediately follows the 59-byte wire descriptor.
+  static constexpr uint32_t kAdmittedSignerKeyOffset = kWireDescriptorOffset + kWireDescriptorBytes;  // = 79
+
+  static uint32_t sequenceOf(const uint8_t* record) { return getU32(record + 8); }
+  static uint64_t transactionNonceOf(const uint8_t* record) { return getU64(record + 12); }
+  static const uint8_t* wireDescriptorOf(const uint8_t* record) { return record + kWireDescriptorOffset; }
+  static const uint8_t* admittedSignerKeyOf(const uint8_t* record) { return record + kAdmittedSignerKeyOffset; }
+
+private:
+  static bool readSlot(const platform::FlashRegion& region, uint32_t slot, uint8_t out[kRecordBytes]) {
+    const uint32_t slot_offset = slot * region.eraseUnitBytes();
+    return platform::isOk(region.read(slot_offset, out, kRecordBytes));
+  }
+
+  static void putU16(uint8_t* out, uint16_t v) {
+    out[0] = static_cast<uint8_t>(v & 0xFFu);
+    out[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+  }
+  static void putU32(uint8_t* out, uint32_t v) {
+    out[0] = static_cast<uint8_t>(v & 0xFFu);
+    out[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    out[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    out[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+  }
+  static void putU64(uint8_t* out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+      out[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+  }
+  static uint16_t getU16(const uint8_t* in) {
+    return static_cast<uint16_t>(in[0]) | (static_cast<uint16_t>(in[1]) << 8);
+  }
+  static uint32_t getU32(const uint8_t* in) {
+    return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
+           (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
+  }
+  static uint64_t getU64(const uint8_t* in) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) {
+      v = (v << 8) | static_cast<uint64_t>(in[i]);
+    }
+    return v;
+  }
+  static uint32_t getBE32(const uint8_t* in) {
+    return (static_cast<uint32_t>(in[0]) << 24) | (static_cast<uint32_t>(in[1]) << 16) |
+           (static_cast<uint32_t>(in[2]) << 8) | static_cast<uint32_t>(in[3]);
+  }
+};
+
 // Result of classifying one physical command A/B slot, agnostic of which
 // record version (if any) actually occupies it.
 struct XiaoOtaCommandSlotView {
-  enum class Kind { None, V1, V2 };
+  enum class Kind { None, V1, V2, V3 };
   bool read_ok = false;  // false: I/O failure -- caller MUST fail closed.
-  bool valid = false;    // true iff a valid V1 OR V2 record was found.
+  bool valid = false;    // true iff a valid V1, V2, OR V3 record was found.
   Kind kind = Kind::None;
   uint32_t sequence = 0;  // meaningful only when `valid` is true.
 };
 
 // Shared, union-aware slot classifier for the command A/B region: the
-// SAME two physical erase-unit slots may transiently hold either a
-// legacy 200-byte XiaoOtaCommandRecord (v1) or a 188-byte
-// XiaoOtaCommandRecordV2 record -- the bootloader dispatches by the
-// record_version byte at a fixed offset regardless of which type
-// physically occupies a slot (see OtaFirmwareStorageSink's v1/v2
-// constructor comment in src/helpers/ota/OtaFirmwareBackend.h). A
+// SAME two physical erase-unit slots may transiently hold a legacy
+// 200-byte XiaoOtaCommandRecord (v1), a 188-byte XiaoOtaCommandRecordV2
+// record (also now retired per the bootloader's own current source, but
+// still classified so an old slot is never misread as empty), or the
+// current 220-byte XiaoOtaCommandRecordV3 record -- the bootloader
+// dispatches by the record_version byte at a fixed offset regardless of
+// which type physically occupies a slot (see OtaFirmwareStorageSink's
+// v1/v2/v3 constructor comment in src/helpers/ota/OtaFirmwareBackend.h). A
 // version-specific writer/reader that only ever recognizes its OWN
-// record type would otherwise treat a live record of the OTHER type as
+// record type would otherwise treat a live record of ANOTHER type as
 // "empty" -- risking erasing/overwriting it, resetting the generation
 // sequence, or selecting the wrong (older) slot as "current". This
-// helper reads the larger of the two record sizes once per slot and
-// classifies it as whichever type (if either) actually validates there,
+// helper reads the largest of the three record sizes once per slot and
+// classifies it as whichever type (if any) actually validates there,
 // exposing a common `sequence` field (byte offset 8, identical
-// position/width in both record layouts) so both XiaoOtaCommandRecord
-// and XiaoOtaCommandRecordV2 can compare and preserve the true max
-// generation across both types, never just their own.
+// position/width in all three record layouts) so all three
+// XiaoOtaCommandRecord* types can compare and preserve the true max
+// generation across every type, never just their own.
 class XiaoOtaCommandSlotClassifier {
 public:
-  // The larger of the two record sizes (200 for v1, 188 for v2): reading
-  // this many bytes per slot is always sufficient to validate either
-  // type, since both formats' CRC/marker/size fields are fully contained
-  // within their own (smaller-or-equal) declared size.
-  static constexpr uint32_t kMaxRecordBytes = XiaoOtaCommandRecord::kRecordBytes;
-  static_assert(XiaoOtaCommandRecord::kRecordBytes >= XiaoOtaCommandRecordV2::kRecordBytes,
-                "kMaxRecordBytes must cover the larger of the two command record sizes");
+  // The largest of the three record sizes (200 for v1, 188 for v2, 220
+  // for v3): reading this many bytes per slot is always sufficient to
+  // validate any of them, since each format's CRC/marker/size fields are
+  // fully contained within its own (smaller-or-equal) declared size.
+  static constexpr uint32_t kMaxRecordBytes = XiaoOtaCommandRecordV3::kRecordBytes;
+  static_assert(XiaoOtaCommandRecordV3::kRecordBytes >= XiaoOtaCommandRecord::kRecordBytes &&
+                XiaoOtaCommandRecordV3::kRecordBytes >= XiaoOtaCommandRecordV2::kRecordBytes,
+                "kMaxRecordBytes must cover the largest of the three command record sizes");
 
   static XiaoOtaCommandSlotView classify(const platform::FlashRegion& region, uint32_t slot) {
     XiaoOtaCommandSlotView view;
@@ -431,7 +614,11 @@ public:
       return view;  // read_ok stays false: caller must fail closed.
     }
     view.read_ok = true;
-    if (XiaoOtaCommandRecord::isValidRecord(buf, XiaoOtaCommandRecord::kRecordBytes)) {
+    if (XiaoOtaCommandRecordV3::isValidRecord(buf, XiaoOtaCommandRecordV3::kRecordBytes)) {
+      view.valid = true;
+      view.kind = XiaoOtaCommandSlotView::Kind::V3;
+      view.sequence = XiaoOtaCommandRecordV3::sequenceOf(buf);
+    } else if (XiaoOtaCommandRecord::isValidRecord(buf, XiaoOtaCommandRecord::kRecordBytes)) {
       view.valid = true;
       view.kind = XiaoOtaCommandSlotView::Kind::V1;
       view.sequence = XiaoOtaCommandRecord::sequenceOf(buf);
@@ -623,6 +810,94 @@ inline bool XiaoOtaCommandRecordV2::readNewest(const platform::FlashRegion& regi
   return true;
 }
 
+inline bool XiaoOtaCommandRecordV3::writeNext(platform::FlashRegion& region, const XiaoOtaCommandV3Fields& fields,
+                                              uint32_t* out_sequence_written) {
+  if (!regionIsValid(region)) {
+    return false;
+  }
+
+  uint32_t current_slot = 0;
+  bool have_current = false;
+  uint32_t current_sequence = 0;
+  for (uint32_t slot = 0; slot < 2u; ++slot) {
+    // Same union-aware rationale as XiaoOtaCommandRecordV2::writeNext():
+    // a live V1/V2 record in either slot must be recognized (never
+    // treated as "empty") and its generation preserved/extended.
+    const XiaoOtaCommandSlotView view = XiaoOtaCommandSlotClassifier::classify(region, slot);
+    if (!view.read_ok) return false;
+    if (!view.valid) continue;
+    if (!have_current || view.sequence >= current_sequence) {
+      have_current = true;
+      current_sequence = view.sequence;
+      current_slot = slot;
+    }
+  }
+
+  if (have_current && current_sequence == 0xFFFFFFFFu) {
+    return false;  // sequence exhaustion: refuse rather than wrap to 0.
+  }
+
+  const uint32_t target_slot = have_current ? (1u - current_slot) : 0u;
+  const uint32_t new_sequence = have_current ? (current_sequence + 1u) : 1u;
+
+  XiaoOtaCommandV3Fields to_write = fields;
+  to_write.sequence = new_sequence;
+
+  uint8_t record[kRecordBytes];
+  if (serialize(to_write, record, sizeof(record)) != kRecordBytes) {
+    return false;
+  }
+
+  const uint32_t slot_offset = target_slot * region.eraseUnitBytes();
+  if (!writeOtaJournalRecordTransactional(region, slot_offset, record, kRecordBytes, kCommitMarkerOffset,
+                                          kRecordBytes - kCommitMarkerOffset)) {
+    return false;
+  }
+
+  uint8_t readback[kRecordBytes];
+  if (!platform::isOk(region.read(slot_offset, readback, kRecordBytes))) {
+    return false;
+  }
+  if (memcmp(record, readback, kRecordBytes) != 0 || !isValidRecord(readback, kRecordBytes)) {
+    return false;
+  }
+
+  if (out_sequence_written != nullptr) {
+    *out_sequence_written = new_sequence;
+  }
+  return true;
+}
+
+inline bool XiaoOtaCommandRecordV3::readNewest(const platform::FlashRegion& region,
+                                               uint8_t out_record[kRecordBytes]) {
+  if (!regionIsValid(region)) return false;
+  bool found = false;
+  uint32_t best_sequence = 0;
+  XiaoOtaCommandSlotView::Kind best_kind = XiaoOtaCommandSlotView::Kind::None;
+  uint32_t best_slot = 0;
+  for (uint32_t slot = 0; slot < 2u; ++slot) {
+    const XiaoOtaCommandSlotView view = XiaoOtaCommandSlotClassifier::classify(region, slot);
+    if (!view.read_ok) return false;
+    if (!view.valid) continue;
+    if (!found || view.sequence >= best_sequence) {
+      found = true;
+      best_sequence = view.sequence;
+      best_kind = view.kind;
+      best_slot = slot;
+    }
+  }
+  if (!found) return false;
+  // Same rationale as XiaoOtaCommandRecordV2::readNewest(): refuse rather
+  // than returning an older V1/V2 record when the true newest is a
+  // different version.
+  if (best_kind != XiaoOtaCommandSlotView::Kind::V3) return false;
+  uint8_t buf[kRecordBytes];
+  if (!readSlot(region, best_slot, buf)) return false;
+  if (!isValidRecord(buf, kRecordBytes)) return false;
+  memcpy(out_record, buf, kRecordBytes);
+  return true;
+}
+
 // READ-ONLY reader for the bootloader-owned `xiao_ota_floor_t` confirmed-
 // counter record (0x192000/0x193000 on XIAO's layout). This firmware never
 // writes this record -- only the bootloader does, after a trial-boot
@@ -699,6 +974,15 @@ public:
   // slot could not be read, and no valid record was found.
   static bool readNewestConfirmedCounterFailClosed(const platform::FlashRegion& region,
                                                     uint32_t& out_confirmed_counter_floor) {
+    return readNewestConfirmedEvidenceFailClosed(region, out_confirmed_counter_floor, nullptr, nullptr);
+  }
+
+  static bool readNewestConfirmedEvidenceFailClosed(const platform::FlashRegion& region,
+                                                    uint32_t& out_confirmed_counter_floor,
+                                                    uint8_t* out_confirmed_hash,
+                                                    uint32_t* out_active_extent) {
+    if (out_confirmed_hash) memset(out_confirmed_hash, 0, 32);
+    if (out_active_extent) *out_active_extent = 0;
     if (!region.isValid() || region.sizeBytes() != (2u * region.eraseUnitBytes()) ||
         region.eraseUnitBytes() < kRecordBytes) {
       return false;
@@ -706,6 +990,8 @@ public:
     bool found_valid = false;
     uint32_t best_sequence = 0;
     uint32_t best_floor = 0;
+    uint32_t best_extent = 0;
+    uint8_t best_hash[32] = {};
     // A genuinely UNREADABLE slot (I/O error) is categorically worse than
     // a readable-but-corrupt one: it might have held the true newest
     // record, so it ALWAYS fails the whole lookup closed, regardless of
@@ -729,6 +1015,8 @@ public:
           found_valid = true;
           best_sequence = seq;
           best_floor = getU32(buf + 12);
+          best_extent = getU32(buf + 16);
+          memcpy(best_hash, buf + 20, 32);
         }
         continue;
       }
@@ -760,6 +1048,8 @@ public:
     }
     if (found_valid) {
       out_confirmed_counter_floor = best_floor;
+      if (out_confirmed_hash) memcpy(out_confirmed_hash, best_hash, 32);
+      if (out_active_extent) *out_active_extent = best_extent;
       return true;
     }
     if (any_corrupt_readable) {

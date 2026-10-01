@@ -2,36 +2,115 @@
 
 ## Scope and status
 
-This guide documents the operator-facing controls for the LoRa OTA
-subsystem: the companion binary protocol, the plain-text CLI as declared in
-`CommonCLI`, and the build-time switch that enables OTA. It is aimed at
-people who administer MeshCore nodes and want to inspect or exercise the
-feature on lab or test hardware.
+This guide explains the update policy and experimental signed host workflow.
+LoRa OTA reuses MeshCore identities and administrator permissions. There is no
+separate OTA authority, signing-key registry or remote commissioning service.
 
-**Only one of these two control surfaces actually works on a shipped
-example today.** `examples/companion_radio` does not use `CommonCLI` at
-all; it implements OTA control itself, over the binary `CMD_OTA_CONTROL`
-serial command, and that path is fully wired and working. The plain-text
-`ota ...`/`set ota.*`/`get ota.*` commands are declared as virtual callbacks
-in `src/helpers/CommonCLI.h` with no-op/"unsupported" default bodies. The
-only examples that use `CommonCLI` — `simple_repeater`, `simple_room_server`,
-and `simple_sensor` — do not override those callbacks, so every text-CLI OTA
-command below currently returns "OTA unsupported" (or fails) on every
-shipped example, regardless of whether `MESHCORE_LORA_OTA` is enabled.
-Someone would need to wire those callbacks in the `simple_*` examples before
-the text CLI becomes functional; that work is outside `companion_radio`'s
-scope.
+**LoRa OTA is not production-ready.** Historical lab controls and build
+results do not qualify the replacement. No physical node has completed a
+LoRa-delivered firmware install, confirmation or rollback. Do not use these
+controls to manage a deployed network.
 
-**LoRa OTA is not production-ready either way.** The controls below let you
-observe status, change policy settings, and drive protocol-level test
-traffic on a companion-radio build. None of them can install a new firmware
-image on a device yet: the custom bootloader's boot marker and its
-SenseCAP flash profile are implemented and native-tested, and a full ARM
-bootloader package now builds and links, but the hand-off from the running
-application to that bootloader, and commissioning/installing it on
-physical hardware, are not qualified — no device has been through a real
-install this way. Do not rely on these commands to manage firmware on a
-network you care about.
+## Update policy
+
+The following is the required behaviour, not a hardware acceptance claim.
+
+1. Use an identity already trusted as an administrator by each target. A
+   contact or shared channel secret alone does not grant update permission.
+2. Sign the image manifest with that administrator's Ed25519 private key.
+   Targets verify with the public key; never distribute the private key.
+3. Select direct, routed or background mode and an airtime budget. A device
+   can retain only one candidate and its original owner. A competing image
+   or administrator is refused; there is no automatic takeover timeout.
+4. Transfer signed blocks. Duplicates do not rewrite flash. Bad or missing
+   frames preserve valid progress and normal radio service. For severe loss,
+   repair missing blocks or explicitly restart the upload.
+5. Wait for each target's durable `READY` result after full-image validation.
+   Finishing reception does not install the image or start a reboot timer.
+6. Have the original owner, still trusted as an administrator, commit each
+   target separately. Sequence the commits to preserve network service and
+   confirm each device has returned before proceeding.
+
+Any currently trusted administrator may abort before commit. The target
+then ignores multicast for that image until an explicit restart. Abort
+does not hand the staging slot to a competing uploader. Once a committed
+install has begun, local boot recovery completes it or restores the previous
+image; a radio abort is no longer the recovery mechanism.
+
+## Signed host workflow
+
+These experimental host commands use the companion's existing MeshCore
+identity. They never export its private key. Each target must already
+trust that identity as an administrator through its normal MeshCore
+permissions; there is no separate OTA key to commission.
+
+For nRF52840, select a qualified raw application image and a security
+counter greater than each intended target's confirmed floor. Set the
+shell variables `image`, `counter` and `target_key` explicitly; the last
+is the target's full 64-character public-key hex string.
+
+```sh
+make ota-lab-image XIAO_NRF52_TARGET_PACKAGE="$qualified_repeater_package" \
+  OTA_UPLOAD_IMAGE="$image"
+make ota-lab-manifest OTA_UPLOAD_IMAGE="$image" \
+  OTA_UPLOAD_MANIFEST=.tmp/update.manifest OTA_UPLOAD_COUNTER="$counter"
+make ota-lab-upload OTA_UPLOAD_IMAGE="$image" \
+  OTA_UPLOAD_MANIFEST=.tmp/update.manifest OTA_UPLOAD_TARGET="$target_key" \
+  OTA_UPLOAD_MODE=directed OTA_UPLOAD_DUTY_MILLI_PERCENT=2000
+make ota-lab-status OTA_UPLOAD_TARGET="$target_key"
+```
+
+For nRF, `ota-lab-image` extracts the exact application BIN from an
+already-qualified application-only DFU package without rebuilding or
+opening a board. Set `qualified_repeater_package` to that package's path.
+It refuses to overwrite an existing image. A package or extracted BIN is
+not, by itself, evidence of a successful LoRa installation.
+
+The descriptor builder defaults to the XIAO nRF52840 repeater profile.
+Use `OTA_UPLOAD_BOARD=sensecap_solar_p1` for SenseCAP or
+`OTA_UPLOAD_ROLE_ID=0` for a companion. It produces only the 59-byte
+unsigned descriptor. Upload signs it with the attached companion, fills
+and seals the companion's cache, then starts the requested campaign.
+Use `OTA_UPLOAD_BOARD=xiao_s3_wio` for an ESP32-S3/Wio application.
+That descriptor uses logical address `0x10000` and a maximum image size of
+2,749,824 bytes; the target selects the inactive physical slot. Use the
+raw application BIN, never a merged bootloader/partition-table image.
+ESP build support does not establish physical installation or rollback.
+
+`OTA_UPLOAD_MODE` selects `direct`, `directed` or `background`. Directed
+and background modes use the normal mesh settings. Background accepts
+several full target keys in the quoted `OTA_UPLOAD_TARGET` value and
+requires `OTA_UPLOAD_CHANNEL` to identify a configured group channel.
+Direct accepts one target and requires an off-frequency channel in
+`OTA_UPLOAD_FREQ_KHZ` plus a bounded `OTA_UPLOAD_LEASE_MS`.
+On the approved lab mesh, the direct frequency is 908525 kHz; normal
+traffic remains at 907525 kHz. Both direct and directed use channel 255
+as the unused group-channel value.
+
+Upload **never commits**, including with `OTA_UPLOAD_WAIT_READY=1`.
+That option waits for fresh, complete READY snapshots within
+`OTA_UPLOAD_TIMEOUT`; the default returns after the campaign request
+without claiming reception is complete. Long background campaigns can
+be checked later. A matching complete READY permits a separate,
+individually addressed commit:
+
+```sh
+make ota-lab-commit OTA_UPLOAD_TARGET="$target_key" \
+  OTA_UPLOAD_MANIFEST=.tmp/update.manifest
+```
+
+The commit command waits for fresh READY before sending COMMIT. An
+accepted command is not proof of installation, reboot or trial
+confirmation. Confirm that node's health and normal mesh service before
+committing the next one.
+
+To abort before commit, use `make ota-lab-abort` with the target key and
+original `OTA_UPLOAD_IMAGE`. Abort identifies the firmware content hash,
+not its manifest hash. An explicit reupload uses
+`OTA_UPLOAD_REUPLOAD=1`; changing the manifest does not bypass an abort.
+Unavailable, denied, failed or malformed replies stop the host command
+explicitly. Firmware transport and physical recovery qualification remain
+incomplete; these commands must not be treated as a deployment result.
 
 ## Build-time requirement
 
@@ -42,74 +121,39 @@ target. It is currently enabled on these `platformio.ini` environments:
 - `variants/sensecap_solar/platformio.ini` (SenseCAP Solar)
 - `variants/xiao_s3_wio/platformio.ini` (XIAO ESP32-S3 + Wio SX1262)
 
-A companion-radio node built without this flag returns "OTA unsupported"
-for the binary `CMD_OTA_CONTROL` command below. `simple_repeater`,
-`simple_room_server`, and `simple_sensor` return "OTA unsupported" for the
-text CLI regardless of this flag, for the reason explained above.
+A build flag alone does not establish install capability. The running
+application, signed receiver, durable storage and recovery-capable bootloader
+must all be qualified together. An unsupported backend must refuse the
+update explicitly without affecting ordinary mesh service.
 
-## Companion binary protocol (working today, companion-radio builds only)
+## Control surface
 
-Companion apps talk to `CMD_OTA_CONTROL` (frame code `66`) and, for lab use
-only, `CMD_OTA_LAB` (frame code `67`). This is the control surface to use
-today; there is no working text-CLI equivalent yet.
+Use the signed uploader commands above for an update. The current host ABI
+is command 66, operations `0x10` to `0x18`, with versioned 86-byte replies.
+It distinguishes local cache state from individually addressed target state.
+The old command-66 mode/duty controls, raw fixed-key sender and binary
+boot-journal cleanup are not an alternative upload workflow; their host
+helpers have been removed.
 
-| Sub-command | Byte value | Effect |
-| --- | --- | --- |
-| `OTA_CTRL_GET_STATUS` | 0 | Returns `RESP_CODE_OTA_STATUS` (29) with a status string (see example below). |
-| `OTA_CTRL_SET_MODE` | 1 | Sets mode: `0`=direct, `1`=routed, `2`=fleet. |
-| `OTA_CTRL_SET_DUTY` | 2 | Sets duty cycle, encoded as milli-percent (e.g. `2000` = 2.0%). |
-| `OTA_CTRL_ABORT` | 3 | Aborts any in-progress OTA session and immediately reverts a direct-mode radio lease if one is active. |
-| `OTA_CTRL_ROLLBACK` | 4 | Requests a rollback of a staged/candidate update, then aborts the session. |
-| `OTA_CTRL_DIRECT_LEASE` | 5 | Requests a temporary, high-speed direct-mode radio lease: frequency/bandwidth in kHz-scaled integers, spreading factor, coding rate, and a 16-bit lease timeout in minutes. The node automatically reverts to its normal radio settings when the lease expires. |
+The repeater's ordinary text CLI remains the way to inspect its full public
+key and existing administrator ACL. An ACL read is not evidence that a
+recent permission change has survived a restart: allow the normal lazy
+save to complete and verify it after reboot. Do not replace the ACL or
+export an administrator's private key to enable OTA.
 
-`CMD_OTA_LAB` currently exposes one operation, `OTA_LAB_QUEUE_PRECEDENCE`
-(`0`), which floods a synthetic OTA announcement and advert pair for
-precedence testing. It exists to exercise the traffic-priority behaviour in a
-lab, not as an administrative fleet-update trigger — see the
-[developer guide](lora_ota_development.md) for the full protocol reference.
-
-Example status reply:
-
-```
-mode=direct duty=2.0% used=120/72000 rx=14 bad=0 aborts=0 recv=1 coord=0 fleet=0 lease=1 rollback=0 backend=1
-```
-
-`used`/duty budget are milliseconds within the current 1-hour window (the
-default budget is 72,000 ms = 2% of one hour). `backend=1` means both a
-trust (signature/hash verification) provider and a staging (storage) sink
-are attached to the OTA integration; `backend=0` means at least one is
-missing and any transfer attempt will fail closed. This flag says nothing
-about bootloader or physical-install capability, which is a separate,
-unproven part of the system.
-
-## Text CLI (declared, not currently wired to any example)
-
-`src/helpers/CommonCLI.cpp` parses these plain-text commands the same way
-it parses `advert`, `clock`, or `set` — see [CLI Commands](cli_commands.md)
-for the general command mechanism. `start ota` (USB/BLE bootloader DFU) is
-a separate, pre-existing feature and is not affected by any of this. As
-explained above, every command in this table returns "OTA unsupported" (or
-fails) on `simple_repeater`, `simple_room_server`, and `simple_sensor` as
-currently shipped, and does not exist at all on `companion_radio`, which
-uses the binary protocol instead. The table is included so the intended
-surface is documented, not as a claim that it works today.
-
-| Command | Intended effect |
-| --- | --- |
-| `ota status` | Reports mode, duty-cycle setting and usage, receive/error counters, and internal state machine values. |
-| `set ota.mode <direct\|routed\|fleet>` | Selects which OTA mode the node currently participates in. |
-| `get ota.mode` | Reports the current mode. |
-| `set ota.dutycycle <percent>` | Sets the OTA airtime budget, from just above 0 up to 100. The default is 2% of a 1-hour window (72,000 ms) for background/fleet mode. |
-| `get ota.dutycycle` | Reports the current duty-cycle setting. |
-| `ota direct <freq> <bw> <sf> <cr> <timeout_mins>` | Requests a temporary, high-speed direct-mode radio lease. |
-| `ota abort` | Aborts any in-progress OTA session and reverts an active direct-mode radio lease. |
-| `ota rollback` | Requests a rollback of a staged/candidate update, then aborts the session. |
+`start ota`, the existing local firmware-update facility, is separate from
+LoRa OTA. Keep using the supported local update and recovery procedure for
+deployed nodes while the radio path is being qualified.
+The experimental ESP OTA repeater profile disables the ordinary Wi-Fi
+updater to prevent competing writes to the inactive slot. The ordinary
+repeater profile is unchanged; USB recovery remains separate.
 
 ## Duty-cycle policy in practice
 
-- Background/fleet mode is intended to run at a low default budget (2%
-  airtime) so that campaigns spanning 24–72 hours never crowd out normal
-  mesh traffic.
+- Background/fleet mode defaults to a 2% airtime allowance. A 24–72-hour
+  campaign is a planning window, not a completion guarantee. Ordinary
+  traffic must retain scheduling priority and packet capacity even when
+  the OTA allowance is exhausted.
 - Routed mode may be given a higher temporary budget for an explicitly
   scheduled maintenance window.
 - Direct mode is a short, supervised session and is expected to be bounded
@@ -121,45 +165,32 @@ surface is documented, not as a claim that it works today.
   implemented enforcement mechanism today.
 - Unused OTA allowance expires at the end of its window; it does not carry
   over into a later burst.
-- **Known gap, 2026-09-30**: an airtime-budget stress run correctly
-  enforced the millisecond quota itself (71,851 of 72,000 ms used, no
-  overshoot) and correctly refused further OTA sends once the cap was
-  reached, but once the radio's shared outgoing-packet pool filled up with
-  queued OTA traffic, sending an ordinary self-advert failed outright
-  (`ERR_TABLE_FULL`) rather than being prioritized. So the duty-cycle
-  *time* budget is enforced, but ordinary traffic is not yet guaranteed to
-  keep working once sustained OTA load has filled the shared packet pool.
-  A firmware fix reserving pool capacity for non-OTA traffic is in
-  progress; this section will be updated once a clean re-run confirms it.
+- An earlier 2026-09-30 pressure run reached 71,851 of 72,000 ms without
+  overshoot but failed ordinary advert allocation with `ERR_TABLE_FULL`.
+  A later full run at 12:26:14 UTC reached 71,822 ms and delivered an
+  ordinary advert in 0.983 s without increasing OTA usage. This is
+  historical evidence for the queue-capacity fix, not qualification of
+  the replacement. A numerical quota pass alone is insufficient.
 
 See the [design document's duty-cycle section](lora_ota_design.md#duty-cycle-behaviour)
 for the full policy model.
 
-## What administrators can honestly rely on today
+## Earlier hardware evidence, not replacement qualification
 
-- Setting mode and duty cycle, and reading them back, works as documented
-  above on any OTA-enabled **companion-radio** build, using the binary
-  `CMD_OTA_CONTROL` protocol. It does not work through the text CLI on any
-  currently shipped example.
-- `OTA_CTRL_GET_STATUS` accurately reflects internal protocol state and is
-  useful for diagnosing lab or bench sessions.
+- Earlier **companion-radio** lab builds supported setting mode and duty
+  cycle, reading them back, and inspecting status through `CMD_OTA_CONTROL`.
+  Those checks must be repeated against the replacement.
 - A direct-mode radio lease correctly applies and automatically reverts
   temporary radio parameters; this was confirmed on repeated lab runs over
-  real RF at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5. The most recent
-  full-harness run did not re-confirm this: it stopped earlier, at a
-  nondeterministic `normal-traffic-precedence` check failure (see the
-  [developer guide](lora_ota_development.md#current-hardware-evidence)),
-  so treat this as last-known-good rather than currently reconfirmed.
-- A signed firmware transfer over the wire protocol now stages a complete
-  test image: as of 2026-09-30, an isolated run (`make
-  test-xiao-nrf52-ota-stage`) took a signed image descriptor through
-  authorization, all data chunks, and commit to a fully staged state on
-  `target` (the earlier wire-descriptor byte-order bug and chunk/serial-
-  frame size mismatch are both fixed). This run deliberately skips
-  normal-traffic precedence, the direct-mode lease, fleet-control probes,
-  and the duty-cycle test, so it is evidence for staging specifically, not
-  a full RF baseline pass, and it still does not install anything on the
-  device. See the
+  real RF at 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5. Earlier harness
+  runs also encountered traffic-priority failures. Those
+  results and later fixes are recorded in the
+  [developer guide](lora_ota_development.md#current-hardware-evidence).
+  None qualifies the replacement's direct-mode path.
+- A historical 2026-09-30 run staged a small signed test image through the
+  earlier wire protocol. Its final message completed staging; it was not
+  the replacement's explicit installation COMMIT. The test image was not
+  bootable firmware, and the old staging command has been removed. See the
   [developer guide](lora_ota_development.md#current-hardware-evidence) for
   specifics and dates.
 - Nothing here yet results in an installed firmware update on a real device.

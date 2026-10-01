@@ -213,13 +213,20 @@ def authorized_serials():
 
 def validate_artifact(artifact_path, board, key_header, role_id=0):
     """Artifact-only checks: UF2 structure/whitelist plus the boot-info
-    marker/board/key/role. Runs with no serial, port, or mounted-device
+    marker/board/role/capability. Runs with no serial, port, or mounted-device
     resolution -- callable standalone (e.g. in CI, before any board is
     connected) via --validate-only.
+
+    key_header is OPTIONAL (may be None): see
+    verify_boot_info_artifact.check_artifact() -- it is only an opt-in
+    build-provenance cross-check of the marker's
+    reference_signer_public_key_ed25519, never a runtime trust requirement
+    and never defaulted to a compiled key here.
     """
     artifact = Path(artifact_path)
     validate_uf2(artifact)
-    marker_errors = boot_info.check_artifact(artifact, board, Path(key_header), role_id)
+    marker_errors = boot_info.check_artifact(
+        artifact, board, Path(key_header) if key_header is not None else None, role_id)
     if marker_errors:
         raise ValueError(
             "boot-info marker in artifact failed independent verification: "
@@ -229,10 +236,7 @@ def validate_artifact(artifact_path, board, key_header, role_id=0):
 
 def install(args):
     board = getattr(args, "board", "xiao_nrf52840")
-    key_header = getattr(
-        args, "key_header",
-        Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",
-    )
+    key_header = getattr(args, "key_header", None)
     role_id = getattr(args, "role_id", 0)
     validate_artifact(args.artifact, board, key_header, role_id)
 
@@ -327,9 +331,14 @@ def parse_args():
                              "the artifact's boot-info marker must match: 0 "
                              "(companion, default) or 1 (repeater)")
     parser.add_argument(
-        "--key-header", type=Path,
-        default=Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",
-        help="public key header the artifact's trusted_public_key field must match",
+        "--key-header", type=Path, default=None,
+        help="OPTIONAL: public key header to cross-check against the "
+             "artifact's boot-info marker reference_signer_public_key_ed25519 "
+             "field (a build-provenance check only). Omit to skip the check "
+             "entirely -- there is no compiled/default key here, and this "
+             "is never the bootloader's actual install-command trust key "
+             "(that key is read per-command from "
+             "admitted_signer_public_key_ed25519)",
     )
     parser.add_argument("--by-id-dir", default="/dev/serial/by-id")
     parser.add_argument("--mountinfo", default="/proc/self/mountinfo")

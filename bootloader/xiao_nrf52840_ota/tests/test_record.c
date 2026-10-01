@@ -31,8 +31,7 @@ int main(void) {
   memset(&a, 0, sizeof(a));
   memset(&b, 0, sizeof(b));
   memset(&confirmation, 0, sizeof(confirmation));
-  assert(sizeof(xiao_ota_canonical_descriptor_t) == 71);
-  assert(sizeof(xiao_ota_command_t) == 200);
+  assert(sizeof(xiao_ota_command_v2_t) == 220);
   assert(sizeof(xiao_ota_state_t) == 152);
   assert((sizeof(xiao_ota_state_t) & 3u) == 0);
   /* Sidecar design acceptance: exact frozen 88-byte layout/offsets, never
@@ -172,7 +171,6 @@ int main(void) {
     uint8_t reencoded[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
     uint8_t tampered[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
     xiao_ota_command_v2_t cmd_v2;
-    xiao_ota_command_t cmd_v1;
     xiao_ota_install_command_t intent;
     xiao_ota_command_any_t any;
 
@@ -253,7 +251,7 @@ int main(void) {
 
     memset(&cmd_v2, 0, sizeof(cmd_v2));
     cmd_v2.magic = XIAO_OTA_RECORD_MAGIC;
-    cmd_v2.record_version = XIAO_OTA_COMMAND_VERSION_WIRE_V2;
+    cmd_v2.record_version = XIAO_OTA_COMMAND_VERSION_CURRENT;
     cmd_v2.record_bytes = sizeof(cmd_v2);
     cmd_v2.sequence = 1;
     cmd_v2.transaction_nonce = 0xABCDEF0123456789ULL;
@@ -264,7 +262,6 @@ int main(void) {
     cmd_v2.commit_marker = XIAO_OTA_COMMIT_MARKER;
 
     assert(xiao_ota_command_v2_valid(&cmd_v2));
-    assert(!xiao_ota_command_valid((const xiao_ota_command_t *)&cmd_v2));
 
     assert(xiao_ota_install_command_from_v2(&cmd_v2, &intent));
     assert(intent.transaction_nonce == cmd_v2.transaction_nonce);
@@ -361,63 +358,34 @@ int main(void) {
     {
       /* v2 has no device-targeting field; device_address is forced 0 and
        * allow_broadcast forced 1, so ANY device address here still passes
-       * (this is the real broadcast-only limitation of v2, not a bug --
-       * v1 retains per-device targeting; see the v1 check below). */
+       * -- this is the real, permanent broadcast-only limitation of the
+       * single supported command format. */
       assert(xiao_ota_install_command_policy_valid(&intent, 4, 0x2000, 0x1234));
       assert(xiao_ota_install_command_policy_valid(&intent, 4, 0x2000, 0xFFFFFFFFu));
     }
 
-    /* Structural rejection: wrong record_version byte must not validate as v1 or v2. */
-    cmd_v2.record_version = 3;
+    /* Structural rejection: wrong record_version byte must not validate.
+     * 2 is deliberately the retired prior version (same 59-byte wire
+     * descriptor, compile-time fixed trust anchor, no admitted-key
+     * field) -- a genuinely different, meaningful wrong value here, not
+     * an arbitrary magic number. */
+    cmd_v2.record_version = 2;
     cmd_v2.crc32 = xiao_ota_crc32(&cmd_v2, offsetof(xiao_ota_command_v2_t, crc32));
     assert(!xiao_ota_command_v2_valid(&cmd_v2));
     memcpy(&any, &cmd_v2, sizeof(cmd_v2));
     assert(!xiao_ota_command_any_valid(&any));
-    cmd_v2.record_version = XIAO_OTA_COMMAND_VERSION_WIRE_V2;
+    cmd_v2.record_version = XIAO_OTA_COMMAND_VERSION_CURRENT;
     cmd_v2.crc32 = xiao_ota_crc32(&cmd_v2, offsetof(xiao_ota_command_v2_t, crc32));
 
-    /* xiao_ota_command_any_valid()/xiao_ota_install_command_decode() dispatch
-     * correctly by version, with no cross-version fallback. */
+    /* xiao_ota_command_any_valid()/xiao_ota_install_command_decode() are
+     * equivalent to their xiao_ota_command_v2_valid()/
+     * xiao_ota_install_command_from_v2() counterparts. */
     memcpy(&any, &cmd_v2, sizeof(cmd_v2));
     assert(xiao_ota_command_any_valid(&any));
     {
       xiao_ota_install_command_t any_intent;
       assert(xiao_ota_install_command_decode(&any, &any_intent));
       assert(any_intent.image_size_bytes == 0x1000);
-    }
-
-    /* A legacy v1 command builds an equivalent, independently-checked intent
-     * via the SAME shared policy function -- v1 and v2 share one policy path. */
-    memset(&cmd_v1, 0, sizeof(cmd_v1));
-    cmd_v1.magic = XIAO_OTA_RECORD_MAGIC;
-    cmd_v1.record_version = XIAO_OTA_COMMAND_VERSION_LEGACY_V1;
-    cmd_v1.record_bytes = sizeof(cmd_v1);
-    cmd_v1.sequence = 1;
-    cmd_v1.transaction_nonce = 0x1122334455667788ULL;
-    cmd_v1.descriptor.target_id_le = XIAO_OTA_TARGET_XIAO_NRF52840;
-    cmd_v1.descriptor.role_id_le = XIAO_OTA_COMPILED_ROLE_ID;
-    cmd_v1.descriptor.device_address_le = 0xFEDCBA98;
-    cmd_v1.descriptor.allow_broadcast_address = 0;
-    cmd_v1.descriptor.required_boot_capability_flags_le = XIAO_OTA_CAP_QSPI_INSTALL;
-    cmd_v1.descriptor.monotonic_counter_le = 5;
-    cmd_v1.descriptor.image_size_bytes_le = 0x1000;
-    cmd_v1.descriptor.app_address_le = 0x27000;
-    cmd_v1.descriptor.format_id_le = XIAO_OTA_DESCRIPTOR_FORMAT;
-    cmd_v1.descriptor.key_id_le = XIAO_OTA_KEY_ID;
-    cmd_v1.descriptor.algorithm_id_le = XIAO_OTA_ALGORITHM_ED25519;
-    memcpy(cmd_v1.descriptor.image_hash_sha256, golden_wire + 13, 32);
-    cmd_v1.active_image_extent = 0x2000;
-    cmd_v1.crc32 = xiao_ota_crc32(&cmd_v1, offsetof(xiao_ota_command_t, crc32));
-    cmd_v1.commit_marker = XIAO_OTA_COMMIT_MARKER;
-
-    assert(xiao_ota_command_valid(&cmd_v1));
-    assert(!xiao_ota_command_v2_valid((const xiao_ota_command_v2_t *)&cmd_v1));
-    {
-      xiao_ota_install_command_t v1_intent;
-      assert(xiao_ota_install_command_from_v1(&cmd_v1, &v1_intent));
-      assert(xiao_ota_install_command_policy_valid(&v1_intent, 4, 0x2000, 0xFEDCBA98));
-      /* Exact-device match (not broadcast) also accepts, for v1 only. */
-      assert(!xiao_ota_install_command_policy_valid(&v1_intent, 4, 0x2000, 0x1234));
     }
   }
 

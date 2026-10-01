@@ -1,12 +1,21 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
+#include <algorithm>
 #include <cmath>
 #include <Mesh.h>
 #include <helpers/ota/OtaBoardBackendCommon.h>
+#include <helpers/ota/OtaBlockSigning.h>
 #include <helpers/ota/OtaDirectLease.h>
 #include <helpers/ota/OtaMeshHooks.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
+__attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
+  out = mesh::ota::OtaBootLifecycleEvidence();
+  return false;
+}
+__attribute__((weak)) bool otaBoardBootLifecycleVerificationPending() { return false; }
+#include <helpers/ota/OtaRfFrames.h>
+#include <helpers/ota/OtaRfUploader.h>
 #if MESHCORE_LORA_OTA
 #include <helpers/radiolib/OtaTrialRadioReadiness.h>
 #endif
@@ -14,6 +23,7 @@
 #define PUSH_CODE_OTA_EVENT             0x91 // hardware-lab OTA receive evidence
 
 #if MESHCORE_LORA_OTA
+__attribute__((weak)) bool otaBoardApplyRfProfile(float, float, uint8_t, uint8_t) { return false; }
 __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
   return false;
 }
@@ -81,54 +91,7 @@ __attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
 __attribute__((weak)) bool otaBoardStorageIoFaultObserved() {
   return false;
 }
-
-// Baseline-measurement-collector source hooks (see
-// helpers/ota/OtaBoardBaselineMeasurementSource.h /
-// OtaBaselineMeasurementCollector.h): weak defaults fail closed so any
-// build with no real backend override never produces fabricated
-// evidence -- the collector simply cannot progress past whichever phase
-// first hits a weak default.
-namespace mesh {
-namespace ota {
-__attribute__((weak)) bool otaBoardBaselineReadUid8(uint8_t[8]) { return false; }
-__attribute__((weak)) bool otaBoardBaselineReadCompiledProfile(uint32_t&, uint32_t&, uint32_t&, uint32_t&) {
-  return false;
-}
-__attribute__((weak)) bool otaBoardBaselineReadRawCurrentSdkSettings(uint8_t[kOtaCurrentSdkSettingsRecordBytes]) {
-  return false;
-}
-__attribute__((weak)) bool otaBoardBaselineReadValidatedBank0Extent(uint32_t&, uint32_t&, uint16_t&) {
-  return false;
-}
-__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepAppImageAccess(uint32_t, uint32_t* out_bytes_consumed,
-                                                                                       const uint8_t**, uint32_t*) {
-  *out_bytes_consumed = 0;
-  return OtaBaselineMeasurementSubStep::Failed;
-}
-__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepStockLoaderRangeHash(
-    uint32_t, uint32_t* out_bytes_consumed, uint32_t&, uint32_t&, uint8_t*) {
-  *out_bytes_consumed = 0;
-  return OtaBaselineMeasurementSubStep::Failed;
-}
-__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepBootConfigSelection(
-    uint32_t, uint32_t* out_bytes_consumed, uint32_t&, bool& out_catalogue_unavailable, bool& out_mismatch) {
-  *out_bytes_consumed = 0;
-  out_catalogue_unavailable = true;
-  out_mismatch = false;
-  return OtaBaselineMeasurementSubStep::Failed;
-}
-__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepQspiStateInspection(
-    uint32_t, uint32_t* out_bytes_consumed) {
-  *out_bytes_consumed = 0;
-  return OtaBaselineMeasurementSubStep::Failed;
-}
-__attribute__((weak)) bool otaBoardBaselineGetPlatformEntropy16(uint8_t[16]) { return false; }
-__attribute__((weak)) OtaBaselineMeasurementArbiterResult otaBoardBaselineAcquireMediaArbiter() {
-  return OtaBaselineMeasurementArbiterResult::Unavailable;
-}
-__attribute__((weak)) void otaBoardBaselineReleaseMediaArbiter() {}
-}  // namespace ota
-}  // namespace mesh
+#endif
 
 void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
 #if MESHCORE_LORA_OTA
@@ -139,7 +102,8 @@ void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
   if (_serial->isConnected()) {
     int i = 0;
     out_frame[i++] = PUSH_CODE_OTA_EVENT;
-    out_frame[i++] = packet->payload_len >= 4 ? packet->payload[3] : 0;
+    out_frame[i++] = packet->payload_len >= 4 && packet->payload[0] == 0x4F ?
+                         packet->payload[3] : (packet->payload_len ? packet->payload[0] : 0);
     out_frame[i++] = packet->getRouteType();
     out_frame[i++] = packet->getPathHashSize();
     out_frame[i++] = after.rxFrames != before.rxFrames ? 1 : 0;
@@ -152,7 +116,6 @@ void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
   Mesh::onOtaDataRecv(packet);
 #endif
 }
-#endif
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -1087,11 +1050,6 @@ void MyMesh::onSendTimeout() {}
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0)
-#if MESHCORE_LORA_OTA
-      , _ota_baseline_source_(self_id.pub_key, _ota_service_), _ota_baseline_collector_(_ota_baseline_source_)
-      , _ota_measurement_job_backend_(_ota_baseline_collector_)
-      , _ota_control_entropy_(), _ota_control_router_(_ota_control_entropy_, _ota_control_backend_slot_)
-#endif
 {
   _iter_started = false;
   _cli_rescue = false;
@@ -1251,19 +1209,20 @@ void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool al
   // 2% before constrain(), since NaN silently passes a `<= 0.0f` check
   // (all NaN comparisons are false) and would otherwise reach constrain()
   // and the airtime-budget float->integer conversion undefined.
-  if (!std::isfinite(_prefs.ota_duty_percent) || _prefs.ota_duty_percent <= 0.0f) {
+  if (!std::isfinite(_prefs.ota_duty_percent) || _prefs.ota_duty_percent < 0.0f) {
     _prefs.ota_duty_percent = 2.0f;
   }
-  _prefs.ota_duty_percent = constrain(_prefs.ota_duty_percent, 0.1f, 100.0f);
+  _prefs.ota_duty_percent = constrain(_prefs.ota_duty_percent, 0.0f, 100.0f);
 #if MESHCORE_LORA_OTA
   getOtaIntegration().setMode(static_cast<mesh::ota::FirmwareOtaMode>(_prefs.ota_mode));
   getOtaIntegration().setDutyCyclePercent(_prefs.ota_duty_percent);
   setOtaAirtimeDutyCyclePercent(_prefs.ota_duty_percent);
+  getOtaIntegration().setLeanAdminCheck(this, &MyMesh::otaAdminCheckThunk);
+  if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
+  getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSelfIdSignThunk, &MyMesh::otaRadioChangeThunk,
+                                       static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
+  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk);
   configureCompanionFirmwareOtaBackend(getOtaIntegration());
-  // Real MEASURE/POLL/READ_OBJECT job backend for the USB commissioning
-  // router -- Certify/Prepare/Activate remain NoCapacity from this same
-  // backend until Authority's/Store's adapters are bound separately.
-  _ota_control_backend_slot_.bind(&_ota_measurement_job_backend_);
 #endif
 
 #ifdef BLE_PIN_CODE // 123456 by default
@@ -1352,6 +1311,9 @@ void MyMesh::startInterface(BaseSerialInterface &serial) {
 }
 
 void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) {
+#if MESHCORE_LORA_OTA
+  _ota_rf_uploader.stop(getOtaIntegration());
+#endif
   set_radio_at = futureMillis(2000);
   pending_freq = freq;
   pending_bw = bw;
@@ -1429,6 +1391,8 @@ bool MyMesh::attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider&
 
 void MyMesh::abortFirmwareOta() {
 #if MESHCORE_LORA_OTA
+  _ota_rf_uploader.stop(getOtaIntegration());
+  _ota_upload_active = false;
   getOtaIntegration().abortSession();
 #endif
   if (revert_radio_at || set_radio_at) {
@@ -1447,26 +1411,502 @@ void MyMesh::rollbackFirmwareOta() {
 
 void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
 #if MESHCORE_LORA_OTA
-  auto status = getOtaStatus(_ms->getMillis());
-  snprintf(reply, reply_size,
-           "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu aborts=%lu recv=%u coord=%u fleet=%u lease=%u rollback=%u backend=%u cap=%s",
-           mesh::ota::firmwareOtaModeName(status.mode),
-           status.dutyCyclePercent,
-           (unsigned long)status.dutyUsedMs,
-           (unsigned long)status.dutyBudgetMs,
-           (unsigned long)status.rxFrames,
-           (unsigned long)status.badFrames,
-           (unsigned long)status.abortedSessions,
-           (uint32_t)status.receiverState,
-           (uint32_t)status.coordinatorState,
-           (uint32_t)status.fleetState,
-           (uint32_t)status.leaseState,
-           status.rollbackRequested ? 1 : 0,
-           status.backendAvailable ? 1 : 0,
-           otaBoardInstallCapabilityStatus());
+  auto& integration = getOtaIntegration();
+  const auto boot = integration.bootLifecycle();
+  mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
+                                         integration.reportedPhase(boot), integration.leanReceiver().status().counter);
 #else
   snprintf(reply, reply_size, "OTA unsupported");
 #endif
+}
+
+bool MyMesh::isOtaAdminKey(const uint8_t key[32]) const {
+#if MESHCORE_LORA_OTA
+  if (key == nullptr) return false;
+  if (_identity_available_ && std::memcmp(key, self_id.pub_key, PUB_KEY_SIZE) == 0) return true;
+  ContactInfo* contact = const_cast<MyMesh*>(this)->lookupContactByPubKey(key, PUB_KEY_SIZE);
+  return contact != nullptr && (contact->flags & CONTACT_FLAG_OTA_ADMIN) != 0;
+#else
+  (void)key;
+  return false;
+#endif
+}
+
+bool MyMesh::otaAdminCheckThunk(void* ctx, const uint8_t key[32]) {
+  return ctx != nullptr && static_cast<MyMesh*>(ctx)->isOtaAdminKey(key);
+}
+
+#if MESHCORE_LORA_OTA
+void MyMesh::otaSelfIdSignThunk(void* ctx, const uint8_t* message, size_t message_len, uint8_t signature_out[64]) {
+  static_cast<MyMesh*>(ctx)->self_id.sign(signature_out, message, static_cast<int>(message_len));
+}
+
+bool MyMesh::floodOtaFrame(const uint8_t* frame, size_t frame_len, meshcore::ota::protocol::OtaAirtimeCategory category) {
+  if (_radio == nullptr || frame == nullptr || frame_len == 0) return false;
+  const uint32_t now_ms = _ms->getMillis();
+  if (isSendInProgress() || _mgr->getOutboundTotal() != 0) return false;
+  const uint32_t est_airtime_ms = _radio->getEstAirtimeFor(static_cast<int>(frame_len + 4));
+  if (!getOtaIntegration().canTransmit(now_ms, category, est_airtime_ms, /*regulatory_allowed=*/true,
+                                      /*normal_traffic_active=*/isSendInProgress())) {
+    return false;
+  }
+  auto* pkt = createOtaData(frame, frame_len);
+  if (pkt == nullptr) return false;
+  if (!sendFlood(pkt, static_cast<uint32_t>(0), _prefs.path_hash_mode + 1)) return false;
+  return true;
+}
+
+bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t* frame, size_t frame_len,
+                                        meshcore::ota::protocol::OtaAirtimeCategory category) {
+  if (_radio == nullptr || frame == nullptr || frame_len == 0) return false;
+  const uint32_t now_ms = _ms->getMillis();
+  if (isSendInProgress() || _mgr->getOutboundTotal() != 0) return false;
+  const uint32_t est_airtime_ms = _radio->getEstAirtimeFor(static_cast<int>(frame_len + 4));
+  if (!getOtaIntegration().canTransmit(now_ms, category, est_airtime_ms, /*regulatory_allowed=*/true,
+                                      /*normal_traffic_active=*/isSendInProgress())) {
+    return false;
+  }
+  auto* pkt = createOtaData(frame, frame_len);
+  if (pkt == nullptr) return false;
+  // The frame's own embedded target field is what actually matters (the
+  // remote receiver re-derives its signed message using ITS OWN real
+  // identity, never a wire-routing hint -- see OtaLeanReceiver::commit()/
+  // abort()'s doc comment), so a known direct path is purely an airtime
+  // optimization, never a correctness requirement.
+  ContactInfo* contact = lookupContactByPubKey(target, PUB_KEY_SIZE);
+  if (getOtaIntegration().directActive()) {
+    sendZeroHop(pkt);
+  } else if (contact != nullptr && contact->out_path_len != OUT_PATH_UNKNOWN) {
+    sendDirect(pkt, contact->out_path, contact->out_path_len);
+  } else if (!sendFlood(pkt, static_cast<uint32_t>(0), _prefs.path_hash_mode + 1)) {
+    return false;
+  }
+  return true;
+}
+
+bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore) {
+  auto* mesh = static_cast<MyMesh*>(ctx);
+  return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
+                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
+}
+bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
+  return otaBoardGetBootLifecycle(out);
+}
+
+bool MyMesh::otaSendThunk(void* ctx, mesh::ota::OtaRfRoute route, const uint8_t target[32],
+                          const uint8_t* frame, size_t len, meshcore::ota::protocol::OtaAirtimeCategory category) {
+  auto* mesh = static_cast<MyMesh*>(ctx);
+  if (route == mesh::ota::OtaRfRoute::Directed) {
+    auto* contact = mesh->lookupContactByPubKey(target, PUB_KEY_SIZE);
+    if (!contact || contact->out_path_len == OUT_PATH_UNKNOWN) return false;
+    return mesh->sendOtaControlFrameToTarget(target, frame, len, category);
+  }
+  if (route == mesh::ota::OtaRfRoute::Multicast) {
+    if (mesh->_ota_upload_channel == 0xFF) return mesh->floodOtaFrame(frame, len, category);
+    ChannelDetails channel;
+    if (!mesh->getChannel(mesh->_ota_upload_channel, channel) || !mesh->_radio ||
+        mesh->isSendInProgress() || mesh->_mgr->getOutboundTotal() != 0) return false;
+    if (!mesh->getOtaIntegration().canTransmit(mesh->_ms->getMillis(), category,
+          mesh->_radio->getEstAirtimeFor(len + 8), true, false)) return false;
+    auto* packet = mesh->createOtaData(frame, len);
+    if (!packet) return false;
+    // Same region/scoping rules as ordinary multicast for this channel;
+    // OTA authority remains the original full-key block signature.
+    mesh->sendFloodScoped(channel.channel, packet);
+    return true;
+  }
+  if (!mesh->_radio || mesh->isSendInProgress() || mesh->_mgr->getOutboundTotal() != 0) return false;
+  const uint32_t now = mesh->_ms->getMillis();
+  if (!mesh->getOtaIntegration().canTransmit(now, category, mesh->_radio->getEstAirtimeFor(len + 4), true, false)) return false;
+  auto* packet = mesh->createOtaData(frame, len);
+  if (!packet) return false;
+  mesh->sendZeroHop(packet);
+  return true;
+}
+
+void MyMesh::pumpOtaRfUpload() {
+  if (!_identity_available_) { _ota_rf_uploader.stop(getOtaIntegration()); return; }
+  if (isSendInProgress() || _mgr->getOutboundTotal() != 0) return;
+  if (_ota_stop_upload_when_idle) {
+    _ota_stop_upload_when_idle = false;
+    _ota_rf_uploader.stop(getOtaIntegration());
+  }
+  _ota_rf_uploader.pump(getOtaIntegration(), _ms->getMillis(), this, &MyMesh::otaSelfIdSignThunk, &MyMesh::otaSendThunk);
+  _ota_upload_active = _ota_rf_uploader.active();
+}
+#endif
+
+void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int len) {
+  using namespace mesh::ota::usb;
+
+  UsbOtaReply reply;
+  reply.requestOp = op;
+  reply.setNoSnapshot();
+
+#if MESHCORE_LORA_OTA
+  auto& lean = getOtaIntegration().leanReceiver();
+  auto mapPhase = [](const ::ota::storage::OtaCandidateStore::Phase phase) -> UsbOtaPhase {
+    switch (phase) {
+      case ::ota::storage::OtaCandidateStore::Phase::Receiving: return UsbOtaPhase::Receiving;
+      case ::ota::storage::OtaCandidateStore::Phase::Verifying: return UsbOtaPhase::Verifying;
+      case ::ota::storage::OtaCandidateStore::Phase::Ready: return UsbOtaPhase::Ready;
+      case ::ota::storage::OtaCandidateStore::Phase::Committed: return UsbOtaPhase::CommitPending;
+      case ::ota::storage::OtaCandidateStore::Phase::Aborted: return UsbOtaPhase::Aborted;
+      case ::ota::storage::OtaCandidateStore::Phase::Failed: return UsbOtaPhase::Failed;
+      default: return UsbOtaPhase::Idle;
+    }
+  };
+  auto fillLocalSnapshot = [&]() {
+    const auto snap = lean.status();
+    if (!snap.valid) return;
+    reply.flags |= kReplyFlagSnapshotValid;
+    reply.phase = getOtaIntegration().reportedPhase();
+    std::memcpy(reply.manifestHash, snap.manifestHash, kHashBytes);
+    reply.durableReceivedBlocks = snap.receivedBlocks;
+    reply.totalBlocks = snap.totalBlocks;
+    reply.counter = snap.counter;
+    reply.statusAgeMs = 0;
+  };
+
+  switch (static_cast<UsbOtaOp>(op)) {
+    case UsbOtaOp::SetContactAdmin: {
+      if ((size_t)len != kSetContactAdminTotalBytes || cmd_frame[34] > 1) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t* pub_key = &cmd_frame[2];
+      const bool enable = cmd_frame[2 + kPubKeyBytes] != 0;
+      std::memcpy(reply.target, pub_key, kPubKeyBytes);
+      if (_store->destructiveWritesDisallowed()) {
+        reply.result = UsbOtaResult::Denied;
+        break;
+      }
+      ContactInfo* recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      if (!recipient) {
+        reply.result = UsbOtaResult::NotFound;
+        break;
+      }
+      const uint8_t prev_flags = recipient->flags;
+      if (enable) recipient->flags |= CONTACT_FLAG_OTA_ADMIN;
+      else recipient->flags &= ~CONTACT_FLAG_OTA_ADMIN;
+      recipient->lastmod = getRTCClock()->getCurrentTime();
+      if (saveContacts()) reply.result = UsbOtaResult::Ok;
+      else { recipient->flags = prev_flags; reply.result = UsbOtaResult::IoError; }
+      break;
+    }
+    case UsbOtaOp::CacheBegin: {
+      if ((size_t)len != kCacheBeginTotalBytes || (cmd_frame[2] & ~kCacheBeginFlagReupload)) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t flags = cmd_frame[2];
+      const uint8_t* canonical = &cmd_frame[3 + kPubKeyBytes];
+      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
+      if (reply.result == UsbOtaResult::Ok) {
+        _ota_rf_uploader.stop(getOtaIntegration());
+        _ota_cache_reupload = (flags & kCacheBeginFlagReupload) != 0;
+        _ota_selected_target_count = 0;
+      }
+      // Per the ABI contract, CacheBegin is a LOCAL-CACHE operation and
+      // must echo targetPK32 as all-zero (reply.target already defaults
+      // to zero) -- never the manifest owner's key, which is a distinct
+      // concept from the remote install target.
+      mesh::ota::computeOtaManifestHash(canonical, reply.manifestHash);
+      fillLocalSnapshot();
+      break;
+    }
+    case UsbOtaOp::CachePut: {
+      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
+      if (reply.result == UsbOtaResult::BadRequest) break;
+      fillLocalSnapshot();
+      break;
+    }
+    case UsbOtaOp::CacheSeal: {
+      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
+      if (reply.result == UsbOtaResult::BadRequest) break;
+      fillLocalSnapshot();
+      break;
+    }
+    case UsbOtaOp::AddTarget: {
+      if ((size_t)len != kAddTargetTotalBytes) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t* target = &cmd_frame[2];
+      std::memcpy(reply.target, target, kPubKeyBytes);
+      if (std::all_of(target, target + 32, [](uint8_t b) { return b == 0; }) ||
+          (_identity_available_ && !std::memcmp(target, self_id.pub_key, 32))) {
+        reply.result = UsbOtaResult::BadRequest; break;
+      }
+      bool exists = false;
+      for (uint8_t i = 0; i < _ota_selected_target_count; ++i) {
+        if (std::memcmp(_ota_selected_targets[i], target, kPubKeyBytes) == 0) { exists = true; break; }
+      }
+      if (!exists) {
+        if (_ota_selected_target_count >= kMaxSelectedTargets) reply.result = UsbOtaResult::Busy;
+        else {
+          std::memcpy(_ota_selected_targets[_ota_selected_target_count++], target, kPubKeyBytes);
+          reply.result = UsbOtaResult::Ok;
+        }
+      } else {
+        reply.result = UsbOtaResult::Ok;
+      }
+      fillLocalSnapshot();
+      break;
+    }
+    case UsbOtaOp::Start: {
+      if ((size_t)len != kStartTotalBytes) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t mode = cmd_frame[2];
+      const uint8_t channel = cmd_frame[3];
+      const uint32_t frequency_khz = getBE32(cmd_frame + 4);
+      const uint32_t lease_ms = getBE16(&cmd_frame[8]);
+      const uint32_t duty_milli_percent = getBE32(&cmd_frame[10]);
+      if (mode != kStartModeDirect && mode != kStartModeDirected && mode != kStartModeBackground) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      if ((mode != kStartModeBackground && channel != kStartChannelDirectedOrDirect) ||
+          (mode != kStartModeDirect && (frequency_khz != 0 || lease_ms != 0)) ||
+          (mode == kStartModeDirect && (frequency_khz < 150000 || frequency_khz > 2500000 ||
+            frequency_khz == static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f) ||
+            lease_ms < kDirectLeaseMsMin || lease_ms > kDirectLeaseMsMax))) {
+        reply.result = UsbOtaResult::BadRequest; break;
+      }
+      if ((mode == kStartModeDirect || mode == kStartModeDirected) && _ota_selected_target_count != 1) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      if (_ota_selected_target_count == 0) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      if (duty_milli_percent > kDutyMilliPercentMax) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const auto snap = lean.status();
+      if (!snap.valid || snap.phase != ::ota::storage::OtaCandidateStore::Phase::Ready) {
+        reply.result = UsbOtaResult::NotFound;
+        break;
+      }
+      if (!_identity_available_) {
+        reply.result = UsbOtaResult::Unavailable;
+        break;
+      }
+      if (!snap.localCache || std::memcmp(snap.ownerPublicKey, self_id.pub_key, 32)) {
+        reply.result = UsbOtaResult::Denied; break;
+      }
+      if (mode != kStartModeDirect) {
+        bool routable = true;
+        for (uint8_t i = 0; i < _ota_selected_target_count; ++i) {
+          const auto* contact = lookupContactByPubKey(_ota_selected_targets[i], PUB_KEY_SIZE);
+          if (!contact || contact->out_path_len == OUT_PATH_UNKNOWN) routable = false;
+        }
+        if (!routable) { reply.result = UsbOtaResult::Busy; break; }
+      }
+      if (mode == kStartModeBackground && channel != 0xFF) {
+        ChannelDetails selected;
+        if (!getChannel(channel, selected)) { reply.result = UsbOtaResult::BadRequest; break; }
+      }
+      // Duty is a real caller-configured share, never pinned to the
+      // 2% default -- setDutyCyclePercent() enforces/propagates the
+      // existing airtime-limiter bounds (0..100%), including a genuine
+      // explicit pause at 0%.
+      if (!getOtaIntegration().setDutyCyclePercent(duty_milli_percent / 1000.0f)) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      setOtaAirtimeDutyCyclePercent(duty_milli_percent / 1000.0f);
+      getOtaIntegration().setMode(static_cast<mesh::ota::FirmwareOtaMode>(mode));
+      for (uint8_t i = 0; i < _ota_selected_target_count; ++i) {
+        getOtaIntegration().trackOtaTarget(_ota_selected_targets[i]);
+      }
+      _ota_upload_channel = channel;
+      _ota_upload_active = _ota_rf_uploader.start(getOtaIntegration(), mode, &_ota_selected_targets[0][0],
+                                                  _ota_selected_target_count, frequency_khz, lease_ms,
+                                                  getRNG()->nextInt(1, 0x7FFFFFFF), _ota_cache_reupload);
+      reply.result = _ota_upload_active ? UsbOtaResult::Ok : UsbOtaResult::BadRequest;
+      fillLocalSnapshot();
+      break;
+    }
+    case UsbOtaOp::Commit: {
+      if ((size_t)len != kCommitTotalBytes) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t* target = &cmd_frame[2];
+      const uint8_t* manifest_hash = &cmd_frame[2 + kPubKeyBytes];
+      const uint32_t counter = getBE32(&cmd_frame[2 + kPubKeyBytes + kHashBytes]);
+      std::memcpy(reply.target, target, kPubKeyBytes);
+      std::memcpy(reply.manifestHash, manifest_hash, kHashBytes);
+      reply.counter = counter;
+      if (!_identity_available_) {
+        reply.result = UsbOtaResult::Unavailable;
+        break;
+      }
+      const bool local_target = std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0;
+      const auto snap = lean.status();
+      if (local_target) {
+        if (!snap.valid) { reply.result = UsbOtaResult::NotFound; break; }
+        if (std::memcmp(snap.manifestHash, manifest_hash, kHashBytes) != 0) { reply.result = UsbOtaResult::Mismatch; break; }
+        uint8_t message[kCommitSignedBytes] = {};
+        const size_t message_len = buildCommitSignedMessage(target, manifest_hash, counter, message);
+        uint8_t signature[64] = {};
+        self_id.sign(signature, message, static_cast<int>(message_len));
+        reply.result = lean.commit(counter, signature);
+        fillLocalSnapshot();
+        break;
+      }
+      // Remote target: a real signed COMMIT frame, destined for exactly
+      // the real device whose identity the ABI caller supplied. The
+      // snapshot bits of the reply are deliberately left at setNoSnapshot()
+      // defaults (never this node's OWN local candidate state, which
+      // would be a different device entirely) -- only target/manifestHash/
+      // counter/kReplyFlagRemote are meaningful here.
+      if (!snap.valid || std::memcmp(snap.manifestHash, manifest_hash, kHashBytes) != 0) {
+        reply.result = UsbOtaResult::Mismatch;
+        reply.flags |= kReplyFlagRemote;
+        break;
+      }
+      uint8_t message[kCommitSignedBytes] = {};
+      const size_t message_len = buildCommitSignedMessage(target, manifest_hash, counter, message);
+      uint8_t signature[64] = {};
+      self_id.sign(signature, message, static_cast<int>(message_len));
+      uint8_t frame[mesh::ota::kOtaCommitFrameBytes] = {};
+      const size_t frame_len = mesh::ota::encodeOtaCommitFrame(target, manifest_hash, counter, signature, frame, sizeof(frame));
+      reply.flags |= kReplyFlagRemote;
+      if (frame_len != 0 &&
+          sendOtaControlFrameToTarget(target, frame, frame_len, meshcore::ota::protocol::OtaAirtimeCategory::Control)) {
+        reply.result = UsbOtaResult::Ok;
+        _ota_stop_upload_when_idle = _ota_rf_uploader.mode() == kStartModeDirect || _ota_selected_target_count == 1;
+      } else {
+        reply.result = UsbOtaResult::Busy; // airtime-denied/unroutable this instant; caller may retry.
+      }
+      break;
+    }
+    case UsbOtaOp::Abort: {
+      if ((size_t)len != kAbortTotalBytes) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t* target = &cmd_frame[2];
+      const uint8_t* image_hash = &cmd_frame[2 + kPubKeyBytes];
+      std::memcpy(reply.target, target, kPubKeyBytes);
+      std::memcpy(reply.manifestHash, image_hash, kHashBytes);
+      const bool zero_target = std::all_of(target, target + kPubKeyBytes, [](uint8_t b) { return b == 0; });
+      const bool local_target = zero_target || (_identity_available_ && std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0);
+      if (!_identity_available_) {
+        reply.result = UsbOtaResult::Unavailable;
+        break;
+      }
+      if (local_target) {
+        uint8_t message[kAbortSignedBytes] = {};
+        const size_t message_len = buildAbortSignedMessage(self_id.pub_key, image_hash, message);
+        uint8_t signature[64] = {};
+        self_id.sign(signature, message, static_cast<int>(message_len));
+        reply.result = lean.abort(self_id.pub_key, signature, image_hash, true);
+        if (reply.result == UsbOtaResult::Ok) {
+          _ota_rf_uploader.stop(getOtaIntegration()); _ota_upload_active = false;
+        }
+        fillLocalSnapshot();
+        break;
+      }
+      // Remote target: any CURRENT admin may abort (not only the
+      // original manifest owner, per the agreed asymmetric authority
+      // rule) -- sign with THIS node's own identity (never a copied
+      // target private key) over a message built against the REAL
+      // destination's public key, exactly what the remote's own
+      // OtaLeanReceiver::abort() reconstructs using its own identity.
+      uint8_t message[kAbortSignedBytes] = {};
+      const size_t message_len = buildAbortSignedMessage(target, image_hash, message);
+      uint8_t signature[64] = {};
+      self_id.sign(signature, message, static_cast<int>(message_len));
+      uint8_t frame[mesh::ota::kOtaAbortFrameBytes] = {};
+      const size_t frame_len =
+          mesh::ota::encodeOtaAbortFrame(self_id.pub_key, target, image_hash, signature, frame, sizeof(frame));
+      reply.flags |= kReplyFlagRemote;
+      if (frame_len != 0 &&
+          sendOtaControlFrameToTarget(target, frame, frame_len, meshcore::ota::protocol::OtaAirtimeCategory::Control)) {
+        reply.result = UsbOtaResult::Ok;
+        // Keep the direct profile until the signed ABORT actually leaves
+        // the TX queue; restoring at enqueue would strand the receiver.
+        _ota_stop_upload_when_idle = _ota_rf_uploader.mode() == kStartModeDirect || _ota_selected_target_count == 1;
+      } else {
+        reply.result = UsbOtaResult::Busy;
+      }
+      break;
+    }
+    case UsbOtaOp::Status: {
+      if ((size_t)len != kStatusTotalBytes) {
+        reply.result = UsbOtaResult::BadRequest;
+        break;
+      }
+      const uint8_t* target = &cmd_frame[2];
+      std::memcpy(reply.target, target, kPubKeyBytes);
+      const bool zero_target = std::all_of(target, target + kPubKeyBytes, [](uint8_t b) { return b == 0; });
+      const bool local_target = zero_target || (_identity_available_ && std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0);
+      if (local_target) {
+        reply.result = UsbOtaResult::Ok;
+        fillLocalSnapshot();
+        break;
+      }
+      // Remote target: actively solicit a FRESH observation every call
+      // -- never answer purely from whatever was last cached, which is
+      // exactly the stale-READY-authorizes-COMMIT hazard MAIN flagged.
+      // A poll is sent (airtime permitting) before reporting the cache,
+      // so a caller that waits for `statusAgeMs` to drop below its own
+      // poll-start timestamp can tell a genuinely fresh reply from an
+      // old one; "no report ever observed" always stays distinguishable
+      // via setNoSnapshot()'s kStatusAgeUnknown sentinel.
+      reply.flags |= kReplyFlagRemote;
+      if (!_identity_available_) {
+        reply.result = UsbOtaResult::Unavailable;
+        break;
+      }
+      getOtaIntegration().trackOtaTarget(target);
+      const auto local_snap = lean.status();
+      if (local_snap.valid) {
+        uint8_t poll_frame[mesh::ota::kOtaCensusPollBytes] = {};
+        const size_t poll_len = mesh::ota::encodeOtaCensusPoll(target, local_snap.manifestHash, 0, poll_frame, sizeof(poll_frame));
+        if (poll_len != 0) {
+          sendOtaControlFrameToTarget(target, poll_frame, poll_len, meshcore::ota::protocol::OtaAirtimeCategory::Control);
+        }
+      }
+      mesh::ota::OtaFirmwareIntegration::TargetObservation obs;
+      const bool tracked = getOtaIntegration().targetObservation(target, _ms->getMillis(), obs);
+      if (!tracked || !obs.haveReport || !obs.haveBitmap || !local_snap.valid ||
+          std::memcmp(obs.manifestHash, local_snap.manifestHash, 32)) {
+        reply.result = UsbOtaResult::Ok; // tracked-but-never-observed is a valid, truthful "Unknown" answer, not an error.
+        break;
+      }
+      reply.result = UsbOtaResult::Ok;
+      reply.flags |= kReplyFlagSnapshotValid;
+      std::memcpy(reply.manifestHash, obs.manifestHash, 32);
+      reply.phase = obs.haveLifecycle ? obs.lifecyclePhase :
+                      mapPhase(static_cast<::ota::storage::OtaCandidateStore::Phase>(obs.phase));
+      reply.durableReceivedBlocks = obs.receivedBlocks;
+      reply.totalBlocks = obs.totalBlocks;
+      reply.statusAgeMs = obs.ageMs;
+      reply.counter = obs.haveLifecycle ? obs.counter : local_snap.counter;
+      break;
+    }
+    default:
+      reply.result = UsbOtaResult::Unsupported;
+      break;
+  }
+
+#else
+  (void)cmd_frame;
+  (void)len;
+  reply.result = UsbOtaResult::Unsupported;
+#endif
+  uint8_t out[kReplyBytes];
+  encodeUsbOtaReply(reply, out);
+  _serial->writeFrame(out, kReplyBytes);
 }
 
 
@@ -1781,13 +2221,34 @@ void MyMesh::handleCmdFrame(size_t len) {
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     uint32_t last_mod = getRTCClock()->getCurrentTime();  // fallback value if not present in cmd_frame
     if (recipient) {
+      // This generic update path is reachable from any app/import flow,
+      // not only the dedicated OTA_CTRL_SET_ADMIN toggle below -- an
+      // app sending a stale/full flags byte must never be able to
+      // silently grant OR revoke OTA admin as a side effect of an
+      // unrelated name/path/favourite edit. Preserve whatever this
+      // contact's OTA-admin bit already was, regardless of what the
+      // wire frame's flags byte says.
+#if MESHCORE_LORA_OTA
+      const bool was_ota_admin = (recipient->flags & CONTACT_FLAG_OTA_ADMIN) != 0;
+#endif
       updateContactFromFrame(*recipient, last_mod, cmd_frame, len);
+#if MESHCORE_LORA_OTA
+      if (was_ota_admin) recipient->flags |= CONTACT_FLAG_OTA_ADMIN;
+      else recipient->flags &= ~CONTACT_FLAG_OTA_ADMIN;
+#endif
       recipient->lastmod = last_mod;
       dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
       writeOKFrame();
     } else {
       ContactInfo contact;
       updateContactFromFrame(contact, last_mod, cmd_frame, len);
+#if MESHCORE_LORA_OTA
+      // A brand new contact (or an import masquerading as one) must
+      // NEVER be born with OTA admin privilege -- that can only be
+      // granted afterwards via the dedicated, locally-trusted
+      // OTA_CTRL_SET_ADMIN toggle.
+      contact.flags &= ~CONTACT_FLAG_OTA_ADMIN;
+#endif
       contact.lastmod = last_mod;
       contact.sync_since = 0;
       if (addContact(contact)) {
@@ -2763,27 +3224,19 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
       }
-    } else if (op >= static_cast<uint8_t>(meshcore::ota::runtime::OtaControlSubcommand::Open) &&
-               op <= static_cast<uint8_t>(meshcore::ota::runtime::OtaControlSubcommand::Close)) {
-      // Source-bound USB commissioning session router (contract section
-      // E): the full 37B request header IS cmd_frame[0..37) (cmd_frame[0]
-      // doubles as both the outer CMD_OTA_CONTROL multiplexer byte and
-      // the ABI header's own cmd field, since they are the same position
-      // on the wire), followed by up to 128B of inline object data.
-      // dispatch() never performs cryptographic signing/verification or
-      // touches flash itself -- see OtaControlSessionRouter.h for the
-      // typed IOtaControlJobBackend seam Authority/Store bind into.
-      if (len < meshcore::ota::protocol::kOtaControlRequestHeaderSize) {
-        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
-      } else {
-        size_t reply_len = _ota_control_router_.dispatch(cmd_frame, len, out_frame, sizeof(out_frame));
-        if (reply_len == 0) {
-          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
-        } else {
-          _serial->writeFrame(out_frame, reply_len);
-        }
-      }
+    } else if (op >= 0x10 && op <= 0x18) {
+      // Lean local-USB uploader/status wire contract (see
+      // helpers/ota/OtaUsbProtocol.h) -- fixed 86-byte reply shape, NOT
+      // writeOKFrame()/writeErrFrame().
+      handleUsbOtaProtocolOp(op, cmd_frame, len);
     } else {
+      // The USB commissioning/session-router subcommand range
+      // (OPEN..CLOSE) that used to be handled here depended on the
+      // now-removed USB control-session-router/measurement-collector
+      // subsystem (see docs/lora_ota_development.md for the cleanup
+      // rationale). Report it as unsupported rather than wiring a
+      // fabricated/placeholder reply; a real minimal uploader API is a
+      // separate, coordinated follow-up.
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     }
 #else
@@ -2894,16 +3347,15 @@ static bool save_filter(const ContactInfo& c) {
   return c.type != ADV_TYPE_NONE;   // don't save the transient/anon entries
 }
 
-void MyMesh::saveContacts() {
+bool MyMesh::saveContacts() {
   const bool ok = _store->saveContacts(this, save_filter);
 #if MESHCORE_LORA_OTA
   // Same latch/rationale as savePrefs() -- a real, already-performed
   // ordinary filesystem write, never a fabricated probe. A policy-
   // refused write must never be misread as a storage fault.
   if (!ok && !_store->destructiveWritesDisallowed()) _ota_service_.noteStorageIoResult(false);
-#else
-  (void)ok;
 #endif
+  return ok;
 }
 
 void MyMesh::enterCLIRescue() {
@@ -3130,6 +3582,10 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
+#if MESHCORE_LORA_OTA
+  if (!_identity_available_) _ota_rf_uploader.stop(getOtaIntegration());
+  getOtaIntegration().tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+#endif
   if (_identity_available_) {
     // Ordinary mesh dispatch (packet TX/RX scheduling, advertising,
     // signing) is entirely identity-dependent -- suppressed whenever
@@ -3139,6 +3595,9 @@ void MyMesh::loop() {
     // maintenance path below still runs either way.
     BaseChatMesh::loop();
     checkTempRadioLease();
+#if MESHCORE_LORA_OTA
+    pumpOtaRfUpload();
+#endif
   }
   // Lease restoration must not be identity-gated -- see
   // revertTempRadioLeaseIfDue()'s doc comment.
@@ -3196,19 +3655,6 @@ bool MyMesh::isRadioStuckOutOfRecv(uint32_t now_ms) {
 }
 
 void MyMesh::tickOtaTrialHealth() {
-  // Drive whichever baseline-measurement job (if any) is currently
-  // Pending, exactly once this tick -- BEFORE the trial-boot health
-  // logic below, and entirely independent of radio_ready/filesystem_
-  // ready: the collector itself has zero radio dependency and must
-  // remain serviceable even while trial-boot health is still unresolved
-  // (see OtaBaselineMeasurementCollector.h). No begin() caller is wired
-  // yet (future USB-bound surface), so on most ticks this is simply a
-  // no-op (status() == Idle).
-  if (_ota_baseline_collector_.status() == mesh::ota::OtaBaselineMeasurementStatus::Pending) {
-    _ota_baseline_collector_.serviceStep(_ota_baseline_collector_.currentTicketId(),
-                                        _ota_baseline_collector_.currentOwnerToken());
-  }
-
   // Reaching this call at all, on every outer-loop pass, IS the
   // "loop_healthy" liveness proof (a crashed/hung/watchdog-reset
   // firmware never gets here again) -- AND, because main.cpp's loop()
@@ -3379,7 +3825,8 @@ bool MyMesh::hasPendingWork() const {
   // radio/filesystem/loop readiness this window requires, and could
   // stall the whole confirmation past the 45-second deadline for no
   // reason other than an otherwise-idle radio queue.
-  trial_active = otaBoardTrialHealthWindowActive();
+  trial_active = otaBoardTrialHealthWindowActive() || otaBoardBootLifecycleVerificationPending() ||
+                   _ota_rf_uploader.active() || getOtaIntegration().hasPendingRfWork();
 #endif
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || trial_active;
 }

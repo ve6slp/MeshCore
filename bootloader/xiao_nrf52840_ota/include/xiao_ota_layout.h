@@ -107,19 +107,6 @@ _Static_assert(XIAO_OTA_FILESYSTEM_SIZE == OTA_NRF52_FILESYSTEM_SIZE,
 #define XIAO_OTA_FLOOR_A               UINT32_C(0x192000)
 #define XIAO_OTA_FLOOR_B               UINT32_C(0x193000)
 
-/* Named 512B-max activation-receipt window carved out of already-reserved
- * space inside EACH floor sector, at a fixed offset -- never overlapping
- * the 60-byte xiao_ota_floor_t record at offset 0 of the same sector, and
- * never expanding the sector itself. See xiao_ota_record.h's
- * xiao_ota_floor_activation_receipt_t doc-comment. */
-#define XIAO_OTA_FLOOR_ACTIVATION_A    (XIAO_OTA_FLOOR_A + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET)
-#define XIAO_OTA_FLOOR_ACTIVATION_B    (XIAO_OTA_FLOOR_B + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET)
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_A == UINT32_C(0x192100), "genesis receipt window A address");
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_B == UINT32_C(0x193100), "genesis receipt window B address");
-_Static_assert(XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE <=
-                  UINT32_C(0x1000), /* XIAO_OTA_QSPI_SECTOR_SIZE, defined below */
-              "genesis receipt window must stay inside its floor sector");
-
 #define XIAO_OTA_QSPI_SECTOR_SIZE      UINT32_C(0x1000)
 #define XIAO_OTA_QSPI_PAGE_SIZE        UINT32_C(0x0100)
 

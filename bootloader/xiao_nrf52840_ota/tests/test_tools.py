@@ -17,6 +17,7 @@ Makefile's `unittest discover -p test_tools.py` wiring):
 """
 
 import binascii
+import hashlib
 import importlib.util
 import os
 import struct
@@ -43,6 +44,16 @@ SIGN_SCRIPT = ROOT / "bootloader/xiao_nrf52840_ota/tools/sign_image.py"
 SIGN_SPEC = importlib.util.spec_from_file_location("sign_image", SIGN_SCRIPT)
 SIGN = importlib.util.module_from_spec(SIGN_SPEC)
 SIGN_SPEC.loader.exec_module(SIGN)
+
+BUILD_MANIFEST_SCRIPT = ROOT / "bootloader/xiao_nrf52840_ota/tools/build_manifest.py"
+BUILD_MANIFEST_SPEC = importlib.util.spec_from_file_location("build_manifest", BUILD_MANIFEST_SCRIPT)
+BUILD_MANIFEST = importlib.util.module_from_spec(BUILD_MANIFEST_SPEC)
+BUILD_MANIFEST_SPEC.loader.exec_module(BUILD_MANIFEST)
+
+DESCRIPTOR_SCRIPT = ROOT / "bootloader/xiao_nrf52840_ota/tools/xiao_ota_descriptor.py"
+DESCRIPTOR_SPEC = importlib.util.spec_from_file_location("xiao_ota_descriptor", DESCRIPTOR_SCRIPT)
+DESCRIPTOR = importlib.util.module_from_spec(DESCRIPTOR_SPEC)
+DESCRIPTOR_SPEC.loader.exec_module(DESCRIPTOR)
 
 ADDRESS = VBI.BOOT_INFO_ADDRESS
 LENGTH = VBI.BOOT_INFO_STRUCT_BYTES
@@ -308,7 +319,20 @@ class CheckArtifactTest(unittest.TestCase):
             _write_hex_covering(hex_path, marker)
             self._write_key_header(key_path, bytes(range(1, 33)))  # different key
             errors = VBI.check_artifact(hex_path, "xiao_nrf52840", key_path, 0)
-            self.assertTrue(any("trusted_public_key mismatch" in e for e in errors))
+            self.assertTrue(any("reference_signer_public_key_ed25519 mismatch" in e for e in errors))
+
+    def test_omitted_key_header_skips_key_check_without_error(self):
+        """No --key-header means no compiled/default key is substituted and
+        no requirement is enforced: the reference-signer field is purely
+        informational, never a runtime trust gate, so its absence/mismatch
+        must never block an otherwise-valid artifact."""
+        key_bytes = bytes(range(32))
+        marker = _build_marker_bytes(key_bytes=key_bytes)
+        with tempfile.TemporaryDirectory(dir=str(ROOT / '.tmp')) as td:
+            hex_path = Path(td) / "a.hex"
+            _write_hex_covering(hex_path, marker)
+            errors = VBI.check_artifact(hex_path, "xiao_nrf52840", None, 0)
+            self.assertEqual(errors, [])
 
     def test_bad_crc_rejected(self):
         key_bytes = bytes(range(32))
@@ -983,3 +1007,194 @@ int main(void) {{
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuildManifestToolTest(unittest.TestCase):
+    """tools/build_manifest.py: bare, UNSIGNED canonical59 descriptor only
+    -- no private key, no --active-image, no install command, no
+    signature -- built via the SAME shared codec sign_image.py uses, so
+    its output must be byte-for-byte identical to sign_image.py's own
+    descriptor.bin for matching inputs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(dir=str(ROOT / ".tmp")))
+        cls.private_key = cls.tmp / "private.pem"
+        subprocess.check_call(
+            ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(cls.private_key)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        cls.image = cls.tmp / "candidate.bin"
+        cls.image.write_bytes(b"\xAB" * 512)
+        cls.active = cls.tmp / "active.bin"
+        cls.active.write_bytes(b"\x00" * 64)
+
+    def _build_manifest(self, output, board="xiao_nrf52840", role_id=0, counter=1, image=None):
+        BUILD_MANIFEST.main([
+            "--image", str(image if image is not None else self.image),
+            "--board", board,
+            "--role-id", str(role_id),
+            "--counter", str(counter),
+            "--output", str(output),
+        ])
+
+    def _sign(self, out_dir, board="xiao_nrf52840", role_id=0, counter=1, image=None):
+        argv = [
+            "sign_image.py",
+            "--image", str(image if image is not None else self.image),
+            "--active-image", str(self.active),
+            "--private-key", str(self.private_key),
+            "--counter", str(counter),
+            "--role-id", str(role_id),
+            "--board", board,
+            "--output-dir", str(out_dir),
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            SIGN.main()
+
+    def test_bare_descriptor_matches_sign_images_descriptor_byte_for_byte(self):
+        out_dir = self.tmp / "sign_out_for_match"
+        self._sign(out_dir, role_id=1, counter=7)
+        output = self.tmp / "manifest_match.bin"
+        self._build_manifest(output, role_id=1, counter=7)
+        self.assertEqual(output.read_bytes(), (out_dir / "descriptor.bin").read_bytes())
+
+    def test_output_is_exactly_59_bytes(self):
+        output = self.tmp / "manifest_59.bin"
+        self._build_manifest(output)
+        self.assertEqual(len(output.read_bytes()), 59)
+        self.assertEqual(len(output.read_bytes()), BUILD_MANIFEST.WIRE_DESCRIPTOR_SIZE)
+
+    def test_output_directory_has_no_other_artifacts(self):
+        out_dir = self.tmp / "manifest_lonely_dir"
+        output = out_dir / "manifest.bin"
+        self._build_manifest(output)
+        produced = sorted(p.name for p in out_dir.iterdir())
+        self.assertEqual(produced, ["manifest.bin"])
+        self.assertFalse((out_dir / "candidate.bin").exists())
+        self.assertFalse((out_dir / "install-command.bin").exists())
+        self.assertFalse((out_dir / "descriptor.sig").exists())
+
+    def test_invalid_role_id_rejected_before_any_output_write(self):
+        output = self.tmp / "manifest_bad_role.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, role_id=2)
+        self.assertFalse(output.exists())
+
+    def test_zero_counter_rejected_before_any_output_write(self):
+        # The bootloader's floor starts at 0 and rejects
+        # monotonic_counter <= counter_floor, so counter 0 can never
+        # install on any real device -- reject it up front.
+        output = self.tmp / "manifest_zero_counter.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, counter=0)
+        self.assertFalse(output.exists())
+
+    def test_negative_counter_rejected(self):
+        output = self.tmp / "manifest_negative_counter.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, counter=-1)
+        self.assertFalse(output.exists())
+
+    def test_counter_above_uint32_rejected(self):
+        output = self.tmp / "manifest_overflow_counter.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, counter=1 << 32)
+        self.assertFalse(output.exists())
+
+    def test_oversized_image_rejected(self):
+        oversized = self.tmp / "oversized.bin"
+        with open(oversized, "wb") as f:
+            f.truncate(DESCRIPTOR.INSTALL_MAX_SIZE + 4)
+        output = self.tmp / "manifest_oversized.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, image=oversized)
+        self.assertFalse(output.exists())
+
+    def test_misaligned_image_rejected(self):
+        misaligned = self.tmp / "misaligned.bin"
+        misaligned.write_bytes(b"\x01" * 61)
+        output = self.tmp / "manifest_misaligned.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, image=misaligned)
+        self.assertFalse(output.exists())
+
+    def test_empty_image_rejected(self):
+        empty = self.tmp / "empty.bin"
+        empty.write_bytes(b"")
+        output = self.tmp / "manifest_empty.bin"
+        with self.assertRaises(SystemExit):
+            self._build_manifest(output, image=empty)
+        self.assertFalse(output.exists())
+
+    def test_both_board_profiles_encode_distinct_family_variant_bytes(self):
+        xiao_output = self.tmp / "manifest_xiao.bin"
+        sensecap_output = self.tmp / "manifest_sensecap.bin"
+        self._build_manifest(xiao_output, board="xiao_nrf52840")
+        self._build_manifest(sensecap_output, board="sensecap_solar_p1")
+        xiao_bytes = xiao_output.read_bytes()
+        sensecap_bytes = sensecap_output.read_bytes()
+        self.assertNotEqual(xiao_bytes[:4], sensecap_bytes[:4])
+        self.assertEqual(
+            struct.unpack(">HH", xiao_bytes[:4]),
+            (BUILD_MANIFEST.BOARD_TARGETS["xiao_nrf52840"] >> 16,
+             BUILD_MANIFEST.BOARD_TARGETS["xiao_nrf52840"] & 0xFFFF),
+        )
+        self.assertEqual(
+            struct.unpack(">HH", sensecap_bytes[:4]),
+            (BUILD_MANIFEST.BOARD_TARGETS["sensecap_solar_p1"] >> 16,
+             BUILD_MANIFEST.BOARD_TARGETS["sensecap_solar_p1"] & 0xFFFF),
+        )
+
+    def test_esp_descriptor_has_exact_target_role_geometry_hash_and_policy(self):
+        for role in (0, 1):
+            with self.subTest(role=role):
+                output = self.tmp / f"esp-role{role}.manifest"
+                self._build_manifest(output, board="xiao_s3_wio", role_id=role, counter=9)
+                canonical = output.read_bytes()
+                self.assertEqual(len(canonical), 59)
+                self.assertEqual(
+                    struct.unpack(">HHBII32sIIHHH", canonical),
+                    (0x4553, 0x5333, role, 0x10000, 512,
+                     hashlib.sha256(self.image.read_bytes()).digest(), 9, 1, 1, 1, 1),
+                )
+
+    def test_esp_capacity_is_not_limited_to_nordic_image_geometry(self):
+        image = self.tmp / "esp-max.bin"
+        with image.open("wb") as stream:
+            stream.truncate(2749824)
+        output = self.tmp / "esp-max.manifest"
+        self._build_manifest(output, board="xiao_s3_wio", image=image)
+        self.assertEqual(struct.unpack_from(">I", output.read_bytes(), 9)[0], 2749824)
+
+    def test_esp_empty_and_over_capacity_images_leave_output_untouched(self):
+        image = self.tmp / "esp-invalid.bin"
+        for size in (0, 2749825):
+            with self.subTest(size=size):
+                with image.open("wb") as stream:
+                    stream.truncate(size)
+                output = self.tmp / f"esp-invalid-{size}.manifest"
+                with self.assertRaisesRegex(SystemExit, "1..2749824"):
+                    self._build_manifest(output, board="xiao_s3_wio", image=image)
+                self.assertFalse(output.exists())
+
+    def test_esp_profile_cannot_build_a_nordic_boot_install_command(self):
+        output = self.tmp / "esp-not-nordic-command"
+        with self.assertRaises(SystemExit):
+            self._sign(output, board="xiao_s3_wio")
+        self.assertFalse(output.exists())
+
+    def test_no_private_key_argument_accepted(self):
+        # The CLI must have no --private-key flag at all: an unrecognized
+        # argument makes argparse SystemExit(2) before --output is ever
+        # written, proving this tool structurally cannot sign anything.
+        output = self.tmp / "manifest_rejects_private_key.bin"
+        argv = [
+            "--image", str(self.image),
+            "--counter", "1",
+            "--output", str(output),
+            "--private-key", str(self.private_key),
+        ]
+        with self.assertRaises(SystemExit):
+            BUILD_MANIFEST.main(argv)
+        self.assertFalse(output.exists())

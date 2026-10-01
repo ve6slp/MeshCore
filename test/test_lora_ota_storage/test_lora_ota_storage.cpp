@@ -17,17 +17,15 @@
 #include "ota/storage/Crc32.h"
 #include "ota/storage/ReceiptMap.h"
 #include "ota/storage/Journal.h"
+#include "ota/storage/OtaCandidateStore.h"
 #include "ota/storage/StorageManager.h"
 #include "ota/storage/XiaoOtaCommandRecord.h"
 #include "ota/storage/XiaoOtaBootInfoReader.h"
 #include "ota/storage/XiaoOtaActiveExtentBridge.h"
 #include "ota/storage/XiaoOtaLegacyResidue.h"
-#include "ota/storage/XiaoOtaCommissioningGuard.h"
 #include "ota/storage/XiaoOtaTrialBootConfirmation.h"
 #include "ota/trust/Sha256.h"
 #include "ota/trust/Ed25519SignatureVerifier.h"
-#include "ota/authority/BootFloorActivationReceipt.h"
-#include "ota/storage/XiaoOtaBootFloorReceiptGate.h"
 #include "../test_lora_ota_trust/Ed25519TestSigner.h"
 #include "helpers/radiolib/RadioDriverHealthLatch.h"
 #include "helpers/radiolib/Sx1262CheckedProbe.h"
@@ -48,6 +46,7 @@ using ota::platform::SenseCapQspiLayout;
 using ota::storage::Crc32;
 using ota::storage::Journal;
 using ota::storage::JournalCheckpoint;
+using ota::storage::OtaCandidateStore;
 using ota::storage::ReceiptMap;
 using ota::storage::StorageManager;
 using ota::test::FakeNorFlash;
@@ -207,6 +206,81 @@ TEST(FlashRegionTest, ProgramEnforcesOneToZeroOnlyViaUnderlyingDevice) {
   uint8_t second[4] = {0xFF, 0xFF, 0xFF, 0xFF};  // would require 0->1 on some bits
   FlashStatus status = region.program(0, second, 4);
   EXPECT_EQ(status, FlashStatus::PartialProgramViolation);
+}
+
+// -----------------------------------------------------------------------
+// Durable lean-OTA candidate metadata + receipt bitmap.
+// -----------------------------------------------------------------------
+
+TEST(OtaCandidateStoreTest, ResetLoadAndNewestAppendRoundTrip) {
+  FakeNorFlash flash(OtaCandidateStore::kExpectedRegionBytes, OtaCandidateStore::kSectorBytes);
+  FlashRegion region(flash, 0, OtaCandidateStore::kExpectedRegionBytes);
+  OtaCandidateStore store(region);
+  ASSERT_TRUE(store.isValid());
+
+  OtaCandidateStore::Snapshot first;
+  first.valid = true;
+  first.phase = OtaCandidateStore::Phase::Receiving;
+  first.campaignId = 0x11223344u;
+  first.sessionId = 7u;
+  first.attemptId = 1u;
+  first.totalBlocks = 3u;
+  first.exactSizeBytes = 2u * mesh::ota::kOtaBlockMaxDataBytes + 5u;
+  for (size_t i = 0; i < sizeof(first.canonical); ++i) first.canonical[i] = static_cast<uint8_t>(i);
+  for (size_t i = 0; i < sizeof(first.ownerPublicKey); ++i) first.ownerPublicKey[i] = static_cast<uint8_t>(0x80u + i);
+  for (size_t i = 0; i < sizeof(first.signature); ++i) first.signature[i] = static_cast<uint8_t>(0x40u + i);
+  ASSERT_TRUE(store.reset(first));
+
+  OtaCandidateStore::Snapshot loaded;
+  ASSERT_TRUE(store.load(loaded));
+  EXPECT_TRUE(loaded.valid);
+  EXPECT_EQ(OtaCandidateStore::Phase::Receiving, loaded.phase);
+  EXPECT_EQ(first.campaignId, loaded.campaignId);
+  EXPECT_EQ(first.sessionId, loaded.sessionId);
+  EXPECT_EQ(first.attemptId, loaded.attemptId);
+  EXPECT_EQ(first.totalBlocks, loaded.totalBlocks);
+  EXPECT_EQ(first.exactSizeBytes, loaded.exactSizeBytes);
+  EXPECT_EQ(0, std::memcmp(first.canonical, loaded.canonical, sizeof(first.canonical)));
+  EXPECT_EQ(0, std::memcmp(first.ownerPublicKey, loaded.ownerPublicKey, sizeof(first.ownerPublicKey)));
+  EXPECT_EQ(0, std::memcmp(first.signature, loaded.signature, sizeof(first.signature)));
+  EXPECT_EQ(0u, loaded.receivedBlocks);
+
+  OtaCandidateStore::Snapshot second = loaded;
+  second.phase = OtaCandidateStore::Phase::Ready;
+  ASSERT_TRUE(store.append(second));
+
+  OtaCandidateStore::Snapshot newest;
+  ASSERT_TRUE(store.load(newest));
+  EXPECT_EQ(OtaCandidateStore::Phase::Ready, newest.phase);
+  EXPECT_GT(newest.sequence, loaded.sequence);
+}
+
+TEST(OtaCandidateStoreTest, DuplicateBitmapMarksAreIdempotentWithoutReprogramming) {
+  FakeNorFlash flash(OtaCandidateStore::kExpectedRegionBytes, OtaCandidateStore::kSectorBytes);
+  FlashRegion region(flash, 0, OtaCandidateStore::kExpectedRegionBytes);
+  OtaCandidateStore store(region);
+  ASSERT_TRUE(store.isValid());
+
+  OtaCandidateStore::Snapshot snapshot;
+  snapshot.valid = true;
+  snapshot.phase = OtaCandidateStore::Phase::Receiving;
+  snapshot.campaignId = 1u;
+  snapshot.sessionId = 1u;
+  snapshot.attemptId = 1u;
+  snapshot.totalBlocks = 16u;
+  snapshot.exactSizeBytes = snapshot.totalBlocks * mesh::ota::kOtaBlockMaxDataBytes;
+  ASSERT_TRUE(store.reset(snapshot));
+
+  const uint32_t program_before = flash.programOpCount();
+  ASSERT_TRUE(store.markReceived(5));
+  const uint32_t program_after_first = flash.programOpCount();
+  EXPECT_GT(program_after_first, program_before);
+  ASSERT_TRUE(store.isReceived(5));
+
+  ASSERT_TRUE(store.markReceived(5));
+  EXPECT_EQ(program_after_first, flash.programOpCount())
+      << "duplicate block receipts must be a durable no-op, not a second bitmap rewrite";
+  EXPECT_EQ(1u, store.countReceived(snapshot.totalBlocks));
 }
 
 // -----------------------------------------------------------------------
@@ -582,6 +656,8 @@ using ota::storage::XiaoOtaCommandFields;
 using ota::storage::XiaoOtaCommandRecord;
 using ota::storage::XiaoOtaCommandV2Fields;
 using ota::storage::XiaoOtaCommandRecordV2;
+using ota::storage::XiaoOtaCommandRecordV3;
+using ota::storage::XiaoOtaCommandV3Fields;
 using ota::storage::XiaoOtaBootInfoReader;
 using ota::storage::XiaoOtaActiveExtentBridge;
 using ota::storage::XiaoOtaBank0Settings;
@@ -638,6 +714,38 @@ XiaoOtaCommandV2Fields makeSampleCommandV2Fields() {
   fields.transaction_nonce = 0x1122334455667788ull;
   size_t out_len = 0;
   encodeOtaDescriptorCanonical(d, fields.wire_descriptor, sizeof(fields.wire_descriptor), out_len);
+  for (int i = 0; i < 64; ++i) fields.signature_ed25519[i] = static_cast<uint8_t>(200 - i);
+  fields.active_image_extent = 0x20000;
+  for (int i = 0; i < 32; ++i) fields.active_image_hash_sha256[i] = static_cast<uint8_t>(64 + i);
+  return fields;
+}
+
+// V3: current/sole bootloader-accepted command format (identical to V2
+// except for the inserted 32-byte admitted-signer-key field; see
+// XiaoOtaCommandRecordV3's doc-comment in XiaoOtaCommandRecord.h).
+XiaoOtaCommandV3Fields makeSampleCommandV3Fields() {
+  using meshcore::ota::protocol::OtaDescriptor;
+  using meshcore::ota::protocol::encodeOtaDescriptorCanonical;
+  using meshcore::ota::protocol::kOtaDescriptorCanonicalSize;
+
+  OtaDescriptor d;
+  d.boardFamily = 0x584E;
+  d.boardVariant = 0x3430;
+  d.role = 0;
+  d.appAddress = 0x27000;
+  d.exactSizeBytes = 8192;
+  for (int i = 0; i < 32; ++i) d.sha256[i] = static_cast<uint8_t>(i + 1);
+  d.securityCounter = 7;
+  d.minBootloaderCapabilities = 1;
+  d.formatId = 1;
+  d.keyId = 1;
+  d.algorithmId = 1;
+
+  XiaoOtaCommandV3Fields fields;
+  fields.transaction_nonce = 0x1122334455667788ull;
+  size_t out_len = 0;
+  encodeOtaDescriptorCanonical(d, fields.wire_descriptor, sizeof(fields.wire_descriptor), out_len);
+  for (int i = 0; i < 32; ++i) fields.admitted_signer_public_key_ed25519[i] = static_cast<uint8_t>(10 + i);
   for (int i = 0; i < 64; ++i) fields.signature_ed25519[i] = static_cast<uint8_t>(200 - i);
   fields.active_image_extent = 0x20000;
   for (int i = 0; i < 32; ++i) fields.active_image_hash_sha256[i] = static_cast<uint8_t>(64 + i);
@@ -908,6 +1016,109 @@ TEST(XiaoOtaCommandRecordV2Test, WriteNextRefusesAndMutatesNothingWhenSlotReadFa
   uint8_t newest[XiaoOtaCommandRecordV2::kRecordBytes];
   ASSERT_TRUE(XiaoOtaCommandRecordV2::readNewest(region, newest));
   EXPECT_EQ(sequenceFieldOf(newest), 1u);
+}
+
+// ---------------------------------------------------------------------
+// XiaoOtaCommandRecordV3: current/sole bootloader-accepted command
+// format (record_version 3, 220 bytes) -- see the bootloader owner's
+// xiao_ota_record.h, which states BOTH the legacy 71-byte v1 format AND
+// the admitted-key-less record_version-2 shape have been retired; "v2"
+// naming on the underlying C struct is kept only to avoid a mechanical
+// rename, not because a newer struct name exists there.
+// ---------------------------------------------------------------------
+
+TEST(XiaoOtaCommandRecordV3Test, RecordSizeMatchesBootloaderCurrentStructLayout) {
+  // magic(4)+version(2)+bytes(2)+seq(4)+nonce(8)+wire_descriptor(59)+
+  // admitted_signer_public_key(32)+sig(64)+active_extent(4)+
+  // active_hash(32)+reserved(1)+crc32(4)+marker(4) = 220, matching
+  // sizeof(xiao_ota_command_v2_t) at XIAO_OTA_COMMAND_VERSION_CURRENT==3.
+  EXPECT_EQ(XiaoOtaCommandRecordV3::kRecordBytes, 220u);
+}
+
+TEST(XiaoOtaCommandRecordV3Test, SerializeThenIsValidRecordRoundTrips) {
+  const XiaoOtaCommandV3Fields fields = makeSampleCommandV3Fields();
+  uint8_t buf[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_EQ(XiaoOtaCommandRecordV3::serialize(fields, buf, sizeof(buf)), XiaoOtaCommandRecordV3::kRecordBytes);
+  EXPECT_TRUE(XiaoOtaCommandRecordV3::isValidRecord(buf, sizeof(buf)));
+}
+
+TEST(XiaoOtaCommandRecordV3Test, EmbeddedWireDescriptorAndAdmittedSignerKeyAreVerbatimAndAdjacent) {
+  // The 59-byte wire descriptor must round-trip unchanged, and the
+  // 32-byte admitted-signer key must immediately follow it (offset 79) --
+  // this is the ONE structural difference from V2.
+  const XiaoOtaCommandV3Fields fields = makeSampleCommandV3Fields();
+  uint8_t buf[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_EQ(XiaoOtaCommandRecordV3::serialize(fields, buf, sizeof(buf)), XiaoOtaCommandRecordV3::kRecordBytes);
+  constexpr uint32_t kDescriptorStart = 20u;
+  constexpr uint32_t kAdmittedSignerKeyStart = kDescriptorStart + 59u;  // 79
+  EXPECT_EQ(memcmp(buf + kDescriptorStart, fields.wire_descriptor, sizeof(fields.wire_descriptor)), 0);
+  EXPECT_EQ(memcmp(buf + kAdmittedSignerKeyStart, fields.admitted_signer_public_key_ed25519,
+                   sizeof(fields.admitted_signer_public_key_ed25519)), 0);
+  EXPECT_EQ(kAdmittedSignerKeyStart, XiaoOtaCommandRecordV3::kAdmittedSignerKeyOffset);
+}
+
+TEST(XiaoOtaCommandRecordV3Test, CorruptingAnyByteInvalidatesCrc) {
+  const XiaoOtaCommandV3Fields fields = makeSampleCommandV3Fields();
+  uint8_t buf[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_EQ(XiaoOtaCommandRecordV3::serialize(fields, buf, sizeof(buf)), XiaoOtaCommandRecordV3::kRecordBytes);
+  buf[90] ^= 0xFFu;  // inside the embedded admitted-signer key
+  EXPECT_FALSE(XiaoOtaCommandRecordV3::isValidRecord(buf, sizeof(buf)));
+}
+
+TEST(XiaoOtaCommandRecordV3Test, V2AndV3RecordVersionsAreDistinctAndNeverCrossValidate) {
+  const XiaoOtaCommandV2Fields v2_fields = makeSampleCommandV2Fields();
+  uint8_t v2_buf[XiaoOtaCommandRecordV2::kRecordBytes];
+  ASSERT_EQ(XiaoOtaCommandRecordV2::serialize(v2_fields, v2_buf, sizeof(v2_buf)), XiaoOtaCommandRecordV2::kRecordBytes);
+  EXPECT_FALSE(XiaoOtaCommandRecordV3::isValidRecord(v2_buf, sizeof(v2_buf)));
+
+  const XiaoOtaCommandV3Fields v3_fields = makeSampleCommandV3Fields();
+  uint8_t v3_buf[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_EQ(XiaoOtaCommandRecordV3::serialize(v3_fields, v3_buf, sizeof(v3_buf)), XiaoOtaCommandRecordV3::kRecordBytes);
+  EXPECT_FALSE(XiaoOtaCommandRecordV2::isValidRecord(v3_buf, sizeof(v3_buf)));
+}
+
+TEST(XiaoOtaCommandRecordV3Test, WriteNextAlternatesSlotsAndIncrementsSequence) {
+  FakeNorFlash flash(8192, 4096);
+  FlashRegion region(flash, 0, 8192);
+  const XiaoOtaCommandV3Fields fields = makeSampleCommandV3Fields();
+
+  uint32_t seq1 = 0;
+  ASSERT_TRUE(XiaoOtaCommandRecordV3::writeNext(region, fields, &seq1));
+  EXPECT_EQ(seq1, 1u);
+
+  uint32_t seq2 = 0;
+  ASSERT_TRUE(XiaoOtaCommandRecordV3::writeNext(region, fields, &seq2));
+  EXPECT_EQ(seq2, 2u);
+
+  uint8_t newest[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_TRUE(XiaoOtaCommandRecordV3::readNewest(region, newest));
+  EXPECT_EQ(sequenceFieldOf(newest), 2u);
+}
+
+TEST(XiaoOtaCommandRecordV3Test, WriteNextRecognizesLiveV2RecordAndTargetsTheOtherSlotWithoutErasingIt) {
+  // Union-aware upgrade path: a device previously running V2-writing
+  // firmware, later reflashed with V3-only firmware, must not have its
+  // live V2 slot silently erased/overwritten by the first V3 write.
+  FakeNorFlash flash(8192, 4096);
+  FlashRegion region(flash, 0, 8192);
+  const XiaoOtaCommandV2Fields v2_fields = makeSampleCommandV2Fields();
+  const XiaoOtaCommandV3Fields v3_fields = makeSampleCommandV3Fields();
+
+  uint32_t v2_seq = 0;
+  ASSERT_TRUE(XiaoOtaCommandRecordV2::writeNext(region, v2_fields, &v2_seq));  // lands in slot 0, sequence 1.
+  EXPECT_EQ(v2_seq, 1u);
+
+  uint32_t v3_seq = 0;
+  ASSERT_TRUE(XiaoOtaCommandRecordV3::writeNext(region, v3_fields, &v3_seq));
+  EXPECT_EQ(v3_seq, 2u);  // continues the shared generation, not reset to 1.
+
+  uint8_t slot0[XiaoOtaCommandRecordV2::kRecordBytes];
+  ASSERT_TRUE(ota::platform::isOk(region.read(0, slot0, sizeof(slot0))));
+  EXPECT_TRUE(XiaoOtaCommandRecordV2::isValidRecord(slot0, sizeof(slot0)));
+
+  uint8_t newest[XiaoOtaCommandRecordV3::kRecordBytes];
+  ASSERT_TRUE(XiaoOtaCommandRecordV3::readNewest(region, newest));
+  EXPECT_EQ(sequenceFieldOf(newest), 2u);
 }
 
 // ---------------------------------------------------------------------
@@ -3659,66 +3870,6 @@ TEST(OtaBoardTrialBootHealthConfirmerTest, ContinuousWindowSurvivesMillisWraparo
 }
 
 
-// factory/lab qualification harness must refuse ALL destructive
-// operations if there is ANY evidence of real commissioning -- boot
-// marker qualified, a non-blank xiao_ota_* journal sub-slot, or a valid
-// generic Journal checkpoint. Each signal alone must be sufficient (OR,
-// not AND), and it must fail closed (treat as commissioned/unsafe) on an
-// unreadable sub-slot.
-// ---------------------------------------------------------------------
-
-TEST(XiaoOtaCommissioningGuardTest, AllSignalsFalseMeansNotCommissioned) {
-  ota::storage::XiaoOtaCommissioningInputs inputs;
-  EXPECT_FALSE(ota::storage::isDeviceAlreadyCommissioned(inputs));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, BootMarkerQualifiedAloneIsSufficient) {
-  ota::storage::XiaoOtaCommissioningInputs inputs;
-  inputs.boot_marker_qualified = true;
-  EXPECT_TRUE(ota::storage::isDeviceAlreadyCommissioned(inputs));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, GenericJournalCheckpointAloneIsSufficient) {
-  ota::storage::XiaoOtaCommissioningInputs inputs;
-  inputs.generic_journal_checkpoint_present = true;
-  EXPECT_TRUE(ota::storage::isDeviceAlreadyCommissioned(inputs));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, NonBlankXiaoSubSlotAloneIsSufficient) {
-  ota::storage::XiaoOtaCommissioningInputs inputs;
-  inputs.any_xiao_subslot_nonblank = true;
-  EXPECT_TRUE(ota::storage::isDeviceAlreadyCommissioned(inputs));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, AllEightBlankSubSlotsAreNotCommissioned) {
-  uint8_t blank[4096];
-  memset(blank, 0xFF, sizeof(blank));
-  const uint8_t* sub_slots[8];
-  for (int i = 0; i < 8; ++i) sub_slots[i] = blank;
-  EXPECT_FALSE(ota::storage::anyXiaoJournalSubSlotNonBlank(sub_slots, sizeof(blank)));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, OneNonBlankByteInAnySingleSubSlotIsDetected) {
-  uint8_t blank[4096];
-  memset(blank, 0xFF, sizeof(blank));
-  uint8_t dirty[4096];
-  memset(dirty, 0xFF, sizeof(dirty));
-  dirty[100] = 0x00;  // single non-blank byte, deep in a slot no one recognizes.
-  const uint8_t* sub_slots[8];
-  for (int i = 0; i < 8; ++i) sub_slots[i] = blank;
-  sub_slots[5] = dirty;  // arbitrary slot index -- must not matter which one.
-  EXPECT_TRUE(ota::storage::anyXiaoJournalSubSlotNonBlank(sub_slots, sizeof(dirty)));
-}
-
-TEST(XiaoOtaCommissioningGuardTest, UnreadableNullSubSlotFailsClosedAsNonBlank) {
-  uint8_t blank[4096];
-  memset(blank, 0xFF, sizeof(blank));
-  const uint8_t* sub_slots[8];
-  for (int i = 0; i < 8; ++i) sub_slots[i] = blank;
-  sub_slots[3] = nullptr;  // simulates an unreadable/unexpected-geometry read.
-  EXPECT_TRUE(ota::storage::anyXiaoJournalSubSlotNonBlank(sub_slots, sizeof(blank)));
-}
-
 TEST(OtaBoardTrialBootHealthConfirmerTest, DeadlineWinsWhenHealthWindowCompletesAtFortyFiveSeconds) {
   FakeNorFlash state_flash(8192, 4096);
   FakeNorFlash confirm_flash(8192, 4096);
@@ -4515,324 +4666,6 @@ TEST(RadioLibDriverFaultClassificationTest, GenuineSpiReadFailureStillAdvancesFa
   EXPECT_FALSE(latch.healthy());
 }
 
-
-// ---------------------------------------------------------------------
-// XiaoOtaBootFloorReceiptGate: Root's durable lifetime-role authority gate
-// ---------------------------------------------------------------------
-
-
-namespace {
-
-using ota::storage::BootFloorRoleAuthorityAnchor;
-using ota::storage::BootFloorRoleAuthorityOutcome;
-using ota::storage::XiaoOtaBootFloorReceiptGate;
-
-constexpr uint32_t kEraseUnitBytes = 4096u;
-constexpr uint32_t kRegionBytes = kEraseUnitBytes * 2u;
-constexpr uint32_t kWindowOffset = XiaoOtaBootFloorReceiptGate::kWindowOffset;
-
-std::vector<uint8_t> makeSeed(uint8_t fill) { return std::vector<uint8_t>(32, fill); }
-
-struct ReceiptFixture {
-  std::vector<uint8_t> seed_storage;
-  ota::test::Ed25519TestSigner signer;
-  BootFloorRoleAuthorityAnchor anchor;
-
-  explicit ReceiptFixture(uint8_t seed_byte = 0x11u) : seed_storage(makeSeed(seed_byte)), signer(seed_storage.data()) {
-    std::memcpy(anchor.trusted_publisher_public_key_ed25519, signer.publicKey(), 32);
-    anchor.expected_target_id = 0x53435031u;
-    anchor.expected_profile_id = 2u;
-    anchor.expected_layout_id = 1u;
-    anchor.expected_role_id = 0u;
-    const uint8_t uid[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    std::memcpy(anchor.device_uid8, uid, 8);
-  }
-
-  // Builds a genuine, correctly-signed genesis receipt matching `anchor`
-  // (unless overridden below), via the SAME real codec Boot/Root use --
-  // never a hand-rolled byte layout.
-  ota::authority::BootFloorActivationReceiptV1 makeMatchingReceipt(uint32_t role_id = 0u) const {
-    ota::authority::BootFloorActivationReceiptV1 r;
-    r.recordVersion = ota::authority::BootFloorActivationReceiptCodec::kCurrentRecordVersion;
-    std::memcpy(r.hardwareUid, anchor.device_uid8, 8);
-    r.targetId = anchor.expected_target_id;
-    r.profileId = anchor.expected_profile_id;
-    r.layoutId = anchor.expected_layout_id;
-    r.currentRole = role_id;
-    r.publisherKeyId = 1u;
-    ota::trust::Sha256::hash(signer.publicKey(), 32, r.publisherKeyFingerprintSha256);
-    r.floor = 0u;  // genesis-only structural invariant.
-    uint8_t digest[32];
-    EXPECT_TRUE(ota::authority::BootFloorActivationReceiptCodec::computeSignedDigest(r, digest));
-    signer.sign(digest, sizeof(digest), r.signatureEd25519);
-    return r;
-  }
-
-  std::vector<uint8_t> serializeToWindow(const ota::authority::BootFloorActivationReceiptV1& r) const {
-    std::vector<uint8_t> buf(XiaoOtaBootFloorReceiptGate::kWindowPhysicalBytes, 0xFFu);
-    const size_t written = ota::authority::BootFloorActivationReceiptCodec::serializeRecord(
-        r, buf.data(), XiaoOtaBootFloorReceiptGate::kRecordBytes);
-    EXPECT_EQ(written, XiaoOtaBootFloorReceiptGate::kRecordBytes);
-    return buf;
-  }
-};
-
-}  // namespace
-
-TEST(XiaoOtaBootFloorReceiptGateTest, BothWindowsBlankIsMissing) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  ota::trust::Ed25519SignatureVerifier verifier;
-
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Missing);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, SingleValidMatchingReceiptInSlotZeroIsOk) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt = fx.makeMatchingReceipt();
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  ota::authority::BootFloorActivationReceiptV1 out;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, &out);
-  ASSERT_EQ(outcome, BootFloorRoleAuthorityOutcome::Ok);
-  EXPECT_EQ(out.currentRole, 0u);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, SingleValidMatchingReceiptInSlotOneIsOk) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt = fx.makeMatchingReceipt();
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(
-      region.program(kEraseUnitBytes + kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Ok);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, TwoAgreeingValidReceiptsAreOk) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt = fx.makeMatchingReceipt();
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-  ASSERT_TRUE(ota::platform::isOk(
-      region.program(kEraseUnitBytes + kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Ok);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, TwoIndependentlyValidButDisagreeingReceiptsIsConflict) {
-  // Two receipts that are BOTH independently signature-valid under the
-  // SAME trusted publisher key, but disagree on currentRole -- the gate
-  // must never pick either (conflict detection, never a "latest wins"
-  // tiebreak, since this format has no sequence number to prefer by).
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt_role0 = fx.makeMatchingReceipt(/*role_id=*/0u);
-  const auto receipt_role1 = fx.makeMatchingReceipt(/*role_id=*/1u);
-  const auto bytes_role0 = fx.serializeToWindow(receipt_role0);
-  const auto bytes_role1 = fx.serializeToWindow(receipt_role1);
-  ASSERT_TRUE(ota::platform::isOk(
-      region.program(kWindowOffset, bytes_role0.data(), static_cast<uint32_t>(bytes_role0.size()))));
-  ASSERT_TRUE(ota::platform::isOk(region.program(
-      kEraseUnitBytes + kWindowOffset, bytes_role1.data(), static_cast<uint32_t>(bytes_role1.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Conflict);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, CorruptSignatureIsRejected) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  auto receipt = fx.makeMatchingReceipt();
-  receipt.signatureEd25519[0] ^= 0xFFu;
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, NonGenesisFloorValueIsRejectedAsCorrupt) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  ota::authority::BootFloorActivationReceiptV1 r;
-  r.recordVersion = ota::authority::BootFloorActivationReceiptCodec::kCurrentRecordVersion;
-  std::memcpy(r.hardwareUid, fx.anchor.device_uid8, 8);
-  r.targetId = fx.anchor.expected_target_id;
-  r.profileId = fx.anchor.expected_profile_id;
-  r.layoutId = fx.anchor.expected_layout_id;
-  r.currentRole = 0u;
-  r.publisherKeyId = 1u;
-  ota::trust::Sha256::hash(fx.signer.publicKey(), 32, r.publisherKeyFingerprintSha256);
-  r.floor = 1u;  // Structurally invalid for a genesis receipt.
-  uint8_t digest[32];
-  ASSERT_TRUE(ota::authority::BootFloorActivationReceiptCodec::computeSignedDigest(r, digest));
-  fx.signer.sign(digest, sizeof(digest), r.signatureEd25519);
-  const auto bytes = fx.serializeToWindow(r);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, WrongHardwareUidIsRejectedAsCorrupt) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  auto receipt = fx.makeMatchingReceipt();
-  receipt.hardwareUid[0] ^= 0xFFu;
-  uint8_t digest[32];
-  ASSERT_TRUE(ota::authority::BootFloorActivationReceiptCodec::computeSignedDigest(receipt, digest));
-  fx.signer.sign(digest, sizeof(digest), receipt.signatureEd25519);  // re-sign over the changed UID.
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, WrongTargetProfileOrLayoutIsRejectedAsCorrupt) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  auto receipt = fx.makeMatchingReceipt();
-  receipt.profileId = 99u;
-  uint8_t digest[32];
-  ASSERT_TRUE(ota::authority::BootFloorActivationReceiptCodec::computeSignedDigest(receipt, digest));
-  fx.signer.sign(digest, sizeof(digest), receipt.signatureEd25519);
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, WrongPublisherKeyIsRejectedAsCorrupt) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  // Signed/fingerprinted under a DIFFERENT key than the anchor trusts.
-  const auto other_seed = makeSeed(0x55u);
-  ota::test::Ed25519TestSigner other_signer(other_seed.data());
-  ota::authority::BootFloorActivationReceiptV1 r;
-  r.recordVersion = ota::authority::BootFloorActivationReceiptCodec::kCurrentRecordVersion;
-  std::memcpy(r.hardwareUid, fx.anchor.device_uid8, 8);
-  r.targetId = fx.anchor.expected_target_id;
-  r.profileId = fx.anchor.expected_profile_id;
-  r.layoutId = fx.anchor.expected_layout_id;
-  r.currentRole = 0u;
-  r.publisherKeyId = 1u;
-  ota::trust::Sha256::hash(other_signer.publicKey(), 32, r.publisherKeyFingerprintSha256);
-  r.floor = 0u;
-  uint8_t digest[32];
-  ASSERT_TRUE(ota::authority::BootFloorActivationReceiptCodec::computeSignedDigest(r, digest));
-  other_signer.sign(digest, sizeof(digest), r.signatureEd25519);
-  const auto bytes = fx.serializeToWindow(r);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, ValidButDifferentCompiledRoleIsRoleMismatch) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt = fx.makeMatchingReceipt(/*role_id=*/1u);  // anchor expects role 0.
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::RoleMismatch);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, ReadableNonBlankInvalidRecordInOneSlotWithBlankOtherIsCorrupt) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  auto receipt = fx.makeMatchingReceipt();
-  auto bytes = fx.serializeToWindow(receipt);
-  bytes[20] ^= 0xFFu;  // corrupt a body byte without fixing up the CRC/signature.
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-  // Slot 1 remains genuinely blank.
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Corrupt);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, ValidSlotIsAcceptedDespiteCorruptOtherSlot) {
-  // A readable-but-corrupt slot alongside a genuinely valid one is NOT a
-  // Conflict -- mirrors XiaoOtaFloorReader's own "a corrupt slot never
-  // overrides a genuinely valid record in the other" precedent.
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto good_receipt = fx.makeMatchingReceipt();
-  auto good_bytes = fx.serializeToWindow(good_receipt);
-  ASSERT_TRUE(
-      ota::platform::isOk(region.program(kWindowOffset, good_bytes.data(), static_cast<uint32_t>(good_bytes.size()))));
-
-  auto bad_bytes = good_bytes;
-  bad_bytes[20] ^= 0xFFu;
-  ASSERT_TRUE(ota::platform::isOk(region.program(
-      kEraseUnitBytes + kWindowOffset, bad_bytes.data(), static_cast<uint32_t>(bad_bytes.size()))));
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::Ok);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, UnreadableWindowFailsWholeLookupClosedEvenWithAValidOtherSlot) {
-  ota::test::FakeNorFlash flash(kRegionBytes, kEraseUnitBytes);
-  ota::platform::FlashRegion region(flash, 0, kRegionBytes);
-  ReceiptFixture fx;
-  const auto receipt = fx.makeMatchingReceipt();
-  const auto bytes = fx.serializeToWindow(receipt);
-  ASSERT_TRUE(ota::platform::isOk(region.program(kWindowOffset, bytes.data(), static_cast<uint32_t>(bytes.size()))));
-
-  ota::test::FakeNorFlash::FaultSpec fault;
-  fault.kind = ota::test::FakeNorFlash::OpKind::Read;
-  fault.timing = ota::test::FakeNorFlash::InjectionTiming::Before;
-  fault.trigger_op_count = flash.readOpCount() + 2;  // the second read == slot 1's window.
-  flash.armFault(fault);
-
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::IoError);
-}
-
-TEST(XiaoOtaBootFloorReceiptGateTest, InvalidRegionShapeIsIoError) {
-  ota::test::FakeNorFlash flash(kEraseUnitBytes, kEraseUnitBytes);  // only ONE erase unit, not two.
-  ota::platform::FlashRegion region(flash, 0, kEraseUnitBytes);
-  ReceiptFixture fx;
-  ota::trust::Ed25519SignatureVerifier verifier;
-  const auto outcome = XiaoOtaBootFloorReceiptGate::resolve(region, fx.anchor, verifier, nullptr);
-  EXPECT_EQ(outcome, BootFloorRoleAuthorityOutcome::IoError);
-}
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

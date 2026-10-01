@@ -28,6 +28,36 @@ public:
     return platform::isOk(region.eraseRange(0, region.sizeBytes()));
   }
 
+  // Writes `data_len` bytes directly at the given raw byte `offset` and
+  // immediately reads them back to confirm they landed correctly. This is
+  // the primitive both writeAndVerifyChunk() below (fixed index*size
+  // addressing, used by the legacy chunk protocol) and any variable-pitch
+  // caller (e.g. the lean path's 84-byte block index arithmetic, which is
+  // NOT a multiple of the legacy 128-byte chunk size) can safely share --
+  // there is no actual flash constraint tying a write's granularity to
+  // any single protocol's chunk-size constant.
+  static bool writeAndVerifyAtOffset(platform::FlashRegion& region, uint32_t offset,
+                                     const uint8_t* data, uint32_t data_len) {
+    if (!region.isValid() || data == nullptr || data_len == 0 || data_len > kMaxChunkBytes) {
+      return false;
+    }
+    if (!platform::isOk(region.program(offset, data, data_len))) {
+      return false;
+    }
+    uint8_t readback[kMaxChunkBytes];
+    if (!platform::isOk(region.read(offset, readback, data_len))) {
+      return false;
+    }
+    return std::memcmp(readback, data, data_len) == 0;
+  }
+
+  static bool readAtOffset(const platform::FlashRegion& region, uint32_t offset, uint8_t* out, uint32_t out_len) {
+    if (!region.isValid() || out == nullptr || out_len == 0 || out_len > kMaxChunkBytes) {
+      return false;
+    }
+    return platform::isOk(region.read(offset, out, out_len));
+  }
+
   // Writes one chunk into `region` at `chunk_index * chunk_size_bytes` and
   // immediately reads it back to confirm the bytes landed correctly.
   // Returns false (without silently accepting a partial/incorrect write) on
@@ -46,16 +76,7 @@ public:
       return false;  // chunk_index * chunk_size_bytes would overflow uint32_t
     }
     const uint32_t offset = chunk_index * chunk_size_bytes;
-
-    if (!platform::isOk(region.program(offset, data, data_len))) {
-      return false;
-    }
-
-    uint8_t readback[kMaxChunkBytes];
-    if (!platform::isOk(region.read(offset, readback, data_len))) {
-      return false;
-    }
-    return std::memcmp(readback, data, data_len) == 0;
+    return writeAndVerifyAtOffset(region, offset, data, data_len);
   }
 
   static bool readChunk(const platform::FlashRegion& region,

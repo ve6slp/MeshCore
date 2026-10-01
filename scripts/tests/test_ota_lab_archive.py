@@ -841,7 +841,7 @@ class ArchiveCryptoRoundTripTests(ScratchDirMixin, unittest.TestCase):
 class ArchiveAndVerifyCommandTests(ScratchDirMixin, unittest.TestCase):
     def _make_args(self, role, key_path, **extra):
         import argparse
-        base = dict(role=role, key_file=str(key_path), timeout=1.0, retries=2)
+        base = dict(role=role, key_file=str(key_path), timeout=1.0, retries=2, validate_only=False)
         base.update(extra)
         return argparse.Namespace(**base)
 
@@ -1020,6 +1020,48 @@ class ArchiveAndVerifyCommandTests(ScratchDirMixin, unittest.TestCase):
         }
         metadata.update(metadata_overrides)
         return ota_lab_archive.encrypt_archive(key, metadata, DEFAULT_INTERNAL, DEFAULT_QSPI)
+
+    def test_offline_validation_authenticates_full_capture_without_device_access(self):
+        key_path = self.make_key_file()
+        archive_path = self.scratch / "target.archive"
+        archive_path.write_bytes(self._full_valid_archive_bytes(ota_lab_archive.load_key(key_path)))
+        args = self._make_args("target", key_path, archive=str(archive_path), validate_only=True)
+        output = io.StringIO()
+        with mock.patch.object(lab_device, "resolve") as resolve_mock, \
+                mock.patch.object(ota_lab_archive, "open_serial_port") as open_mock, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(0, ota_lab_archive.cmd_verify(args))
+        resolve_mock.assert_not_called()
+        open_mock.assert_not_called()
+        self.assertIn("no live device comparison", output.getvalue())
+
+    def test_offline_validation_refuses_wrong_role_serial_or_uid(self):
+        key_path = self.make_key_file()
+        key = ota_lab_archive.load_key(key_path)
+        archive_path = self.scratch / "target.archive"
+        args = self._make_args("target", key_path, archive=str(archive_path), validate_only=True)
+        for field, value in (("role", "client"), ("stable_serial", CLIENT_SERIAL),
+                             ("device_uid_hex", CLIENT_SERIAL)):
+            with self.subTest(field=field):
+                archive_path.write_bytes(self._full_valid_archive_bytes(key, **{field: value}))
+                with self.assertRaisesRegex(ota_lab_archive.DeviceRefused, "does not match"):
+                    ota_lab_archive.cmd_verify(args)
+
+    def test_offline_validation_refuses_corruption_and_partial_capture(self):
+        key_path = self.make_key_file()
+        key = ota_lab_archive.load_key(key_path)
+        archive_path = self.scratch / "target.archive"
+        args = self._make_args("target", key_path, archive=str(archive_path), validate_only=True)
+        damaged = bytearray(self._full_valid_archive_bytes(key))
+        damaged[-1] ^= 1
+        archive_path.write_bytes(damaged)
+        with self.assertRaisesRegex(ota_lab_archive.ProtocolError, "authentication failed"):
+            ota_lab_archive.cmd_verify(args)
+        metadata = {"schema": ota_lab_archive.ARCHIVE_SCHEMA_VERSION, "role": "target",
+                    "stable_serial": TARGET_SERIAL, "device_uid_hex": TARGET_SERIAL}
+        archive_path.write_bytes(ota_lab_archive.encrypt_archive(key, metadata, b"partial", b""))
+        with self.assertRaisesRegex(SystemExit, "not a full-media capture"):
+            ota_lab_archive.cmd_verify(args)
 
     def test_verify_refuses_same_uid_but_archive_role_reassigned_with_zero_media_reads(self):
         # Same physical device UID, but the archive was captured under a

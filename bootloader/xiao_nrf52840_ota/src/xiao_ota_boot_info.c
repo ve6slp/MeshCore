@@ -5,7 +5,7 @@
 void xiao_ota_boot_info_build(xiao_ota_boot_info_t *out, uint32_t board_target_id,
                               uint32_t role_id, uint32_t capability_flags,
                               uint16_t key_id, uint16_t algorithm_id,
-                              const uint8_t public_key[32]) {
+                              const uint8_t reference_signer_public_key[32]) {
   size_t i;
   out->magic = XIAO_OTA_BOOT_INFO_MAGIC;
   out->format_version = XIAO_OTA_BOOT_INFO_FORMAT_VERSION;
@@ -15,8 +15,8 @@ void xiao_ota_boot_info_build(xiao_ota_boot_info_t *out, uint32_t board_target_i
   out->capability_flags = capability_flags;
   out->key_id = key_id;
   out->algorithm_id = algorithm_id;
-  for (i = 0; i < sizeof(out->trusted_public_key); ++i) {
-    out->trusted_public_key[i] = public_key[i];
+  for (i = 0; i < sizeof(out->reference_signer_public_key_ed25519); ++i) {
+    out->reference_signer_public_key_ed25519[i] = reference_signer_public_key[i];
   }
   out->crc32 = xiao_ota_crc32(out, offsetof(xiao_ota_boot_info_t, crc32));
 }
@@ -32,8 +32,8 @@ bool xiao_ota_boot_info_valid(const xiao_ota_boot_info_t *info) {
 /*
  * The actual immutable marker baked into this bootloader binary: a real
  * `const` object, fully initialized at compile time from this build's real
- * board profile, capability, and trusted key, placed by the linker script's
- * dedicated .xiao_ota_boot_info section at the fixed
+ * board profile, capability, and reference signer key, placed by the
+ * linker script's dedicated .xiao_ota_boot_info section at the fixed
  * XIAO_OTA_BOOT_INFO_ADDRESS (see linker/nrf52840_xiao_ota*.ld). There is no
  * runtime write path to this object anywhere in this bootloader -- it is
  * `const`, lives in true flash ROM, and a Cortex-M plain store instruction
@@ -72,6 +72,6 @@ const xiao_ota_boot_info_t g_xiao_ota_boot_info = {
     .capability_flags = XIAO_OTA_CAP_QSPI_INSTALL,
     .key_id = XIAO_OTA_KEY_ID,
     .algorithm_id = XIAO_OTA_ALGORITHM_ED25519,
-    .trusted_public_key = {XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES},
+    .reference_signer_public_key_ed25519 = {XIAO_OTA_LAB_PUBLIC_KEY_ED25519_BYTES},
     .crc32 = 0xFFFFFFFFu, /* XIAO_OTA_BOOT_INFO_CRC32_PLACEHOLDER: patched by prepare_upstream.py */
 };

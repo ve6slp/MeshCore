@@ -8,7 +8,7 @@ escalation order instead of ad-hoc commands.
 
   ./scripts/lab_device.py list
   ./scripts/lab_device.py path target
-  ./scripts/lab_device.py reset target
+  ./scripts/lab_device.py reset target --protocol repeater
   ./scripts/lab_device.py bootloader target
   ./scripts/lab_device.py power-cycle target
   ./scripts/lab_device.py wait target --mode app
@@ -21,10 +21,13 @@ from __future__ import annotations
 import argparse
 import configparser
 import glob
+import hashlib
+import json
 import os
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -291,14 +294,20 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    """Restart companion firmware using its binary reboot command."""
+    """Restart the selected application through its actual serial protocol."""
+    commands = {
+        "companion": b"<\x07\x00\x13reboot",
+        "repeater": b"reboot\r",
+    }
+    if args.protocol not in commands:
+        raise SystemExit("reset requires an explicit companion or repeater protocol")
     device = resolve(args.role, MODE_APP)
     try:
         import serial  # type: ignore
     except ImportError:
         raise SystemExit("pyserial is required for `reset`")
     with serial.Serial(str(device.by_id), 115200, timeout=1, write_timeout=2) as port:
-        frame = b"<\x07\x00\x13reboot"
+        frame = commands[args.protocol]
         if port.write(frame) != len(frame):
             raise SystemExit(f"short reboot command write for role '{args.role}'")
     ready = wait_for(args.role, MODE_APP, args.timeout, absent_first=True)
@@ -321,6 +330,51 @@ def cmd_bootloader(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_application_package(package: Path) -> bytes:
+    tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
+    sys.path.insert(0, str(tools))
+    from xiao_ota_descriptor import assert_matches_canonical_layout_contract, validate_image_geometry
+
+    assert_matches_canonical_layout_contract()
+    try:
+        with zipfile.ZipFile(package) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise SystemExit("DFU package contains duplicate entries")
+            manifest = json.loads(archive.read("manifest.json"))
+            contents = manifest.get("manifest") if isinstance(manifest, dict) else None
+            if not isinstance(contents, dict) or set(contents) - {"dfu_version"} != {"application"}:
+                raise SystemExit("flash requires an application-only DFU package; use the guarded bootloader installer")
+            application = contents["application"]
+            if not isinstance(application, dict):
+                raise SystemExit("invalid DFU application manifest")
+            binary = application.get("bin_file")
+            init_packet = application.get("dat_file")
+            if (not isinstance(binary, str) or not isinstance(init_packet, str)
+                    or binary == init_packet or binary not in names or init_packet not in names):
+                raise SystemExit("DFU package is missing its application binary or init packet")
+            image = archive.read(binary)
+            validate_image_geometry(image, "DFU application")
+            if not archive.read(init_packet):
+                raise SystemExit("DFU application init packet is empty")
+            return image
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, KeyError) as exc:
+        raise SystemExit(f"invalid application DFU package: {exc}") from exc
+
+
+def cmd_extract_application(args: argparse.Namespace) -> int:
+    image = validate_application_package(Path(args.package))
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output.open("xb") as stream:
+            stream.write(image)
+    except FileExistsError as exc:
+        raise SystemExit(f"refusing to overwrite application image: {output}") from exc
+    print(f"application image: {output} ({len(image)} bytes, SHA-256 {hashlib.sha256(image).hexdigest()})")
+    return 0
+
+
 def cmd_flash(args: argparse.Namespace) -> int:
     """Flash a DFU package to a role.
 
@@ -332,6 +386,7 @@ def cmd_flash(args: argparse.Namespace) -> int:
     package = Path(args.package)
     if not package.is_file():
         raise SystemExit(f"DFU package not found: {package}\nbuild it first (make build-xiao-nrf52-lab)")
+    validate_application_package(package)
 
     nrfutil = Path(os.environ.get("ADAFRUIT_NRFUTIL",
                                   Path.home() / ".platformio/packages/tool-adafruit-nrfutil"))
@@ -473,12 +528,20 @@ def main() -> int:
     doctor = sub.add_parser("doctor", help="check the lab host can drive the boards")
     doctor.set_defaults(func=cmd_doctor)
 
+    extract = sub.add_parser("extract-application",
+                             help="extract the validated raw application from an existing DFU package; no board access")
+    extract.add_argument("--package", required=True)
+    extract.add_argument("--output", required=True)
+    extract.set_defaults(func=cmd_extract_application)
+
     add_role_command("path", cmd_path, help_text="print the stable by-id path for a role")
     add_role_command("serial", cmd_serial, help_text="print the USB serial pinned to a role")
     add_role_command("wait", cmd_wait, mode_default=MODE_APP,
                      help_text="block until a role enumerates")
-    add_role_command("reset", cmd_reset, mode_default=MODE_APP,
-                     help_text="restart the application firmware")
+    reset = add_role_command("reset", cmd_reset, mode_default=MODE_APP,
+                             help_text="restart the application firmware")
+    reset.add_argument("--protocol", choices=["companion", "repeater"], required=True,
+                       help="serial protocol of the installed application")
     add_role_command("bootloader", cmd_bootloader, mode_default=MODE_BOOT,
                      help_text="enter the serial DFU bootloader (1200-baud touch)")
     flash = add_role_command("flash", cmd_flash, mode_default=MODE_APP,

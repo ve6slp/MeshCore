@@ -10,6 +10,28 @@ verification, backup, install, trial confirmation, and rollback before the
 upstream boot flow starts. The original larger BLE-enabled profile remains
 available for SWD commissioning.
 
+## Lean simplification: genesis/authority receipt removed
+
+The previous `BootFloorActivationReceiptV1` genesis/role-continuity receipt system has been deleted. The bootloader now trusts any structurally valid floor record — CRC-correct and commit-marker-complete, including `confirmed_counter_floor == 0` — without any separate genesis receipt requirement. Admin-signed install-command verification is unchanged: Ed25519 over the transport's 59-byte wire descriptor remains the sole authorization gate for installing new firmware.
+
+The backup -> install -> watchdog trial -> health confirm/rollback flow, the A/B command/state/confirmation/floor journals, and the exact 28-byte Nordic SDK settings restore are unchanged. Historical sections further below that describe the removed receipt mechanism are kept only as background on why it was built and then deleted; they do not describe current bootloader behavior.
+
+## Lean simplification: legacy v1 install-command format removed
+
+The legacy 71-byte little-endian `xiao_ota_command_t` install-command format (the bootloader's own standalone descriptor, distinct from the LoRa OTA transport's wire format) has been deleted along with `xiao_ota_canonical_descriptor_t`, `xiao_ota_command_valid()`, and `xiao_ota_install_command_from_v1()`. This format was never used by any released firmware or deployed signing tool; it predates this bootloader's adoption of the transport's own canonical 59-byte big-endian wire descriptor + 64-byte Ed25519 signature (`xiao_ota_command_v2_t`), which was then the sole supported install-command format (188 bytes total: magic/version/length/sequence/nonce + 59-byte wire descriptor + 64-byte signature + active-image extent/hash + CRC/commit marker). `tools/sign_image.py` no longer accepts a `--command-version`/`--device-address` flag; it always emits this one format family. "v2" naming is kept in code purely to avoid a mechanical rename, not because another version still exists -- see the next section for why the actual on-wire `record_version` has since moved from 2 to 3.
+
+## Lean simplification: app-admitted signer key embedded in the install command
+
+`xiao_ota_command_v2_t` (`record_version` now `XIAO_OTA_COMMAND_VERSION_CURRENT` = 3, 220 bytes total, up from the prior 188-byte/version-2 shape) adds a 32-byte `admitted_signer_public_key_ed25519` field between `wire_descriptor` and `signature_ed25519`. This closes a gap versus the lean design: verification previously trusted only a single bootloader-compiled-in key (`XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY`, defaulting to `xiao_ota_lab_public_key_ed25519` from `include/xiao_ota_public_key.h`), with no way to honor MeshCore admin-identity key rotation without a bootloader rebuild.
+
+The trust model: the already-trusted, currently-running app verifies a manifest's signer using its own pre-existing MeshCore admin-identity mechanism (entirely outside this bootloader), then durably snapshots that admitted public key, alongside the signed manifest, into the install command at the explicit per-target COMMIT step. The bootloader itself never judges whether an embedded key "is a legitimate admin key" -- it only re-verifies that `signature_ed25519` is a genuine Ed25519 signature over `wire_descriptor` under EXACTLY the command's own embedded key (cryptographic self-consistency of the durable record across a power-fail), plus the existing SHA256/model/size/geometry/counter-floor checks. Anti-rollback -- rejecting a stale command signed under a previously-admitted but since-rotated-out key -- is unchanged and still enforced solely by the existing monotonic counter-floor check, independent of key identity; no new ACL/issuer/grant/attestation hierarchy was added. This remains the documented local-failure trust boundary, not a physical-attacker secure-boot/APPROTECT feature.
+
+The compile-time `XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY` override mechanism in `src/xiao_ota_boot_io.c` has been removed entirely (including its `#include "xiao_ota_public_key.h"`), since verification now always reads the key from the command record. `tests/fake_trust_anchor.h` and the Makefile's `-DXIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY=xiao_ota_test_public_key_ed25519 -include .../fake_trust_anchor.h` test-build flags are harmless vestigial build inputs now (an unused macro definition and an unused extern declaration); `tests/test_boot_process.c` instead copies its own fresh test keypair's public half directly into each built command's `admitted_signer_public_key_ed25519` field. `include/xiao_ota_public_key.h`/`xiao_ota_lab_public_key_ed25519` remains in use for the unrelated boot-info marker embedded at `0xFDC00` (an informational/audit field read by `tools/verify_boot_info_artifact.py`, not a runtime trust anchor).
+
+`tools/sign_image.py` derives the admitted key from `--private-key`'s own public half (`openssl pkey ... -pubout -outform DER`, last 32 bytes) -- the lab/CLI signer and the admitted key are the same keypair in this tool, the correct analogue of "the running app just finished verifying this exact signer and is now snapshotting its key." A real app-side COMMIT flow supplies whatever key it actually admitted for that specific manifest.
+
+This field addition has **zero impact on internal code-flash fit**: install commands live entirely in external QSPI flash (`XIAO_OTA_COMMAND_A`/`XIAO_OTA_COMMAND_B` at `0x18C000`/`0x18D000`, inside the `[0x18C000,0x194000)` bootjournal region), never the internal 38,912-byte fixed-boot-code budget. ARM fit after this change (both roles): 37,812 / 38,912 bytes used, 1,100 bytes free -- slightly *better* than the pre-change 37,844/38,912 figure, since removing the now-unused `XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY`/`xiao_ota_public_key.h` reference from `xiao_ota_boot_io.c` recovered 32 bytes that more than offset any other change in this file.
+
 ## Fixed: no-SWD Ed25519 wrapper stack overflow
 
 `src/xiao_ota_ed25519_tweetnacl.c`'s `ed25519_verify()` previously sized its
@@ -554,10 +576,11 @@ from the whitelist even though they sit between two permitted ranges --
 neither ever appears in a real packaged UF2, and an update artifact must
 never be able to touch either. `install()` also now calls
 `verify_boot_info_artifact.check_artifact()` against the artifact's
-`--board`/`--key-header` (defaulting to `xiao_nrf52840` and this project's
-committed public-key header) before the volume copy, binding the install
-to the same independent marker/profile/key check the Make package targets
-already run at build time.
+`--board`/`--role-id` (and OPTIONALLY `--key-header`, see "Independent
+artifact-level marker verification" below -- there is no compiled/default
+key here; omitting it simply skips that one cross-check) before the volume
+copy, binding the install to the same independent marker/profile check the
+Make package targets already run at build time.
 
 `tests/test_install_uf2.py`'s fixture is now a genuinely-shaped
 multi-block UF2 (MBR + bootloader-code + a real boot-info marker + UICR
@@ -565,9 +588,13 @@ blocks, all with the real family ID) instead of a single otherwise-empty
 block, and adds behavioural refusals -- all asserted to happen before any
 volume copy -- for a block targeting the application/ExtraFS region, a
 block targeting the settings page, an oversized payload, a wrong
-`family_id`, and a boot-info marker with the wrong board or the wrong
-trusted public key. The new whitelist/family/payload/marker checks were
-also confirmed to pass unmodified against a genuine main-built artifact
+`family_id`, and (when `--key-header` is explicitly given) a boot-info
+marker with the wrong board or the wrong reference signer key; a
+companion test confirms omitting `--key-header` installs successfully even
+against a marker whose reference key doesn't match any particular header,
+since that field is never a runtime trust gate. The new
+whitelist/family/payload/marker checks were also confirmed to pass
+unmodified against a genuine main-built artifact
 (`.tmp/xiao_nrf52840_ota_artifacts/custom-noswd/xiao_nrf52840_ota_noswd_update.uf2`,
 read-only), so the hardening does not reject real packaged output.
 
@@ -832,7 +859,13 @@ typedef struct __attribute__((packed)) {
   uint32_t capability_flags;  /* e.g. XIAO_OTA_CAP_QSPI_INSTALL */
   uint16_t key_id;
   uint16_t algorithm_id;      /* XIAO_OTA_ALGORITHM_ED25519 */
-  uint8_t trusted_public_key[32]; /* the exact Ed25519 key this binary verifies with */
+  uint8_t reference_signer_public_key_ed25519[32]; /* build-provenance record only --
+    the static placeholder value include/xiao_ota_public_key.h held when THIS
+    build/role was compiled (embedded by tools/prepare_upstream.py's CRC-patch
+    step); NOT a trust anchor and unrelated to any private key or signing
+    operation. Runtime install-command verification always reads the key from
+    that command's own admitted_signer_public_key_ed25519 (xiao_ota_command_v2_t),
+    never from this marker. */
   uint32_t crc32;             /* IEEE CRC-32 over every byte above */
 } xiao_ota_boot_info_t;        /* 60 bytes, at 0xFDC00 */
 ```
@@ -841,7 +874,13 @@ typedef struct __attribute__((packed)) {
 `src/xiao_ota_boot_info.c`) validates magic/format/size/CRC; the application
 **must** treat a `false` result -- including the fully-erased-stock-bootloader
 case -- as "cannot confirm a qualified custom boot", and fail closed rather
-than assume install capability or trust an unverified public key.
+than assume install capability. Confirming a qualified custom boot this way
+is a build/board/role/capability provenance check -- it is **not** an
+install-command trust decision, and `reference_signer_public_key_ed25519`
+must never be used as one: each install command carries and is verified
+against its own `admitted_signer_public_key_ed25519` (see "App-admitted
+signer key" above), independent of whatever key this marker happens to
+record.
 
 There is no runtime write path to this object anywhere in this bootloader:
 it is `const`, lives in true flash ROM, and a Cortex-M plain store to it
@@ -930,36 +969,48 @@ logic. It parses the bytes at `0xFDC00` straight out of a real packaged
 `.hex` or `.uf2` artifact, decodes them against its own independently
 re-declared 60-byte little-endian layout and golden constants, and
 separately recomputes and checks the CRC-32, magic, format/size, and every
-profile/key field (`board_target_id`, `role_id`, `capability_flags`,
-`key_id`, `algorithm_id`, `trusted_public_key`). It is meant to catch
-drift or a bad build even if the C helpers and the patch step ever agreed
-on the same wrong value:
+profile field (`board_target_id`, `role_id`, `capability_flags`, `key_id`,
+`algorithm_id`). It is meant to catch drift or a bad build even if the C
+helpers and the patch step ever agreed on the same wrong value:
 
 ```sh
 python3 bootloader/xiao_nrf52840_ota/tools/verify_boot_info_artifact.py \
   --board xiao_nrf52840 \
-  --key-header bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h \
   .tmp/xiao_nrf52840_ota_artifacts/custom-noswd/xiao_nrf52840_ota_noswd.hex
 ```
 
+`--key-header` is OPTIONAL and strictly an opt-in extra: when given, it
+additionally cross-checks the marker's `reference_signer_public_key_ed25519`
+build-provenance field (the static placeholder value
+`include/xiao_ota_public_key.h` held when this build was compiled, embedded
+by `tools/prepare_upstream.py`'s CRC-patch step) against a header file.
+There is no compiled/default key substituted when it's omitted -- omission
+simply skips that one check, it is never a failure, and a mismatch or
+absence here says nothing about which key the bootloader will actually
+accept on a real install command (that is always read per-command from
+`admitted_signer_public_key_ed25519`, see "App-admitted signer key" above).
+
 Run against a real `make package-xiao-ota-bootloader-noswd` output this
 session: passes on both the `.hex` and `.uf2` artifacts for the default
-`xiao_nrf52840` profile, and passes against a real SenseCAP `--board
-sensecap_solar_p1 --work-dir ...` build's own `.hex` and the matching
-`--key-header` copied into that build's work tree. Confirmed to genuinely
-fail (not silently pass) on: a `--board` argument that does not match the
-artifact's real compiled target, and a hand-corrupted marker byte (both
-the public-key mismatch and the recomputed-CRC mismatch are reported).
-For a SenseCAP artifact, point `--key-header` at the copied
-`src/xiao_ota/xiao_ota_public_key.h` inside that build's own `--work-dir`
-tree (the same key file that build actually compiled from), not the
-top-level `include/` copy, in case they ever diverge.
+`xiao_nrf52840` profile (with and without `--key-header`), and passes
+against a real SenseCAP `--board sensecap_solar_p1 --work-dir ...` build's
+own `.hex`. Confirmed to genuinely fail (not silently pass) on: a `--board`
+argument that does not match the artifact's real compiled target, and a
+hand-corrupted marker byte (both an explicitly-requested
+`--key-header` mismatch and the recomputed-CRC mismatch are reported).
+For a SenseCAP artifact, if cross-checking the key, point `--key-header` at
+the copied `src/xiao_ota/xiao_ota_public_key.h` inside that build's own
+`--work-dir` tree (the same key file that build actually compiled from),
+not the top-level `include/` copy, in case they ever diverge.
 
-The lab public key this script (and the marker itself) checks against is
-the **publicly-reproducible bench/lab test fixture** generated by
-`tools/provision_lab_key.py` -- explicitly bench-only, never a production
-key, and its private half is never written anywhere this tool touches or
-outputs.
+The reference-signer value this script (and the marker itself) checks
+against, when `--key-header` is given, is a **fixed, non-secret placeholder
+committed directly in `include/xiao_ota_public_key.h`** -- not generated,
+provisioned, or rotated by any tool, and with no corresponding private key
+retained anywhere in this repo. `tools/provision_lab_key.py` is an
+unrelated, purely offline test-fixture generator (a throwaway private key
+under `.tmp`, for passing to `sign_image.py --private-key` in manual/lab
+signing); it does not read or write this header.
 
 The reader is strict on purpose: it validates every Intel HEX record's
 declared byte count and checksum, rejects unsupported (data-address-
@@ -1065,14 +1116,13 @@ make sign-xiao-ota-image \
   XIAO_OTA_COUNTER=2
 ```
 
-This produces a command v1 (legacy, 71-byte) bundle by default, matching the
-Makefile target's current behaviour unchanged. To produce a command v2
-bundle around the transport's real 59-byte wire descriptor instead, run
-`tools/sign_image.py` directly with `--command-version 2` (not yet wired as
-a separate Makefile target/flag; ask before adding one). Output is a
-188-byte `install-command.bin` (versus 200 bytes for v1) plus the same
-`candidate.bin`/`descriptor.bin`/`descriptor.sig` files, where `descriptor.bin`
-is the real 59-byte big-endian wire form, not the 71-byte legacy form.
+This produces a single-schema `install-command.bin` (220 bytes,
+`record_version` 3 -- see "App-admitted signer key" above for the exact
+layout) plus `candidate.bin`/`descriptor.bin`/`descriptor.sig`, where
+`descriptor.bin` is the real 59-byte big-endian wire form. There is no
+`--command-version` flag or legacy format to select: the prior 71-byte
+(v1) and 188-byte (v2, no admitted-key field) shapes have both been
+removed.
 
 The active image file must be the exact installed binary extent beginning at
 `0x27000`; the maximum end is `0xED000`. The bootloader authenticates the
@@ -1107,19 +1157,86 @@ three unconfirmed boots are allowed; then the byte-verified backup is restored.
 Power loss in backup/install/rollback resumes from the last committed 4 KiB
 boundary. Candidate and backup are not erased by the bootloader.
 
-## Lab key
+## Reference-signer placeholder and offline key fixtures
 
-The committed key is a non-secret lab public key. Its private key exists only
-as `.tmp/xiao-ota-keys/lab-ed25519-private.pem`. To create or deliberately
-rotate the lab key and update the public header:
+`include/xiao_ota_public_key.h`'s `xiao_ota_lab_public_key_ed25519` is a
+**fixed, non-secret placeholder value committed directly in source
+control** -- it is not generated, provisioned, or rotated by any tool, and
+no corresponding private key is retained anywhere in this repo. It exists
+only to give two build-time-only consumers a stable 32-byte value: the
+boot-info marker's build-provenance field
+(`reference_signer_public_key_ed25519`, see "Boot-info/capability marker"
+above) and `tools/prepare_upstream.py`'s CRC-patch input. It is never a
+runtime install-command trust anchor -- that is always read per-command
+from a command's own `admitted_signer_public_key_ed25519` (see "App-admitted
+signer key" above), snapshotted by the already-trusted running app at
+COMMIT time.
+
+`tools/provision_lab_key.py` is unrelated to this header: it is a purely
+offline/local test-fixture generator that creates (or reuses) a throwaway
+Ed25519 private key under `.tmp/xiao-ota-keys/lab-ed25519-private.pem`
+(never committed), for passing to `sign_image.py --private-key` in
+manual/lab signing workflows only:
 
 ```sh
-make provision-xiao-ota-lab-key
+python3 bootloader/xiao_nrf52840_ota/tools/provision_lab_key.py
 ```
 
-Review and commit only `include/xiao_ota_public_key.h`; never commit `.tmp`.
-Production commissioning must replace this lab key under controlled key
-management.
+It does not read or write `include/xiao_ota_public_key.h` or any other
+compiled header, and establishes no "default trust" key. Production
+signing never exports a private key to a tool like this at all: it happens
+entirely through the existing host companion protocol (CMD33 start / CMD34
+raw message bytes / CMD35 finish, returning only the signature), with the
+already-trusted running app snapshotting the resulting admitted public key
+directly into the install command at COMMIT time.
+
+## Host-side bare manifest builder: `build_manifest.py`
+
+`tools/sign_image.py` bundles three distinct concerns together: building
+the canonical59 wire descriptor, invoking a local OpenSSL private key to
+sign it, and assembling a full durable 220-byte install command. A
+production host instead signs through the existing companion protocol
+(CMD33 start / CMD34 raw message bytes / CMD35 finish) and has no local
+private key to hand `sign_image.py` at all -- it only needs the bare,
+unsigned descriptor bytes to hand to that protocol.
+
+`tools/build_manifest.py` provides exactly that and nothing else: it never
+touches a private key, an `--active-image` reference, a signature, or a
+durable install command.
+
+```sh
+python3 bootloader/xiao_nrf52840_ota/tools/build_manifest.py \
+  --image .pio/build/ENV/firmware.bin \
+  --board xiao_nrf52840 \
+  --role-id 0 \
+  --counter 2 \
+  --output manifest.bin
+```
+
+| Flag | Required | Meaning |
+| --- | --- | --- |
+| `--image` | yes | candidate application image to describe (read-only; never modified or signed by this tool) |
+| `--board` | no (default `xiao_nrf52840`) | `xiao_nrf52840` or `sensecap_solar_p1`; selects the descriptor's `boardFamily`/`boardVariant` bytes |
+| `--role-id` | no (default `0`) | `0` (companion) or `1` (repeater); any other value is rejected before `--output` is written |
+| `--counter` | yes | anti-rollback security counter; must be `0 < counter <= 0xFFFFFFFF` -- a device's floor starts at `0` and the bootloader rejects `monotonic_counter <= counter_floor`, so `0` itself can never install on any real device and is rejected up front |
+| `--output` | yes | path to write the bare 59-byte unsigned descriptor to |
+
+`--image` is validated against the exact same geometry/alignment policy as
+`sign_image.py`'s candidate image (word-aligned, `1..0xAD000` bytes,
+cross-checked at runtime against
+`src/ota/platform/Nrf52FlashLayoutContract.h`), and `--board`/`--role-id`/
+`--counter` are all validated before anything is written to `--output` --
+an invalid input never produces a partial/truncated output file.
+
+Both `sign_image.py` and `build_manifest.py` build the 59-byte canonical
+descriptor through the single shared codec in `tools/xiao_ota_descriptor.py`
+(`build_descriptor()`); there is exactly one place in this tree that
+encodes a canonical59 descriptor, so their outputs for matching inputs are
+always byte-for-byte identical. Sign the resulting file's bytes EXACTLY as
+emitted -- no domain prefix, no NUL terminator, no extra hashing/wrapping
+-- via the host companion protocol, then supply the resulting 64-byte
+signature plus the app-admitted public key to the install command (see
+"App-admitted signer key" above).
 
 ## Fixed: five review regressions in metadata I/O, confirmation, slot tracking, backup, and QSPI init
 

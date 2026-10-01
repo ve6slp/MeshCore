@@ -17,6 +17,9 @@
 #include <ota/runtime/OtaLeaseStateMachine.h>
 #include <ota/runtime/OtaReceiverStateMachine.h>
 #include <ota/runtime/OtaTrustInterfaces.h>
+#include <ota/storage/OtaCandidateStore.h>
+#include <helpers/ota/OtaLeanReceiver.h>
+#include <helpers/ota/OtaRfFrames.h>
 
 namespace mesh {
 namespace ota {
@@ -120,20 +123,241 @@ public:
 
   bool setDutyCyclePercent(float percent) {
     // Reject non-finite input (NaN, +-Inf) explicitly: NaN fails both
-    // `<= 0.0f` and `> 100.0f` (all NaN comparisons are false), so without
+    // `< 0.0f` and `> 100.0f` (all NaN comparisons are false), so without
     // this guard a NaN would silently pass the bounds check below and then
     // hit undefined behavior in the float->integer budget conversion.
-    if (!std::isfinite(percent) || percent <= 0.0f || percent > 100.0f) return false;
+    if (!std::isfinite(percent) || percent < 0.0f || percent > 100.0f) return false;
     duty_percent_ = percent;
     const uint64_t budget = (static_cast<uint64_t>(window_ms_) * static_cast<uint32_t>(percent * 1000.0f + 0.5f)) / 100000u;
-    budget_ms_ = budget > 0 ? static_cast<uint32_t>(budget) : 1;
+    budget_ms_ = static_cast<uint32_t>(budget);
     airtime_.retune(window_ms_, budget_ms_);
     return true;
   }
 
-  void attachTrustProvider(meshcore::ota::runtime::IOtaTrustProvider* provider) { trust_provider_ = provider; }
-  void attachStagingSink(meshcore::ota::runtime::IOtaStagingSink* sink) { staging_sink_ = sink; }
+  void attachTrustProvider(meshcore::ota::runtime::IOtaTrustProvider* provider) {
+    trust_provider_ = provider;
+    lean_.attachTrustProvider(provider);
+  }
+  void attachStagingSink(meshcore::ota::runtime::IOtaStagingSink* sink) {
+    staging_sink_ = sink;
+    lean_.attachStagingSink(sink);
+  }
+  void attachCandidateStore(::ota::storage::OtaCandidateStore* store) { lean_.attachCandidateStore(store); }
+  void attachLeanSignatureVerifier(const ::ota::trust::SignatureVerifier* verifier) { lean_.attachOwnerSignatureVerifier(verifier); }
+  void setLeanAdminCheck(void* ctx, OtaLeanReceiver::AdminCheckFn fn) { lean_.setAdminCheck(ctx, fn); }
+  void setLeanTargetPublicKey(const uint8_t key[32]) { lean_.setTargetPublicKey(key); }
+  OtaLeanReceiver& leanReceiver() { return lean_; }
+  const OtaLeanReceiver& leanReceiver() const { return lean_; }
+  void loop() { lean_.loop(); }
+  using SignFn = void (*)(void*, const uint8_t*, size_t, uint8_t[64]);
+  using RadioChangeFn = bool (*)(void*, uint32_t, bool);
+  void attachRfIdentity(void* ctx, SignFn sign, RadioChangeFn change, uint32_t normal_freq_khz) {
+    rf_ctx_ = ctx; rf_sign_ = sign; rf_radio_change_ = change; normal_freq_khz_ = normal_freq_khz;
+  }
+  using BootLifecycleFn = bool (*)(void*, OtaBootLifecycleEvidence&);
+  void attachBootLifecycle(void* ctx, BootLifecycleFn fn) { boot_ctx_ = ctx; boot_lifecycle_ = fn; }
+  OtaBootLifecycleEvidence bootLifecycle() const {
+    OtaBootLifecycleEvidence out;
+    if (boot_lifecycle_ && !boot_lifecycle_(boot_ctx_, out)) out = OtaBootLifecycleEvidence();
+    return out;
+  }
+  static usb::UsbOtaPhase candidatePhase(::ota::storage::OtaCandidateStore::Phase phase) {
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    switch (phase) {
+      case Phase::Receiving: return usb::UsbOtaPhase::Receiving;
+      case Phase::Verifying: return usb::UsbOtaPhase::Verifying;
+      case Phase::Ready: return usb::UsbOtaPhase::Ready;
+      case Phase::Committed: return usb::UsbOtaPhase::CommitPending;
+      case Phase::Aborted: return usb::UsbOtaPhase::Aborted;
+      case Phase::Failed: return usb::UsbOtaPhase::Failed;
+      default: return usb::UsbOtaPhase::Idle;
+    }
+  }
+  usb::UsbOtaPhase reportedPhase() const {
+    return reportedPhase(bootLifecycle());
+  }
+  usb::UsbOtaPhase reportedPhase(const OtaBootLifecycleEvidence& boot) const {
+    const auto st = lean_.status();
+    if (!st.valid) return usb::UsbOtaPhase::Unknown;
+    if (st.localCache) return st.phase == ::ota::storage::OtaCandidateStore::Phase::Ready ?
+                                usb::UsbOtaPhase::CacheSealed : candidatePhase(st.phase);
+    if (boot.transactionNonce == st.transactionNonce && boot.transactionNonce && boot.counter == st.counter) {
+      if (boot.phase == usb::UsbOtaPhase::Failed) return usb::UsbOtaPhase::Failed;
+      if ((boot.phase == usb::UsbOtaPhase::Trial || boot.phase == usb::UsbOtaPhase::Installed) &&
+          !std::memcmp(boot.imageHash, st.imageHash, 32)) {
+        uint8_t canonical[59], signature[64];
+        if (lean_.exportCandidateForUpload(canonical, signature) &&
+            lean_.verifySignature(st.ownerPublicKey, canonical, sizeof(canonical), signature) &&
+            (boot.phase == usb::UsbOtaPhase::Trial ||
+             (boot.imageVerified && boot.floorKnown && boot.confirmedFloor == st.counter))) return boot.phase;
+      }
+    }
+    return candidatePhase(st.phase);
+  }
+  bool directActive() const { return direct_active_; }
+  bool directPending() const { return direct_pending_; }
+  bool hasPendingRfWork() const {
+    return direct_active_ || direct_pending_ || pending_control_frame_valid_ ||
+           lean_.status().phase == ::ota::storage::OtaCandidateStore::Phase::Verifying;
+  }
+  void stopDirect() {
+    direct_pending_ = false;
+    direct_waiting_ack_ = false;
+    if (pending_control_frame_valid_ && pending_control_frame_[0] == kOtaDirectAckKind) pending_control_frame_valid_ = false;
+    if (direct_active_ && rf_radio_change_ && rf_radio_change_(rf_ctx_, normal_freq_khz_, true)) direct_active_ = false;
+  }
+  void tickDirect(uint32_t now_ms, bool radio_idle = true) {
+    if (direct_active_ && static_cast<int32_t>(now_ms - direct_expiry_ms_) >= 0) stopDirect();
+    if (direct_pending_ && static_cast<int32_t>(now_ms - direct_transition_deadline_) >= 0) stopDirect();
+    if (direct_pending_ && direct_ack_tx_wait_ && !pending_control_frame_valid_ && radio_idle) {
+      // Begin the receiver's transition delay after ACK TX drained, not
+      // when its request arrived (a queued/duty-delayed ACK is not sent).
+      direct_ack_tx_wait_ = false;
+      direct_apply_ms_ = now_ms + 5000u;
+    }
+    if (direct_pending_ && !direct_ack_tx_wait_ && !pending_control_frame_valid_ &&
+        static_cast<int32_t>(now_ms - direct_apply_ms_) >= 0 && radio_idle) {
+      direct_pending_ = false;
+      if (rf_radio_change_ && rf_radio_change_(rf_ctx_, direct_freq_khz_, false)) {
+        direct_active_ = true;
+        direct_expiry_ms_ = now_ms + direct_lease_ms_;
+      } else if (rf_radio_change_ && !rf_radio_change_(rf_ctx_, normal_freq_khz_, true)) {
+        direct_active_ = true;
+        direct_expiry_ms_ = now_ms;
+      }
+    }
+    const auto st = lean_.status();
+    if (direct_active_ && (st.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted ||
+                          st.phase == ::ota::storage::OtaCandidateStore::Phase::Committed ||
+                          !st.valid || (!st.localCache && !lean_.currentAdmin(st.ownerPublicKey)))) stopDirect();
+  }
+  size_t buildDirectRequest(const uint8_t target[32], uint32_t freq_khz, uint16_t lease_ms,
+                            uint32_t token, uint8_t* out, size_t capacity) {
+    const auto st = lean_.status();
+    if (!st.valid || !rf_sign_ || !lean_.haveTargetPublicKey() || freq_khz == normal_freq_khz_ ||
+        freq_khz < 150000 || freq_khz > 2500000 || lease_ms < usb::kDirectLeaseMsMin ||
+        lease_ms > usb::kDirectLeaseMsMax || direct_active_ || direct_pending_) return 0;
+    const auto len = encodeOtaDirectFrame(kOtaDirectRequestKind, lean_.targetPublicKey(), target, st.manifestHash,
+                                          freq_khz, lease_ms, token, out, capacity);
+    if (!len) return 0;
+    uint8_t message[160];
+    const auto mlen = buildOtaDirectMessage(out, message);
+    rf_sign_(rf_ctx_, message, mlen, out + 107);
+    std::memcpy(direct_request_, out, 107);
+    direct_waiting_ack_ = true;
+    return len;
+  }
   bool backendAvailable() const { return trust_provider_ != nullptr && staging_sink_ != nullptr; }
+
+  // --- Real-mesh (RF-only) remote-target observation tracking ---------
+  // Used by an uploader (e.g. the companion USB-driven uploader) to learn
+  // whether a remote target it added actually has the candidate in Ready
+  // phase, WITHOUT ever trusting a stale/cached belief: `trackOtaTarget`
+  // registers interest, `requestStatusPoll` builds an (unsigned,
+  // authority-free) solicitation frame to provoke a fresh reply, and
+  // `targetObservation` reports the age of the last reply actually seen
+  // from that exact reporter key so a caller can tell a genuinely fresh
+  // remote observation from a stale/nonexistent one (age ==
+  // kNoObservationAgeMs means "never observed").
+  static constexpr size_t kMaxTrackedOtaTargets = usb::kMaxSelectedTargets;
+  static constexpr uint32_t kNoObservationAgeMs = 0xFFFFFFFFu;
+
+  struct TargetObservation {
+    bool tracked = false;
+    bool haveReport = false;
+    uint32_t ageMs = kNoObservationAgeMs;
+    uint16_t receivedBlocks = 0;
+    uint16_t totalBlocks = 0;
+    uint8_t phase = 0;
+    uint8_t manifestHash[32] = {};
+    uint16_t first = 0;
+    uint8_t bitmap[kOtaCensusBitmapBytes] = {};
+    bool haveBitmap = false;
+    uint32_t generation = 0;
+    usb::UsbOtaPhase lifecyclePhase = usb::UsbOtaPhase::Unknown;
+    bool haveLifecycle = false, floorKnown = false;
+    uint32_t confirmedFloor = 0, counter = 0;
+  };
+
+  void trackOtaTarget(const uint8_t target_pk[32]) {
+    if (target_pk == nullptr) return;
+    int free_slot = -1;
+    uint32_t oldest_seen = 0xFFFFFFFFu;
+    int oldest_slot = 0;
+    for (size_t i = 0; i < kMaxTrackedOtaTargets; ++i) {
+      if (targets_[i].tracked && std::memcmp(targets_[i].publicKey, target_pk, 32) == 0) return;
+      if (!targets_[i].tracked && free_slot < 0) free_slot = static_cast<int>(i);
+      if (targets_[i].lastSeenMs <= oldest_seen) { oldest_seen = targets_[i].lastSeenMs; oldest_slot = static_cast<int>(i); }
+    }
+    const int slot = (free_slot >= 0) ? free_slot : oldest_slot;
+    targets_[slot] = TrackedTarget();
+    targets_[slot].tracked = true;
+    std::memcpy(targets_[slot].publicKey, target_pk, 32);
+  }
+  void clearTargetObservation(const uint8_t key[32]) {
+    for (auto& t : targets_) {
+      if (!t.tracked || std::memcmp(t.publicKey, key, 32)) continue;
+      t.haveReport = false; t.haveBitmap = false;
+    }
+  }
+
+  bool targetObservation(const uint8_t target_pk[32], uint32_t now_ms, TargetObservation& out) const {
+    out = TargetObservation();
+    if (target_pk == nullptr) return false;
+    for (size_t i = 0; i < kMaxTrackedOtaTargets; ++i) {
+      if (!targets_[i].tracked || std::memcmp(targets_[i].publicKey, target_pk, 32) != 0) continue;
+      out.tracked = true;
+      if (targets_[i].haveReport) {
+        out.haveReport = true;
+        out.ageMs = now_ms - targets_[i].lastSeenMs;
+        out.receivedBlocks = targets_[i].receivedBlocks;
+        out.totalBlocks = targets_[i].totalBlocks;
+        out.phase = targets_[i].phase;
+        std::memcpy(out.manifestHash, targets_[i].manifestHash, 32);
+        std::memcpy(out.bitmap, targets_[i].bitmap, kOtaCensusBitmapBytes);
+        out.first = targets_[i].first;
+        out.haveBitmap = targets_[i].haveBitmap;
+        out.generation = targets_[i].generation;
+        out.lifecyclePhase = targets_[i].lifecyclePhase;
+        out.haveLifecycle = targets_[i].haveLifecycle;
+        out.floorKnown = targets_[i].floorKnown;
+        out.confirmedFloor = targets_[i].confirmedFloor;
+        out.counter = targets_[i].counter;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // Builds the (unsigned, informational-only) poll frame that a caller
+  // should transmit to provoke a fresh StatusReport from a tracked
+  // target -- a forged poll can only cause an extra harmless broadcast,
+  // never an authority decision, so it deliberately carries no signature.
+  size_t buildStatusPollFrame(const uint8_t manifest_tag[kOtaManifestTagBytes],
+                             uint8_t* out, size_t out_capacity) const {
+    return encodeOtaStatusPollFrame(manifest_tag, out, out_capacity);
+  }
+
+  // Drains at most one queued outbound StatusReport reply this node owes
+  // (in response to a received StatusPoll for its own admitted
+  // candidate). The caller (board/Mesh loop) is responsible for actually
+  // transmitting the bytes; this object only ever stages one at a time.
+  bool pollOutboundControlFrame(uint8_t* out, size_t out_capacity, size_t& out_len) {
+    if (!pending_control_frame_valid_) return false;
+    if (out == nullptr || out_capacity < pending_control_frame_len_) return false;
+    std::memcpy(out, pending_control_frame_, pending_control_frame_len_);
+    out_len = pending_control_frame_len_;
+    pending_control_frame_valid_ = false;
+    return true;
+  }
+  bool peekOutboundControlFrame(uint8_t* out, size_t capacity, size_t& len, uint32_t now_ms) const {
+    if (!pending_control_frame_valid_ || static_cast<int32_t>(now_ms - pending_control_due_ms_) < 0 ||
+        !out || capacity < pending_control_frame_len_) return false;
+    std::memcpy(out, pending_control_frame_, pending_control_frame_len_);
+    len = pending_control_frame_len_;
+    return true;
+  }
+  void releaseOutboundControlFrame() { pending_control_frame_valid_ = false; }
 
   const meshcore::ota::runtime::OtaAirtimeLimiter& airtimeLimiter() const { return airtime_; }
   meshcore::ota::runtime::OtaAirtimeLimiter& airtimeLimiter() { return airtime_; }
@@ -143,6 +367,15 @@ public:
                    uint32_t prospective_airtime_ms,
                    bool regulatory_allowed,
                    bool normal_traffic_active) const {
+    // The configured share applies on-mesh, not to the negotiated
+    // off-frequency SF5 window. Bound every off-mesh TX by the remaining
+    // lease instead (including TX completion margin), and retain normal
+    // queue precedence and regulatory gating.
+    if (direct_active_) {
+      const int32_t remaining = static_cast<int32_t>(direct_expiry_ms_ - now_ms);
+      return budget_ms_ != 0 && regulatory_allowed && !normal_traffic_active && remaining > 0 &&
+             static_cast<uint64_t>(prospective_airtime_ms) * 3u / 2u + 20u < static_cast<uint32_t>(remaining);
+    }
     meshcore::ota::runtime::OtaAirtimeDecisionInput input;
     input.regulatoryAllowed = regulatory_allowed;
     input.normalTrafficActive = normal_traffic_active;
@@ -152,10 +385,11 @@ public:
   bool recordTransmit(uint32_t now_ms,
                       meshcore::ota::protocol::OtaAirtimeCategory category,
                       uint32_t airtime_ms) {
+    if (direct_active_) return true;
     return airtime_.recordUsage(now_ms, category, airtime_ms);
   }
 
-  bool handleReceivedFrame(const uint8_t* frame, size_t frame_len) {
+  bool handleReceivedFrame(const uint8_t* frame, size_t frame_len, uint32_t now_ms = 0) {
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
 
@@ -164,10 +398,27 @@ public:
     size_t payload_len = 0;
     OtaCodecResult decoded = decodeOtaEnvelope(frame, frame_len, hdr, payload, payload_len);
     if (decoded != OtaCodecResult::Ok) {
+      const LeanControlResult control = handleLeanControlFrame(frame, frame_len, now_ms);
+      if (control == LeanControlResult::Handled) {
+        ++rx_frames_;
+        return true;
+      }
+      if (control == LeanControlResult::Rejected) {
+        ++bad_frames_;
+        return false;
+      }
+      const auto lean_result = lean_.handleSignedBlockFrame(frame, frame_len);
+      if (lean_result == usb::UsbOtaResult::Ok) {
+        ++rx_frames_;
+        return true;
+      }
       ++bad_frames_;
       return false;
     }
 
+    // A configured lean product must not allow the obsolete envelope
+    // session to write the same candidate bank around its durable owner.
+    if (lean_.hasStore()) { ++bad_frames_; return false; }
     ++rx_frames_;
     const OtaSessionId id = otaSessionFromEnvelope(hdr);
     switch (hdr.type) {
@@ -216,6 +467,14 @@ public:
   }
 
   void abortSession() {
+    stopDirect();
+    if (lean_.hasStore()) {
+      // This legacy transport-stop command has no signed image hash.
+      // It must not abort the lean sink behind a durable READY/cache
+      // snapshot, nor discard the candidate's original owner/progress.
+      ++aborted_sessions_;
+      return;
+    }
     receiver_.reset();
     coordinator_.reset();
     fleet_.reset();
@@ -256,6 +515,233 @@ public:
 
 private:
   static constexpr size_t kDescriptorFragmentHeaderSize = 1 + 1 + 2 + 2;
+
+  enum class LeanControlResult { NotControlFrame, Handled, Rejected };
+
+  struct TrackedTarget {
+    bool tracked = false;
+    uint8_t publicKey[32] = {0};
+    bool haveReport = false;
+    uint32_t lastSeenMs = 0;
+    uint16_t receivedBlocks = 0;
+    uint16_t totalBlocks = 0;
+    uint8_t phase = 0;
+    uint8_t manifestHash[32] = {};
+    uint16_t first = 0;
+    uint8_t bitmap[kOtaCensusBitmapBytes] = {};
+    bool haveBitmap = false;
+    uint32_t generation = 0;
+    usb::UsbOtaPhase lifecyclePhase = usb::UsbOtaPhase::Unknown;
+    bool haveLifecycle = false, floorKnown = false;
+    uint32_t confirmedFloor = 0, counter = 0;
+  };
+
+  // Dispatches the 4 real-mesh lean control-frame kinds (Authorization /
+  // Commit / Abort / StatusReport / StatusPoll, see OtaRfFrames.h) that
+  // are NOT the per-block SignedBlock frame. Any frame whose first byte
+  // doesn't match one of these kinds is NotControlFrame (falls through to
+  // the SignedBlock path unchanged); a recognized kind that fails to
+  // parse or is denied by lean_ is Rejected (counted as a bad frame, no
+  // fallback attempted -- these kind bytes can never also be a valid
+  // SignedBlock frame, see OtaBlockSigning.h kOtaSignedBlockKind=0x01).
+  LeanControlResult handleLeanControlFrame(const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
+    if (frame == nullptr || frame_len == 0) return LeanControlResult::NotControlFrame;
+    switch (frame[0]) {
+      case kOtaTargetAuthorizationKind: {
+        if (frame_len != 164 || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
+        uint8_t tag[8]; otaTargetTag(lean_.targetPublicKey(), tag);
+        if (std::memcmp(tag, frame + 1, 8)) return LeanControlResult::Rejected;
+        const auto r = lean_.begin(frame + 9, frame + 41, frame + 100, false, false);
+        return r == usb::UsbOtaResult::Ok || lean_.prepareReupload(frame + 9, frame + 41, frame + 100) ?
+                  LeanControlResult::Handled : LeanControlResult::Rejected;
+      }
+      case kOtaAuthorizationKind: {
+        OtaAuthorizationFrame parsed;
+        if (!parseOtaAuthorizationFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+        const auto r = lean_.begin(parsed.ownerPublicKey, parsed.canonical, parsed.signature,
+                                   /*reupload=*/false, /*local_owner_trusted=*/false);
+        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
+      }
+      case kOtaCommitKind: {
+        OtaCommitFrame parsed;
+        if (!parseOtaCommitFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+        const auto st = lean_.status();
+        if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32) ||
+            !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32)) return LeanControlResult::Rejected;
+        const auto r = lean_.commit(parsed.counter, parsed.signature);
+        if (r == usb::UsbOtaResult::Ok) stopDirect();
+        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
+      }
+      case kOtaAbortKind: {
+        OtaAbortFrame parsed;
+        if (!parseOtaAbortFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+        if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32)) return LeanControlResult::Rejected;
+        const auto r = lean_.abort(parsed.signerPublicKey, parsed.signature, parsed.imageHash);
+        if (r == usb::UsbOtaResult::Ok) stopDirect();
+        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
+      }
+      case kOtaStatusReportKind: {
+        OtaStatusReportFrame parsed;
+        if (!parseOtaStatusReportFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+        recordTargetObservation(parsed, now_ms);
+        return LeanControlResult::Handled;
+      }
+      case kOtaCensusPollKind: {
+        if (frame_len != kOtaCensusPollBytes || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
+        auto st = lean_.status();
+        if (!st.valid || st.localCache || std::memcmp(frame + 1, lean_.targetPublicKey(), 32)) return LeanControlResult::Handled;
+        const bool pending = std::memcmp(frame + 33, st.manifestHash, 32) != 0;
+        if (pending && !lean_.pendingReuploadStatus(frame + 33, st)) return LeanControlResult::Handled;
+        if (pending_control_frame_valid_) return LeanControlResult::Handled;
+        OtaCensusReport r;
+        std::memcpy(r.reporter, lean_.targetPublicKey(), 32);
+        std::memcpy(r.manifestHash, st.manifestHash, 32);
+        r.first = usb::getBE16(frame + 65);
+        if (r.first >= st.totalBlocks) return LeanControlResult::Rejected;
+        for (size_t bit = 0; bit < kOtaCensusWindowBlocks; ++bit) {
+          const uint32_t index = static_cast<uint32_t>(r.first) + bit;
+          if (!pending && index < st.totalBlocks && lean_.isBlockReceived(index)) r.bitmap[bit / 8] |= 1u << (bit % 8);
+        }
+        r.received = st.receivedBlocks; r.total = st.totalBlocks;
+        r.phase = static_cast<uint8_t>(st.phase); r.generation = st.generation;
+        const auto boot = bootLifecycle();
+        r.lifecyclePhase = pending ? usb::UsbOtaPhase::Aborted : reportedPhase(boot);
+        r.floorKnown = boot.floorKnown; r.confirmedFloor = boot.confirmedFloor;
+        r.counter = st.counter;
+        pending_control_frame_len_ = encodeOtaCensusReport(r, pending_control_frame_, sizeof(pending_control_frame_));
+        pending_control_frame_valid_ = pending_control_frame_len_ != 0;
+        pending_control_due_ms_ = now_ms + ((r.reporter[0] * 17u + r.reporter[31]) % 250u);
+        return LeanControlResult::Handled;
+      }
+      case kOtaCensusReportKind: {
+        OtaCensusReport r;
+        if (!parseOtaCensusReport(frame, frame_len, r) || r.received > r.total) return LeanControlResult::Rejected;
+        const auto st = lean_.status();
+        if (!st.valid || std::memcmp(st.manifestHash, r.manifestHash, 32) || r.total != st.totalBlocks ||
+            r.first >= st.totalBlocks || (r.haveLifecycle && r.counter != st.counter)) return LeanControlResult::Rejected;
+        for (auto& t : targets_) {
+          if (!t.tracked || std::memcmp(t.publicKey, r.reporter, 32)) continue;
+          t.haveReport = true; t.lastSeenMs = now_ms;
+          t.receivedBlocks = r.received; t.totalBlocks = r.total; t.phase = r.phase;
+          std::memcpy(t.manifestHash, r.manifestHash, 32);
+          t.first = r.first; std::memcpy(t.bitmap, r.bitmap, kOtaCensusBitmapBytes); t.haveBitmap = true;
+          t.generation = r.generation;
+          t.lifecyclePhase = r.lifecyclePhase; t.haveLifecycle = r.haveLifecycle;
+          t.floorKnown = r.floorKnown; t.confirmedFloor = r.confirmedFloor; t.counter = r.counter;
+        }
+        return LeanControlResult::Handled;
+      }
+      case kOtaDirectRequestKind:
+      case kOtaDirectAckKind:
+        return handleDirectFrame(frame, frame_len, now_ms);
+      case kOtaReuploadKind: {
+        if (frame_len != kOtaReuploadFrameBytes) return LeanControlResult::Rejected;
+        const auto st = lean_.status();
+        if (!st.valid || st.localCache || st.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
+            !lean_.haveTargetPublicKey() ||
+            std::memcmp(frame + 33, lean_.targetPublicKey(), 32) ||
+            usb::getBE32(frame + 97) != st.generation ||
+            !lean_.currentAdmin(frame + 1)) return LeanControlResult::Rejected;
+        uint8_t message[160];
+        auto len = buildOtaReuploadMessage(frame, message);
+        if (!lean_.verifySignature(frame + 1, message, len, frame + 101)) return LeanControlResult::Rejected;
+        usb::UsbOtaResult result;
+        if (std::memcmp(frame + 65, st.manifestHash, 32) == 0 && std::memcmp(frame + 1, st.ownerPublicKey, 32) == 0) {
+          uint8_t canonical[59], sig[64];
+          if (!lean_.exportCandidateForUpload(canonical, sig)) return LeanControlResult::Rejected;
+          result = lean_.begin(st.ownerPublicKey, canonical, sig, true, false);
+        } else {
+          result = lean_.activatePreparedReupload(frame + 1, frame + 65);
+        }
+        return result == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
+      }
+      case kOtaStatusPollKind: {
+        OtaStatusPollFrame parsed;
+        if (!parseOtaStatusPollFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+        queueStatusReportReply(parsed.manifestTag);
+        return LeanControlResult::Handled;
+      }
+
+      default:
+        return LeanControlResult::NotControlFrame;
+    }
+  }
+
+  LeanControlResult handleDirectFrame(const uint8_t* frame, size_t len, uint32_t now) {
+        if (len != kOtaDirectFrameBytes || !rf_sign_ || !rf_radio_change_ || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
+        const auto st = lean_.status();
+        if (!st.valid || std::memcmp(frame + 65, st.manifestHash, 32)) return LeanControlResult::Rejected;
+        const uint32_t freq = usb::getBE32(frame + 97);
+        const uint16_t lease = usb::getBE16(frame + 101);
+        if (freq == normal_freq_khz_ || freq < 150000 || freq > 2500000 ||
+            lease < usb::kDirectLeaseMsMin || lease > usb::kDirectLeaseMsMax) return LeanControlResult::Rejected;
+        uint8_t message[160];
+        const auto mlen = buildOtaDirectMessage(frame, message);
+        if (frame[0] == kOtaDirectAckKind) {
+          if (!direct_waiting_ack_ || std::memcmp(frame + 1, direct_request_ + 1, 106) ||
+              !lean_.verifySignature(frame + 33, message, mlen, frame + 107)) return LeanControlResult::Rejected;
+          direct_waiting_ack_ = false;
+          direct_ack_tx_wait_ = false;
+        } else {
+          if (st.localCache || std::memcmp(frame + 33, lean_.targetPublicKey(), 32) ||
+              std::memcmp(frame + 1, st.ownerPublicKey, 32) || !lean_.currentAdmin(frame + 1) ||
+              (st.phase != ::ota::storage::OtaCandidateStore::Phase::Receiving &&
+               st.phase != ::ota::storage::OtaCandidateStore::Phase::Ready) ||
+              !lean_.verifySignature(frame + 1, message, mlen, frame + 107)) return LeanControlResult::Rejected;
+          if (direct_active_ || direct_pending_ || pending_control_frame_valid_) return LeanControlResult::Handled;
+          // A repeated signed request must not renew a lease after a timeout.
+          const uint32_t token = usb::getBE32(frame + 103);
+          if (direct_have_token_ && token == direct_last_token_) return LeanControlResult::Rejected;
+          direct_have_token_ = true; direct_last_token_ = token;
+          std::memcpy(pending_control_frame_, frame, len);
+          pending_control_frame_[0] = kOtaDirectAckKind;
+          const auto ack_len = buildOtaDirectMessage(pending_control_frame_, message);
+          rf_sign_(rf_ctx_, message, ack_len, pending_control_frame_ + 107);
+          pending_control_frame_len_ = len; pending_control_frame_valid_ = true; pending_control_due_ms_ = now;
+          direct_ack_tx_wait_ = true;
+        }
+        direct_freq_khz_ = freq; direct_lease_ms_ = lease;
+        direct_apply_ms_ = now + 5000u; direct_pending_ = true;
+        direct_transition_deadline_ = now + 20000u;
+        return LeanControlResult::Handled;
+  }
+
+  // Unsigned/informational by design (see OtaRfFrames.h header comment):
+  // only ever updates bookkeeping for a target this node itself chose to
+  // track via trackOtaTarget(), never an authority decision.
+  void recordTargetObservation(const OtaStatusReportFrame& report, uint32_t now_ms) {
+    const auto st = lean_.status();
+    if (st.valid && std::memcmp(report.manifestTag, st.manifestHash, kOtaManifestTagBytes)) return;
+    for (size_t i = 0; i < kMaxTrackedOtaTargets; ++i) {
+      if (!targets_[i].tracked || std::memcmp(targets_[i].publicKey, report.reporterPublicKey, 32) != 0) continue;
+      targets_[i].haveReport = true;
+      targets_[i].lastSeenMs = now_ms;
+      targets_[i].receivedBlocks = report.receivedBlocks;
+      targets_[i].totalBlocks = report.totalBlocks;
+      targets_[i].phase = report.phase;
+      return;
+    }
+  }
+
+  // Stages (at most one pending) an outbound StatusReport reply to a
+  // StatusPoll, only if this node itself currently holds a valid admitted
+  // candidate matching the polled manifest tag -- a poll for any other
+  // tag, or arriving while idle, is silently ignored (never an error:
+  // StatusPoll carries no authority, so there is nothing to fail closed).
+  void queueStatusReportReply(const uint8_t manifest_tag[kOtaManifestTagBytes]) {
+    const auto st = lean_.status();
+    if (!st.valid || st.localCache || !lean_.haveTargetPublicKey() || pending_control_frame_valid_) return;
+    uint8_t my_tag[kOtaManifestTagBytes];
+    manifestTagFromHash(st.manifestHash, my_tag);
+    if (std::memcmp(my_tag, manifest_tag, kOtaManifestTagBytes) != 0) return;
+    const uint8_t phase = static_cast<uint8_t>(st.phase);
+    const size_t len = encodeOtaStatusReportFrame(lean_.targetPublicKey(), my_tag, st.receivedBlocks,
+                                                  st.totalBlocks, phase, pending_control_frame_,
+                                                  sizeof(pending_control_frame_));
+    if (len == 0) return;
+    pending_control_frame_len_ = len;
+    pending_control_frame_valid_ = true;
+  }
 
   static bool isReceiverTerminal(meshcore::ota::runtime::OtaReceiverState state) {
     using meshcore::ota::runtime::OtaReceiverState;
@@ -717,6 +1203,24 @@ private:
   uint32_t budget_ms_ = meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultBudgetMs;
   meshcore::ota::runtime::IOtaTrustProvider* trust_provider_ = nullptr;
   meshcore::ota::runtime::IOtaStagingSink* staging_sink_ = nullptr;
+  OtaLeanReceiver lean_;
+  TrackedTarget targets_[kMaxTrackedOtaTargets];
+  bool pending_control_frame_valid_ = false;
+  uint8_t pending_control_frame_[kOtaDirectFrameBytes] = {0};
+  size_t pending_control_frame_len_ = 0;
+  uint32_t pending_control_due_ms_ = 0;
+  void* rf_ctx_ = nullptr;
+  void* boot_ctx_ = nullptr;
+  BootLifecycleFn boot_lifecycle_ = nullptr;
+  SignFn rf_sign_ = nullptr;
+  RadioChangeFn rf_radio_change_ = nullptr;
+  uint32_t normal_freq_khz_ = 0, direct_freq_khz_ = 0;
+  uint16_t direct_lease_ms_ = 0;
+  uint32_t direct_apply_ms_ = 0, direct_expiry_ms_ = 0, direct_last_token_ = 0;
+  uint32_t direct_transition_deadline_ = 0;
+  bool direct_active_ = false, direct_pending_ = false, direct_waiting_ack_ = false, direct_have_token_ = false;
+  bool direct_ack_tx_wait_ = false;
+  uint8_t direct_request_[107] = {};
   meshcore::ota::runtime::OtaAirtimeLimiter airtime_;
   meshcore::ota::runtime::OtaReceiverStateMachine receiver_;
   meshcore::ota::runtime::OtaCoordinatorStateMachine coordinator_;

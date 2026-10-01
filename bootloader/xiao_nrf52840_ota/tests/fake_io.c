@@ -14,7 +14,7 @@
  * test double can silently "succeed" on a misaligned transfer that
  * would be hardware-invalid on the real chip -- assert loudly instead,
  * so any production code path that ever issues one (the exact defect
- * class this caught: the genesis floor-activation-receipt window read,
+ * class this caught: an auxiliary window read whose canonical wire
  * whose 386-byte canonical wire size is NOT a multiple of 4) fails a
  * native test immediately rather than passing here and only surfacing
  * on real hardware. */

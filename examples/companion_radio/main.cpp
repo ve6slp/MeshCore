@@ -62,22 +62,8 @@ MultiSerialInterface interface_manager;
 
 // include usb interface
 #if defined(ENABLE_USB_INTERFACE)
-  #if MESHCORE_LORA_OTA
-    // Source-bound USB port/framer+router adapter (NOT a second/
-    // duplicate parser) -- demuxes legacy companion CLI frames from OTA
-    // commissioning control frames on the same physical USB byte
-    // stream; see its own doc comment for the full rationale. Only the
-    // header is included here: the actual instance is declared further
-    // below (after `the_mesh`), since it must wrap the SAME real
-    // OtaControlSessionRouter that MyMesh owns -- `usb_serial_interface`
-    // below has the identical begin(Stream&)/BaseSerialInterface shape
-    // as the non-OTA ArduinoSerialInterface case, so the registration
-    // call site in setup() is unchanged either way.
-    #include "helpers/ota/OtaUsbCommissioningSerialInterface.h"
-  #else
-    #include <helpers/ArduinoSerialInterface.h>
-    ArduinoSerialInterface usb_serial_interface;
-  #endif
+  #include <helpers/ArduinoSerialInterface.h>
+  ArduinoSerialInterface usb_serial_interface;
 #endif
 
 // include ethernet interface
@@ -129,21 +115,6 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
       , &ui_task
    #endif
 );
-
-#if defined(ENABLE_USB_INTERFACE) && MESHCORE_LORA_OTA
-  // Wraps the SAME real OtaControlSessionRouter `the_mesh` owns/binds its
-  // job backend into (see MyMesh::getOtaControlRouter()) -- never a
-  // second/duplicate router or session instance. Declared only after
-  // `the_mesh` so this reference is valid at construction time.
-  meshcore::ota::helpers::OtaUsbControlService ota_usb_control_service(the_mesh.getOtaControlRouter());
-  // Real connection probe: on the TinyUSB/Adafruit nRF52 cores this is
-  // wired for (XIAO nRF52840 / SenseCAP Solar), the concrete `Serial`
-  // object's operator bool() reflects whether the host actually has the
-  // CDC port open -- never a stub literal true/false.
-  static bool otaUsbIsPhysicallyConnected() { return static_cast<bool>(Serial); }
-  meshcore::ota::helpers::OtaUsbCommissioningSerialInterface usb_serial_interface(
-      ota_usb_control_service, otaUsbIsPhysicallyConnected);
-#endif
 
 /* END GLOBAL OBJECTS */
 
@@ -201,10 +172,10 @@ void setup() {
   // ota_allow_destructive_boot_writes (ordinary userdata-write
   // authority) or of each other, and not merely differently-named
   // copies of the same value. Each requires its own explicit,
-  // independently verified factory/repair authority (see
-  // OtaBaselineCertificationEvidence.h -- a future certified-baseline/
-  // host-certificate provider, separate owner) that does not exist
-  // anywhere in this tree yet; until that authority is wired, BOTH stay
+  // independently verified factory/repair authority (a future
+  // certified-baseline/host-certificate provider, separate owner)
+  // that does not exist anywhere in this tree yet; until that
+  // authority is wired, BOTH stay
   // honestly false for EVERY MESHCORE_LORA_OTA=1 boot -- including a
   // genuinely Normal (userdata-write-permitted) boot. Normal userdata-
   // write evidence alone does not grant filesystem-format authority or

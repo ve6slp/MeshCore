@@ -9,10 +9,6 @@
 // examples/companion_radio/main.cpp's identical usage.
 #include "helpers/ota/OtaTrialSafeFilesystemMount.h"
 #include "helpers/ota/OtaTrialSafeIdentityBoot.h"
-#if MESHCORE_LORA_OTA
-#include "helpers/ota/OtaUsbControlService.h"
-#include "helpers/ota/OtaUsbTextCliBinaryDemux.h"
-#endif
 
 #if MESHCORE_LORA_OTA
 // Declared here (not exposed via MyMesh.h), same reasoning as
@@ -36,26 +32,6 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
-
-#if MESHCORE_LORA_OTA
-// Wraps the SAME real OtaControlSessionRouter `the_mesh` owns/binds its
-// job backend into (see MyMesh::getOtaControlRouter()) -- never a
-// second/duplicate router or session instance. Declared only after
-// `the_mesh` so this reference is valid at construction time.
-meshcore::ota::helpers::OtaUsbControlService ota_usb_control_service(the_mesh.getOtaControlRouter());
-// Idle-byte text/binary demultiplexer in front of this board's existing
-// plain text-line Serial CLI reader -- see its own doc comment.
-meshcore::ota::helpers::OtaUsbTextCliBinaryDemux ota_usb_cli_demux(ota_usb_control_service);
-
-// Writes any reply the OTA control service produced directly back to the
-// physical Serial object -- NEVER broadcast, since simple_repeater has
-// only ever had the one physical USB source to begin with.
-static void otaFlushPendingUsbReply() {
-  if (!ota_usb_control_service.hasPendingReply()) return;
-  Serial.write(ota_usb_control_service.pendingReplyData(), ota_usb_control_service.pendingReplyLen());
-  ota_usb_control_service.consumeReply();
-}
-#endif
 
 void halt() {
   while (1) ;
@@ -278,17 +254,6 @@ void loop() {
   int len = strlen(command);
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
-#if MESHCORE_LORA_OTA
-    // A '<' arriving while no partial command line is pending (len==0)
-    // may be the start of a binary OTA commissioning frame -- see
-    // OtaUsbTextCliBinaryDemux's doc comment. Once committed to binary
-    // framing, every subsequent byte (even one that looks like CR/LF)
-    // is consumed here and never reaches the text CLI below.
-    if (ota_usb_cli_demux.consumeByte((uint8_t)c, millis(), len == 0)) {
-      otaFlushPendingUsbReply();
-      continue;
-    }
-#endif
     if (c != '\n') {
       command[len++] = c;
       command[len] = 0;
@@ -296,12 +261,6 @@ void loop() {
     }
     if (c == '\r') break;
   }
-#if MESHCORE_LORA_OTA
-  // Independent of whether any bytes arrived this pass, so a stalled
-  // partial binary frame can never wedge text CLI input forever.
-  ota_usb_cli_demux.tick(millis());
-  otaFlushPendingUsbReply();
-#endif
   if (len == sizeof(command)-1) {  // command buffer full
     command[sizeof(command)-1] = '\r';
   }

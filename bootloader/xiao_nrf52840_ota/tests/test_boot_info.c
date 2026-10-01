@@ -30,7 +30,7 @@ int main(void) {
   /* Positive: a genuinely built marker validates. */
   assert(xiao_ota_boot_info_valid(&info));
   assert(info.board_target_id == XIAO_OTA_TARGET_XIAO_NRF52840);
-  assert(memcmp(info.trusted_public_key, xiao_ota_lab_public_key_ed25519, 32) == 0);
+  assert(memcmp(info.reference_signer_public_key_ed25519, xiao_ota_lab_public_key_ed25519, 32) == 0);
 
   /* A stock/unqualified bootloader leaves this flash region erased --
    * simulate that exact byte pattern and confirm it is unambiguously
@@ -62,7 +62,7 @@ int main(void) {
   }
   {
     xiao_ota_boot_info_t tampered = info;
-    tampered.trusted_public_key[0] ^= 1u; /* swap the trusted key */
+    tampered.reference_signer_public_key_ed25519[0] ^= 1u; /* mutate the reference signer key */
     assert(!xiao_ota_boot_info_valid(&tampered));
   }
   {

@@ -5,9 +5,9 @@
 // variants/sensecap_solar/OtaProductionBackend.cpp), extracted to avoid
 // duplicating ~200 lines of near-identical MonotonicCounter/
 // SignatureVerifier/InstallCommandProviderV2/boot-marker-qualification
-// logic between the two boards. Board-specific differences (target id,
-// whether a hardcoded-key STAGING_ONLY fallback is permitted at all) stay
-// in each backend .cpp file and are passed in as parameters here.
+// logic between the two boards. Board-specific target identities stay
+// in each backend .cpp file. Unqualified boards expose only a signed
+// uploader cache, without a fallback signer or installation authority.
 //
 // Header-only, dependency-free of Arduino/Ed25519 (the caller supplies its
 // own ota::trust::SignatureVerifier implementation), so this can be
@@ -16,24 +16,56 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
+#include <helpers/ota/OtaRfFrames.h>
 #include <ota/runtime/OtaInstallAttemptIdentity.h>
-#include <ota/security/OtaSecurityPhysicalPartitionArbiter.h>
 #include <ota/storage/XiaoOtaActiveExtentBridge.h>
-#include <ota/storage/XiaoOtaBootFloorReceiptGate.h>
 #include <ota/storage/XiaoOtaBootInfoReader.h>
 #include <ota/storage/XiaoOtaCommandRecord.h>
 #include <ota/storage/XiaoOtaTrialBootConfirmation.h>
 #include <ota/storage/XiaoOtaTrialHealthMonitor.h>
 #include <ota/trust/MonotonicCounter.h>
+#include <ota/trust/ImageHasher.h>
 #include <ota/trust/Sha256.h>
 #include <ota/trust/SignatureVerifier.h>
 #include <ota/trust/TrustTypes.h>
 #include <helpers/ota/OtaFirmwareBackend.h>  // IOtaInstallCommandProviderV2
-#include <helpers/ota/OtaBaselineMeasurementCollector.h>  // OtaBaselineMeasurementArbiterResult
+#include <helpers/ota/OtaFirmwareIntegration.h>
 
 namespace mesh {
 namespace ota {
+
+class OtaNrf52FirmwareTrustProvider final : public OtaFirmwareTrustProvider {
+public:
+  using OtaFirmwareTrustProvider::OtaFirmwareTrustProvider;
+  static constexpr uint32_t kMaximumImageBytes = 0xAD000u;
+
+  bool verifyDescriptorPolicyOnly(const meshcore::ota::protocol::OtaDescriptor& descriptor) override {
+    return descriptor.exactSizeBytes <= kMaximumImageBytes &&
+           OtaFirmwareTrustProvider::verifyDescriptorPolicyOnly(descriptor);
+  }
+};
+
+// OTA profile changes must restart the wrapper's RX state as well as
+// changing the chip. Otherwise STATE_RX can describe a chip left in
+// standby by a RadioLib parameter setter, silently losing all blocks.
+template<class PhysicalRadio, class Wrapper>
+bool applyCheckedOtaRadioProfile(PhysicalRadio& radio, Wrapper& wrapper,
+                                 float frequency, float bandwidth, uint8_t sf, uint8_t cr) {
+  if (radio.standby() != 0 || radio.setFrequency(frequency) != 0 ||
+      radio.setSpreadingFactor(sf) != 0 || radio.setBandwidth(bandwidth) != 0 ||
+      radio.setCodingRate(cr) != 0) return false;
+  wrapper.begin();
+  const uint16_t preamble = Wrapper::preambleLengthForSF(sf);
+  if (radio.setPreambleLength(preamble) != 0) return false;
+  const auto timing = wrapper.calcMaxPacketMillis(sf, bandwidth, cr, preamble);
+  radio.setPreambleMillis(timing.preambleMillis);
+  radio.setMaxPayloadMillis(timing.payloadMillis);
+  uint8_t unused = 0;
+  wrapper.recvRaw(&unused, 0);
+  return wrapper.isInRecvMode() && wrapper.probeDriverStatus();
+}
 
 // Durable-across-reset anti-rollback counter, shared by both backends.
 // Fails closed (currentValue()/commitNewValue() both return false) unless
@@ -50,36 +82,19 @@ public:
   explicit OtaBoardFailClosedMonotonicCounter(::ota::platform::FlashRegion& floor_region)
       : floor_region_(floor_region) {}
 
-  // Root's "FINAL IMPLEMENTABLE HIGH-FIX CONTRACT" section D: wires the
-  // durable, publisher-signed BootFloorActivationReceiptV1 lifetime-role
-  // fact into this already-fail-closed gate, so EVERY existing consumer
-  // of currentValue()/commitNewValue() (DescriptorVerifier's anti-
-  // rollback check before any admission, and its commitCounter() after
-  // confirmation) automatically also requires proven role continuity --
-  // no separate call site to keep in sync. Optional: a caller that never
-  // calls this gets exactly the prior (numeric-floor-only) behavior,
-  // e.g. existing native tests exercising this class directly without a
-  // receipt fixture.
-  void setRoleAuthority(const ::ota::storage::BootFloorRoleAuthorityAnchor& anchor,
-                         ::ota::trust::SignatureVerifier& verifier) {
-    role_anchor_ = anchor;
-    role_verifier_ = &verifier;
-    role_authority_configured_ = true;
-    seeded_ = false;  // Force re-evaluation even if an earlier seed attempt already ran.
-  }
-
-  // Diagnostic accessor only -- never itself a permission check. Lets a
-  // backend report WHY install-path trust decisions are currently denied
-  // (pending/IoError/Missing/Corrupt/RoleMismatch/Conflict) distinctly
-  // from a bare false return, per the contract's "expose ... separately"
-  // requirement. Valid only after ensureSeeded() has actually run (i.e.
-  // after any currentValue()/commitNewValue() call); defaults to Ok
-  // (meaning "not yet evaluated / no role authority configured") before
-  // that, which callers must not mistake for a positive guarantee.
-  ::ota::storage::BootFloorRoleAuthorityOutcome lastRoleAuthorityOutcome() const {
-    return last_role_outcome_;
-  }
-
+  // NOTE: this counter previously also supported an optional
+  // `setRoleAuthority()` seam gating every read/commit behind a
+  // publisher-signed `BootFloorActivationReceiptV1` lifetime-role record
+  // (src/ota/authority/BootFloorActivationReceipt.h). That record format
+  // belonged to the deleted parallel Authority/Store system and has been
+  // removed as part of the lean identity-simplification migration -- see
+  // docs/lora_ota_development.md. This class now always runs exactly the
+  // "prior (numeric-floor-only)" behavior that was already its documented
+  // fallback: fail closed unless the confirmed-counter floor is a valid
+  // record or both slots are genuinely blank/erased. A durable minimal
+  // signer-snapshot + manifest-hash install-command contract, if the Boot
+  // owner's migration produces one, is a separate, future, explicitly
+  // coordinated addition -- not a silent re-creation of this seam.
   bool currentValue(uint32_t& out) const override {
     ensureSeeded();
     if (!seed_ok_) return false;
@@ -99,29 +114,12 @@ private:
     if (seeded_) return;
     seeded_ = true;
     uint32_t floor_value = 0;
-    bool floor_ok = ::ota::storage::XiaoOtaFloorReader::readNewestConfirmedCounterFailClosed(floor_region_,
-                                                                                       floor_value);
-    if (role_authority_configured_) {
-      last_role_outcome_ = ::ota::storage::XiaoOtaBootFloorReceiptGate::resolve(
-          floor_region_, role_anchor_, *role_verifier_, /*out_receipt=*/nullptr);
-      // The role gate must precede every mutation/trust decision this
-      // counter gates: a missing/corrupt/wrong-role/conflicting receipt
-      // fails the WHOLE seed closed, even if the plain numeric floor
-      // read above happened to succeed.
-      if (last_role_outcome_ != ::ota::storage::BootFloorRoleAuthorityOutcome::Ok) {
-        floor_ok = false;
-      }
-    }
-    seed_ok_ = floor_ok;
+    seed_ok_ = ::ota::storage::XiaoOtaFloorReader::readNewestConfirmedCounterFailClosed(floor_region_,
+                                                                                         floor_value);
     if (seed_ok_) value_ = floor_value;
   }
 
   ::ota::platform::FlashRegion& floor_region_;
-  bool role_authority_configured_ = false;
-  ::ota::storage::BootFloorRoleAuthorityAnchor role_anchor_;
-  ::ota::trust::SignatureVerifier* role_verifier_ = nullptr;
-  mutable ::ota::storage::BootFloorRoleAuthorityOutcome last_role_outcome_ =
-      ::ota::storage::BootFloorRoleAuthorityOutcome::Ok;
   mutable bool seeded_ = false;
   mutable bool seed_ok_ = false;
   mutable uint32_t value_ = 0;
@@ -201,9 +199,58 @@ private:
   TrialActivePredicate trial_active_predicate_ = nullptr;
 };
 
+// Command v3's counterpart -- identical copy/extent-resolution/trial-gate
+// logic to V2, but additionally carries `controller` verbatim into the
+// new admitted_signer_public_key_ed25519 field: the Ed25519 public key
+// the running app already verified the manifest signer against (see
+// OtaFirmwareBackend.h's IOtaInstallCommandProviderV3 doc-comment -- this
+// IS the sole sanctioned source for that field, never a wire-supplied or
+// fabricated key). Board-agnostic: both backends' command-v3 wiring is
+// byte-for-byte identical.
+class OtaBoardInstallCommandProviderV3 : public IOtaInstallCommandProviderV3 {
+public:
+  using TrialActivePredicate = bool (*)();
+  void setTrialActivePredicate(TrialActivePredicate predicate) { trial_active_predicate_ = predicate; }
+
+  bool buildInstallCommandV3(const uint8_t wire_descriptor[59], const uint8_t signature[64],
+                             const uint8_t admitted_signer_public_key[32],
+                             const meshcore::ota::runtime::OtaSessionId& session,
+                             const uint8_t controller[32],
+                             ::ota::storage::XiaoOtaCommandV3Fields& out) override {
+    if (wire_descriptor == nullptr || signature == nullptr || controller == nullptr ||
+        admitted_signer_public_key == nullptr) {
+      return false;
+    }
+    if (trial_active_predicate_ != nullptr && trial_active_predicate_()) {
+      return false;  // refuse: a prior install's trial-boot confirmation is still pending.
+    }
+    const uint64_t nonce = computeOtaTransactionNonce(controller, session, wire_descriptor);
+    if (nonce == 0) return false;
+    const ::ota::storage::XiaoOtaActiveExtentInfo extent_info =
+        ::ota::storage::XiaoOtaActiveExtentBridge::resolveCurrent();
+    if (extent_info.active_image_extent == 0) {
+      // Same fail-closed rationale as V2: never write a command with a
+      // bogus/guessed extent or hash.
+      return false;
+    }
+    memcpy(out.wire_descriptor, wire_descriptor, sizeof(out.wire_descriptor));
+    memcpy(out.admitted_signer_public_key_ed25519, admitted_signer_public_key,
+           sizeof(out.admitted_signer_public_key_ed25519));
+    memcpy(out.signature_ed25519, signature, sizeof(out.signature_ed25519));
+    out.active_image_extent = extent_info.active_image_extent;
+    memcpy(out.active_image_hash_sha256, extent_info.active_image_hash_sha256,
+           sizeof(out.active_image_hash_sha256));
+    out.transaction_nonce = nonce;
+    return true;
+  }
+
+private:
+  TrialActivePredicate trial_active_predicate_ = nullptr;
+};
+
 // Three-way classification of the boot-info marker check: `Normal` is
 // reserved for a FUTURE, separately signed "CertifyExistingBaseline"
-// evidence chain (see OtaBaselineCertificationEvidence.h) -- NOT merely
+// evidence chain -- NOT merely
 // a blank/erased marker, and NOT merely `!isTrialActive()`. Until that
 // authority is wired in (a separate owner's responsibility), this
 // function NEVER produces Normal: a genuinely blank/erased marker
@@ -266,7 +313,7 @@ inline OtaBoardBootQualification resolveOtaBoardBootQualificationFromRecordStatu
     // Genuinely blank/erased marker: an uncertified stock/never-flashed
     // board. NOT, by itself, sufficient for a positive Normal
     // classification -- see OtaBoardQualificationStatus's doc comment
-    // and OtaBaselineCertificationEvidence.h: Normal requires a
+    // Normal requires a
     // separately signed CertifyExistingBaseline record, which no call
     // site constructs/verifies yet. Stays Unknown: read-only local
     // maintenance for this whole boot (never the bounded trial/reboot
@@ -346,7 +393,7 @@ inline OtaBoardBootQualification resolveOtaBoardBootQualification(uint32_t expec
 // requires `has_verified_fresh_baseline_proof` -- a positive result from
 // a REAL, currently-unimplemented proof provider that freshly re-binds
 // the running image to the confirmed record this boot (see
-// OtaBaselineCertificationEvidence.h; separate future owner). No caller
+// separate future owner). No caller
 // in this tree currently supplies true for that parameter, so Normal is
 // HONESTLY UNREACHABLE today -- Confirmed-phase-without-fresh-proof
 // stays Unknown (ConfirmedPendingFreshVerification), never fabricated.
@@ -525,6 +572,117 @@ private:
   ::ota::storage::XiaoOtaIncrementalExtentResolver resolver_;
 };
 
+// Observes existing bootloader records and verifies the running bytes.
+// It never writes a confirmation, floor, command, or lifecycle record.
+class OtaBoardBootLifecycleObserver {
+public:
+  OtaBoardBootLifecycleObserver(::ota::platform::FlashRegion& state, ::ota::platform::FlashRegion& floor)
+      : state_(state), floor_(floor), accessor_(&real_accessor_) {}
+  OtaBoardBootLifecycleObserver(::ota::platform::FlashRegion& state, ::ota::platform::FlashRegion& floor,
+                                ::ota::storage::IXiaoOtaActiveImageAccessor& accessor)
+      : state_(state), floor_(floor), accessor_(&accessor) {}
+
+  void tick(bool qualified) {
+    if (!qualified || finished_) return;
+    if (!loaded_) {
+      loaded_ = true;
+      uint8_t record[::ota::storage::XiaoOtaStateReader::kRecordBytes];
+      if (::ota::storage::XiaoOtaStateReader::readNewestWithStatus(state_, record) !=
+          ::ota::storage::XiaoOtaStateReader::ReadStatus::Found) { finished_ = true; return; }
+      state_phase_ = ::ota::storage::XiaoOtaStateReader::phase(record);
+      evidence_.transactionNonce = ::ota::storage::XiaoOtaStateReader::transactionNonce(record);
+      evidence_.counter = ::ota::storage::XiaoOtaStateReader::candidateCounter(record);
+      memcpy(expected_hash_, ::ota::storage::XiaoOtaStateReader::installedHashSha256(record), 32);
+      if (evidence_.transactionNonce && state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax) {
+        evidence_.phase = usb::UsbOtaPhase::Failed;
+        finished_ = true;
+        return;
+      }
+      if (!evidence_.transactionNonce ||
+          memcmp(expected_hash_, ::ota::storage::XiaoOtaStateReader::candidateHashSha256(record), 32)) {
+        finished_ = true; return;
+      }
+      if (state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseTrialBoot) {
+        memcpy(evidence_.imageHash, expected_hash_, 32);
+        evidence_.phase = usb::UsbOtaPhase::Trial;
+        finished_ = true;
+        return;
+      }
+      if (state_phase_ != ::ota::storage::XiaoOtaStateReader::kPhaseConfirmed) {
+        if (state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseFailedMax)
+          evidence_.phase = usb::UsbOtaPhase::Failed;
+        finished_ = true;
+        return;
+      }
+    }
+    if (!image_) {
+      const auto result = accessor_->stepExtentResolution(kBytesPerTick, &image_, &image_extent_);
+      if (result == ::ota::storage::XiaoOtaExtentResolutionStep::InProgress) {
+        image_ = nullptr;
+        image_extent_ = 0;
+        return;
+      }
+      if (result != ::ota::storage::XiaoOtaExtentResolutionStep::Resolved || !image_ ||
+          !image_extent_) { finished_ = true; return; }
+    }
+    const uint32_t chunk = (image_extent_ - offset_) < kBytesPerTick ? image_extent_ - offset_ : kBytesPerTick;
+    hasher_.update(image_ + offset_, chunk);
+    offset_ += chunk;
+    if (offset_ != image_extent_) return;
+    hasher_.finish(evidence_.imageHash);
+    evidence_.imageVerified = memcmp(evidence_.imageHash, expected_hash_, 32) == 0;
+    finished_ = true;
+  }
+
+  bool read(bool qualified, OtaBootLifecycleEvidence& out) const {
+    out = OtaBootLifecycleEvidence();
+    if (!qualified) return false;
+    out = evidence_;
+    uint8_t floor_hash[32]; uint32_t floor_extent = 0;
+    out.floorKnown = ::ota::storage::XiaoOtaFloorReader::readNewestConfirmedEvidenceFailClosed(floor_,
+                                                                                           out.confirmedFloor,
+                                                                                           floor_hash, &floor_extent);
+    if (state_phase_ == ::ota::storage::XiaoOtaStateReader::kPhaseConfirmed &&
+        out.imageVerified && out.floorKnown && out.confirmedFloor == out.counter &&
+        floor_extent == image_extent_ && memcmp(floor_hash, out.imageHash, 32) == 0)
+      out.phase = usb::UsbOtaPhase::Installed;
+    return true;
+  }
+  bool pending() const { return !finished_; }
+
+private:
+  static constexpr uint32_t kBytesPerTick = 4096;
+  ::ota::platform::FlashRegion& state_;
+  ::ota::platform::FlashRegion& floor_;
+  OtaBoardRealActiveImageAccessor real_accessor_;
+  ::ota::storage::IXiaoOtaActiveImageAccessor* accessor_;
+  ::ota::trust::Sha256 hasher_;
+  OtaBootLifecycleEvidence evidence_;
+  uint8_t expected_hash_[32] = {};
+  const uint8_t* image_ = nullptr;
+  uint32_t image_extent_ = 0, offset_ = 0, state_phase_ = 0;
+  bool loaded_ = false, finished_ = false;
+};
+
+inline void formatOtaBootLifecycleStatus(char* out, size_t size, const OtaBootLifecycleEvidence& boot,
+                                         usb::UsbOtaPhase phase, uint32_t counter) {
+  char floor[12] = "unknown", image[65] = "unknown";
+  if (boot.floorKnown) snprintf(floor, sizeof(floor), "%lu", (unsigned long)boot.confirmedFloor);
+  if (boot.imageVerified) {
+    static constexpr char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+      image[2 * i] = hex[boot.imageHash[i] >> 4];
+      image[2 * i + 1] = hex[boot.imageHash[i] & 15];
+    }
+    image[64] = 0;
+  }
+  const char* boot_name = boot.phase == usb::UsbOtaPhase::Installed ? "confirmed" :
+                          boot.phase == usb::UsbOtaPhase::Trial ? "trial" :
+                          boot.phase == usb::UsbOtaPhase::Failed ? "failed" : "unknown";
+  snprintf(out, size, "boot=%s phase=%s floor=%s counter=%lu verified=%u image=%s", boot_name,
+           otaLifecyclePhaseName(phase), floor, (unsigned long)counter, boot.imageVerified ? 1 : 0, image);
+}
+
 // Thin board-facing wrapper around ::ota::storage::XiaoOtaTrialHealthMonitor
 // (see that header for the full continuous-window/deadline/incremental-
 // hash contract), shared by both backends' loop()-tick entry points. Owns
@@ -640,8 +798,18 @@ public:
     return wrapped_.beginSession(descriptor);
   }
 
+  Result resumeSession(const meshcore::ota::protocol::OtaDescriptor& descriptor) override {
+    return wrapped_.resumeSession(descriptor);
+  }
+
   Result writeChunk(uint64_t offset, const uint8_t* data, size_t len) override {
     const Result result = wrapped_.writeChunk(offset, data, len);
+    if (result == Result::IoError) io_fault_observed_ = true;
+    return result;
+  }
+
+  Result readChunk(uint64_t offset, uint8_t* out, size_t len) override {
+    const Result result = wrapped_.readChunk(offset, out, len);
     if (result == Result::IoError) io_fault_observed_ = true;
     return result;
   }
@@ -664,6 +832,10 @@ public:
     wrapped_.onAuthorizedSession(session, controller);
   }
 
+  void onAdmittedOwnerIdentity(const uint8_t owner_public_key[32]) override {
+    wrapped_.onAdmittedOwnerIdentity(owner_public_key);
+  }
+
   // Real, grounded (not invented) filesystem-fault signal: true once any
   // writeChunk()/commit() call on the wrapped sink has ever reported
   // IoError this boot. Latched, never auto-clears -- a device that has
@@ -677,89 +849,45 @@ private:
   bool io_fault_observed_ = false;
 };
 
-// Shared, board-agnostic real arbitration for the baseline-measurement
-// job's media-arbiter seam (IOtaBaselineMeasurementSource::
-// acquireMediaArbiter/releaseMediaArbiter in
-// OtaBaselineMeasurementCollector.h). Backed by the genuine RAM-only
-// ota::security::OtaSecurityPartitionArbiterRegistry (the SAME shared
-// mechanism OtaSecurityStore itself uses) -- NOT a private/unshared
-// token of this collector's own.
-//
-// Root correction: an EARLIER draft keyed this guard on
-// (boardTargetId, candidateRegion.baseOffset(), candidateRegion.baseOffset())
-// -- a private tuple Store's OWN OtaSecurityStore construction (real key:
-// (physicalToken, SenseCapQspiLayout::kSecurityAOffset,
-// SenseCapQspiLayout::kSecurityBOffset)) would NEVER share, so the two
-// never actually arbitrated against each other. The collector's own
-// QSPI-state-inspection phase inspects the security tails and journal
-// too, not just the candidate image, so a candidate-only tuple was also
-// unsafe on its own terms. This guard now uses the SAME canonical
-// security-partition tuple
-// (SenseCapQspiLayout::kSecurityAOffset, SenseCapQspiLayout::kSecurityBOffset)
-// as OtaSecurityStore's real construction, so a real OtaSecurityStore
-// instance constructed over the SAME physical chip genuinely serializes
-// against this guard (and vice versa) via the shared registry -- see
-// test_ota_board_media_arbiter_guard.cpp's cross-class tests.
-//
-// `physical_token` is a full, genuine `ota::security::PhysicalPartitionToken`
-// (64-bit) -- never a 32-bit value silently widened -- identifying the
-// ONE real physical QSPI chip. Every backend's real per-board chip
-// token (see kQspiChipPhysicalToken in each backend .cpp) AND any future
-// OtaSecurityStore construction wired into that SAME board MUST supply
-// this EXACT value, or the two mechanisms silently stop sharing a lease.
-// A zero token ("unknown/unbound", matching OtaSecurityStore's own
-// convention) is refused immediately -- Unavailable, never silently
-// treated as a valid identity.
-//
-// Registry acquire/release is called AT MOST once per held lifetime
-// (cached in arbiter_): a Contended result must be retried by calling
-// acquire() again without spuriously incrementing the registry's
-// refcount on every retry.
-class OtaBoardMediaArbiterGuard {
- public:
-  OtaBoardMediaArbiterGuard(::ota::security::PhysicalPartitionToken physical_token, uint32_t bank_a_offset,
-                            uint32_t bank_b_offset)
-      : key_{physical_token, bank_a_offset, bank_b_offset}, valid_token_(physical_token != 0) {}
-
-  ~OtaBoardMediaArbiterGuard() { release(); }
-
-  OtaBoardMediaArbiterGuard(const OtaBoardMediaArbiterGuard&) = delete;
-  OtaBoardMediaArbiterGuard& operator=(const OtaBoardMediaArbiterGuard&) = delete;
-
-  mesh::ota::OtaBaselineMeasurementArbiterResult acquire() {
-    if (!valid_token_) return mesh::ota::OtaBaselineMeasurementArbiterResult::Unavailable;
-    if (arbiter_ == nullptr) {
-      arbiter_ = ::ota::security::OtaSecurityPartitionArbiterRegistry::acquire(key_, nullptr);
-      if (arbiter_ == nullptr) {
-        return mesh::ota::OtaBaselineMeasurementArbiterResult::Unavailable;
-      }
-    }
-    if (!arbiter_->acquire(ownerTag())) {
-      return mesh::ota::OtaBaselineMeasurementArbiterResult::Contended;
-    }
-    held_ = true;
-    return mesh::ota::OtaBaselineMeasurementArbiterResult::Acquired;
+class OtaBoardCacheOnlyTrustProvider final : public meshcore::ota::runtime::IOtaTrustProvider {
+public:
+  explicit OtaBoardCacheOnlyTrustProvider(::ota::platform::FlashRegion& candidate) : candidate_(candidate) {}
+  bool verifyDescriptorSignature(const uint8_t*, size_t, const uint8_t*, size_t,
+                                 uint16_t, uint16_t) override { return false; }
+  bool verifyStagedImageHashPolicyOnly(const meshcore::ota::protocol::OtaDescriptor& descriptor) override {
+    if (descriptor.exactSizeBytes == 0 || descriptor.exactSizeBytes > candidate_.sizeBytes()) return false;
+    ::ota::trust::Sha256 sha;
+    uint8_t actual[32];
+    return ::ota::trust::ImageHasher::hashRegion(sha, candidate_, descriptor.exactSizeBytes, actual) &&
+           !std::memcmp(actual, descriptor.sha256, sizeof(actual));
   }
+private:
+  ::ota::platform::FlashRegion& candidate_;
+};
 
-  void release() {
-    if (arbiter_ == nullptr) return;
-    if (held_) {
-      arbiter_->release(ownerTag());
-      held_ = false;
-    }
-    ::ota::security::OtaSecurityPartitionArbiterRegistry::release(key_, arbiter_);
-    arbiter_ = nullptr;
+class OtaBoardCacheOnlyBackend {
+  class CacheSink final : public OtaFirmwareStorageSink {
+  public:
+    using OtaFirmwareStorageSink::OtaFirmwareStorageSink;
+    Result commit() override { return Result::Rejected; }
+  };
+public:
+  OtaBoardCacheOnlyBackend(::ota::platform::FlashRegion& candidate, ::ota::platform::FlashRegion& records,
+                          OtaBoardTrialGuardedStagingSink::TrialActiveOrUnknownPredicate predicate)
+      : trust_(candidate), sink_(candidate), guarded_(sink_, predicate), store_(records) {}
+
+  bool attach(OtaFirmwareIntegration& integration, const ::ota::trust::SignatureVerifier& signatures) {
+    integration.attachTrustProvider(&trust_);
+    integration.attachLeanSignatureVerifier(&signatures);
+    integration.attachStagingSink(&guarded_);
+    integration.attachCandidateStore(&store_);
+    return integration.backendAvailable();
   }
-
- private:
-  // Stable per-instance owner identity for
-  // OtaSecurityPhysicalPartitionArbiter::OwnerToken (== const void*).
-  const void* ownerTag() const { return this; }
-
-  ::ota::security::PhysicalPartitionKey key_;
-  ::ota::security::OtaSecurityPhysicalPartitionArbiter* arbiter_ = nullptr;
-  bool held_ = false;
-  bool valid_token_ = false;
+private:
+  OtaBoardCacheOnlyTrustProvider trust_;
+  CacheSink sink_;
+  OtaBoardTrialGuardedStagingSink guarded_;
+  ::ota::storage::OtaCandidateStore store_;
 };
 
 }  // namespace ota

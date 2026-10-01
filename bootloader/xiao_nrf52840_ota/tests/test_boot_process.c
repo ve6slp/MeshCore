@@ -7,9 +7,12 @@
  * reimplemented here: commands are built by calling the same
  * xiao_ota_wire_descriptor_encode()/xiao_ota_crc32() functions production
  * and the host tooling already share, and signed with a genuinely fresh,
- * test-runtime-generated Ed25519 keypair (tweetnacl crypto_sign_keypair())
- * fed to xiao_ota_boot_process_io() via -DXIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY,
- * so this never depends on (or needs) the real committed lab private key.
+ * test-runtime-generated Ed25519 keypair (tweetnacl crypto_sign_keypair()),
+ * embedded directly into each built command's own
+ * admitted_signer_public_key_ed25519 field -- exactly the same per-command
+ * embedded-key verification path xiao_ota_boot_process_io() runs in
+ * production, so this never depends on (or needs) any compile-time fixed
+ * trust anchor or the real committed lab private key.
  */
 
 #include "xiao_ota_record.h"
@@ -24,22 +27,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <errno.h>
-
-/* Production ed25519_verify() (xiao_ota_ed25519_tweetnacl.c) -- no
- * dedicated header declares this symbol (same pattern already used by
- * test_ed25519.c/test_descriptor_contract.c); declared here so
- * test_authority_literal_interop_vector_verifies_and_tamper_rejects()
- * can call it directly against the literal Authority fixture below. */
-int ed25519_verify(const unsigned char *signature, const unsigned char *message,
-                   size_t message_length, const unsigned char *public_key);
 
 /* Required by tweetnacl's crypto_sign_keypair()/crypto_sign(). Test-only,
  * deterministic (not cryptographically secure) -- fine, since this key
- * exists purely to exercise the real ed25519_verify() call in
- * xiao_ota_boot_io.c with a genuinely fresh keypair never rooted in any
- * committed secret. */
+ * exists purely to exercise the real command verification path with a
+ * genuinely fresh keypair never rooted in any committed secret. */
 static uint32_t g_rand_state = 0x9E3779B9u;
 void randombytes(unsigned char *buffer, unsigned long long length) {
   unsigned long long i;
@@ -49,8 +41,10 @@ void randombytes(unsigned char *buffer, unsigned long long length) {
   }
 }
 
-/* Definition of the symbol declared in fake_trust_anchor.h and substituted
- * for the production trust anchor via -D on this test build only. */
+/* This test's own fresh keypair: its public half is copied into every
+ * built command's admitted_signer_public_key_ed25519 field below (the
+ * same field the real app durably snapshots at COMMIT), never fed to
+ * the bootloader through any compile-time override. */
 uint8_t xiao_ota_test_public_key_ed25519[32];
 static uint8_t g_test_secret_key[64];
 
@@ -66,52 +60,20 @@ static void sha256_of(const uint8_t *data, size_t length, uint8_t out[32]) {
   xiao_ota_sha256_final(&sha, out);
 }
 
-/* Provisions the CURRENT ("old") running application directly in fake
- * internal flash plus real, matching bank-0 settings -- exactly what a
- * fresh, already-installed device looks like from the bootloader's point
- * of view -- AND a matching, genuinely signed genesis
- * BootFloorActivationReceiptV1 (xiao_ota_record.h) bound to this exact,
- * ALREADY-DURABLY-PERSISTED floor body (written via write_floor_direct()
- * before the receipt, mirroring the real provisioning sequence). A
- * genuinely blank floor pair no longer implicitly trusts counter floor
- * 0, nor does a receipt alone without a matching persisted floor body
- * (see xiao_ota_boot_io.c's XIAO_OTA_PAIR_FOUND/XIAO_OTA_PAIR_MISSING
- * handling and floor_genesis_receipt_matches()); this is the single shared place
- * nearly every fixture already establishes its "already-provisioned"
- * starting device, so making its provisioning explicit and signed here
- * converts every existing implicit-factory-floor-0 fixture at once,
- * rather than requiring one-by-one per-test surgery. Fixtures that
- * specifically need a genuinely un-provisioned (no receipt) device use
- * provision_old_image_no_genesis_receipt() instead. */
-static void provision_genesis_receipt(fake_io_state_t *s,
-                                      uint32_t baseline_extent,
-                                      const uint8_t baseline_hash[32]);
 static void write_floor_direct(fake_io_state_t *s, uint32_t counter_floor,
                                uint32_t extent, const uint8_t hash[32]);
 
-static void provision_old_image_no_genesis_receipt(fake_io_state_t *s,
-                                                    uint32_t size, uint8_t seed,
-                                                    uint8_t out_hash[32]) {
+/* Provisions the current ("old") running application directly in fake
+ * internal flash plus matching bank-0 settings, then writes the committed
+ * floor record that represents the currently installed image. */
+static void provision_old_image(fake_io_state_t *s, uint32_t size,
+                                uint8_t seed, uint8_t out_hash[32]) {
   uint8_t *region = s->internal_flash + XIAO_OTA_APP_START;
   fill_pattern(region, size, seed);
   sha256_of(region, size, out_hash);
   fake_io_provision_bank0_settings(s, XIAO_OTA_BANK_VALID_APP,
                                   crc16_compute(region, size, NULL), size);
-}
-
-static void provision_old_image(fake_io_state_t *s, uint32_t size,
-                                uint8_t seed, uint8_t out_hash[32]) {
-  provision_old_image_no_genesis_receipt(s, size, seed, out_hash);
-  /* Genesis (floor 0) is trusted only once BOTH an already-durable,
-   * fully-committed floor body AND a matching receipt exist -- a
-   * receipt is provenance for a PRESENT floor, never a from-nothing
-   * reseed instruction (xiao_ota_boot_io.c's XIAO_OTA_PAIR_FOUND/
-   * XIAO_OTA_PAIR_MISSING handling). write_floor_direct() performs the
-   * EXACT durable body-then-marker write a real factory/provisioning
-   * tool would; the receipt is published only afterward, mirroring the
-   * real prepare-body -> publish-receipt production sequence. */
   write_floor_direct(s, 0, size, out_hash);
-  provision_genesis_receipt(s, size, out_hash);
 }
 
 static void write_candidate(fake_io_state_t *s, uint32_t size, uint8_t seed,
@@ -122,12 +84,23 @@ static void write_candidate(fake_io_state_t *s, uint32_t size, uint8_t seed,
   sha256_of(buffer, size, out_hash);
 }
 
-static void build_and_write_command(fake_io_state_t *s, uint64_t nonce,
-                                    uint32_t sequence, uint32_t counter,
-                                    uint32_t image_size,
-                                    const uint8_t candidate_hash[32],
-                                    uint32_t active_extent,
-                                    const uint8_t active_hash[32]) {
+/*
+ * Builds and durably writes a fully real, signed install command -- the
+ * SAME xiao_ota_wire_descriptor_encode()/crypto_sign()/xiao_ota_crc32()
+ * production path every other build_and_write_command* helper below
+ * uses -- but lets the caller supply ANY Ed25519 keypair to sign with
+ * and embed as admitted_signer_public_key_ed25519, rather than always
+ * the one process-global g_test_secret_key/xiao_ota_test_public_key_
+ * ed25519 pair. This is what proves the bootloader genuinely verifies
+ * against EACH command's OWN embedded key (the app-admitted-key design),
+ * not merely against one fixed key that happens to be test-generated
+ * instead of lab-committed.
+ */
+static void build_and_write_command_signed_by(
+    fake_io_state_t *s, uint64_t nonce, uint32_t sequence, uint32_t counter,
+    uint32_t image_size, const uint8_t candidate_hash[32],
+    uint32_t active_extent, const uint8_t active_hash[32],
+    const uint8_t secret_key[64], const uint8_t admitted_public_key[32]) {
   xiao_ota_wire_descriptor_t descriptor;
   uint8_t encoded[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
   unsigned char signed_message[64 + XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
@@ -154,16 +127,18 @@ static void build_and_write_command(fake_io_state_t *s, uint64_t nonce,
   xiao_ota_wire_descriptor_encode(&descriptor, encoded);
 
   crypto_sign(signed_message, &signed_length, encoded,
-             XIAO_OTA_WIRE_DESCRIPTOR_SIZE, g_test_secret_key);
+             XIAO_OTA_WIRE_DESCRIPTOR_SIZE, secret_key);
   assert(signed_length == 64 + XIAO_OTA_WIRE_DESCRIPTOR_SIZE);
 
   memset(&cmd, 0, sizeof(cmd));
   cmd.magic = XIAO_OTA_RECORD_MAGIC;
-  cmd.record_version = XIAO_OTA_COMMAND_VERSION_WIRE_V2;
+  cmd.record_version = XIAO_OTA_COMMAND_VERSION_CURRENT;
   cmd.record_bytes = sizeof(cmd);
   cmd.sequence = sequence;
   cmd.transaction_nonce = nonce;
   memcpy(cmd.wire_descriptor, encoded, sizeof(encoded));
+  memcpy(cmd.admitted_signer_public_key_ed25519, admitted_public_key,
+        sizeof(cmd.admitted_signer_public_key_ed25519));
   memcpy(cmd.signature_ed25519, signed_message, 64);
   cmd.active_image_extent = active_extent;
   memcpy(cmd.active_image_hash_sha256, active_hash, 32);
@@ -173,6 +148,18 @@ static void build_and_write_command(fake_io_state_t *s, uint64_t nonce,
   memset(s->qspi + XIAO_OTA_COMMAND_A, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
   memcpy(s->qspi + XIAO_OTA_COMMAND_A, &cmd, sizeof(cmd));
   memset(s->qspi + XIAO_OTA_COMMAND_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
+}
+
+static void build_and_write_command(fake_io_state_t *s, uint64_t nonce,
+                                    uint32_t sequence, uint32_t counter,
+                                    uint32_t image_size,
+                                    const uint8_t candidate_hash[32],
+                                    uint32_t active_extent,
+                                    const uint8_t active_hash[32]) {
+  build_and_write_command_signed_by(s, nonce, sequence, counter, image_size,
+                                    candidate_hash, active_extent, active_hash,
+                                    g_test_secret_key,
+                                    xiao_ota_test_public_key_ed25519);
 }
 
 static void write_confirmation(fake_io_state_t *s, uint64_t nonce,
@@ -223,199 +210,6 @@ static void write_floor_direct(fake_io_state_t *s, uint32_t counter_floor,
   memset(s->qspi + XIAO_OTA_FLOOR_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
 }
 
-/* Directly fabricates a structurally self-consistent (CRC/magic/bytes
- * all valid) floor record at slot A whose commit_marker is deliberately
- * left at the erased sentinel (0xFFFFFFFF) -- exactly what an
- * un-committed, "prepared" (body written, not yet Spent/finalized)
- * genesis floor body looks like: durably written and CRC-readback-
- * verifiable, but genuinely not yet a trusted, committed fact. Used to
- * build every genesis provisioning-cut fixture below; xiao_ota_boot_io.c
- * must never treat this as trustworthy on its own, with or without an
- * accompanying receipt, and must never attempt to durably repair/
- * finalize it (write its marker) itself -- only an external factory/
- * provisioning tool, alone, ever writes that marker. */
-static void write_floor_prepared_direct(fake_io_state_t *s,
-                                        uint32_t counter_floor,
-                                        uint32_t extent,
-                                        const uint8_t hash[32]) {
-  xiao_ota_floor_t floor;
-  memset(&floor, 0, sizeof(floor));
-  floor.magic = XIAO_OTA_FLOOR_MAGIC;
-  floor.record_version = XIAO_OTA_FORMAT_VERSION;
-  floor.record_bytes = sizeof(floor);
-  floor.sequence = 1;
-  floor.confirmed_counter_floor = counter_floor;
-  floor.active_image_extent = extent;
-  memcpy(floor.confirmed_hash_sha256, hash, 32);
-  floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
-  floor.commit_marker = 0xFFFFFFFFu; /* deliberately NOT committed */
-  memset(s->qspi + XIAO_OTA_FLOOR_A, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memcpy(s->qspi + XIAO_OTA_FLOOR_A, &floor, sizeof(floor));
-  memset(s->qspi + XIAO_OTA_FLOOR_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-}
-
-/*
- * Builds a genuinely signed BootFloorActivationReceiptV1 (see
- * xiao_ota_record.h) declaring genesis (floor 0) for `baseline_extent`/
- * `baseline_hash`, and writes it into floor slot A's activation-receipt
- * window (leaving slot B's window untouched -- xiao_ota_boot_io.c's
- * floor_genesis_receipt_matches() checks both, either verifying
- * suffices). `s->device_address` and the currently-provisioned bank-0
- * settings page are read directly so the receipt genuinely matches
- * whatever this fake device already has configured -- exactly the
- * fresh-hardware-truth proof xiao_ota_boot_io.c independently demands at
- * verification time, never merely a self-consistent but stale claim.
- * Pass a deliberately wrong `corrupt` bit (bad_signature/bad_uid/...) to
- * build the negative-mismatch fixtures without duplicating this whole
- * function per case.
- */
-typedef enum {
-  RECEIPT_OK = 0,
-  RECEIPT_BAD_SIGNATURE,
-  RECEIPT_BAD_UID,
-  RECEIPT_BAD_DOMAIN,
-  RECEIPT_BAD_PROFILE,
-  RECEIPT_BAD_TARGET,
-  RECEIPT_BAD_ROLE,
-  RECEIPT_BAD_BASELINE_HASH,
-  RECEIPT_BAD_BASELINE_EXTENT,
-  RECEIPT_BAD_SDK28,
-  RECEIPT_BAD_ACTIVATION_FLOOR
-} receipt_fault_t;
-
-static void build_genesis_receipt_fields(xiao_ota_floor_activation_receipt_t *r,
-                                         fake_io_state_t *s,
-                                         uint32_t baseline_extent,
-                                         const uint8_t baseline_hash[32],
-                                         uint32_t host_txn_patch,
-                                         receipt_fault_t fault) {
-  uint8_t raw_settings[XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE];
-  uint8_t sdk28_digest[32];
-  uint8_t key_hash[32];
-
-  fake_io_read_settings_raw(s, raw_settings);
-  sha256_of(raw_settings, sizeof(raw_settings), sdk28_digest);
-  sha256_of(xiao_ota_test_public_key_ed25519, 32, key_hash);
-
-  memset(r, 0, sizeof(*r));
-  r->magic = XIAO_OTA_FLOOR_ACTIVATION_MAGIC;
-  r->record_version = XIAO_OTA_FLOOR_ACTIVATION_RECORD_VERSION;
-  r->record_bytes = sizeof(*r);
-  r->boot_counter_domain = (fault == RECEIPT_BAD_DOMAIN)
-                             ? XIAO_OTA_BOOT_COUNTER_DOMAIN + 1u
-                             : XIAO_OTA_BOOT_COUNTER_DOMAIN;
-  r->hw_uid = (fault == RECEIPT_BAD_UID) ? s->device_address + 1u
-                                        : s->device_address;
-  /* local_public_key / consent_owner_public_key / host_txn_id /
-   * authority_txn_digest / manifest_digest / prepared_root_digest: opaque
-   * to the bootloader's own verification (host/app responsibility) --
-   * arbitrary fixed test bytes, present purely to prove the signature
-   * genuinely binds them (tamper-evidence), never interpreted here.
-   * host_txn_id's leading 4 bytes carry `host_txn_patch` (default
-   * 0x33333333, i.e. byte-identical to the plain 0x33 fill used
-   * everywhere else in this struct) -- purely a free, opaque "knob"
-   * used by the CRC-collision regression fixture below to construct a
-   * SECOND, genuinely differently-signed receipt whose crc32 happens to
-   * match a target value, without touching any field that this file's
-   * actual verification logic interprets. */
-  memset(r->local_public_key, 0x11u, sizeof(r->local_public_key));
-  memset(r->consent_owner_public_key, 0x22u, sizeof(r->consent_owner_public_key));
-  memset(r->host_txn_id, 0x33u, sizeof(r->host_txn_id));
-  r->host_txn_id[0] = (uint8_t)(host_txn_patch);
-  r->host_txn_id[1] = (uint8_t)(host_txn_patch >> 8);
-  r->host_txn_id[2] = (uint8_t)(host_txn_patch >> 16);
-  r->host_txn_id[3] = (uint8_t)(host_txn_patch >> 24);
-  r->target = (fault == RECEIPT_BAD_TARGET)
-                ? (XIAO_OTA_BOARD_TARGET == XIAO_OTA_TARGET_XIAO_NRF52840
-                       ? XIAO_OTA_TARGET_SENSECAP_SOLAR_P1
-                       : XIAO_OTA_TARGET_XIAO_NRF52840)
-                : XIAO_OTA_BOARD_TARGET;
-  r->profile = (fault == RECEIPT_BAD_PROFILE)
-                 ? 0u
-                 : XIAO_OTA_FLOOR_ACTIVATION_COMPILED_PROFILE;
-  r->layout_id = XIAO_OTA_FLOOR_ACTIVATION_LAYOUT_ID;
-  /* RECEIPT_BAD_ROLE must always carry a role that is WRONG relative to
-   * THIS binary's own compiled role, in both role-0 and role-1 builds --
-   * "1 - compiled role" (the other of the only two valid role values)
-   * rather than a hardcoded literal 1u, which would silently stop being
-   * a fault case at all once compiled for role 1. */
-  r->current_role = (fault == RECEIPT_BAD_ROLE) ? (1u - XIAO_OTA_COMPILED_ROLE_ID)
-                                                : XIAO_OTA_COMPILED_ROLE_ID;
-  r->key_id = XIAO_OTA_KEY_ID;
-  memcpy(r->key_fingerprint, key_hash, sizeof(r->key_fingerprint));
-  memset(r->authority_txn_digest, 0x44u, sizeof(r->authority_txn_digest));
-  memset(r->manifest_digest, 0x55u, sizeof(r->manifest_digest));
-  memset(r->prepared_root_digest, 0x66u, sizeof(r->prepared_root_digest));
-  r->activation_floor = (fault == RECEIPT_BAD_ACTIVATION_FLOOR) ? 1u : 0u;
-  memcpy(r->baseline_hash_sha256, baseline_hash, 32);
-  if (fault == RECEIPT_BAD_BASELINE_HASH) r->baseline_hash_sha256[0] ^= 0x01u;
-  r->baseline_extent = (fault == RECEIPT_BAD_BASELINE_EXTENT)
-                         ? baseline_extent + 4u
-                         : baseline_extent;
-  /* original_sdk28_digest is now actively bound: genesis_sdk28_baseline_ok()
-   * (xiao_ota_boot_io.c) checks it against the live settings page when no
-   * transaction is active (always true for the fixtures in this file,
-   * which write no state record), or against the admission-time sidecar
-   * snapshot while a transaction is active -- never re-derived from a
-   * settings page that may have legitimately mutated mid-transaction. See
-   * that function's doc-comment for the full phase/provenance rationale. */
-  memcpy(r->original_sdk28_digest, sdk28_digest, 32);
-  if (fault == RECEIPT_BAD_SDK28) r->original_sdk28_digest[0] ^= 0x01u;
-  r->crc32 = xiao_ota_crc32(r, offsetof(xiao_ota_floor_activation_receipt_t, crc32));
-}
-
-static void sign_and_write_genesis_receipt_at(fake_io_state_t *s,
-                                              uint32_t window_addr,
-                                              xiao_ota_floor_activation_receipt_t *r,
-                                              receipt_fault_t fault) {
-  uint8_t signing_buf[XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN +
-                     offsetof(xiao_ota_floor_activation_receipt_t,
-                              signature_ed25519)];
-  uint8_t digest[32];
-  unsigned char signed_message[64 + 32];
-  unsigned long long signed_length = 0;
-
-  memcpy(signing_buf, XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN,
-        XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN);
-  memcpy(signing_buf + XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN, r,
-        offsetof(xiao_ota_floor_activation_receipt_t, signature_ed25519));
-  sha256_of(signing_buf, sizeof(signing_buf), digest);
-  crypto_sign(signed_message, &signed_length, digest, sizeof(digest),
-             g_test_secret_key);
-  assert(signed_length == 64 + sizeof(digest));
-  memcpy(r->signature_ed25519, signed_message, 64);
-  if (fault == RECEIPT_BAD_SIGNATURE) r->signature_ed25519[0] ^= 0x01u;
-
-  memset(s->qspi + window_addr, 0xFF,
-        XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE);
-  memcpy(s->qspi + window_addr, r, sizeof(*r));
-}
-
-static void write_genesis_receipt_variant_at(fake_io_state_t *s,
-                                             uint32_t window_addr,
-                                             uint32_t baseline_extent,
-                                             const uint8_t baseline_hash[32],
-                                             receipt_fault_t fault) {
-  xiao_ota_floor_activation_receipt_t r;
-  build_genesis_receipt_fields(&r, s, baseline_extent, baseline_hash,
-                              0x33333333u, fault);
-  sign_and_write_genesis_receipt_at(s, window_addr, &r, fault);
-}
-
-static void write_genesis_receipt_variant(fake_io_state_t *s,
-                                          uint32_t baseline_extent,
-                                          const uint8_t baseline_hash[32],
-                                          receipt_fault_t fault) {
-  write_genesis_receipt_variant_at(s, XIAO_OTA_FLOOR_ACTIVATION_A,
-                                   baseline_extent, baseline_hash, fault);
-}
-
-static void provision_genesis_receipt(fake_io_state_t *s,
-                                      uint32_t baseline_extent,
-                                      const uint8_t baseline_hash[32]) {
-  write_genesis_receipt_variant(s, baseline_extent, baseline_hash, RECEIPT_OK);
-}
-
 /* Directly fabricates a structurally-valid state record at slot A, for
  * exercising confirmation-path guards against combinations (e.g. a
  * lower-counter TRIAL_BOOT than the existing floor) that the normal
@@ -430,17 +224,12 @@ static void write_state_direct(fake_io_state_t *s, uint32_t phase,
   xiao_ota_settings_sidecar_t sidecar;
   /* The sidecar's frozen 28-byte snapshot is the ACTUAL live settings
    * page at the moment this fixture is called (read via
-   * fake_io_read_settings_raw(), the exact same accessor
-   * provision_genesis_receipt()/write_genesis_receipt_variant() use to
-   * compute a genesis receipt's original_sdk28_digest) -- not arbitrary
-   * fabricated bytes. This keeps the fabricated in-flight transaction
-   * genuinely, byte-for-byte consistent with whatever genesis receipt
-   * callers of this helper may ALSO have provisioned (see
-   * genesis_sdk28_baseline_ok() in xiao_ota_boot_io.c, which now
-   * requires the active-transaction sidecar snapshot to hash-match the
-   * receipt's signed claim), while the previous_bank_0/_crc/_size triad
-   * mirrored into the state record below is read from those SAME bytes,
-   * so xiao_ota_boot_process_io()'s bank0_triad_matches check still
+   * fake_io_read_settings_raw()) -- not arbitrary fabricated bytes.
+   * This keeps the fabricated in-flight transaction byte-for-byte
+   * consistent with the device state the bootloader would have seen at
+   * admission time, while the previous_bank_0/_crc/_size triad mirrored
+   * into the state record below is read from those SAME bytes so
+   * xiao_ota_boot_process_io()'s bank0_triad_matches check still
    * agrees. */
   uint8_t live_settings_raw[XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE];
   uint16_t previous_bank_0;
@@ -525,6 +314,169 @@ static uint32_t read_bank0_size(const fake_io_state_t *s) {
   return settings.bank_0_size;
 }
 
+/*
+ * Decisive proof of the app-admitted-signer-key design: TWO independently
+ * generated Ed25519 keypairs, each signing (and embedding as
+ * admitted_signer_public_key_ed25519) its OWN, separate install command,
+ * both genuinely install/confirm. This is what actually distinguishes
+ * "the bootloader verifies against this command's own embedded key" from
+ * a test that would coincidentally still pass against one single fixed/
+ * compiled-in anchor -- key B here is NEVER the process-global test key
+ * any other fixture in this file uses, and is generated fresh inside this
+ * test, so nothing else could make this pass except genuinely reading and
+ * using each command's own embedded key.
+ */
+static void test_two_different_admitted_keys_each_verify_their_own_image(void) {
+  fake_io_state_t s;
+  uint8_t old_hash[32], hash_a[32], hash_b[32];
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t public_key_a[32], secret_key_a[64];
+  uint8_t public_key_b[32], secret_key_b[64];
+  const uint32_t old_size = 8192;
+  const uint32_t size_a = 4096;
+  const uint32_t size_b = 12288;
+
+  crypto_sign_keypair(public_key_a, secret_key_a);
+  crypto_sign_keypair(public_key_b, secret_key_b);
+  assert(memcmp(public_key_a, public_key_b, 32) != 0);
+
+  fake_io_reset(&s);
+  provision_old_image(&s, old_size, 0x61, old_hash);
+
+  /* First transaction: signed and admitted under key A. */
+  write_candidate(&s, size_a, 0x62, hash_a);
+  build_and_write_command_signed_by(&s, /*nonce=*/301, /*sequence=*/1,
+                                    /*counter=*/1, size_a, hash_a, old_size,
+                                    old_hash, secret_key_a, public_key_a);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  write_confirmation(&s, 301, 1, hash_a);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(read_floor(&s, &floor));
+  assert(floor.confirmed_counter_floor == 1);
+
+  /* Second, later transaction: signed and admitted under an entirely
+   * DIFFERENT key B, rolling the floor forward again -- a real admin
+   * key rotation, honoured purely because THIS command carries its own
+   * admitted key, never because it happens to match key A. */
+  write_candidate(&s, size_b, 0x63, hash_b);
+  build_and_write_command_signed_by(&s, /*nonce=*/302, /*sequence=*/1,
+                                    /*counter=*/2, size_b, hash_b, size_a,
+                                    hash_a, secret_key_b, public_key_b);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  write_confirmation(&s, 302, 2, hash_b);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(read_floor(&s, &floor));
+  assert(floor.confirmed_counter_floor == 2);
+  assert(floor.active_image_extent == size_b);
+  assert(memcmp(floor.confirmed_hash_sha256, hash_b, 32) == 0);
+}
+
+/*
+ * A command whose admitted_signer_public_key_ed25519 has been mutated
+ * (e.g. torn/corrupted after the app wrote it, or a bit-rot event) no
+ * longer matches signature_ed25519 -- xiao_ota_install_command_decode()
+ * must reject it on cryptographic grounds before the internal app is
+ * ever touched. Proven directly on real internal_flash bytes (not just a
+ * phase/return-code enum): the running application's code bytes are
+ * byte-for-byte identical after the rejected boot to what they were
+ * before it, i.e. no erase/program cycle against the app region ever
+ * started. CRC32 is recomputed over the mutated record so this is
+ * rejected by signature verification specifically, not merely caught
+ * earlier by the cheaper structural CRC check. */
+static void test_mutated_admitted_key_rejected_before_any_app_erase(void) {
+  fake_io_state_t s;
+  uint8_t old_hash[32], candidate_hash[32];
+  xiao_ota_state_t state;
+  xiao_ota_command_v2_t cmd;
+  uint8_t internal_before[8192];
+  const uint32_t old_size = 8192;
+  const uint32_t new_size = 4096;
+
+  fake_io_reset(&s);
+  provision_old_image(&s, old_size, 0x71, old_hash);
+  write_candidate(&s, new_size, 0x72, candidate_hash);
+  build_and_write_command(&s, /*nonce=*/401, /*sequence=*/1, /*counter=*/1,
+                          new_size, candidate_hash, old_size, old_hash);
+
+  /* Mutate the durable command's embedded admitted key in place (as if a
+   * torn/corrupted write landed only partway through this field), then
+   * recompute CRC so the record is still STRUCTURALLY valid -- isolating
+   * the test to the cryptographic admitted-key check specifically. */
+  memcpy(&cmd, s.qspi + XIAO_OTA_COMMAND_A, sizeof(cmd));
+  cmd.admitted_signer_public_key_ed25519[0] ^= 0x01u;
+  cmd.crc32 = xiao_ota_crc32(&cmd, offsetof(xiao_ota_command_v2_t, crc32));
+  memcpy(s.qspi + XIAO_OTA_COMMAND_A, &cmd, sizeof(cmd));
+  assert(xiao_ota_command_v2_valid(&cmd)); /* structurally fine, still rejected below */
+
+  memcpy(internal_before, s.internal_flash + XIAO_OTA_APP_START, sizeof(internal_before));
+
+  assert(fake_io_run_boot(&s) == 0);
+
+  /* Rejected: no trial/install state was ever opened. */
+  assert(read_state(&s, &state) == false ||
+        state.phase != XIAO_OTA_PHASE_TRIAL_BOOT);
+  /* The real running app's own code bytes are untouched -- proof no
+   * erase/program cycle against the internal app region ever began. */
+  assert(memcmp(internal_before, s.internal_flash + XIAO_OTA_APP_START,
+                sizeof(internal_before)) == 0);
+}
+
+/*
+ * A torn/partial overwrite of the durable command record (the app's own
+ * write of a NEW command interrupted before completing -- a bad CRC is
+ * the direct, observable consequence, modelled here the same way other
+ * torn-record fixtures throughout this file do: corrupt bytes, keep the
+ * stale CRC) must never strand or regress an already-confirmed install:
+ * with no readable/valid command and a healthy current app, boot must
+ * behave exactly like the normal no-active-update case (confirmed state
+ * intact, no forced recovery, no DFU-only stranding). The prior valid,
+ * already-confirmed record (committed state + floor) must survive
+ * completely untouched. */
+static void test_torn_command_preserves_prior_confirmed_record(void) {
+  fake_io_state_t s;
+  uint8_t old_hash[32], candidate_hash[32];
+  xiao_ota_state_t before_state, after_state;
+  xiao_ota_floor_t before_floor, after_floor;
+  const uint32_t old_size = 8192;
+  const uint32_t new_size = 4096;
+
+  fake_io_reset(&s);
+  provision_old_image(&s, old_size, 0x81, old_hash);
+  write_candidate(&s, new_size, 0x82, candidate_hash);
+  build_and_write_command(&s, /*nonce=*/501, /*sequence=*/1, /*counter=*/1,
+                          new_size, candidate_hash, old_size, old_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  write_confirmation(&s, 501, 1, candidate_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &before_state));
+  assert(before_state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(read_floor(&s, &before_floor));
+
+  /* Simulate a torn overwrite of command slot A by a would-be NEXT
+   * transaction: a handful of bytes landed, the rest (including a
+   * recomputed CRC) never did, leaving the stale/prior CRC in place
+   * against now-mismatched body bytes -- i.e. genuinely unreadable, not
+   * "erased" (xiao_ota_bytes_erased() must not mistake this for a
+   * never-provisioned slot either). */
+  memset(s.qspi + XIAO_OTA_COMMAND_A, 0x5A, 17);
+
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &after_state));
+  assert(after_state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(memcmp(&before_state, &after_state, sizeof(before_state)) == 0);
+  assert(read_floor(&s, &after_floor));
+  assert(memcmp(&before_floor, &after_floor, sizeof(before_floor)) == 0);
+}
+
 /* (a)/(HIGH2 regression): differently-sized old->new update, correct
  * confirmation advances the floor to the NEW (freshly verified) extent,
  * never the old backup extent. Run both directions, per the reviewer's
@@ -592,14 +544,12 @@ static void test_failed_retry_then_new_nonce(void) {
   }
   assert(read_state(&s, &state));
   assert(state.phase == XIAO_OTA_PHASE_FAILED);
-  /* This device is genesis-provisioned (provision_old_image() writes a
-   * genuinely signed BootFloorActivationReceiptV1 -- see
-   * xiao_ota_boot_io.c's floor_genesis_receipt_matches()), so a
-   * confirmed_counter_floor==0 floor record IS legitimately established
-   * the very first boot, well before any OTA transaction ever confirms
-   * -- this is the fail-closed genesis contract itself, not evidence of
-   * a completed install. The floor's own identity must match the
-   * genesis baseline (the OLD image), never the failed candidate. */
+  /* This device starts with a committed floor-0 record, so a
+   * confirmed_counter_floor==0 floor is legitimately established well
+   * before any OTA transaction ever confirms. That is not evidence of a
+   * completed install; it simply records the currently running baseline.
+   * The floor's own identity must match the OLD image, never the failed
+   * candidate. */
   assert(read_floor(&s, &floor));
   assert(floor.confirmed_counter_floor == 0);
   assert(floor.active_image_extent == old_size);
@@ -622,7 +572,7 @@ static void test_failed_retry_then_new_nonce(void) {
     assert(memcmp(s.internal_flash + XIAO_OTA_APP_START, internal_snapshot,
                  sizeof(internal_snapshot)) == 0);
   }
-  /* The genesis floor established above must remain exactly unchanged
+  /* The floor-0 record established above must remain exactly unchanged
    * across every repeated refused-retry boot -- no re-derivation, no
    * drift. */
   assert(read_floor(&s, &floor));
@@ -737,7 +687,7 @@ static void test_stale_confirmation_never_advances_floor(void) {
    * metadata was never touched by that reflash path. */
   fill_pattern(s.internal_flash + XIAO_OTA_APP_START, new_size, 0x66);
 
-  /* This device is genesis-provisioned, so the genesis floor (counter 0,
+  /* This device is floor-0-provisioned, so the floor-0 record (counter 0,
    * bound to the OLD image) already exists at this point -- capture it
    * so the assertion below can prove it is exactly UNCHANGED, not merely
    * re-check presence/absence. */
@@ -1007,337 +957,6 @@ static void test_torn_state_write_refuses_without_commit(void) {
   assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
 }
 
-/*
- * Genesis (floor 0) provisioning-cut/fault battery: a receipt is
- * provenance for an ALREADY-DURABLE, matching, committed floor body,
- * never an instruction to reconstruct a missing body or finalize
- * (write the commit_marker for) an uncommitted one -- this bootloader
- * must never do either, at any of the cut boundaries a real factory/
- * provisioning sequence (prepare body -> publish receipt -> commit
- * marker, each a separate durable step) can be interrupted at. Every
- * case here must refuse ALL fresh command admission (no state record
- * ever created) without ever calling force_recovery -- exactly the
- * same fail-closed-but-otherwise-inert outcome an ordinary DAMAGED
- * floor already produces (see test_corrupt_floor_refuses_new_
- * transaction above).
- */
-static void assert_genesis_denies_fresh_admission(fake_io_state_t *s) {
-  xiao_ota_state_t state;
-  assert(fake_io_run_boot(s) == 0);
-  assert(!read_state(s, &state));
-  assert(s->force_recovery_calls == 0);
-}
-
-/* Pre-body cut: a genuinely fresh device, no floor body and no receipt
- * in either slot at all -- the ordinary XIAO_OTA_PAIR_MISSING case, and
- * (per the fail-closed genesis contract) always untrustworthy, with no
- * exception, even though nothing here is actually damaged. */
-static void test_genesis_pre_body_cut_never_admits(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, 8192, 0xA1, old_hash);
-  write_candidate(&s, 8192, 0xB2, candidate_hash);
-  build_and_write_command(&s, 1, 1, 1, 8192, candidate_hash, 8192, old_hash);
-  assert_genesis_denies_fresh_admission(&s);
-}
-
-/* Post-body cut: the floor body was durably written (CRC-valid,
- * readback-verifiable) but the provisioning process was cut BEFORE the
- * receipt was ever published -- no receipt exists in either window at
- * all. Must deny exactly like a genuinely missing pair; the bootloader
- * must never treat an unauthenticated prepared body as trustworthy on
- * its own, and must never invent/publish a receipt itself. */
-static void test_genesis_post_body_pre_receipt_cut_never_admits(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, 8192, 0xA2, old_hash);
-  write_floor_prepared_direct(&s, 0, 8192, old_hash);
-  write_candidate(&s, 8192, 0xB3, candidate_hash);
-  build_and_write_command(&s, 1, 1, 1, 8192, candidate_hash, 8192, old_hash);
-  assert_genesis_denies_fresh_admission(&s);
-}
-
-/* Post-Spent/pre-marker cut: the floor body AND a genuinely verifying,
- * matching receipt are both durably present, but the provisioning
- * process was cut BEFORE the floor's own commit_marker was ever
- * written -- the body is still only "prepared", not committed. A
- * receipt alone (even a fully verifying one) must NEVER reconstruct the
- * missing marker/finalize this record itself; only the ALREADY
- * committed floor (checked at XIAO_OTA_PAIR_FOUND) is ever trusted.
- * Local/factory authority is expected to resume the activation from
- * scratch (a fresh, still-uncommitted candidate body), never this
- * bootloader synthesizing that resume on its own. */
-static void test_genesis_post_receipt_pre_marker_cut_never_admits(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, 8192, 0xA3, old_hash);
-  write_floor_prepared_direct(&s, 0, 8192, old_hash);
-  provision_genesis_receipt(&s, 8192, old_hash);
-  write_candidate(&s, 8192, 0xB4, candidate_hash);
-  build_and_write_command(&s, 1, 1, 1, 8192, candidate_hash, 8192, old_hash);
-  assert_genesis_denies_fresh_admission(&s);
-}
-
-/* Every individual RECEIPT_BAD_* mismatch -- including RECEIPT_BAD_SDK28,
- * now actively bound by genesis_sdk28_baseline_ok() (xiao_ota_boot_io.c)
- * against the live settings page, since none of these fixtures have any
- * active transaction -- must independently deny fresh admission against
- * an otherwise fully genuine, committed genesis floor body -- a single
- * tampered/wrong field is exactly as untrusted as no receipt at all. */
-static void run_genesis_receipt_fault_denies_admission(receipt_fault_t fault) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, 8192, 0xA4, old_hash);
-  write_floor_direct(&s, 0, 8192, old_hash);
-  write_genesis_receipt_variant(&s, 8192, old_hash, fault);
-  write_candidate(&s, 8192, 0xB5, candidate_hash);
-  build_and_write_command(&s, 1, 1, 1, 8192, candidate_hash, 8192, old_hash);
-  assert_genesis_denies_fresh_admission(&s);
-}
-
-static void test_genesis_receipt_faults_deny_admission(void) {
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_SIGNATURE);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_UID);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_DOMAIN);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_PROFILE);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_TARGET);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_ROLE);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_BASELINE_HASH);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_BASELINE_EXTENT);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_SDK28);
-  run_genesis_receipt_fault_denies_admission(RECEIPT_BAD_ACTIVATION_FLOOR);
-}
-
-/*
- * Genuine cross-language Ed25519 interop proof against a LITERAL shared
- * fixture (not a re-signed/re-derived roundtrip): this exact 386-byte
- * canonical record and 32-byte publisher public key are byte-identical
- * to Authority's own test/test_lora_ota_authority/test_lora_ota_authority.cpp
- * (BootFloorActivationReceiptCodecTest,
- * RealEd25519CrossLanguageInteropVectorVerifiesWithActualCrypto) and
- * scripts/tests/test_ota_authority_registry.py's mirrored
- * _INTEROP_RECORD_HEX/_INTEROP_PUBLISHER_PUBLIC_KEY_HEX -- independently
- * produced via Python/openssl (ephemeral, discarded test private key;
- * never committed/available here), already proven there to genuinely
- * verify under Authority's own C++ Ed25519 verifier and raw `openssl
- * pkeyutl -verify`. This test proves THIS bootloader's own production
- * digest construction (XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN (no NUL)
- * || body[0..322)) and its production ed25519_verify() independently
- * accept the identical bytes and key -- genuine cross-language/
- * cross-tool interop, no private key or re-signing involved on this
- * side. This is a pure codec/digest/verifier-layer test (not a genesis-
- * admission/boot-state-machine test): the fixture's UID/bindings/
- * fingerprint are Authority's illustrative interop values, not this
- * device's real identity, so it is never staged into fake QSPI floor
- * state and never exercises floor_genesis_receipt_matches()/policy
- * checks -- only the shared record layout + digest + raw signature
- * verification, exactly as requested.
- */
-static const uint8_t kAuthorityInteropRecord[386] = {
-    0x52, 0x41, 0x46, 0x58, 0x01, 0x00, 0x82, 0x01, 0x54, 0x4F, 0x4F, 0x42, 0xEF, 0xCD, 0xAB, 0x89,
-    0x67, 0x45, 0x23, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-    0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-    0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C,
-    0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C,
-    0x3D, 0x3E, 0x3F, 0x40, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A,
-    0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A,
-    0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A,
-    0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A,
-    0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A,
-    0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A,
-    0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA,
-    0xAB, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA,
-    0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA,
-    0xCB, 0xCC, 0xCD, 0xCE, 0xCF, 0xD0, 0x00, 0x00, 0x00, 0x00, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6,
-    0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6,
-    0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0x00, 0x20, 0x00, 0x00, 0xF1, 0xF2,
-    0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF, 0x01, 0x02, 0x03,
-    0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x89, 0x42,
-    0x30, 0x86, 0xD8, 0xC2, 0xA9, 0x9B, 0x59, 0x25, 0xBC, 0x52, 0x4A, 0x27, 0xB6, 0x9B, 0xFA, 0x71,
-    0xD3, 0x02, 0x4F, 0xD9, 0x9B, 0xC7, 0xD5, 0x8D, 0xB9, 0x50, 0x4B, 0x3E, 0xB0, 0x0A, 0xE0, 0x74,
-    0xBE, 0x34, 0xB7, 0x5F, 0xD2, 0x44, 0x7C, 0x64, 0xD0, 0x49, 0x81, 0x8A, 0xC2, 0x7E, 0xDA, 0x24,
-    0x89, 0x3B, 0x76, 0x21, 0x89, 0x9E, 0x66, 0xB3, 0xCE, 0xCE, 0x7E, 0x0B, 0x13, 0xB3, 0x10, 0x5A,
-    0xAA, 0x0E,
-};
-static const uint8_t kAuthorityInteropPublisherPublicKey[32] = {
-    0x10, 0x14, 0xCA, 0xE1, 0xB5, 0xCF, 0x78, 0xA5, 0x26, 0x35, 0x45, 0x25, 0x15, 0x65, 0x8B, 0x73,
-    0x0A, 0xF5, 0x97, 0x99, 0xCA, 0x1B, 0x2C, 0x25, 0x0A, 0x63, 0x18, 0x52, 0xC8, 0x24, 0x40, 0x3B,
-};
-
-/* Builds SHA256(XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN (no NUL) ||
- * record[0..322)) -- this bootloader's exact production digest
- * construction (matches floor_activation_receipt_binds_floor() in
- * xiao_ota_boot_io.c byte for byte) -- from an arbitrary 386-byte
- * canonical record buffer. */
-static void authority_interop_digest(const uint8_t record[386], uint8_t digest[32]) {
-  uint8_t signing_buf[XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN +
-                      XIAO_OTA_FLOOR_ACTIVATION_SIGNED_BODY_BYTES];
-  memcpy(signing_buf, XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN,
-        XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN);
-  memcpy(signing_buf + XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN, record,
-        XIAO_OTA_FLOOR_ACTIVATION_SIGNED_BODY_BYTES);
-  sha256_of(signing_buf, sizeof(signing_buf), digest);
-}
-
-static void test_authority_literal_interop_vector_verifies_and_tamper_rejects(void) {
-  uint8_t digest[32];
-
-  /* Genuine positive: this bootloader's own production digest
-   * construction + its own production ed25519_verify() accept the
-   * literal, independently (Python/openssl)-produced fixture and key --
-   * never a mocked/always-true check. (Note: this fixture's
-   * key_fingerprint/UID/other body fields are Authority's illustrative
-   * filler bytes for exercising the codec, not a real SHA-256(public
-   * key) binding -- only the signature/digest/key triple is a genuine
-   * cross-language cryptographic claim here.) */
-  authority_interop_digest(kAuthorityInteropRecord, digest);
-  assert(ed25519_verify(
-            kAuthorityInteropRecord + XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519,
-            digest, sizeof(digest), kAuthorityInteropPublisherPublicKey) != 0);
-
-  /* Padding-ignored: an arbitrary 388-byte PHYSICAL (word-aligned QSPI
-   * read) buffer, with non-0xFF garbage in the 2 trailing bytes that
-   * are never part of the canonical/signed contract, must still verify
-   * identically -- the digest is built strictly from record[0..322),
-   * never the physical padding. */
-  {
-    uint8_t physical[XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES];
-    uint8_t padded_digest[32];
-    memcpy(physical, kAuthorityInteropRecord, 386);
-    physical[386] = 0x5Au;
-    physical[387] = 0xA5u;
-    authority_interop_digest(physical, padded_digest);
-    assert(memcmp(padded_digest, digest, 32) == 0);
-    assert(ed25519_verify(
-              physical + XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519,
-              padded_digest, sizeof(padded_digest),
-              kAuthorityInteropPublisherPublicKey) != 0);
-  }
-
-  /* Negative: flip one signed-body byte (offset 100, inside key_id --
-   * well before the signature), then recompute the CRC32 field (offset
-   * 318) the SAME way a real producer would so the record stays
-   * internally CRC-consistent -- the recomputed SHA-256 digest still
-   * differs from what was actually signed, so the ORIGINAL, untouched
-   * signature must now genuinely fail cryptographic verification (not
-   * merely fail a separate CRC check): proves this is a real
-   * cryptographic accept/reject, not a CRC-gated stand-in. */
-  {
-    uint8_t tampered[386];
-    uint8_t tampered_digest[32];
-    uint32_t crc;
-    memcpy(tampered, kAuthorityInteropRecord, sizeof(tampered));
-    tampered[100] ^= 0x01u;
-    crc = xiao_ota_crc32(tampered, XIAO_OTA_FLOOR_ACTIVATION_OFF_CRC32);
-    tampered[318] = (uint8_t)(crc & 0xFFu);
-    tampered[319] = (uint8_t)((crc >> 8) & 0xFFu);
-    tampered[320] = (uint8_t)((crc >> 16) & 0xFFu);
-    tampered[321] = (uint8_t)((crc >> 24) & 0xFFu);
-    authority_interop_digest(tampered, tampered_digest);
-    assert(memcmp(tampered_digest, digest, 32) != 0);
-    assert(ed25519_verify(
-              tampered + XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519,
-              tampered_digest, sizeof(tampered_digest),
-              kAuthorityInteropPublisherPublicKey) == 0);
-  }
-
-  /* Negative: signature-only tamper against the ORIGINAL, untouched
-   * digest -- a single flipped signature byte must be rejected. */
-  {
-    uint8_t tampered_sig[64];
-    memcpy(tampered_sig, kAuthorityInteropRecord +
-                            XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519,
-          64);
-    tampered_sig[0] ^= 0x01u;
-    assert(ed25519_verify(tampered_sig, digest, sizeof(digest),
-                          kAuthorityInteropPublisherPublicKey) == 0);
-  }
-
-  /* Negative: wrong public key against the ORIGINAL, untouched
-   * signature/digest -- a single flipped key byte must be rejected. */
-  {
-    uint8_t wrong_key[32];
-    memcpy(wrong_key, kAuthorityInteropPublisherPublicKey, 32);
-    wrong_key[0] ^= 0x01u;
-    assert(ed25519_verify(
-              kAuthorityInteropRecord + XIAO_OTA_FLOOR_ACTIVATION_OFF_SIGNATURE_ED25519,
-              digest, sizeof(digest), wrong_key) == 0);
-  }
-}
-
-/*
- * genesis_sdk28_baseline_ok()'s ACTIVE-transaction seam
- * (xiao_ota_boot_io.c): while an OTA transaction is actively in-flight
- * (TRIAL_BOOT here, before confirmation), the live settings page may
- * already legitimately differ from the true original baseline, so the
- * admission-time sidecar snapshot must be used instead -- but if THAT
- * snapshot itself does not hash-match the genesis receipt's signed
- * original_sdk28_digest (e.g. a torn/corrupted sidecar write, or one
- * belonging to a different device), the floor-0 genesis claim must be
- * denied exactly like any other tampered receipt field: no confirmation,
- * fail closed via rollback, never silently trusted from the live page
- * instead. Flips a BYTE OUTSIDE the bank-0 triad (app_image_size, offset
- * 20) so xiao_ota_boot_process_io()'s separate, narrower
- * bank0_triad_matches/sidecar_matches_state check still passes -- this
- * exercises the SDK28 digest seam specifically, not that unrelated
- * guard. */
-static void test_active_transaction_sdk28_sidecar_mismatch_denies_confirm(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32], candidate_hash[32];
-  xiao_ota_state_t state, state_a, state_b;
-  xiao_ota_settings_sidecar_t sidecar;
-  uint32_t sidecar_address;
-  const uint32_t size = 8192;
-  int attempt;
-
-  fake_io_reset(&s);
-  provision_old_image(&s, size, 0xE1, old_hash);
-  write_candidate(&s, size, 0xE2, candidate_hash);
-  build_and_write_command(&s, 1, 1, 1, size, candidate_hash, size, old_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-
-  memcpy(&state_a, s.qspi + XIAO_OTA_STATE_A, sizeof(state_a));
-  memcpy(&state_b, s.qspi + XIAO_OTA_STATE_B, sizeof(state_b));
-  sidecar_address = (xiao_ota_state_valid(&state_a) &&
-                    state_a.sequence == state.sequence)
-                        ? XIAO_OTA_SETTINGS_SIDECAR_A
-                        : XIAO_OTA_SETTINGS_SIDECAR_B;
-  memcpy(&sidecar, s.qspi + sidecar_address, sizeof(sidecar));
-  sidecar.original_settings_raw[20] ^= 0xFFu;
-  sidecar.crc32 = xiao_ota_crc32(&sidecar, offsetof(xiao_ota_settings_sidecar_t, crc32));
-  memcpy(s.qspi + sidecar_address, &sidecar, sizeof(sidecar));
-
-  write_confirmation(&s, 1, 1, candidate_hash);
-  for (attempt = 0; attempt < 4; ++attempt) {
-    assert(fake_io_run_boot(&s) == 0);
-    assert(read_state(&s, &state));
-    assert(state.phase != XIAO_OTA_PHASE_CONFIRMED);
-  }
-  /* The original genesis floor must never have been overwritten by this
-   * unauthenticated-baseline confirmation attempt. */
-  {
-    xiao_ota_floor_t floor;
-    assert(read_floor(&s, &floor));
-    assert(floor.confirmed_counter_floor == 0);
-    assert(memcmp(floor.confirmed_hash_sha256, old_hash, 32) == 0);
-  }
-}
-
 /* Astra HIGH-2 (floor corruption defence): a floor pair that fails
  * structural validation but is NOT genuinely blank (bit rot / leftover
  * unrelated data, not "never provisioned") must refuse ALL new command
@@ -1418,13 +1037,13 @@ static void test_no_confirmed_without_durable_floor(void) {
   s.fail.after = 1;
   assert(fake_io_run_boot(&s) == 0);
   assert(s.force_recovery_calls == 1);
-  /* This device is genesis-provisioned (provision_old_image()), so the
-   * pre-existing genesis floor (counter 0) still durably exists in
+  /* This device is floor-0-provisioned (provision_old_image()), so the
+   * pre-existing floor-0 record (counter 0) still durably exists in
    * whichever sibling slot persist_floor() did NOT target -- the failed
    * write only ever erases+fails ITS OWN target sector, never the
    * other. The confirmation must still never be honoured (no ADVANCED
    * floor was durably persisted), so the readable floor must remain
-   * exactly the pre-confirmation genesis value, not the new counter. */
+   * exactly the pre-confirmation initial value, not the new counter. */
   assert(read_floor(&s, &floor));
   assert(floor.confirmed_counter_floor == 0);
   assert(read_state(&s, &state));
@@ -1876,7 +1495,7 @@ static void test_full_capacity_backup_install_rollback_preserves_tail_regions(vo
   }
   assert(read_state(&s, &state));
   assert(state.phase == XIAO_OTA_PHASE_FAILED);
-  /* Genesis-provisioned device: the pre-existing genesis floor (counter
+  /* Initial floor-0 device: the pre-existing floor-0 record (counter
    * 0, bound to the OLD image) still exists and is untouched -- never
    * confirmed, so no floor advance ever occurred. */
   assert(read_floor(&s, &floor));
@@ -1995,14 +1614,6 @@ static void test_rollback_restores_settings_raw_verbatim(void) {
                        0x33333333u, 0x44444444u, 0x55555555u, custom_raw);
   }
   fake_io_write_settings_raw(&s, custom_raw);
-  /* The genesis receipt provision_old_image() wrote captured the SDK28
-   * digest of the STOCK settings raw, now superseded by custom_raw above
-   * (this test's whole point is a custom-but-legitimate starting
-   * settings page) -- re-provision so genesis verification binds the
-   * settings page this device ACTUALLY has before its first ever boot,
-   * exactly as a real factory-provisioning step would capture whatever
-   * the device's true starting state is, not a stale earlier snapshot. */
-  provision_genesis_receipt(&s, old_size, old_hash);
   fake_io_read_settings_raw(&s, original_raw);
 
   write_candidate(&s, old_size, 0x22, candidate_hash);
@@ -2550,7 +2161,7 @@ static void test_committed_state_marker_bit_set_never_reopens_stale_state(void) 
 
 /*
  * Main's follow-up regression: nonce agreement ALONE is not sufficient
- * binding proof for STATE -- see state_ambiguous_binding_ok()'s
+ * binding evidence for STATE -- see state_ambiguous_binding_ok()'s
  * doc-comment. Slot A holds an older, fully valid, durable TRIAL_BOOT
  * record with trial_attempts=0. Slot B holds a NEWER (sequence 2)
  * record for the SAME transaction (same nonce, same command still
@@ -2671,853 +2282,10 @@ static void test_floor_corruption_fixture_admits_counter_four_above_healthy_thre
   write_candidate(&s, 8192, 0xC7, candidate_hash);
   build_and_write_command(&s, 4, 1, 4, 8192, candidate_hash, 8192, old_hash);
   write_floor_direct(&s, 3, 8192, old_hash);
-  /* write_floor_direct() wipes both physical receipt windows (it fully
-   * blanks each slot's whole sector before writing the floor body) --
-   * re-provision genesis role/identity evidence afterward, exactly as
-   * persist_floor()'s real carry-forward would have kept available on
-   * an actual device that genuinely advanced to floor 3 (see
-   * floor_role_evidence_ok() in xiao_ota_boot_io.c). */
-  provision_genesis_receipt(&s, 8192, old_hash);
   assert(fake_io_run_boot(&s) == 0);
   assert(read_state(&s, &state));
   assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
   assert(state.candidate_counter == 4);
-}
-
-/*
- * Sol/Astra HIGH finding regression: once a device's floor has genuinely
- * ADVANCED past 0 via the REAL persist_floor() carry-forward path (this
- * test uses the actual install/confirm flow, never write_floor_direct()),
- * the durable role evidence that carry-forward preserved must keep
- * gating EVERY later signed command, not merely genesis -- even a
- * structurally valid, correctly-signed, counter-advancing command for
- * the compiled role actually running, if the retained genesis receipt
- * now belongs to a DIFFERENT role. This is the exact attack described:
- * "replace ONLY the compiled loader binary, keep the same QSPI floor/
- * receipt records" -- role-evidence agreement is symmetric, so forcing
- * BOTH durable receipt windows to attest to the OTHER role (exactly
- * what RECEIPT_BAD_ROLE already always does: "1 - this binary's own
- * compiled role", never a hardcoded literal) is the equivalent, in-
- * process-testable mirror of that swap.
- */
-static void test_cross_role_loader_swap_cannot_install_after_real_confirm(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t confirmed_hash[32];
-  uint8_t attack_candidate_hash[32];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  const uint32_t image_size = 65536;
-
-  fake_io_reset(&s);
-  provision_old_image(&s, image_size, 0xD1, old_hash);
-  write_candidate(&s, image_size, 0xD2, confirmed_hash);
-  build_and_write_command(&s, /*nonce=*/1, /*sequence=*/1, /*counter=*/1,
-                          image_size, confirmed_hash, image_size, old_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-
-  write_confirmation(&s, /*nonce=*/1, /*counter=*/1, confirmed_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1);
-  assert(floor.active_image_extent == image_size);
-  assert(memcmp(floor.confirmed_hash_sha256, confirmed_hash, 32) == 0);
-
-  /* Durable carry-forward proof: BOTH physical receipt windows must now
-   * independently verify for THIS compiled role -- proving
-   * persist_floor()'s carry-forward actually ran for real across a
-   * genuine ping-pong advance, not merely that one slot happened to
-   * still hold its original genesis copy untouched. */
-  {
-    xiao_ota_floor_activation_receipt_t ra, rb;
-    memcpy(&ra, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, sizeof(ra));
-    memcpy(&rb, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, sizeof(rb));
-    assert(ra.magic == XIAO_OTA_FLOOR_ACTIVATION_MAGIC);
-    assert(rb.magic == XIAO_OTA_FLOOR_ACTIVATION_MAGIC);
-    assert(ra.current_role == XIAO_OTA_COMPILED_ROLE_ID);
-    assert(rb.current_role == XIAO_OTA_COMPILED_ROLE_ID);
-  }
-
-  /* Simulate the loader swap: both durable receipt windows now attest to
-   * the OTHER role only. */
-  write_genesis_receipt_variant(&s, image_size, confirmed_hash, RECEIPT_BAD_ROLE);
-  memcpy(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B,
-        s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A,
-        XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE);
-
-  /* A genuinely new, correctly-signed, counter-advancing command for THIS
-   * compiled role must still be refused -- role continuity must hold at
-   * every subsequent command, not just once at genesis. */
-  write_candidate(&s, image_size, 0xD3, attack_candidate_hash);
-  build_and_write_command(&s, /*nonce=*/2, /*sequence=*/2, /*counter=*/2,
-                          image_size, attack_candidate_hash, image_size,
-                          confirmed_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  /* No new trial/confirmation must ever be admitted: the existing
-   * CONFIRMED state and floor must survive completely untouched. */
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1);
-  assert(floor.active_image_extent == image_size);
-  assert(memcmp(floor.confirmed_hash_sha256, confirmed_hash, 32) == 0);
-  /* A role-evidence conflict at floor>0 must escalate to a terminal,
-   * externally observable Recovery -- not merely a silent "command
-   * refused, boot normally" outcome. */
-  assert(s.force_recovery_calls == 1);
-}
-
-static const char *kColdRoleSwapDir = ".tmp/cold-role-swap-state";
-
-static void cold_role_swap_ensure_dir(void) {
-  if (mkdir(kColdRoleSwapDir, 0700) != 0 && errno != EEXIST) {
-    fprintf(stderr, "could not create %s: %s\n", kColdRoleSwapDir,
-            strerror(errno));
-    abort();
-  }
-}
-
-static void cold_role_swap_path(char *buffer, size_t size, int role) {
-  int n = snprintf(buffer, size, "%s/role%d_genuine_floor1.bin",
-                   kColdRoleSwapDir, role);
-  assert(n > 0 && (size_t)n < size);
-}
-
-/*
- * LITERAL cold two-role harness, phase 1 of 2 (producer side).
- *
- * This compiled test binary's OWN role (XIAO_OTA_COMPILED_ROLE_ID, a
- * per-binary compile-time constant -- it cannot be flipped in-process)
- * genuinely commissions genesis and reaches a real CONFIRMED floor1 via
- * the actual install/confirm path (never write_floor_direct()/a hand-
- * built floor), then durably dumps the complete resulting simulated
- * QSPI+internal-flash image and physical device identity to a file
- * named by ITS OWN role. A SEPARATELY, differently-role-compiled test
- * binary (a distinct `make test-xiao-ota-boot-process
- * XIAO_OTA_ROLE_ID=<other>` invocation -- a fresh OS process, fresh
- * RAM, exactly like swapping only the loader binary on real hardware
- * and power-cycling) later reads this same file in
- * test_cold_two_binary_role_swap_refuses_other_role_dump() below. This
- * is what makes the resulting scenario a literal, not simulated, cold
- * two-role test: no single process ever holds two different compiled
- * xiao_ota_boot_io.c role identities at once.
- */
-static void test_cold_two_binary_role_swap_produce_genesis_floor1_dump(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t confirmed_hash[32];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  const uint32_t image_size = 65536;
-  char path[256];
-
-  fake_io_reset(&s);
-  /* A fixed, shared physical identity both role-compiled binaries use --
-   * this is what the real hw_uid-binding check in
-   * floor_activation_receipt_identity_role_ok() requires to be IDENTICAL
-   * across the swap (same physical device, only the loader changed). */
-  s.device_address = UINT64_C(0xC01DC0FFEE0D1D1D);
-
-  provision_old_image(&s, image_size, 0xB1, old_hash);
-  write_candidate(&s, image_size, 0xB2, confirmed_hash);
-  build_and_write_command(&s, /*nonce=*/1, /*sequence=*/1, /*counter=*/1,
-                          image_size, confirmed_hash, image_size, old_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-
-  write_confirmation(&s, /*nonce=*/1, /*counter=*/1, confirmed_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1);
-  assert(memcmp(floor.confirmed_hash_sha256, confirmed_hash, 32) == 0);
-
-  cold_role_swap_ensure_dir();
-  cold_role_swap_path(path, sizeof(path), XIAO_OTA_COMPILED_ROLE_ID);
-  assert(fake_io_dump_to_file(&s, path));
-}
-
-/*
- * LITERAL cold two-role harness, phase 2 of 2 (consumer side).
- *
- * If a PRIOR, separate invocation of the OTHER role's test binary has
- * already produced its genesis-floor1 dump (see above), this compiled
- * binary -- genuinely built with the OTHER XIAO_OTA_COMPILED_ROLE_ID --
- * loads that exact byte-for-byte QSPI/internal-flash image (same
- * device_address, same floor/receipt history, every byte untouched: the
- * real "swap only the loader, keep the same QSPI chip" scenario) and
- * submits a genuinely signed, counter-advancing command FOR THIS
- * BINARY'S OWN compiled role. The durable floor/receipt history was
- * only ever genesis-certified for the OTHER role, so this must be
- * refused with a terminal Recovery escalation and, critically, must
- * leave every single durable byte (QSPI and internal flash) completely
- * unchanged -- not merely "the right counter/phase fields", the WHOLE
- * image, proving zero mutation occurred on the refusal path.
- *
- * If no such dump exists yet (e.g. this is the very first of the three
- * invocations needed -- role0 then role1 then role0 again, to cover
- * both directions -- in a fresh .tmp), this is reported and skipped
- * rather than failed, since a single `make test-xiao-ota-bootloader`
- * invocation only ever builds/runs ONE compiled role.
- */
-static void test_cold_two_binary_role_swap_refuses_other_role_dump(void) {
-  const int other_role = 1 - XIAO_OTA_COMPILED_ROLE_ID;
-  char path[256];
-  fake_io_state_t s;
-  uint8_t before_qspi[FAKE_IO_QSPI_SIZE];
-  uint8_t before_internal[FAKE_IO_INTERNAL_SIZE];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  uint8_t attack_hash[32];
-  FILE *probe;
-
-  cold_role_swap_path(path, sizeof(path), other_role);
-  probe = fopen(path, "rb");
-  if (!probe) {
-    fprintf(stderr,
-           "note: no role%d genuine genesis-floor1 dump present yet at "
-           "%s -- run `make test-xiao-ota-boot-process "
-           "XIAO_OTA_ROLE_ID=%d` (a separately compiled binary) first, "
-           "then this role%d binary again, to exercise the literal cold "
-           "two-role swap in this direction; skipping for now.\n",
-           other_role, path, other_role, XIAO_OTA_COMPILED_ROLE_ID);
-    return;
-  }
-  fclose(probe);
-
-  assert(fake_io_load_from_file(&s, path));
-
-  /* Sanity: the loaded image genuinely shows the OTHER role's own real
-   * confirmed floor1, never anything already correct for THIS binary --
-   * otherwise this would not be testing a role conflict at all. */
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1);
-  {
-    xiao_ota_floor_activation_receipt_t ra, rb;
-    memcpy(&ra, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, sizeof(ra));
-    memcpy(&rb, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, sizeof(rb));
-    assert(ra.current_role == (uint32_t)other_role);
-    assert(rb.current_role == (uint32_t)other_role);
-    assert(ra.current_role != (uint32_t)XIAO_OTA_COMPILED_ROLE_ID);
-  }
-
-  /* A genuinely signed, counter-advancing command for THIS compiled
-   * role -- real production shape, not a tampered/bad-signature attack
-   * -- must still be refused. Staging the candidate image + signed
-   * command record here mirrors exactly what the real companion
-   * firmware legitimately writes to flash BEFORE requesting a reboot
-   * into the bootloader -- that write is not itself the thing under
-   * test. The zero-mutation proof below is specifically about what
-   * fake_io_run_boot() (the bootloader's OWN processing) may or may not
-   * additionally touch once it decides to refuse; the snapshot is taken
-   * immediately before that call, after staging. */
-  write_candidate(&s, 65536, 0xB3, attack_hash);
-  build_and_write_command(&s, /*nonce=*/2, /*sequence=*/2, /*counter=*/2,
-                          65536, attack_hash, 65536, floor.confirmed_hash_sha256);
-  memcpy(before_qspi, s.qspi, sizeof(before_qspi));
-  memcpy(before_internal, s.internal_flash, sizeof(before_internal));
-
-  assert(fake_io_run_boot(&s) == 0);
-
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED); /* unchanged */
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1); /* unchanged */
-  assert(s.force_recovery_calls >= 1);
-
-  /* Zero-mutation proof: not just the fields checked above, but every
-   * durable byte the bootloader's OWN processing of this refused
-   * command could have touched. */
-  assert(memcmp(before_qspi, s.qspi, sizeof(before_qspi)) == 0);
-  assert(memcmp(before_internal, s.internal_flash, sizeof(before_internal)) ==
-        0);
-}
-
-/*
- * Ordinary same-role continuity must survive an arbitrary NUMBER of real
- * floor advances, not just one -- proving persist_floor()'s carry-forward
- * genuinely re-persists role evidence on every single ping-pong flip (A->
- * B->A->B->...), never merely "once, by accident of which slot happened
- * to still hold the original genesis copy".
- */
-static void test_same_role_floor_survives_many_real_advances(void) {
-  fake_io_state_t s;
-  uint8_t active_hash[32];
-  uint8_t candidate_hash[32];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  const uint32_t image_size = 65536;
-  const int advances = 6;
-  int i;
-
-  fake_io_reset(&s);
-  provision_old_image(&s, image_size, 0xE1, active_hash);
-
-  for (i = 0; i < advances; ++i) {
-    uint32_t counter = (uint32_t)(i + 1);
-    uint64_t nonce = (uint64_t)(i + 1);
-
-    write_candidate(&s, image_size, (uint8_t)(0xF0u + i), candidate_hash);
-    build_and_write_command(&s, nonce, /*sequence=*/nonce, counter, image_size,
-                            candidate_hash, image_size, active_hash);
-    assert(fake_io_run_boot(&s) == 0);
-    assert(read_state(&s, &state));
-    assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-
-    write_confirmation(&s, nonce, counter, candidate_hash);
-    assert(fake_io_run_boot(&s) == 0);
-    assert(read_state(&s, &state));
-    assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-    assert(read_floor(&s, &floor));
-    assert(floor.confirmed_counter_floor == counter);
-    assert(floor.active_image_extent == image_size);
-    assert(memcmp(floor.confirmed_hash_sha256, candidate_hash, 32) == 0);
-
-    /* Durable role evidence must still independently verify in BOTH
-     * physical windows after every single advance -- not just the
-     * first one -- proving the carry-forward re-runs on every ping-
-     * pong flip, not only once by accident. */
-    {
-      xiao_ota_floor_activation_receipt_t ra, rb;
-      memcpy(&ra, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, sizeof(ra));
-      memcpy(&rb, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, sizeof(rb));
-      assert(ra.magic == XIAO_OTA_FLOOR_ACTIVATION_MAGIC);
-      assert(rb.magic == XIAO_OTA_FLOOR_ACTIVATION_MAGIC);
-      assert(ra.current_role == XIAO_OTA_COMPILED_ROLE_ID);
-      assert(rb.current_role == XIAO_OTA_COMPILED_ROLE_ID);
-    }
-
-    memcpy(active_hash, candidate_hash, 32);
-  }
-
-  assert(s.force_recovery_calls == 0);
-}
-
-/*
- * Builds the LEGACY "sole surviving genesis receipt lives in the NEXT
- * erase target" fixture required by the durable-role HIGH-fix contract:
- * a real, committed floor1 physically resides in slot B (this
- * fixture's chosen "current winner"/persist_floor() SOURCE -- never
- * erased by the following advance), carrying NO valid receipt of its
- * own, while the device's sole surviving signed genesis receipt lives
- * in slot A -- persist_floor()'s next erase TARGET. This is
- * deliberately fabricated directly (never via a real multi-advance
- * install/confirm sequence, which would already carry the receipt into
- * both windows via steady-state carry-forward) to exercise exactly the
- * legacy/transitional case the contract calls out: floor1 reached
- * before this repair logic existed, or a first-ever advance away from
- * genesis whose carry-forward copy never durably landed in the source
- * slot. The app image + matching bank-0 settings are genuinely
- * provisioned (fake_io_run_boot()'s own later install/confirm calls
- * depend on them matching `hash`), but NO state record exists yet --
- * exactly provision_old_image()'s own "idle, no pending transaction"
- * shape, just at floor1 instead of floor0.
- */
-static void provision_legacy_floor1_with_sole_receipt_in_next_erase_target(
-    fake_io_state_t *s, uint32_t size, const uint8_t hash[32]) {
-  xiao_ota_floor_t floor;
-
-  memset(s->qspi + XIAO_OTA_FLOOR_A, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memset(s->qspi + XIAO_OTA_FLOOR_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-
-  memset(&floor, 0, sizeof(floor));
-  floor.magic = XIAO_OTA_FLOOR_MAGIC;
-  floor.record_version = XIAO_OTA_FORMAT_VERSION;
-  floor.record_bytes = sizeof(floor);
-  floor.sequence = 1;
-  floor.confirmed_counter_floor = 1;
-  floor.active_image_extent = size;
-  memcpy(floor.confirmed_hash_sha256, hash, 32);
-  floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
-  floor.commit_marker = XIAO_OTA_COMMIT_MARKER;
-  memcpy(s->qspi + XIAO_OTA_FLOOR_B, &floor, sizeof(floor));
-
-  /* Writes a genuinely signed, identity/role-verifying genesis receipt
-   * into slot A's window ONLY (XIAO_OTA_FLOOR_ACTIVATION_A), leaving
-   * slot A's own floor BODY area untouched (blank, from the memset
-   * above) and slot B's receipt window untouched (blank) -- the exact
-   * "sole surviving copy, in the OTHER slot" shape. */
-  write_genesis_receipt_variant(s, size, hash, RECEIPT_OK);
-}
-
-/*
- * No-fault control case: proves the legacy fixture above genuinely
- * reaches a real, successful same-role advance (floor1 -> floor2) via
- * the actual confirm path, with persist_floor()'s propagate-before-
- * erase durability logic completing cleanly and the ORIGINAL receipt's
- * exact signed bytes (not a re-derived/re-signed copy) ending up
- * present in BOTH physical windows afterward.
- */
-static void test_legacy_floor1_sole_receipt_in_next_erase_target_advances_cleanly(void) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  xiao_ota_floor_activation_receipt_t original_receipt, final_a, final_b;
-  const uint32_t size = 24576;
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, size, 0x9A, old_hash);
-  provision_legacy_floor1_with_sole_receipt_in_next_erase_target(&s, size,
-                                                                 old_hash);
-  memcpy(&original_receipt, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A,
-        sizeof(original_receipt));
-
-  write_candidate(&s, size, 0x9B, candidate_hash);
-  build_and_write_command(&s, /*nonce=*/301, /*sequence=*/1, /*counter=*/2,
-                          size, candidate_hash, size, old_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-
-  write_confirmation(&s, /*nonce=*/301, /*counter=*/2, candidate_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(s.force_recovery_calls == 0);
-
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 2);
-  assert(memcmp(floor.confirmed_hash_sha256, candidate_hash, 32) == 0);
-
-  memcpy(&final_a, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, sizeof(final_a));
-  memcpy(&final_b, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, sizeof(final_b));
-  /* Both windows now hold the IDENTICAL, ORIGINAL signed bytes -- never
-   * a re-signed/re-derived receipt (this binary never has a signing
-   * key; durability here can only ever mean "copy the exact bytes"). */
-  assert(memcmp(&final_a, &original_receipt, sizeof(original_receipt)) == 0);
-  assert(memcmp(&final_b, &original_receipt, sizeof(original_receipt)) == 0);
-}
-
-typedef enum {
-  LEGACY_CUT_PROPAGATE_WRITE_CRASH,
-  LEGACY_CUT_PROPAGATE_WRITE_TORN,
-  LEGACY_CUT_AFTER_ERASE_BEFORE_RECEIPT,
-  LEGACY_CUT_AFTER_RECEIPT_BEFORE_BODY,
-} legacy_cut_point_t;
-
-/*
- * The actual physical cut-point matrix the durable-role HIGH-fix
- * contract requires: every one of persist_floor()'s own survivor-copy-
- * before-erase steps, interrupted at the moment right before its
- * durable effect would land, for the EXACT legacy "sole receipt in the
- * next erase target" fixture above (the single most dangerous ordering,
- * since the next erase would otherwise destroy the device's only
- * remaining lifetime-role proof). Every variant asserts: (1) the
- * surviving evidence is never lost regardless of where the cut lands,
- * (2) a subsequent un-faulted retry converges to the IDENTICAL final
- * state as the clean-path test above (same counter, same original
- * signed receipt bytes byte-for-byte in both windows), and (3) no
- * phantom floor/state advance is ever observable from the cut call
- * itself (either the whole confirm visibly didn't happen yet, or it is
- * safely re-attemptable with zero information loss).
- */
-static void run_legacy_sole_receipt_advance_cut(legacy_cut_point_t cut) {
-  fake_io_state_t s;
-  uint8_t old_hash[32];
-  uint8_t candidate_hash[32];
-  xiao_ota_state_t state;
-  xiao_ota_floor_t floor;
-  xiao_ota_floor_activation_receipt_t original_receipt, final_a, final_b;
-  const uint32_t size = 20480;
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, size, 0xAC, old_hash);
-  provision_legacy_floor1_with_sole_receipt_in_next_erase_target(&s, size,
-                                                                 old_hash);
-  memcpy(&original_receipt, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A,
-        sizeof(original_receipt));
-
-  write_candidate(&s, size, 0xAD, candidate_hash);
-  build_and_write_command(&s, /*nonce=*/401, /*sequence=*/1, /*counter=*/2,
-                          size, candidate_hash, size, old_hash);
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-  write_confirmation(&s, /*nonce=*/401, /*counter=*/2, candidate_hash);
-
-  switch (cut) {
-    case LEGACY_CUT_PROPAGATE_WRITE_CRASH:
-      /* The very first write to B's (source's) own window this call --
-       * i.e. the propagate write itself -- never takes effect. */
-      s.crash.op = FAKE_IO_OP_QSPI_WRITE;
-      s.crash.addr_lo = XIAO_OTA_FLOOR_ACTIVATION_B;
-      s.crash.addr_hi =
-          XIAO_OTA_FLOOR_ACTIVATION_B + XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES;
-      s.crash.after = 1;
-      assert(fake_io_run_boot(&s) == 1);
-      s.crash.op = FAKE_IO_OP_NONE;
-      s.crash.after = -1;
-
-      /* Target (A, never touched this call) is untouched; source (B)
-       * never received any bytes (crash fired before the write's
-       * effect); the confirm transaction visibly never happened. */
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, &original_receipt,
-                   sizeof(original_receipt)) == 0);
-      {
-        uint8_t blank_window[sizeof(original_receipt)];
-        memset(blank_window, 0xFF, sizeof(blank_window));
-        assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, blank_window,
-                     sizeof(blank_window)) == 0);
-      }
-      assert(read_floor(&s, &floor));
-      assert(floor.confirmed_counter_floor == 1);
-      assert(read_state(&s, &state));
-      assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-      break;
-
-    case LEGACY_CUT_PROPAGATE_WRITE_TORN:
-      /* The propagate write lands only partially (first 96 of 388
-       * bytes) -- a genuine torn/interrupted-but-not-crashed write, the
-       * device stays running and observes the failure within this
-       * same call. The partially-landed prefix is a true PREFIX of the
-       * real target bytes (never garbage), so a later exact-byte retry
-       * is NOR-compatible (no bit needs to flip 1, only 0s over
-       * already-0s or 0s over still-blank 0xFF). */
-      s.tear.op = FAKE_IO_OP_QSPI_WRITE;
-      s.tear.addr_lo = XIAO_OTA_FLOOR_ACTIVATION_B;
-      s.tear.addr_hi =
-          XIAO_OTA_FLOOR_ACTIVATION_B + XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES;
-      s.tear.after = 1;
-      s.tear_bytes = 96;
-      assert(fake_io_run_boot(&s) == 0);
-      s.tear.op = FAKE_IO_OP_NONE;
-      s.tear.after = -1;
-      s.tear_bytes = 0;
-
-      assert(s.force_recovery_calls == 1);
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, &original_receipt,
-                   sizeof(original_receipt)) == 0);
-      /* Source's first 96 bytes already match the real target content
-       * (that's what "torn" means here); the call never reached a
-       * floor/state advance. */
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, &original_receipt,
-                   96) == 0);
-      assert(read_floor(&s, &floor));
-      assert(floor.confirmed_counter_floor == 1);
-      assert(read_state(&s, &state));
-      assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-      break;
-
-    case LEGACY_CUT_AFTER_ERASE_BEFORE_RECEIPT:
-      /* Propagate+readback into B (source) already durably completed
-       * earlier in THIS SAME call (uncrashed); target (A) has already
-       * been erased (uncrashed, a different op). The very first write
-       * into target's OWN window afterward -- re-publishing its receipt
-       * copy -- never takes effect: this is the single most dangerous
-       * instant, since A (the device's ORIGINAL copy) is now blank. */
-      s.crash.op = FAKE_IO_OP_QSPI_WRITE;
-      s.crash.addr_lo = XIAO_OTA_FLOOR_ACTIVATION_A;
-      s.crash.addr_hi =
-          XIAO_OTA_FLOOR_ACTIVATION_A + XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES;
-      s.crash.after = 1;
-      assert(fake_io_run_boot(&s) == 1);
-      s.crash.op = FAKE_IO_OP_NONE;
-      s.crash.after = -1;
-
-      /* A is now genuinely blank (erased, receipt write never landed)
-       * -- the sole surviving durable copy is in B, already confirmed
-       * BEFORE the erase in this same call ever ran. */
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, &original_receipt,
-                   sizeof(original_receipt)) == 0);
-      assert(read_floor(&s, &floor));
-      assert(floor.confirmed_counter_floor == 1); /* A not yet committed */
-      break;
-
-    case LEGACY_CUT_AFTER_RECEIPT_BEFORE_BODY:
-      /* Receipt already durably re-published+read-back into target (A)
-       * this call (uncrashed); the floor BODY write into target
-       * (distinct address range, offset 0 vs the window's +0x100)
-       * never takes effect. */
-      s.crash.op = FAKE_IO_OP_QSPI_WRITE;
-      s.crash.addr_lo = XIAO_OTA_FLOOR_A;
-      s.crash.addr_hi = XIAO_OTA_FLOOR_A + offsetof(xiao_ota_floor_t, commit_marker);
-      s.crash.after = 1;
-      assert(fake_io_run_boot(&s) == 1);
-      s.crash.op = FAKE_IO_OP_NONE;
-      s.crash.after = -1;
-
-      /* Both windows already independently hold the receipt (A from
-       * this call's own re-publish, B from this call's own earlier
-       * propagate) -- no evidence lost either way -- but A's floor BODY
-       * never landed, so it is correctly still invalid/blank and B (at
-       * counter 1, untouched) remains the sole trusted floor. */
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, &original_receipt,
-                   sizeof(original_receipt)) == 0);
-      assert(memcmp(s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, &original_receipt,
-                   sizeof(original_receipt)) == 0);
-      assert(read_floor(&s, &floor));
-      assert(floor.confirmed_counter_floor == 1);
-      break;
-  }
-
-  /* Clean, un-faulted retry must converge to the EXACT same final state
-   * as the no-fault control test, regardless of which exact instant was
-   * cut: the original signed receipt bytes, byte-for-byte, in BOTH
-   * windows, and the floor genuinely advanced to counter 2. */
-  assert(fake_io_run_boot(&s) == 0);
-  assert(read_state(&s, &state));
-  assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 2);
-  assert(memcmp(floor.confirmed_hash_sha256, candidate_hash, 32) == 0);
-
-  memcpy(&final_a, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_A, sizeof(final_a));
-  memcpy(&final_b, s.qspi + XIAO_OTA_FLOOR_ACTIVATION_B, sizeof(final_b));
-  assert(memcmp(&final_a, &original_receipt, sizeof(original_receipt)) == 0);
-  assert(memcmp(&final_b, &original_receipt, sizeof(original_receipt)) == 0);
-}
-
-static void test_legacy_sole_receipt_propagate_write_crash_resumes(void) {
-  run_legacy_sole_receipt_advance_cut(LEGACY_CUT_PROPAGATE_WRITE_CRASH);
-}
-
-static void test_legacy_sole_receipt_propagate_write_torn_resumes(void) {
-  run_legacy_sole_receipt_advance_cut(LEGACY_CUT_PROPAGATE_WRITE_TORN);
-}
-
-static void test_legacy_sole_receipt_erase_before_receipt_crash_resumes(void) {
-  run_legacy_sole_receipt_advance_cut(LEGACY_CUT_AFTER_ERASE_BEFORE_RECEIPT);
-}
-
-static void test_legacy_sole_receipt_receipt_before_body_crash_resumes(void) {
-  run_legacy_sole_receipt_advance_cut(LEGACY_CUT_AFTER_RECEIPT_BEFORE_BODY);
-}
-
-/*
- * TWO INDEPENDENTLY VALID, CONFLICTING GENESIS RECEIPTS, SAME DEVICE/ROLE:
- * fabricates a receipt in window A that is genuinely bound to the
- * currently-committed floor1 (real baseline for THIS device's actual
- * history), and a SECOND, separately and genuinely signed receipt in
- * window B that independently passes every identity/role/signature
- * check (same device hw_uid, same compiled role, same trust-anchor
- * key) but certifies a DIFFERENT baseline (distinct extent/hash) --
- * i.e. a second, distinct, validly-signed genesis authorization for
- * this exact device/role that was never the one actually used for its
- * real history. This is the "two independently valid receipts ... with
- * conflicting lifetime provenance" case the durable-role contract
- * explicitly calls out: identity_role_ok() alone (used by
- * floor_role_evidence_ok() for the ANY-floor gate) does not compare
- * baseline_hash_sha256/baseline_extent across windows, so both A and B
- * currently satisfy it despite disagreeing on which genesis image was
- * ever genuinely activated. This test asserts the REQUIRED behaviour
- * (reject/Recovery on conflicting provenance, never silently pick
- * whichever one happens to verify) and documents a FAIL here as an
- * open contract gap for Root, not a false green.
- */
-static void test_two_conflicting_valid_genesis_receipts_same_role(void) {
-  fake_io_state_t s;
-  uint8_t hash_a[32];
-  uint8_t hash_b_unused[32];
-  uint8_t candidate_hash[32];
-  xiao_ota_floor_t floor;
-  const uint32_t size_a = 16384;
-  const uint32_t size_b = 24576; /* deliberately different "other genesis" */
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, size_a, 0xD1, hash_a);
-
-  /* Real, committed floor1 for THIS device's actual history, matching
-   * receipt A below. */
-  memset(s.qspi + XIAO_OTA_FLOOR_A, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memset(s.qspi + XIAO_OTA_FLOOR_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memset(&floor, 0, sizeof(floor));
-  floor.magic = XIAO_OTA_FLOOR_MAGIC;
-  floor.record_version = XIAO_OTA_FORMAT_VERSION;
-  floor.record_bytes = sizeof(floor);
-  floor.sequence = 1;
-  floor.confirmed_counter_floor = 1;
-  floor.active_image_extent = size_a;
-  memcpy(floor.confirmed_hash_sha256, hash_a, 32);
-  floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
-  floor.commit_marker = XIAO_OTA_COMMIT_MARKER;
-  memcpy(s.qspi + XIAO_OTA_FLOOR_A, &floor, sizeof(floor));
-
-  /* Window A: genuinely bound to the real, committed floor above. */
-  write_genesis_receipt_variant_at(&s, XIAO_OTA_FLOOR_ACTIVATION_A, size_a,
-                                   hash_a, RECEIPT_OK);
-  /* Window B: a SECOND, independently valid (same device/role/key,
-   * passes identity_role_ok) signed genesis receipt, but for an
-   * entirely different baseline image that was never this device's
-   * real history. hash_b_unused's content doesn't matter beyond being
-   * distinct from hash_a; the sdk28 digest is still computed fresh
-   * against the live settings page inside the helper, same as window A,
-   * since neither genesis floor's receipt controls that independently. */
-  memset(hash_b_unused, 0xEE, sizeof(hash_b_unused));
-  write_genesis_receipt_variant_at(&s, XIAO_OTA_FLOOR_ACTIVATION_B, size_b,
-                                   hash_b_unused, RECEIPT_OK);
-
-  /* Attempt a genuine same-role advance (floor1 -> floor2). */
-  write_candidate(&s, size_a, 0xD2, candidate_hash);
-  build_and_write_command(&s, /*nonce=*/501, /*sequence=*/1, /*counter=*/2,
-                          size_a, candidate_hash, size_a, hash_a);
-  (void)fake_io_run_boot(&s);
-  write_confirmation(&s, /*nonce=*/501, /*counter=*/2, candidate_hash);
-  (void)fake_io_run_boot(&s);
-
-  assert(read_floor(&s, &floor));
-  /* REQUIRED: conflicting provenance must never be silently resolved by
-   * picking whichever window happens to verify -- the advance must be
-   * refused (floor stays at 1, never reaches 2) and the device must
-   * enter Recovery rather than quietly trusting window A over B (or
-   * vice versa) with zero cross-window consistency check. */
-  assert(floor.confirmed_counter_floor == 1);
-  assert(s.force_recovery_calls > 0);
-}
-
-/*
- * GF(2) linear-algebra helper: finds a 32-bit `patch` such that XOR-ing
- * together the subset of `elems[i]` selected by patch's set bits equals
- * `target`, via a standard linear-basis reduction (each elems[i] is
- * treated as a vector over GF(2); this is the same technique used to
- * decide "subset xor == target" problems). Used immediately below to
- * construct a genuine CRC32 COLLISION between two otherwise-different
- * signed receipts -- proving the production fix compares actual
- * receipt bytes, not merely the (collidable) 32-bit CRC. Returns false
- * only if target is not in the span of elems (not expected here, since
- * flipping 32 independent bits of a fixed-width CRC32 input reliably
- * yields a full-rank set of deltas).
- */
-static bool gf2_find_xor_subset(const uint32_t elems[32], uint32_t target,
-                                uint32_t *out_mask) {
-  uint32_t basis_vec[32];
-  uint32_t basis_mask[32];
-  bool basis_used[32] = {0};
-  uint32_t cur, cur_mask;
-  int i, b;
-
-  for (i = 0; i < 32; ++i) {
-    cur = elems[i];
-    cur_mask = (1u << i);
-    for (b = 31; b >= 0; --b) {
-      if (!((cur >> b) & 1u)) continue;
-      if (!basis_used[b]) {
-        basis_vec[b] = cur;
-        basis_mask[b] = cur_mask;
-        basis_used[b] = true;
-        break;
-      }
-      cur ^= basis_vec[b];
-      cur_mask ^= basis_mask[b];
-    }
-  }
-
-  cur = target;
-  cur_mask = 0;
-  for (b = 31; b >= 0; --b) {
-    if (!((cur >> b) & 1u)) continue;
-    if (!basis_used[b]) return false;
-    cur ^= basis_vec[b];
-    cur_mask ^= basis_mask[b];
-  }
-  if (cur != 0u) return false;
-  *out_mask = cur_mask;
-  return true;
-}
-
-/*
- * SAME-CRC, DIFFERENT VALID SIGNED RECEIPTS (deliberate CRC32
- * collision): constructs window A's receipt normally, then uses
- * gf2_find_xor_subset() to find a `host_txn_id` patch value for window
- * B's receipt (a DIFFERENT baseline image -- different extent/hash,
- * i.e. genuinely different signed content) such that B's crc32 field
- * is made to EXACTLY EQUAL A's crc32, by construction -- not by luck.
- * Both receipts are independently, genuinely Ed25519-signed over their
- * own actual (different) content; only their crc32 fields coincide.
- * This proves the earlier CRC32-equality approach would have wrongly
- * treated these as "the same provenance" and let the advance through,
- * while the current byte-exact comparison correctly still refuses it.
- */
-static void test_two_valid_receipts_same_crc32_different_content_still_conflicts(void) {
-  fake_io_state_t s;
-  uint8_t hash_a[32];
-  uint8_t hash_b[32];
-  uint8_t candidate_hash[32];
-  xiao_ota_floor_t floor;
-  xiao_ota_floor_activation_receipt_t ra, rb_probe;
-  const uint32_t size_a = 12288;
-  const uint32_t size_b = 28672;
-  uint32_t crc_target;
-  uint32_t elems[32];
-  uint32_t crc_base;
-  uint32_t diff;
-  uint32_t patch_mask = 0;
-  int i;
-
-  fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, size_a, 0xF1, hash_a);
-  memset(hash_b, 0xF2, sizeof(hash_b));
-
-  memset(s.qspi + XIAO_OTA_FLOOR_A, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memset(s.qspi + XIAO_OTA_FLOOR_B, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
-  memset(&floor, 0, sizeof(floor));
-  floor.magic = XIAO_OTA_FLOOR_MAGIC;
-  floor.record_version = XIAO_OTA_FORMAT_VERSION;
-  floor.record_bytes = sizeof(floor);
-  floor.sequence = 1;
-  floor.confirmed_counter_floor = 1;
-  floor.active_image_extent = size_a;
-  memcpy(floor.confirmed_hash_sha256, hash_a, 32);
-  floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
-  floor.commit_marker = XIAO_OTA_COMMIT_MARKER;
-  memcpy(s.qspi + XIAO_OTA_FLOOR_A, &floor, sizeof(floor));
-
-  /* Window A: real receipt, default patch. */
-  build_genesis_receipt_fields(&ra, &s, size_a, hash_a, 0x33333333u,
-                              RECEIPT_OK);
-  crc_target = ra.crc32;
-  sign_and_write_genesis_receipt_at(&s, XIAO_OTA_FLOOR_ACTIVATION_A, &ra,
-                                    RECEIPT_OK);
-
-  /* Measure the CRC32 delta contributed by each of the 32 bits of the
-   * free host_txn_id-based patch, holding window B's OWN (different)
-   * baseline fixed, so the solved patch is valid specifically for B's
-   * actual content. */
-  build_genesis_receipt_fields(&rb_probe, &s, size_b, hash_b, 0u, RECEIPT_OK);
-  crc_base = rb_probe.crc32;
-  for (i = 0; i < 32; ++i) {
-    build_genesis_receipt_fields(&rb_probe, &s, size_b, hash_b,
-                                (1u << i), RECEIPT_OK);
-    elems[i] = rb_probe.crc32 ^ crc_base;
-  }
-  diff = crc_base ^ crc_target;
-  assert(gf2_find_xor_subset(elems, diff, &patch_mask));
-
-  build_genesis_receipt_fields(&rb_probe, &s, size_b, hash_b, patch_mask,
-                              RECEIPT_OK);
-  /* Sanity: the collision was genuinely constructed, not coincidental --
-   * B's crc32 now exactly equals A's, while B's actual signed content
-   * (baseline_extent/baseline_hash_sha256) is still genuinely different
-   * from A's. */
-  assert(rb_probe.crc32 == crc_target);
-  assert(rb_probe.baseline_extent != ra.baseline_extent);
-  assert(memcmp(rb_probe.baseline_hash_sha256, ra.baseline_hash_sha256, 32) != 0);
-  sign_and_write_genesis_receipt_at(&s, XIAO_OTA_FLOOR_ACTIVATION_B, &rb_probe,
-                                    RECEIPT_OK);
-
-  /* Attempt a genuine same-role advance (floor1 -> floor2): must still
-   * be refused, exactly like the different-CRC conflict case, even
-   * though a CRC32-only comparison would have wrongly accepted this
-   * pair as "the same provenance". */
-  write_candidate(&s, size_a, 0xF3, candidate_hash);
-  build_and_write_command(&s, /*nonce=*/601, /*sequence=*/1, /*counter=*/2,
-                          size_a, candidate_hash, size_a, hash_a);
-  (void)fake_io_run_boot(&s);
-  write_confirmation(&s, /*nonce=*/601, /*counter=*/2, candidate_hash);
-  (void)fake_io_run_boot(&s);
-
-  assert(read_floor(&s, &floor));
-  assert(floor.confirmed_counter_floor == 1);
-  assert(s.force_recovery_calls > 0);
 }
 
 static void test_committed_floor_marker_bit_set_never_reopens_stale_counter(void) {
@@ -3603,7 +2371,6 @@ static void run_real_retry_bodies_survive_erased_markers_without_losing_backup(
   fake_io_reset(&s);
   provision_old_image(&s, size, 0x36, old_hash);
   write_floor_direct(&s, 3, size, old_hash);
-  provision_genesis_receipt(&s, size, old_hash); /* carry-forward re-established after write_floor_direct() wipes the window */
   write_candidate(&s, size, 0x76, candidate_hash);
   build_and_write_command(&s, 746, 1, 7, size, candidate_hash, size, old_hash);
   assert(fake_io_run_boot(&s) == 0);
@@ -3663,7 +2430,6 @@ static void run_damaged_floor_bound_to_real_confirmed_state_never_reopens_counte
   fake_io_reset(&s);
   provision_old_image(&s, size, 0x35, old_hash);
   write_floor_direct(&s, 3, size, old_hash);
-  provision_genesis_receipt(&s, size, old_hash); /* carry-forward re-established after write_floor_direct() wipes the window */
   write_candidate(&s, size, 0x75, confirmed_hash);
   build_and_write_command(&s, 707, 1, 7, size, confirmed_hash, size, old_hash);
   assert(fake_io_run_boot(&s) == 0);
@@ -3762,7 +2528,7 @@ static void test_erased_floor_marker_and_body_bound_to_real_confirmed_state_neve
  * candidate_counter (e.g. 7) genuinely DOMINATES the surviving stale
  * slot (e.g. 3), so repair is legitimate. Here the surviving slot
  * itself is structurally valid and ALREADY at a HIGHER counter (8) than
- * the CONFIRMED state's candidate_counter (7) -- conflicting proof: the
+ * the CONFIRMED state's candidate_counter (7) -- conflicting evidence: the
  * state record is itself stale relative to real, already-durable
  * anti-rollback history sitting on the surviving slot. Repairing the
  * damaged slot from this stale state would silently regress the floor
@@ -3781,7 +2547,7 @@ static void run_surviving_floor_above_state_counter_refuses_repair(
   uint32_t survivor_address, damaged_address;
 
   fake_io_reset(&s);
-  provision_old_image_no_genesis_receipt(&s, size, 0xD3, old_hash);
+  provision_old_image(&s, size, 0xD3, old_hash);
 
   memset(&survivor, 0, sizeof(survivor));
   survivor.magic = XIAO_OTA_FLOOR_MAGIC;
@@ -3817,7 +2583,7 @@ static void run_surviving_floor_above_state_counter_refuses_repair(
 
   /* A genuinely CONFIRMED state record whose own candidate_counter (7)
    * sits strictly BETWEEN the damaged slot's stale 6 and the surviving
-   * slot's real 8 -- proof enough to repair from if the surviving slot
+   * slot's real 8 -- enough evidence to repair from if the surviving slot
    * did not already out-rank it, but here it must NOT: the survivor's
    * own already-durable 8 must never be silently discarded. */
   write_state_direct(&s, XIAO_OTA_PHASE_CONFIRMED, /*nonce=*/1, /*candidate_counter=*/7,
@@ -4019,7 +2785,6 @@ static void test_committed_sidecar_marker_bit_set_forces_recovery(void) {
   assert(fake_io_run_boot(&s) == 0);
   assert(s.force_recovery_calls == 1);
 }
-
 
 /*
  * Symmetric/terminal counterpart to test_partial_state_marker_
@@ -4684,24 +3449,18 @@ int main(void) {
 
   test_partial_state_marker_conservatively_burns_possible_retry();
   printf("partial state marker conservatively burns possible retry passed\n");
-  test_genesis_pre_body_cut_never_admits();
-  printf("genesis pre-body cut never admits passed\n");
-  test_genesis_post_body_pre_receipt_cut_never_admits();
-  printf("genesis post-body/pre-receipt cut never admits passed\n");
-  test_genesis_post_receipt_pre_marker_cut_never_admits();
-  printf("genesis post-receipt/pre-marker cut never admits passed\n");
-  test_genesis_receipt_faults_deny_admission();
-  printf("genesis receipt faults deny admission passed\n");
-  test_authority_literal_interop_vector_verifies_and_tamper_rejects();
-  printf("authority literal interop vector verifies and tamper-rejects passed\n");
-  test_active_transaction_sdk28_sidecar_mismatch_denies_confirm();
-  printf("active-transaction SDK28 sidecar mismatch denies confirm passed\n");
   test_prepared_sidecar_retains_committed_state_pair();
   printf("prepared sidecar retains committed state pair passed\n");
   test_resize_confirm(320u * 1024u, 500u * 1024u);
   printf("resize confirm 320K->500K passed\n");
   test_resize_confirm(500u * 1024u, 320u * 1024u);
   printf("resize confirm 500K->320K passed\n");
+  test_two_different_admitted_keys_each_verify_their_own_image();
+  printf("two different admitted signer keys each verify their own image passed\n");
+  test_mutated_admitted_key_rejected_before_any_app_erase();
+  printf("mutated admitted key rejected before any app erase passed\n");
+  test_torn_command_preserves_prior_confirmed_record();
+  printf("torn command preserves prior confirmed record passed\n");
   test_failed_retry_then_new_nonce();
   printf("failed-retry / new-nonce passed\n");
   test_crash_mid_install_then_rollback();
@@ -4772,28 +3531,6 @@ int main(void) {
   printf("corrupted committed newer floor refuses stale trust passed\n");
   test_floor_corruption_fixture_admits_counter_four_above_healthy_three();
   printf("floor corruption fixture admits counter four above healthy three passed\n");
-  test_cross_role_loader_swap_cannot_install_after_real_confirm();
-  printf("cross-role loader swap cannot install after real confirm passed\n");
-  test_cold_two_binary_role_swap_produce_genesis_floor1_dump();
-  printf("cold two-binary role swap genesis-floor1 dump produced passed\n");
-  test_cold_two_binary_role_swap_refuses_other_role_dump();
-  printf("cold two-binary role swap refuses other role dump passed\n");
-  test_same_role_floor_survives_many_real_advances();
-  printf("same-role floor survives many real advances passed\n");
-  test_legacy_floor1_sole_receipt_in_next_erase_target_advances_cleanly();
-  printf("legacy floor1 sole receipt in next erase target advances cleanly passed\n");
-  test_legacy_sole_receipt_propagate_write_crash_resumes();
-  printf("legacy sole receipt propagate write crash resumes passed\n");
-  test_legacy_sole_receipt_propagate_write_torn_resumes();
-  printf("legacy sole receipt propagate write torn resumes passed\n");
-  test_legacy_sole_receipt_erase_before_receipt_crash_resumes();
-  printf("legacy sole receipt erase before receipt crash resumes passed\n");
-  test_legacy_sole_receipt_receipt_before_body_crash_resumes();
-  printf("legacy sole receipt receipt before body crash resumes passed\n");
-  test_two_conflicting_valid_genesis_receipts_same_role();
-  printf("two conflicting valid genesis receipts same role passed\n");
-  test_two_valid_receipts_same_crc32_different_content_still_conflicts();
-  printf("two valid receipts same crc32 different content still conflicts passed\n");
   test_committed_floor_marker_bit_set_never_reopens_stale_counter();
   printf("committed floor marker bit set never reopens stale counter passed\n");
   test_committed_floor_marker_and_body_damage_never_reopen_stale_counter();
@@ -4840,8 +3577,6 @@ int main(void) {
   test_state_sidecar_publication_cut_matrix_active_retry();
   printf("state/sidecar publication cut matrix (active retry) passed\n");
   test_publication_erase_crash_active_retry_resumes();
-  printf("publication erase-crash (active retry) resumes passed\n");
-
   printf("publication erase-crash (active retry) resumes passed\n");
   test_signed_zero_crc_candidate_installs_confirms_and_resolves_next_boot();
   printf("signed zero-CRC candidate installs/confirms/resolves next boot passed\n");

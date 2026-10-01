@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+"""Configure or monitor a lab companion and TEXT repeater without OTA transfers.
+
+Configuration preserves existing identities and ACLs. Readbacks describe current
+settings, not active RF, reboot persistence, transfer, install, or trial evidence.
+Repeater settings are preference readbacks; radio application requires a separate
+reboot. This helper never reboots.
+Use ota_uploader.py for the signed USB uploader and its explicit commit operation.
+"""
 
 import argparse
-import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -11,6 +19,7 @@ import sys
 import termios
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,52 +31,28 @@ CLIENT_ROLE = os.environ.get("MESHCORE_LAB_CLIENT_ROLE", "client")
 TARGET_ROLE = os.environ.get("MESHCORE_LAB_TARGET_ROLE", "target")
 
 CMD_APP_START = 1
-CMD_SEND_SELF_ADVERT = 7
 CMD_SET_ADVERT_NAME = 8
 CMD_SET_RADIO_PARAMS = 11
 CMD_DEVICE_QUERY = 22
+CMD_SIGN_START = 33
+CMD_SIGN_DATA = 34
+CMD_SIGN_FINISH = 35
 CMD_SET_PATH_HASH_MODE = 61
-CMD_SEND_RAW_PACKET = 65
-CMD_OTA_CONTROL = 66
-CMD_OTA_LAB = 67
+CMD_OTA_CONTROL = 66  # Existing USB uploader ABI, implemented only by ota_uploader.py.
 
 RESP_OK = 0
 RESP_ERR = 1
-ERR_TABLE_FULL = 3
 RESP_SELF_INFO = 5
 RESP_DEVICE_INFO = 13
-RESP_OTA_STATUS = 29
-PUSH_ADVERT = 0x80
-PUSH_RAW_LOG = 0x88
-PUSH_NEW_ADVERT = 0x8A
-PUSH_OTA_EVENT = 0x91
-
-OTA_GET_STATUS = 0
-OTA_SET_MODE = 1
-OTA_SET_DUTY = 2
-OTA_ABORT = 3
-OTA_DIRECT_LEASE = 5
-
-OTA_DESCRIPTOR = 1
-OTA_CHUNK = 3
-OTA_ABORT_MESSAGE = 5
-OTA_LEASE = 6
-OTA_ANNOUNCEMENT = 7
-OTA_CENSUS = 8
-OTA_COHORT = 9
-OTA_MISSING = 10
-OTA_COMMIT = 11
-
-ROUTE_FLOOD = 1
-ROUTE_DIRECT = 2
-PAYLOAD_TYPE_LORA_OTA = 0x0C
-OTA_PRIORITY = 4
-OTA_CHUNK_BYTES = 128
+RESP_SIGN_START = 19
+RESP_SIGNATURE = 20
 MAX_SERIAL_FRAME_SIZE = 176
+ADV_TYPE_CHAT = 1  # src/helpers/AdvertDataHelpers.h
 
-
-class OtaQueueFull(RuntimeError):
-    pass
+NORMAL_RADIO = (907525, 62500, 7, 5)
+PATH_HASH_MODE = 2
+CLIENT_NAME = "OTA-LAB-CLIENT"
+TARGET_NAME = "OTA-LAB-TARGET"
 
 
 def utc_now():
@@ -102,7 +87,7 @@ class Evidence:
         self.events.close()
 
 
-class FramedSerial:
+class LabSerial:
     def __init__(self, name, path, evidence):
         if not str(path).startswith("/dev/serial/by-id/"):
             raise RuntimeError(f"refusing unstable device path: {path}")
@@ -121,8 +106,6 @@ class FramedSerial:
         attrs[6][termios.VTIME] = 0
         termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
         termios.tcflush(self.fd, termios.TCIOFLUSH)
-        self.buffer = bytearray()
-        self.pending = []
         evidence.log("serial_open", node=name, path=path, resolved=os.path.realpath(path))
 
     def close(self):
@@ -130,16 +113,37 @@ class FramedSerial:
             os.close(self.fd)
             self.fd = None
 
-    def write_frame(self, payload):
-        if len(payload) > MAX_SERIAL_FRAME_SIZE:
-            raise ValueError(f"serial frame too large: {len(payload)}")
-        frame = b"<" + struct.pack("<H", len(payload)) + payload
+    def _write_bytes(self, frame):
         offset = 0
         while offset < len(frame):
             _, writable, _ = select.select([], [self.fd], [], 2.0)
             if not writable:
                 raise TimeoutError(f"{self.name}: serial write timeout")
-            offset += os.write(self.fd, frame[offset:])
+            written = os.write(self.fd, frame[offset:])
+            if written == 0:
+                raise ConnectionError(f"{self.name}: serial write made no progress")
+            offset += written
+
+    def _read_bytes(self, timeout):
+        readable, _, _ = select.select([self.fd], [], [], timeout)
+        if not readable:
+            return b""
+        chunk = os.read(self.fd, 4096)
+        if not chunk:
+            raise ConnectionError(f"{self.name}: serial disconnected")
+        return chunk
+
+
+class FramedSerial(LabSerial):
+    def __init__(self, name, path, evidence):
+        super().__init__(name, path, evidence)
+        self.buffer = bytearray()
+        self.pending = []
+
+    def write_frame(self, payload):
+        if len(payload) > MAX_SERIAL_FRAME_SIZE:
+            raise ValueError(f"serial frame too large: {len(payload)}")
+        self._write_bytes(b"<" + struct.pack("<H", len(payload)) + payload)
         self.evidence.log("serial_tx", node=self.name, length=len(payload), hex=payload.hex())
 
     def _extract(self):
@@ -162,11 +166,7 @@ class FramedSerial:
         return frames
 
     def poll(self, timeout=0.0):
-        readable, _, _ = select.select([self.fd], [], [], timeout)
-        if readable:
-            chunk = os.read(self.fd, 4096)
-            if chunk:
-                self.buffer.extend(chunk)
+        self.buffer.extend(self._read_bytes(timeout))
         for payload in self._extract():
             self.pending.append((time.monotonic(), payload))
             self.evidence.log("serial_rx", node=self.name, length=len(payload), code=payload[0] if payload else None,
@@ -203,25 +203,99 @@ class FramedSerial:
         return found
 
 
-def parse_status(frame):
-    text = frame[1:].decode("ascii", errors="replace")
-    values = {"raw": text}
-    for key, value in re.findall(r"([a-z]+)=([^ ]+)", text):
-        value = value.rstrip("%")
-        if "/" in value:
-            left, right = value.split("/", 1)
-            values[key] = int(left)
-            values[key + "_limit"] = int(right)
-        else:
-            try:
-                values[key] = float(value) if "." in value else int(value)
-            except ValueError:
-                values[key] = value
-    return values
+class RepeaterSerial(LabSerial):
+    MAX_COMMAND_BYTES = 158
+    MAX_LINE_BYTES = 4096
+    REPLY_PREFIX = "  -> "
 
+    def __init__(self, name, path, evidence):
+        super().__init__(name, path, evidence)
+        self.buffer = bytearray()
+        self.pending = []
 
-def status(node):
-    return parse_status(node.command(bytes([CMD_OTA_CONTROL, OTA_GET_STATUS]), expected=(RESP_OTA_STATUS,)))
+    def _extract_lines(self):
+        lines = []
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline < 0:
+                if len(self.buffer) > self.MAX_LINE_BYTES:
+                    raise ValueError(f"{self.name}: oversized repeater serial line")
+                return lines
+            if newline > self.MAX_LINE_BYTES:
+                raise ValueError(f"{self.name}: oversized repeater serial line")
+            line = bytes(self.buffer[:newline]).rstrip(b"\r").decode("utf-8")
+            del self.buffer[:newline + 1]
+            lines.append(line)
+
+    def poll(self, timeout=0.0):
+        self.buffer.extend(self._read_bytes(timeout))
+        for line in self._extract_lines():
+            self.pending.append(line)
+            self.evidence.log("serial_rx", node=self.name, text=line)
+
+    def _start_command(self, command):
+        payload = command.encode("ascii")
+        if (not payload or len(payload) > self.MAX_COMMAND_BYTES
+                or any(byte < 0x20 or byte > 0x7E for byte in payload)):
+            raise ValueError("repeater command must be one bounded printable ASCII line")
+        self.poll()
+        self.pending.clear()
+        self.buffer.clear()
+        self._write_bytes(payload + b"\r")
+        self.evidence.log("serial_tx", node=self.name, text=command)
+
+    def command(self, command, timeout=5.0):
+        self._start_command(command)
+        deadline = time.monotonic() + timeout
+        echoed = False
+        while time.monotonic() < deadline:
+            self.poll(max(0.0, min(0.1, deadline - time.monotonic())))
+            while self.pending:
+                line = self.pending.pop(0)
+                if line == command:
+                    echoed = True
+                elif echoed and line.startswith(self.REPLY_PREFIX):
+                    return line[len(self.REPLY_PREFIX):]
+        raise TimeoutError(f"{self.name}: no repeater CLI reply for {command!r}")
+
+    def get_acl(self, timeout=5.0):
+        self._start_command("get acl")
+        deadline = time.monotonic() + timeout
+        echoed = False
+        collecting = False
+        barrier_echoed = False
+        entries = {}
+        while time.monotonic() < deadline:
+            self.poll(max(0.0, min(0.1, deadline - time.monotonic())))
+            while self.pending:
+                line = self.pending.pop(0)
+                if line == "get acl" and not collecting:
+                    echoed = True
+                elif echoed and line == "ACL:" and not collecting:
+                    collecting = True
+                    # ACL has no end marker. A later command brackets the complete list.
+                    self._write_bytes(b"get role\r")
+                    self.evidence.log("serial_tx", node=self.name, text="get role")
+                elif collecting and line == "get role":
+                    barrier_echoed = True
+                elif echoed and line.startswith(self.REPLY_PREFIX):
+                    reply = line[len(self.REPLY_PREFIX):]
+                    if collecting and barrier_echoed and reply == "> repeater":
+                        return entries
+                    raise RuntimeError(f"{self.name}: unexpected ACL reply: {reply!r}")
+                elif collecting:
+                    row = re.fullmatch(r"([0-9a-fA-F]{2}) ([0-9a-fA-F]{64})", line)
+                    if row and not barrier_echoed:
+                        permissions, key = row.groups()
+                        key = key.lower()
+                        if key == "00" * 32:
+                            raise ValueError(f"{self.name}: invalid zero ACL public key")
+                        if key in entries:
+                            raise ValueError(f"{self.name}: duplicate ACL public key")
+                        entries[key] = int(permissions, 16)
+                    elif line and not re.match(r"^[0-9]{2}:[0-9]{2}:[0-9]{2}\b", line):
+                        raise ValueError(f"{self.name}: malformed ACL row: {line!r}")
+        raise TimeoutError(f"{self.name}: incomplete repeater ACL response")
 
 
 def app_info(node):
@@ -229,435 +303,204 @@ def app_info(node):
     frame = node.command(payload, expected=(RESP_SELF_INFO,))
     if len(frame) < 58:
         raise RuntimeError(f"{node.name}: short self-info frame")
+    if frame[0] != RESP_SELF_INFO:
+        raise RuntimeError(f"{node.name}: invalid self-info response code")
+    if frame[1] != ADV_TYPE_CHAT:
+        raise RuntimeError(f"{node.name}: expected companion role, advert type is {frame[1]}")
+    if frame[4:36] == bytes(32):
+        raise RuntimeError(f"{node.name}: invalid zero public key")
+    name = frame[58:].decode("utf-8")
+    if "\x00" in name:
+        raise ValueError(f"{node.name}: malformed self-info name")
     return {
+        "role": "companion",
+        "advert_type": frame[1],
         "pubkey": frame[4:36].hex(),
         "pubkey_bytes": frame[4:36],
         "freq_khz": struct.unpack_from("<I", frame, 48)[0],
         "bw_hz": struct.unpack_from("<I", frame, 52)[0],
         "sf": frame[56],
         "cr": frame[57],
-        "name": frame[58:].decode("utf-8", errors="replace"),
+        "name": name,
     }
 
 
-def require_ok(node, payload):
-    frame = node.command(payload)
-    if frame[0] != RESP_OK:
+def require_ok(node, payload, timeout=None):
+    options = {} if timeout is None else {"timeout": timeout}
+    frame = node.command(payload, **options)
+    if frame != bytes([RESP_OK]):
         raise RuntimeError(f"{node.name}: command failed: {frame.hex()}")
+
+
+def sign_manifest(node, canonical, owner_public_key, deadline=None):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    if len(canonical) != 59:
+        raise ValueError("OTA manifest signing requires exactly 59 canonical bytes")
+    verifier = Ed25519PublicKey.from_public_bytes(owner_public_key)
+
+    def command_options():
+        if deadline is None:
+            return {}
+        remaining = deadline - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise TimeoutError("OTA manifest signing deadline expired")
+        return {"timeout": min(5.0, remaining)}
+
+    frame = node.command(bytes([CMD_SIGN_START]), expected=(RESP_SIGN_START, RESP_ERR),
+                         **command_options())
+    if len(frame) != 6 or frame[:2] != bytes([RESP_SIGN_START, 0]):
+        raise RuntimeError(f"{node.name}: invalid signing-start reply: {frame.hex()}")
+    if struct.unpack_from("<I", frame, 2)[0] < len(canonical):
+        raise RuntimeError(f"{node.name}: signing buffer cannot hold the OTA manifest")
+    require_ok(node, bytes([CMD_SIGN_DATA]) + canonical, **command_options())
+    frame = node.command(bytes([CMD_SIGN_FINISH]), expected=(RESP_SIGNATURE, RESP_ERR),
+                         **command_options())
+    if len(frame) != 65 or frame[0] != RESP_SIGNATURE:
+        raise RuntimeError(f"{node.name}: invalid signature reply: {frame.hex()}")
+    signature = frame[1:]
+    verifier.verify(signature, canonical)
+    return signature
 
 
 def serializable_app_info(info):
     return {key: value for key, value in info.items() if key != "pubkey_bytes"}
 
 
-def configure_node(node, name):
-    node.command(bytes([CMD_DEVICE_QUERY, 13]), expected=(RESP_DEVICE_INFO,))
+def companion_info(node):
+    info = app_info(node)
+    frame = node.command(bytes([CMD_DEVICE_QUERY, 13]), expected=(RESP_DEVICE_INFO,))
+    if len(frame) < 82 or frame[0] != RESP_DEVICE_INFO or frame[1] < 10:
+        raise RuntimeError(f"{node.name}: invalid device-info path hash readback")
+    if frame[81] not in (0, 1, 2):
+        raise RuntimeError(f"{node.name}: invalid path hash mode: {frame[81]}")
+    return {**info, "path_hash_mode": frame[81],
+            "settings_readback_scope": "companion_self_info_and_device_info"}
+
+
+def repeater_value(node, command):
+    reply = node.command(command)
+    if not reply.startswith("> "):
+        raise RuntimeError(f"{node.name}: invalid repeater reply for {command!r}: {reply!r}")
+    return reply[2:]
+
+
+def repeater_identity(node):
+    role = repeater_value(node, "get role")
+    if role != "repeater":
+        raise RuntimeError(f"{node.name}: expected repeater role, got {role!r}")
+    key = repeater_value(node, "get public.key")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", key) or key == "00" * 32:
+        raise RuntimeError(f"{node.name}: invalid full repeater public key: {key!r}")
+    return {"role": role, "pubkey": key.lower()}
+
+
+def repeater_info(node):
+    info = repeater_identity(node)
+    name = repeater_value(node, "get name")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError(f"{node.name}: malformed repeater name")
+    radio = repeater_value(node, "get radio")
+    fields = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?),([0-9]+(?:\.[0-9]+)?),([0-9]+),([0-9]+)", radio)
+    if not fields:
+        raise ValueError(f"{node.name}: malformed repeater radio readback: {radio!r}")
+    freq, bw = (Decimal(value) * 1000 for value in fields.groups()[:2])
+    sf, cr = (int(value) for value in fields.groups()[2:])
+    if (freq != freq.to_integral_value() or bw != bw.to_integral_value()
+            or not 150000 <= freq <= 2500000 or not 7800 <= bw <= 500000
+            or not 5 <= sf <= 12 or not 5 <= cr <= 8):
+        raise ValueError(f"{node.name}: invalid repeater radio readback: {radio!r}")
+    mode = repeater_value(node, "get path.hash.mode")
+    if mode not in ("0", "1", "2"):
+        raise ValueError(f"{node.name}: invalid repeater path hash mode: {mode!r}")
+    return {**info, "name": name, "freq_khz": int(freq), "bw_hz": int(bw),
+            "sf": sf, "cr": cr, "path_hash_mode": int(mode),
+            "settings_readback_scope": "preferences"}
+
+
+def require_repeater_ok(node, command, expected="OK"):
+    reply = node.command(command)
+    if reply != expected:
+        raise RuntimeError(f"{node.name}: repeater command failed for {command!r}: {reply!r}")
+
+
+def configure_repeater(node, before=None):
+    if before is None:
+        before = repeater_info(node)
+    require_repeater_ok(node, f"set name {TARGET_NAME}")
+    freq, bw, sf, cr = NORMAL_RADIO
+    require_repeater_ok(node, f"set radio {freq / 1000:g},{bw / 1000:g},{sf},{cr}",
+                        expected="OK - reboot to apply")
+    require_repeater_ok(node, f"set path.hash.mode {PATH_HASH_MODE}")
+    info = repeater_info(node)
+    if info["pubkey"] != before["pubkey"]:
+        raise RuntimeError(f"{node.name}: repeater identity changed during configuration")
+    return info
+
+
+def configure_node(node, name, before=None):
+    if not re.fullmatch(r"[\x20-\x7e]{1,31}", name):
+        raise ValueError("companion name must be 1..31 printable ASCII bytes")
+    if before is None:
+        before = companion_info(node)
     require_ok(node, bytes([CMD_SET_ADVERT_NAME]) + name.encode("ascii"))
-    require_ok(node, bytes([CMD_SET_RADIO_PARAMS]) + struct.pack("<II", 907525, 62500) + bytes([7, 5, 0]))
-    require_ok(node, bytes([CMD_SET_PATH_HASH_MODE, 0, 2]))
-    require_ok(node, bytes([CMD_OTA_CONTROL, OTA_SET_DUTY]) + struct.pack("<I", 2000))
-    require_ok(node, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
-    return app_info(node), status(node)
+    freq, bw, sf, cr = NORMAL_RADIO
+    require_ok(node, bytes([CMD_SET_RADIO_PARAMS]) + struct.pack("<II", freq, bw) + bytes([sf, cr, 0]))
+    require_ok(node, bytes([CMD_SET_PATH_HASH_MODE, 0, PATH_HASH_MODE]))
+    info = companion_info(node)
+    if info["pubkey"] != before["pubkey"]:
+        raise RuntimeError(f"{node.name}: companion identity changed during configuration")
+    return info
 
 
-def ota_envelope(message_type, campaign, session, attempt, payload=b"", namespace=0x4F54):
-    return struct.pack(">HBBIIHBH", namespace, 1, message_type, campaign, session, attempt, 0, len(payload)) + payload
+def record_configuration(evidence, role, before, info, name):
+    observed = serializable_app_info(info)
+    evidence.check(f"identity-{role}-preserved", info["pubkey"] == before["pubkey"],
+                   before=before["pubkey"], after=info["pubkey"])
+    evidence.check(f"default-radio-{role}",
+                   (info["freq_khz"], info["bw_hz"], info["sf"], info["cr"]) == NORMAL_RADIO,
+                   observed=observed, active_rf_verified=False)
+    evidence.check(f"configured-name-{role}", info["name"] == name, observed=observed)
+    evidence.check(f"path-hash-mode-{role}", info["path_hash_mode"] == PATH_HASH_MODE,
+                   observed=observed, bytes_per_hash=3, physical_path_verified=False)
+    evidence.summary["measurements"].setdefault("configured", {})[role] = observed
+    evidence.log("configuration_readback", node=role, observed=observed,
+                 settings_readback_scope=info["settings_readback_scope"],
+                 reboot_persistence_verified=False, active_rf_verified=False)
 
 
-def descriptor_fragment(image, security_counter):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    if not image or security_counter <= 0:
-        raise ValueError("a descriptor requires an image and a positive security counter")
-    descriptor = (
-        struct.pack(">HHBII", 0x584E, 0x3430, 0, 0x27000, len(image)) +
-        hashlib.sha256(image).digest() +
-        struct.pack(">IIHHH", security_counter, 1, 1, 1, 1)
-    )
-    # Publicly reproducible lab fixture; never use this key on deployed nodes.
-    signature = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33))).sign(descriptor)
-    blob = descriptor + signature
-    return bytes([0, 1]) + struct.pack(">HH", len(blob), len(blob)) + blob
-
-
-def chunk_payload(image, chunk_index):
-    if chunk_index < 0:
-        raise ValueError("chunk index must not be negative")
-    offset = chunk_index * OTA_CHUNK_BYTES
-    data = image[offset:offset + OTA_CHUNK_BYTES]
-    if not data:
-        raise ValueError("chunk index is outside the image")
-    return struct.pack(">IH", chunk_index, len(data)) + data
-
-
-def announcement_payload(campaign):
-    return struct.pack(">IHBI", campaign, 123, OTA_PRIORITY, 3600000)
-
-
-def lease_payload(subtype, lease_id):
-    return struct.pack(">BIIB", subtype, lease_id, 60000, 1)
-
-
-def budget_chunk_payload(index):
-    data = struct.pack(">I", index) + bytes(OTA_CHUNK_BYTES - 4)
-    return struct.pack(">IH", index, len(data)) + data
-
-
-def send_ota(node, route, message_type, campaign, session=1, attempt=1, payload=b"", namespace=0x4F54):
-    if message_type == OTA_ANNOUNCEMENT and not payload:
-        payload = announcement_payload(campaign)
-    envelope = ota_envelope(message_type, campaign, session, attempt, payload, namespace)
-    header = route | (PAYLOAD_TYPE_LORA_OTA << 2)
-    raw = bytes([header, 0x80]) + envelope
-    response = node.command(bytes([CMD_SEND_RAW_PACKET, OTA_PRIORITY]) + raw, timeout=8.0)
-    if response == bytes([RESP_ERR, ERR_TABLE_FULL]):
-        raise OtaQueueFull(f"{node.name}: OTA packet pool full")
-    if response[0] != RESP_OK:
-        raise RuntimeError(f"{node.name}: OTA packet queue failed: {response.hex()}")
-
-
-def wait_ota_event(node, message_type, timeout=12.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            frame = node.wait_frame({PUSH_OTA_EVENT}, timeout=min(1.0, deadline - time.monotonic()))
-        except TimeoutError:
-            continue
-        if len(frame) >= 2 and frame[1] == message_type:
-            return frame
-    raise TimeoutError(f"{node.name}: no OTA event type {message_type}")
-
-
-def wait_advert(node, timeout=15.0):
-    return node.wait_frame({PUSH_ADVERT, PUSH_NEW_ADVERT}, timeout=timeout)
-
-
-def wait_raw_packet(node, predicate, timeout=15.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        frame = node.wait_frame({PUSH_RAW_LOG}, timeout=deadline - time.monotonic())
-        if predicate(frame[3:]):
-            return frame[3:]
-    raise TimeoutError(f"{node.name}: no matching raw radio packet")
-
-
-def wait_advert_from(node, public_key, timeout=30.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        frame = wait_advert(node, timeout=deadline - time.monotonic())
-        if frame[1:33] == public_key:
-            return frame
-    raise TimeoutError(f"{node.name}: no fresh advert from {public_key.hex()}")
-
-
-def run_airtime_test(client, target, client_info, evidence, duty_timeout):
-    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_DUTY]) + struct.pack("<I", 2000))
-    require_ok(client, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
-    start = last_progress = time.monotonic()
-    sent = refused = 0
-    packet_cost = None
-    previous = status(client)
-    reached = False
-    while time.monotonic() - start < duty_timeout:
-        try:
-            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 5000,
-                     payload=budget_chunk_payload(sent))
-            sent += 1
-        except OtaQueueFull as exc:
-            refused += 1
-            evidence.log("ota_backpressure", error=str(exc), refused=refused)
-        target.poll(0.05)
-        target.take_pending({PUSH_OTA_EVENT})
-        time.sleep(0.25)
-        current = status(client)
-        increment = current["used"] - previous["used"]
-        if increment > 0:
-            packet_cost = increment if packet_cost is None else min(packet_cost, increment)
-            last_progress = time.monotonic()
-        if sent % 12 == 0 or current["used"] != previous["used"]:
-            evidence.log("duty_progress", sent=sent, refused=refused, status=current,
-                         observed_packet_cost_ms=packet_cost)
-        evidence.check("airtime-cap-not-exceeded",
-                       current["used_limit"] == 72000 and current["used"] <= 72000,
-                       status=current)
-        previous = current
-        remaining = current["used_limit"] - current["used"]
-        if packet_cost is not None and remaining < packet_cost and time.monotonic() - last_progress >= 15:
-            reached = True
-            break
-    evidence.check("airtime-budget-exhausted", reached, sent=sent, refused=refused,
-                   status=previous, observed_packet_cost_ms=packet_cost,
-                   synthetic_load=True, install_or_boot_claim=False)
-
-    target.poll(0.1)
-    target.take_pending({PUSH_OTA_EVENT, PUSH_ADVERT, PUSH_NEW_ADVERT})
-    target_before = status(target)["rx"]
-    for index in range(8):
-        try:
-            send_ota(client, ROUTE_FLOOD, OTA_CHUNK, 5000,
-                     payload=budget_chunk_payload(sent + index))
-        except OtaQueueFull as exc:
-            refused += 1
-            evidence.log("ota_backpressure", error=str(exc), refused=refused)
-        target.poll(0.1)
-        target.take_pending({PUSH_OTA_EVENT})
-    target.collect(15.0)
-    blocked = status(client)
-    evidence.check("ota-remains-budget-blocked",
-                   blocked["used"] == previous["used"] and status(target)["rx"] == target_before,
-                   before=previous, after=blocked)
-
-    target.take_pending({PUSH_ADVERT, PUSH_NEW_ADVERT})
-    request_time = time.monotonic()
-    advert_response = client.command(bytes([CMD_SEND_SELF_ADVERT, 1]))
-    evidence.check("normal-advert-allocates-after-ota-cap",
-                   advert_response == bytes([RESP_OK]), response=advert_response.hex(),
-                   status=blocked)
-    advert = wait_advert_from(target, client_info["pubkey_bytes"])
-    after_advert = status(client)
-    evidence.check("normal-advert-after-ota-cap",
-                   after_advert["used"] == blocked["used"],
-                   sender=client_info["pubkey"], received_frame=advert.hex(),
-                   delay_seconds=time.monotonic() - request_time,
-                   before=blocked, after=after_advert)
-    evidence.check("airtime-two-percent-enforced",
-                   after_advert["used"] <= 72000 and after_advert["used_limit"] == 72000,
-                   sent=sent, refused=refused, observed_packet_cost_ms=packet_cost,
-                   remaining_ms=after_advert["used_limit"] - after_advert["used"])
-
-
-def run_configure(client, target, evidence):
-    client_info = run_configure_client(client, evidence)
-    target_info, target_status = configure_node(target, "OTA-LAB-TARGET")
-    evidence.summary["measurements"]["configured"] = {
-        **evidence.summary["measurements"]["configured"],
-        "target": serializable_app_info(target_info),
-        "target_status": target_status,
-    }
-    expected = (907525, 62500, 7, 5)
-    evidence.check("default-radio-target",
-                   (target_info["freq_khz"], target_info["bw_hz"], target_info["sf"], target_info["cr"]) == expected,
-                   observed=serializable_app_info(target_info))
-    return client_info, target_info
-
-
-def run_configure_client(client, evidence):
-    client_info, client_status = configure_node(client, "OTA-LAB-CLIENT")
-    evidence.summary["measurements"]["configured"] = {
-        "client": serializable_app_info(client_info),
-        "client_status": client_status,
-    }
-    expected = (907525, 62500, 7, 5)
-    evidence.check("default-radio-client",
-                   (client_info["freq_khz"], client_info["bw_hz"], client_info["sf"], client_info["cr"]) == expected,
-                   observed=serializable_app_info(client_info))
-    evidence.log("path_hash_mode_configured", mode=2, bytes_per_hash=3,
-                 radio_verification_pending=True)
+def run_configure_client(client, evidence, before=None):
+    if before is None:
+        before = companion_info(client)
+    evidence.summary["measurements"].setdefault("configuration_before", {})["client"] = (
+        serializable_app_info(before))
+    client_info = configure_node(client, CLIENT_NAME, before=before)
+    record_configuration(evidence, "client", before, client_info, CLIENT_NAME)
     return client_info
 
 
-def run_hardware_test(client, target, evidence, duty_timeout, staging_only=False, airtime_only=False):
-    client_info, target_info = run_configure(client, target, evidence)
+def run_configure(client, target, evidence):
+    client_before = companion_info(client)
+    target_before = repeater_info(target)
+    evidence.check("node-identities-are-distinct",
+                   client_before["pubkey"] != target_before["pubkey"],
+                   client=client_before["pubkey"], target=target_before["pubkey"])
+    acl_before = target.get_acl()
+    evidence.summary["measurements"]["acl_before"] = acl_before
+    evidence.summary["measurements"].setdefault("configuration_before", {})["target"] = (
+        serializable_app_info(target_before))
+    client_info = run_configure_client(client, evidence, before=client_before)
+    target_info = configure_repeater(target, before=target_before)
+    acl_after = target.get_acl()
+    evidence.summary["measurements"]["acl_after"] = acl_after
+    evidence.check("repeater-acl-preserved", acl_after == acl_before,
+                   before=acl_before, after=acl_after, admin_provisioned=False,
+                   reboot_persistence_verified=False)
+    record_configuration(evidence, "target", target_before, target_info, TARGET_NAME)
+    evidence.log("repeater_radio_application_pending", reboot_required=True,
+                 reboot_requested=False, active_rf_verified=False)
+    return client_info, target_info
 
-    require_ok(client, bytes([CMD_SEND_SELF_ADVERT, 1]))
-    advert_ct = wait_raw_packet(
-        target, lambda raw: len(raw) >= 34 and raw[0] >> 2 & 15 == 4
-        and raw[2:34] == client_info["pubkey_bytes"])
-    wait_advert(target)
-    require_ok(target, bytes([CMD_SEND_SELF_ADVERT, 1]))
-    advert_tc = wait_raw_packet(
-        client, lambda raw: len(raw) >= 34 and raw[0] >> 2 & 15 == 4
-        and raw[2:34] == target_info["pubkey_bytes"])
-    wait_advert(client)
-    evidence.check("three-byte-path-mode",
-                   (advert_ct[1] >> 6) + 1 == 3 and (advert_tc[1] >> 6) + 1 == 3,
-                   client_path_header=advert_ct[1], target_path_header=advert_tc[1],
-                   physical_multi_hop_claim=False)
-    evidence.check("bidirectional-advert-rf", True, frequency_khz=907525, bandwidth_hz=62500, sf=7, cr=5)
-
-    if not staging_only and not airtime_only:
-        run_transport_probes(client, target, client_info["pubkey_bytes"], evidence)
-    if not airtime_only:
-        run_signed_staging(client, target, evidence)
-    if not staging_only:
-        run_airtime_test(client, target, client_info, evidence, duty_timeout)
-    evidence.summary["measurements"]["final"] = {
-        "client": status(client),
-        "target": status(target),
-        "client_identity": client_info["pubkey"],
-        "target_identity": target_info["pubkey"],
-    }
-
-
-def run_precedence_probe(client, target, client_public_key, evidence):
-    # Avoid identical signed adverts when the board's RTC has not advanced.
-    fresh_name = b"OTA-LAB-CLIENT-" + os.urandom(4).hex().encode("ascii")
-    require_ok(client, bytes([CMD_SET_ADVERT_NAME]) + fresh_name)
-    try:
-        return observe_precedence_probe(client, target, client_public_key, evidence)
-    finally:
-        require_ok(client, bytes([CMD_SET_ADVERT_NAME]) + b"OTA-LAB-CLIENT")
-
-
-def observe_precedence_probe(client, target, client_public_key, evidence):
-    event_codes = {PUSH_ADVERT, PUSH_NEW_ADVERT, PUSH_OTA_EVENT}
-    target.poll(0.2)
-    target.take_pending(event_codes)
-    require_ok(client, bytes([CMD_OTA_LAB, 0]))
-    deadline = time.monotonic() + 15.0
-    ordered = []
-    observed_types = set()
-    while time.monotonic() < deadline and len(observed_types) < 2:
-        target.poll(0.2)
-        for timestamp, payload in target.take_pending(event_codes):
-            if payload[0] in (PUSH_ADVERT, PUSH_NEW_ADVERT):
-                if payload[1:33] != client_public_key:
-                    continue
-                kind = "normal-advert"
-            elif len(payload) >= 2 and payload[1] == OTA_ANNOUNCEMENT:
-                kind = "ota-announcement"
-            else:
-                continue
-            ordered.append((timestamp, kind, payload.hex()))
-            observed_types.add(kind)
-    evidence.check("normal-traffic-precedence",
-                   len(observed_types) == 2 and ordered[0][1] == "normal-advert",
-                   observed=ordered, expected_sender=client_public_key.hex())
-
-
-def run_transport_probes(client, target, client_public_key, evidence):
-    send_ota(client, ROUTE_FLOOD, OTA_ANNOUNCEMENT, 1001)
-    event_ct = wait_ota_event(target, OTA_ANNOUNCEMENT)
-    send_ota(target, ROUTE_FLOOD, OTA_ANNOUNCEMENT, 1002)
-    event_tc = wait_ota_event(client, OTA_ANNOUNCEMENT)
-    evidence.check("bidirectional-ota-rf", True, client_to_target=event_ct.hex(), target_to_client=event_tc.hex())
-
-    run_precedence_probe(client, target, client_public_key, evidence)
-
-    for node in (client, target):
-        require_ok(node, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 0]))
-        lease = bytes([CMD_OTA_CONTROL, OTA_DIRECT_LEASE]) + struct.pack("<II", 907525, 250000) + bytes([7, 5]) + struct.pack("<H", 1)
-        require_ok(node, lease)
-    time.sleep(3.0)
-    direct_client = app_info(client)
-    direct_target = app_info(target)
-    evidence.check("direct-high-speed-lease-active",
-                   direct_client["bw_hz"] == 250000 and direct_target["bw_hz"] == 250000,
-                   client=serializable_app_info(direct_client),
-                   target=serializable_app_info(direct_target))
-    for sender, receiver, lease_id in ((client, target, 2001), (target, client, 2002)):
-        before_lease = status(receiver)
-        for subtype in (1, 2):
-            send_ota(sender, ROUTE_DIRECT, OTA_LEASE, lease_id,
-                     payload=lease_payload(subtype, lease_id))
-            wait_ota_event(receiver, OTA_LEASE)
-        after_lease = status(receiver)
-        evidence.check(f"typed-lease-probe-{receiver.name}",
-                       after_lease["bad"] == before_lease["bad"],
-                       before=before_lease, after=after_lease)
-    evidence.check("direct-high-speed-bidirectional", True, bandwidth_hz=250000,
-                   route="direct-zero-hop", frequency_khz=907525, sf=7, cr=5,
-                   remote_radio_negotiation_claim=False)
-
-    before_bad = status(target)
-    send_ota(client, ROUTE_DIRECT, OTA_ANNOUNCEMENT, 2100, namespace=0x0000)
-    wait_ota_event(target, OTA_ANNOUNCEMENT)
-    after_bad = status(target)
-    evidence.check("corruption-rejection", after_bad["bad"] == before_bad["bad"] + 1,
-                   before=before_bad, after=after_bad)
-
-    remaining = 65.0 - 3.0
-    evidence.log("lease_revert_wait", seconds=remaining)
-    time.sleep(remaining)
-    reverted_client = app_info(client)
-    reverted_target = app_info(target)
-    evidence.check("radio-lease-auto-revert",
-                   reverted_client["bw_hz"] == 62500 and reverted_target["bw_hz"] == 62500,
-                   client=serializable_app_info(reverted_client),
-                   target=serializable_app_info(reverted_target))
-
-    require_ok(target, bytes([CMD_OTA_CONTROL, OTA_ABORT]))
-    require_ok(target, bytes([CMD_OTA_CONTROL, OTA_SET_MODE, 2]))
-    campaign = 3001
-    progression = []
-    probes = (
-        (OTA_ANNOUNCEMENT, announcement_payload(campaign)),
-        (OTA_CENSUS, struct.pack(">IBIH", campaign, 0, 0, 1)),
-        (OTA_CENSUS, struct.pack(">IBIH", campaign, 1, 0, 1)),
-        (OTA_COHORT, struct.pack(">IHHH", campaign, 1, 1, 0)),
-        (OTA_CENSUS, struct.pack(">IBIH", campaign, 1, 128, 1)),
-        (OTA_MISSING, struct.pack(">III", campaign, 1, 1)),
-    )
-    for message_type, payload in probes:
-        send_ota(client, ROUTE_FLOOD, message_type, campaign, payload=payload)
-        wait_ota_event(target, message_type)
-        progression.append({"type": message_type, "status": status(target)})
-    fleet_before_abort = progression[-1]["status"]["fleet"]
-    send_ota(client, ROUTE_FLOOD, OTA_ABORT_MESSAGE, campaign + 99, session=99, payload=bytes(5))
-    wait_ota_event(target, OTA_ABORT_MESSAGE)
-    fleet_after_abort = status(target)["fleet"]
-    evidence.check("fleet-control-state-probes", len({row["status"]["fleet"] for row in progression}) >= 3,
-                   progression=progression, full_fleet_update_claim=False)
-    evidence.check("foreign-abort-rejection", fleet_after_abort == fleet_before_abort,
-                   before=fleet_before_abort, after=fleet_after_abort)
-
-
-def run_signed_staging(client, target, evidence):
-    require_ok(target, bytes([CMD_OTA_CONTROL, OTA_ABORT]))
-    image = bytes((index * 37 + 0x5A) & 0xFF for index in range(320))
-    security_counter = 1
-    send_ota(client, ROUTE_DIRECT, OTA_DESCRIPTOR, 4001,
-             payload=descriptor_fragment(image, security_counter))
-    wait_ota_event(target, OTA_DESCRIPTOR, timeout=60.0)
-    descriptor_status = status(target)
-    evidence.check("signed-descriptor-accepted",
-                   descriptor_status["backend"] == 1 and descriptor_status["recv"] == 2,
-                   status=descriptor_status, receiver_state_awaiting_authorization=2)
-
-    authorization = struct.pack(">BIIH", 1, 1, 60000, 2)
-    send_ota(client, ROUTE_DIRECT, 2, 4001, payload=authorization)
-    wait_ota_event(target, 2)
-    authorized_status = status(target)
-    evidence.check("transfer-authorized", authorized_status["recv"] == 3,
-                   status=authorized_status, receiver_state_receiving=3)
-
-    first_chunk = chunk_payload(image, 0)
-    send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=first_chunk)
-    wait_ota_event(target, OTA_CHUNK)
-    progress_before_resume = status(target)
-    time.sleep(1.0)
-    target.take_pending({PUSH_RAW_LOG})
-    send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001, payload=first_chunk)
-    duplicate_raw = bytes([ROUTE_DIRECT | PAYLOAD_TYPE_LORA_OTA << 2, 0x80]) + \
-        ota_envelope(OTA_CHUNK, 4001, 1, 1, first_chunk)
-    wait_raw_packet(target, lambda raw: raw == duplicate_raw)
-    progress_after_resume = status(target)
-    evidence.check("radio-duplicate-chunk-rejection",
-                   progress_after_resume["rx"] == progress_before_resume["rx"] and
-                   progress_after_resume["recv"] == 3 and
-                   progress_after_resume["bad"] == progress_before_resume["bad"],
-                   before=progress_before_resume, after=progress_after_resume,
-                   receiver_duplicate_handler_claim=False)
-    chunk_count = (len(image) + OTA_CHUNK_BYTES - 1) // OTA_CHUNK_BYTES
-    for chunk_index in range(1, chunk_count):
-        send_ota(client, ROUTE_DIRECT, OTA_CHUNK, 4001,
-                 payload=chunk_payload(image, chunk_index))
-        wait_ota_event(target, OTA_CHUNK)
-    commit = struct.pack(">IBI", 4001, 1, security_counter)
-    send_ota(client, ROUTE_DIRECT, OTA_COMMIT, 4001, payload=commit)
-    wait_ota_event(target, OTA_COMMIT)
-    staged = status(target)
-    evidence.check("signed-rf-qspi-stage",
-                   progress_before_resume["recv"] == 3 and
-                   progress_after_resume["recv"] == 3 and
-                   staged["recv"] == 6,
-                   before_resume=progress_before_resume,
-                   after_resume=progress_after_resume,
-                   staged=staged,
-                   receiver_state_complete_staging=6,
-                   bytes_staged=len(image), sha256=hashlib.sha256(image).hexdigest(),
-                   reboot_resume_claim=False,
-                   install_or_boot_claim=False)
 
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
@@ -675,20 +518,21 @@ def resolve_roles(evidence, client_only=False):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--client-only", action="store_true")
-    parser.add_argument("--configure-only", action="store_true")
-    parser.add_argument("--monitor-seconds", type=float, default=0)
-    parser.add_argument("--duty-timeout", type=float, default=420)
     scope = parser.add_mutually_exclusive_group()
-    scope.add_argument("--staging-only", action="store_true")
-    scope.add_argument("--airtime-only", action="store_true")
+    scope.add_argument("--configure-only", action="store_true",
+                       help="configure ordinary radio/name/path settings; never provision ADMIN or run OTA")
+    scope.add_argument("--monitor-seconds", type=float, default=0,
+                       help="read-only role-checked serial monitoring for a positive duration")
     args = parser.parse_args()
-    if args.client_only and not (args.configure_only or args.monitor_seconds > 0):
-        parser.error("--client-only requires --configure-only or --monitor-seconds")
-    if (args.staging_only or args.airtime_only) and (args.configure_only or args.monitor_seconds > 0):
-        parser.error("a qualification scope cannot be combined with configuration or monitoring")
+    if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
+        parser.error("--monitor-seconds must be finite and non-negative")
+    if not (args.configure_only or args.monitor_seconds > 0):
+        parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
+                     "select --configure-only or a positive --monitor-seconds. "
+                     "Signed transfers use ota_uploader.py with a separate explicit commit")
 
     evidence = Evidence(args.artifact_dir)
     client = target = None
@@ -700,23 +544,26 @@ def main():
                               str(client_device.by_id), evidence)
         if not args.client_only:
             target_device = devices[TARGET_ROLE]
-            target = FramedSerial(f"{TARGET_ROLE}-{target_device.serial}",
-                                  str(target_device.by_id), evidence)
+            target = RepeaterSerial(f"{TARGET_ROLE}-{target_device.serial}",
+                                    str(target_device.by_id), evidence)
         time.sleep(2.0)
         if args.monitor_seconds > 0:
+            identities = {"client": serializable_app_info(app_info(client))}
+            if target:
+                identities["target"] = repeater_identity(target)
+            evidence.summary["measurements"]["identities"] = identities
             deadline = time.monotonic() + args.monitor_seconds
             while time.monotonic() < deadline:
                 client.poll(0.05)
+                client.pending.clear()
                 if target:
                     target.poll(0.05)
-        elif args.configure_only:
+                    target.pending.clear()
+        else:
             if args.client_only:
                 run_configure_client(client, evidence)
             else:
                 run_configure(client, target, evidence)
-        else:
-            run_hardware_test(client, target, evidence, args.duty_timeout,
-                              args.staging_only, args.airtime_only)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)

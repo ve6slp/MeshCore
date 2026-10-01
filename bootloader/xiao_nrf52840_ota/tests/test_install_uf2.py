@@ -291,6 +291,20 @@ class GuardedInstallerTest(unittest.TestCase):
             INSTALLER.install(self.args(artifact=artifact, dry_run=False))
         self.assertFalse((self.volume / "replacement.uf2").exists())
 
+    def test_omitted_key_header_accepts_mismatched_marker_key(self):
+        """key_header is purely an opt-in build-provenance cross-check, with
+        no compiled/default fallback: with it omitted (None), even an
+        artifact whose marker key differs from this test's own key_header
+        fixture must install -- the reference-signer field is never a
+        runtime trust gate."""
+        data = _genuine_uf2(marker=_build_marker_bytes(key_bytes=bytes(range(1, 33))))
+        artifact = self._replace_artifact(data)
+        with mock.patch.object(INSTALLER.os, "sync"):
+            INSTALLER.install(
+                self.args(artifact=artifact, key_header=None, dry_run=False)
+            )
+        self.assertTrue((self.volume / "replacement.uf2").exists())
+
     def test_physical_install_rejects_non_xiao_board_even_with_valid_marker(self):
         # A --board sensecap_solar_p1 artifact whose own boot-info marker
         # validates correctly for that profile must still never reach

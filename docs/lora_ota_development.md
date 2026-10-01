@@ -8,8 +8,7 @@ surface, and the current hardware validation status. For the design
 rationale and policy model, start with
 [docs/lora_ota_design.md](lora_ota_design.md). For nRF52840 QSPI/bootloader
 specifics, see [docs/lora_ota_nrf52840_qspi.md](lora_ota_nrf52840_qspi.md)
-and `bootloader/xiao_nrf52840_ota/README.md`, both owned by the bootloader
-work stream — this guide does not duplicate them.
+and `bootloader/xiao_nrf52840_ota/README.md`.
 
 ## Source layout
 
@@ -18,8 +17,7 @@ src/ota/
   protocol/   wire types, byte-stream codec, envelope, canonical descriptor
   runtime/    chunk geometry, receipt bitmap, session identity, receiver/
               coordinator/fleet state machines, radio-profile lease,
-              airtime limiter, AEAD framing and durable sequence/replay
-              primitives
+              airtime limiter
   storage/    CRC32, redundant journal, receipt map, storage manager over
               the QSPI layout
   trust/      SHA-256 and Ed25519 (vendored orlp/ed25519), fail-closed
@@ -33,26 +31,29 @@ examples/companion_radio/  CLI/binary command handling and lifecycle hooks
 test/test_lora_ota_{protocol,runtime,storage,trust,boot,integration}/
 ```
 
-The portable OTA core is mostly header-only. ESP32 partition and NVS
-adapters also have `.cpp` SDK boundaries. It is gated by the `MESHCORE_LORA_OTA`
+The portable OTA core is mostly header-only. Board backends provide the
+Nordic and ESP32 SDK boundaries. It is gated by the `MESHCORE_LORA_OTA`
 build flag, currently set in `variants/xiao_nrf52/platformio.ini`,
 `variants/sensecap_solar/platformio.ini`, and
 `variants/xiao_s3_wio/platformio.ini`.
 
-Campaign staging delegates to `OtaFirmwareStorageSink`, including its
-optional durable command handoff. `beginSession()` erases the candidate;
-`resumeSession()` only attaches RAM state to existing bytes and clears
-prior authorization. The receiver must re-verify durable metadata and
-restore the exact verified descriptor and consented session before
-committing a resumed install. Attaching alone proves neither image
-integrity nor installation.
+The lean migration uses MeshCore identities and existing administrator
+permissions, not a separate commissioning authority or transport-key ledger.
+Firmware manifests and background frames use Ed25519 signatures; a sender's
+public key is accepted only through the device's administrator policy.
 
-The shared nRF install nonce derives the first BE64 hash bytes from
-`"MeshCore/OTA/install-attempt/v1"` (no NUL), controller32, campaignBE32,
-sessionBE32, attemptBE16 and SHA256(canonical59). Independent golden
-vectors cover each binding component. This pure calculation does not
-authenticate the controller: durable immutable attempt ownership,
-collision refusal and integration remain separate acceptance gates.
+Each device retains one candidate image and its original administrator.
+Duplicate durable blocks do not write flash again. Invalid frames preserve
+valid progress, and installed or older versions do not acquire the candidate
+slot. A competing image or administrator receives a busy refusal. Any trusted
+administrator may abort reception and suppress that image's multicast until
+an explicit restart.
+
+All three transfer modes converge on the same image validation. Complete
+reception leaves durable `READY` state, not an install command. Only an
+explicit per-device commit for the validated image publishes the bootloader
+handoff. The current image remains operational during reception and while
+waiting for commit. These are migration requirements, not hardware results.
 
 ## Building and testing
 
@@ -61,179 +62,198 @@ work so the repo-local `.tmp` scratch directory and target lists stay
 consistent.
 
 ```sh
-make test-ota                # all native OTA tests
+make test-ota                # all native OTA and host tests
+make test-ota-native          # native tests only; supports OTA_TEST_FILTER
 make test-ota-protocol        # one layer at a time, for fast iteration
 make test-ota-runtime
 make test-ota-storage
 make test-ota-trust
-make test-ota-aead-cipher     # actual firmware Crypto library, not native mocks
 make test-ota-boot
 make test-ota-integration
-make test-ota-campaign       # portable controller/receiver and install handoff
 make test-ota-lab-host        # host-side unittest suite for lab scripts (below)
-make test-ota-maintenance-host # host maintenance wire-codec tests
-make test-ota-maintenance     # shared protocol and native maintenance codecs
+make test-ota-lab-host OTA_LAB_HOST_TEST_PATTERN=test_lab_device.py
 
 make build-ota-targets        # compile the OTA-enabled firmware targets
 make build-ota-nrf52-targets  # XIAO/SenseCAP, companion and repeater roles
+make build-ota-esp32-targets  # XIAO S3/Wio, companion and repeater roles
 make build-ota-baseline-targets  # same targets, OTA disabled, for size diffing
 make build-non-ota-targets    # regression guard: platforms that never enable OTA
 
-make verify-ota-software      # native tests + both build passes, in one gate
+make verify-ota-software      # full tests + six OTA and ordinary profile builds
 ```
 
 `verify-ota-software` is explicitly a **software-only** qualification gate.
 Its own summary output says so: passing it means native tests are green and
 firmware links, not that any device can be updated.
+It builds all four nRF profiles, both ESP profiles and the representative
+ordinary non-OTA profiles. The default Arduino source filter excludes OTA;
+only the six OTA application profiles add its sources and C++17 explicitly.
 
 `build-ota-nrf52-targets` builds all four nRF52840 USB application profiles.
 It does not substitute the ESP32-S3 profile for the XIAO nRF52840 companion
 or qualify custom-loader installation.
 
-### Public nRF52840 boot references
+`build-ota-esp32-targets` builds `Xiao_S3_WIO_companion_radio_usb` and
+`Xiao_S3_WIO_repeater_ota_usb`. The new repeater profile inherits the
+ordinary repeater's configuration and dependencies, adding the OTA flag,
+source filters and C++17. The existing `Xiao_S3_WIO_repeater` profile
+remains unchanged. Building either role does not qualify installation or
+rollback on physical ESP32 hardware.
 
-```sh
-make generate-ota-boot-catalogue
-make test-ota-boot-catalogue
-```
+The ESP OTA profiles bind `XIAO_S3_OTA_COMPILED_ROLE_ID` to companion 0 or
+repeater 1. The experimental OTA repeater also disables the ordinary Wi-Fi
+updater with `DISABLE_WIFI_OTA`, preventing two updaters from owning the same
+inactive slot. The ordinary repeater profile retains its existing updater.
 
-Generation first validates and clean-builds the unmodified pinned public loader,
-its ELF flash load addresses, and the public MBR/SoftDevice artifacts.
-It does not read a device or approve an observed loader hash. The generated
-header contains the XIAO USB profile's reference bytes; the provenance
-sidecar records artifact hashes, source/submodule pins, compiler identity,
-build options, and fixed build epoch. Pre-existing HEX/ELF pairs are replaced
-by that fresh build, not trusted as proof of their source. A shared memory
-layout does not authorize another board profile.
-
-`XIAO_OTA_UPSTREAM` selects the public checkout. Override
-`OTA_BOOT_CATALOGUE_HEADER` and `OTA_BOOT_CATALOGUE_PROVENANCE` to write
-qualification outputs beneath `.tmp/` instead of replacing the source
-header. Generation neither flashes hardware nor grants commissioning
-authority. Acceptance still requires fresh live measurements of the
-complete catalogue conjunction, the raw MBR/UICR selector policy, and the
-separate blank retained-command parameter page.
-
-For a complete stock-plus-custom catalogue:
-
-```sh
-make generate-ota-boot-catalogue-custom \
-  OTA_BOOT_CATALOGUE_CUSTOM_MANIFEST=/absolute/path/to/qualified-builds.json
-```
-
-The explicit manifest must contain all four board/role pairs, their exact
-ELF/packaged HEX/UF2 paths, trusted public-key header and qualified overlay
-provenance. Missing, duplicate or unapproved custom inputs refuse generation;
-neither shared pins nor successful compilation licenses a SenseCAP stock row.
-Both outputs are generated into staging before publication, with the source
-header replaced last. Stock-only generation remains available without a
-custom manifest.
+### nRF52840 bootloader qualification
 
 `make qualify-xiao-ota-bootloader` builds and packages both nRF board
 profiles for companion role 0 and repeater role 1, then runs each native
 gate with matching boot-process identity. Its metadata harness must run
 against that board/role's actual prepared source; a missing tree fails
 qualification rather than silently skipping. This remains an offline
-gate, not an installation or live-commissioning result.
+gate, not an installation result. Package validation must include every
+file-backed flash load segment, including initialized `.data`, and preserve
+the fixed configuration and boot-info addresses.
 
-`test-ota-aead-cipher` links the installed firmware Crypto library's actual
-ChaCha20-Poly1305 implementation in a separate host executable, so ordinary
-native suites can retain their existing deterministic hash mocks. It
-checks the RFC 8439 known-answer vector, full-tag and associated-data
-tampering, plaintext quarantine, every allowed plaintext length, and the
-exact 28-byte associated-data / 179-byte maximum protected frame. It is a
-dependency of `test`, `test-ota`, and `test-ota-trust`. The default library
-comes from `Xiao_nrf52_companion_radio_usb`; a missing dependency fails
-explicitly with the corresponding PlatformIO package-install command.
-These checks do not qualify authenticated transport, durable replay
-protection, installation, or hardware.
+Independent qualification of all four current no-SWD packages found
+37,812 bytes of code, unwind metadata and initialized data within the
+38,912-byte load slot. The final file-backed load ends at `0xFD3B4`,
+leaving 1,100 bytes before configuration at `0xFD800`. Each package
+retains its ELF and section report alongside HEX, UF2 and linker map.
+These are build-artifact and simulated-recovery results, not physical
+installation or power-cut results.
 
-The key schedule uses immutable public salt bytes, avoiding concurrent
-first-call initialization races. Native SHA-256 and independently computed
-HKDF known-answer vectors pin the exact no-NUL protocol domain and
-directional key/nonce outputs.
+The running app checks the manifest signer against its administrator policy
+before committing. Its install record snapshots that accepted public key
+and signed manifest; the bootloader independently verifies the signature,
+image hash, hardware, size and installed version floor. This is a
+local-failure trust boundary, not a physical-attacker secure-boot claim.
 
-The native runtime suite also exercises the durable TX/RX primitives
-through 103 erase/body/marker/readback fault cases each, reconstructing
-fresh objects over the resulting NOR bytes. Corrupt or unreadable slots
-cannot fall back to older authorization, an RX watermark loaded at boot
-remains a permanent replay floor for that boot, and uncertain writes
-freeze the current instance. Both runtime constructors default to
-`OtaSequenceInitialization::RequireExisting`; their explicit
-`CommissionVirgin` mode requires independently verified commissioning
-facts from the caller, not merely blank records. The production transport
-and commissioning-store wiring are still pending.
+Boot reliability qualification covers durable backup before internal erase,
+invalid-bank publication before copying, valid settings publication last,
+exact original SDK settings restoration, and trial confirmation or rollback.
+Reception and staging tests must exercise the production integration path,
+including reboot resume, harmless duplicates, bad-frame refusal, busy
+ownership, abort suppression and `READY` without an install command.
 
-`OtaSequenceBackingPort` separates those runtime algorithms from physical
-storage. TX reservations compare the expected global counter before
-claiming a new range; after a conflict, the allocator skips ranges owned
-by other writers and reserves its own before emitting a sequence. RX
-refresh closes the externally advanced replay window rather than
-reopening earlier admissions. `WouldBlock` and `Conflict` remain
-retryable at every open, read and mutation boundary; uncertain or
-regressing durable facts freeze the instance.
+### ESP32-S3 vendor recovery inspection
 
-The two-sector flash adapters are existing-record-only references, not
-commissioning authorities or a production wear solution. Missing records
-do not prove first use. Full-identity collision and bounded-capacity
-fixtures exercise the port in RAM; they do not qualify a persistent
-350-peer store, compaction, endurance or firmware transport.
+The 2026-10-01 build of `Xiao_S3_WIO_companion_radio_usb` linked with the
+resolved Arduino-ESP32 2.0.17 package. Its SDK enables
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, and disassembly of the actual
+QIO/80 MHz bootloader found both pending-image abort transitions and
+the new-image-to-pending transition. The generated `bootloader.bin`
+SHA-256 was
+`1776e4dd896a69d0a5c2e79957b0e2a88aa4129b1381d6478683515a1f6af343`.
+This identifies that inspected build; it is not a compiled trust anchor
+or a guarantee about an unknown bootloader already on a device.
 
-`make test-ota-counter-ports-index` archives the prospective Git index
-under `.tmp/` and runs its runtime, actual-cipher and lab-host gates.
-Unstaged work is excluded, and the output identifies the exact tree.
+`make inspect-xiao-s3-ota-bootloader` records the existing ELF, SDK config
+and generated binary hashes and prints the boot-selection disassembly.
+Run it as a manual release inspection after building the profile; it
+does not upload anything and is not a recurring infrastructure test.
+Override the `ESP32_OTA_*` paths if PlatformIO's packages live elsewhere.
+Select `ESP32_OTA_ENV=Xiao_S3_WIO_repeater_ota_usb` to inspect that
+profile's generated bootloader instead of the companion's.
+`ESP32_OTA_BUILD_DIR` defaults to `PLATFORMIO_BUILD_DIR` when supplied,
+otherwise `.pio/build`, so isolated firmware builds can be inspected too.
+
+The actual core's `esp32-hal-misc.c` also defines the weak
+`verifyRollbackLater()` hook to return false and confirms pending images
+inside `initArduino()`. The LoRa OTA integration must defer that default
+confirmation until filesystem, radio and main-loop health are established.
+The board backend supplies explicit installation, vendor image validation,
+late confirmation and an independent RTC watchdog. The raw flash adapter
+alone does not expose installation. Its product tests and linked symbols
+are software evidence; receiver-to-installation and physical rollback
+remain unqualified on ESP32 hardware.
+
+The shared unsigned descriptor builder supports `xiao_s3_wio`: family
+`0x4553`, variant `0x5333`, role 0 or 1, logical application address
+`0x10000`, capabilities 1 and at most 2,749,824 image bytes. The capacity
+is bounded by the durable bitmap and 84-byte blocks, not the Nordic
+application region. The SDK chooses the inactive physical slot; the
+descriptor never names a raw flash destination. The offline nRF
+install-command signer still accepts only nRF board profiles.
+
+`make test-ota-index` archives the prospective Git index under `.tmp/`.
+Unstaged work is excluded and the output identifies the exact source tree.
+Builds and library dependencies stay inside that snapshot, preserving
+board scripts that resolve libraries relative to their project directory.
 
 Combine native suite selectors in one invocation when working across
 layers, for example:
 
 ```sh
-make test-ota OTA_TEST_FILTER='test_lora_ota_trust test_lora_ota_runtime'
+make test-ota-native OTA_TEST_FILTER='test_lora_ota_trust test_lora_ota_runtime'
 ```
 
 `test-ota-lab-host` runs `python3 -m unittest discover -s scripts/tests` —
 real unit tests for the lab tooling itself (for example, the protected-
 power-domain refusal logic in `scripts/lab_device.py`), not a proxy for
 hardware or firmware qualification. It is now a dependency of both `make
-test` and `make test-ota`. Before running it, or any other lab script,
-install the lab's Python dependencies:
+test` and `make test-ota`. If a command reports missing Python packages,
+install the lab's declared dependencies:
 
 ```sh
 python3 -m pip install -r requirements-ota.txt   # cryptography>=43.0, pyserial>=3.5
 ```
 
-## Binary protocol (companion frame codes)
+## Signed companion USB ABI
 
-Handled in `examples/companion_radio/MyMesh.cpp::handleCmdFrame`:
+`src/helpers/ota/OtaUsbProtocol.h` is the authoritative contract.
+Companion requests use `<`, a little-endian 16-bit payload length, then
+command 66 and an operation byte. Replies use `>` and the same outer
+length encoding. Multi-byte fields inside the OTA payload are big-endian.
 
-- `CMD_OTA_CONTROL` (66), sub-operations in byte 1 of the frame:
-  - `OTA_CTRL_GET_STATUS` (0) → `RESP_CODE_OTA_STATUS` (29)
-  - `OTA_CTRL_SET_MODE` (1): byte 2 selects `0`=direct, `1`=routed, `2`=fleet
-  - `OTA_CTRL_SET_DUTY` (2): bytes 2–5 are a little-endian `uint32_t`
-    milli-percent value
-  - `OTA_CTRL_ABORT` (3)
-  - `OTA_CTRL_ROLLBACK` (4)
-  - `OTA_CTRL_DIRECT_LEASE` (5): frequency (kHz-scaled `uint32_t`),
-    bandwidth (kHz-scaled `uint32_t`), spreading factor, coding rate, and a
-    16-bit lease timeout in minutes, validated by
-    `mesh::ota::isValidOtaDirectLease` before
-    `mesh::ota::requestOtaDirectLease` applies it
-- `CMD_OTA_LAB` (67): currently one operation, `OTA_LAB_QUEUE_PRECEDENCE`
-  (0), which builds and floods a synthetic `OtaAnnouncementPayload` plus a
-  self-advert to exercise OTA-vs-normal traffic precedence. This exists for
-  lab/test harnesses, not as a fleet-management primitive.
+| Operation | Value | Body after command and operation |
+| --- | --- | --- |
+| CacheBegin | `0x10` | flags1, canonical59, signature64 |
+| CachePut | `0x11` | blockIndex16, exactLength8, data1..84 |
+| CacheSeal | `0x12` | none |
+| AddTarget | `0x13` | full target PK32 |
+| Start | `0x14` | mode8, channel8, frequencyKHz32, leaseMs16, dutyMilliPercent32 |
+| Commit | `0x15` | target PK32, manifestHash32, counter32 |
+| Abort | `0x16` | target PK32, imageHash32 |
+| Status | `0x17` | target PK32; all zero selects the local cache |
+| SetContactAdmin | `0x18` | target PK32, enabled8 |
 
-`src/helpers/CommonCLI.cpp` also parses text-CLI equivalents (`ota status`,
-`ota abort`, `ota rollback`, `ota direct ...`, `set ota.mode`,
-`set ota.dutycycle`, `get ota.mode`, `get ota.dutycycle`), but they do
-**not** work today: the underlying `CommonCLICallbacks` OTA methods
-(`src/helpers/CommonCLI.h:221-244`) default to no-op/"unsupported" stubs,
-and `companion_radio` does not use `CommonCLI` at all, so no example
-currently overrides them. `simple_repeater`, `simple_room_server`, and
-`simple_sensor` are the only examples that use `CommonCLI`, and none of
-them wires these callbacks up to `src/ota/`. If you're adding OTA support to
-one of those examples, this is the gap to close. See the
-[administrator guide](lora_ota_administration.md) for the operator-facing
-writeup of this gap and the binary protocol used in the meantime.
+CacheBegin flag 1 means explicit reupload. Its signer is the companion's
+existing local identity; no additional owner key is supplied in the USB
+request. A local cache must not become an install command for the uploader.
+CacheSeal validates it for transmission; target admission separately checks
+that same signer against the target's live administrator policy.
+
+Start modes are direct 0, directed 1 and background 2. Direct requires one
+target, channel 255 and a frequency with a 250..60,000 ms lease. Directed
+requires one target and channel 255; background requires a configured group
+channel and accepts up to 32 targets. On-mesh frequency and lease are zero.
+Positive airtime shares are 1..100,000 milli-percent; 2,000 means 2%.
+
+Every reply is exactly 86 bytes: response code 31, ABI version 1, echoed
+operation, result, phase, flags, target PK32, hash32, received16, total16,
+counter32, statusAgeMs32 and retryAfterMs32. Flags are snapshot-valid 1 and
+remote 2. A reply without a snapshot has unknown phase, zero hash, counts
+and counter, and age `0xFFFFFFFF`. It still reports the actual operation
+result and requested target. Unknown versions, flags or enum values are
+errors, not successful defaults.
+
+Local cache operations and Start echo a zero target; individually addressed
+operations echo the full supplied target. CacheSealed is a local uploader
+state; Ready is the target's validated candidate awaiting explicit Commit.
+Pending is not final success. The host honours retryAfterMs and retries an
+identical block when backpressure requires it.
+
+An old cached READY cannot authorize a new commit wait. Snapshot age must
+establish a remote observation made after the wait began, with the expected
+manifest, counter, scope and complete nonzero block counts. A status query
+may honestly report FAILED; a fresh failure for the current candidate ends
+a mutating wait. COMMIT acceptance does not prove a reboot or confirmation.
+
+The old raw sender, fixed-key fixture, command-66 mode/duty helpers and
+binary journal cleanup have been removed from the host workflow. Existing
+MeshCore local-update commands remain separate from this signed upload ABI.
 
 ## Hardware lab workflow
 
@@ -242,6 +262,7 @@ roles pinned in `lab/devices.ini` — never a raw `ttyACMn` path. See
 [Hardware lab device workflow](hardware_lab.md) for the full rationale
 (mode detection, DFU entry, power cycling, recovery). The current lab pair
 is two XIAO nRF52840 + SX1262 boards, addressed as `client` and `target`.
+The client is a USB companion; the target must run `simple_repeater`.
 A third board, listed under `[protected]`, belongs to an unrelated project
 and must never be reset, flashed, or power-cycled by any MeshCore command.
 
@@ -250,38 +271,121 @@ Relevant targets:
 ```sh
 make lab-devices                       # list attached boards and roles
 make lab-doctor                        # check host tooling/power control
-make build-xiao-nrf52-ota-lab          # build companion firmware, OTA enabled
+make build-xiao-nrf52-ota-lab          # build companion client and repeater target
 make upload-xiao-nrf52-lab             # flash both client and target
-make configure-xiao-nrf52-ota-lab      # apply lab radio/name configuration
-make test-xiao-nrf52-ota-lab           # run the two-node RF harness (scripts/ota_rf_lab.py)
-make test-xiao-nrf52-ota-stage         # same harness, signed-descriptor/staging path only
-                                        # (skips the airtime-budget-exhaustion pass below)
-make test-xiao-nrf52-ota-airtime       # same harness, airtime/duty-cycle stress only
-                                        # (skips normal-traffic precedence, direct-mode
-                                        # lease, fleet-control probes, and signed staging)
+make monitor-xiao-nrf52-ota-lab        # capture binary client and text repeater output
+make configure-xiao-nrf52-ota-client   # client-only radio/name configuration
+make configure-xiao-nrf52-ota-lab      # role-correct paired configuration, no reboot
+make test-xiao-nrf52-ota-lab           # refuses until end-to-end qualification is implemented
 make validate-xiao-nrf52-qspi-hardware # run the on-target QSPI hardware test
 make test-xiao-ota-bootloader-tools    # host tests for installer and artifact tooling
-make verify-xiao-ota-boot-info-artifacts # check actual HEX/UF2 markers, keys and UF2 admissibility
+make verify-xiao-ota-boot-info-artifacts # check actual HEX/UF2 markers and UF2 admissibility
                                         # (XIAO_OTA_BOARD=xiao_nrf52840 default, or
                                         # XIAO_OTA_BOARD=sensecap_solar_p1)
 ```
 
-`make test-xiao-nrf52-ota-airtime` exercises only the airtime/duty-cycle
-budget check against whatever firmware is already flashed on `client` and
-`target` — it does not build or flash first, so it's independent of the
-current state of the source tree. It accepts the same `OTA_LAB_DUTY_TIMEOUT`
-override as `test-xiao-nrf52-ota-lab` (default 420 seconds) for longer
-stress runs, e.g. `make test-xiao-nrf52-ota-airtime OTA_LAB_DUTY_TIMEOUT=900`.
-The latest full RF harness passed on 2026-09-30T12:26:14Z: usage reached
+The serial transport distinguishes the binary companion client from the
+repeater's echoed text CLI. Monitoring and configuration support both
+roles. Paired configuration checks the roles and full identities before
+mutation, sets ordinary MeshCore names, radio preferences and path hashes,
+then requires unchanged identities and complete administrator ACL
+readbacks. It neither provisions an administrator nor reboots a board.
+Client-only configuration remains available.
+
+Repeater readbacks are preferences; applying the radio profile requires a
+separate reboot. Readback does not prove reboot persistence or reception on
+the configured mesh. The source-confirmed radio setter reply is exactly
+`OK - reboot to apply`; name and path setters return `OK`. Value readbacks
+start with `> `. The default qualification operation
+continues to refuse before device access rather than run the retired raw
+sender.
+
+Configuration does not send historical command-66 mode or duty
+subcommands. Campaign mode and airtime belong to the signed uploader's
+START request; configuration does not claim an OTA status or installation
+capability.
+
+The replacement host signing helper uses the companion's existing signing
+commands (33, 34 and 35) for the canonical 59-byte manifest. It verifies
+the returned Ed25519 signature against the companion's public identity
+before accepting it; it does not export or substitute a private lab key.
+This helper and the delimited repeater ACL reader are host-side building
+blocks, not evidence of an implemented upload or bootloader handoff.
+
+### Signed uploader host
+
+`scripts/ota_uploader.py` implements the replacement host side of
+`src/helpers/ota/OtaUsbProtocol.h`: command 66, operations `0x10` to
+`0x18`, with versioned 86-byte replies. It matches the operation and full
+target identity, rejects unavailable or malformed replies, and uses
+snapshot age rather than reply arrival time when waiting for READY.
+An old failure snapshot does not invalidate a newer candidate; a fresh
+failure or abort ends the wait explicitly. Companion signing shares the
+upload deadline, rather than starting a separate timeout for each command.
+ABORT supplies the image-content SHA-256; COMMIT supplies the canonical
+manifest SHA-256 and counter. These hashes are not interchangeable.
+
+`make ota-lab-manifest` builds the unsigned descriptor from a raw nRF52840
+application image. Set `OTA_UPLOAD_IMAGE`, `OTA_UPLOAD_MANIFEST` and an
+explicit `OTA_UPLOAD_COUNTER` greater than the target's confirmed floor.
+`OTA_UPLOAD_BOARD` defaults to `xiao_nrf52840`; select
+`sensecap_solar_p1` for that board profile. `OTA_UPLOAD_ROLE_ID` defaults
+to repeater role 1; use 0 for a companion. The shared descriptor builder
+also serves the offline signing tool and validates geometry, alignment,
+role and counter before writing. It emits exactly 59 bytes, with no
+signature, private key or boot command. Select `xiao_s3_wio` for the
+ESP32 descriptor policy described above.
+
+The other Make entry points are `ota-lab-upload`, `ota-lab-status`,
+`ota-lab-commit`, `ota-lab-abort` and `ota-lab-admin`. Supply a raw image
+with `OTA_UPLOAD_IMAGE`, its exact canonical 59-byte descriptor with
+`OTA_UPLOAD_MANIFEST`, and the full target public key with
+`OTA_UPLOAD_TARGET`. Upload signs the descriptor using the companion,
+fills and seals its cache, then requests a campaign. It never commits.
+Set `OTA_UPLOAD_WAIT_READY=1` to wait for fresh, complete target snapshots;
+the default returns the campaign request result without claiming target
+completion. `OTA_UPLOAD_DUTY_MILLI_PERCENT=2000` selects 2% airtime; the
+host also accepts lower positive shares.
+
+**Implementation boundary:** host commands and native tests are not a
+hardware qualification result. The firmware implements autonomous
+three-mode transfer, remote status and target-bound commit. Native tests
+exercise durable admission, repair, image validation, commit retry and
+byte-exact full-image transfer across multiple direct leases. Fresh boot
+evidence, not a COMMIT acknowledgement, must establish installation.
+Physical qualification still requires reviewed applications and recovery
+packages, real radio transfers, installation and late trial confirmation.
+
+The boot signing utility now emits only the version-3, 220-byte install
+record containing the application-admitted signer key. Its Make wrapper
+no longer passes the removed `--command-version` argument or selects a
+private key implicitly. `sign-xiao-ota-image` requires a deliberately supplied
+`XIAO_OTA_PRIVATE_KEY` and is only an offline fixture workflow, not production
+MeshCore authorization. `generate-xiao-ota-fixture-key` creates or reuses a
+local test keypair without changing any compiled header. Artifact verification
+checks board, role, layout, capabilities and record integrity, not a compiled
+signer key: the bootloader verifies each command with its admitted public key.
+Fixture keys always live in the project-root `.tmp/xiao-ota-keys` directory;
+overriding `TMPDIR` changes build scratch, not that fixture location. No
+fixture key is selected automatically.
+
+The retired `test-xiao-nrf52-ota-airtime` scope exercised only the
+airtime/duty-cycle budget against already-flashed firmware, without
+building or flashing first. Its default timeout was 420 seconds.
+That helper, its raw fixed-key sender and the binary floor-cleanup workflow
+have been removed rather than maintained alongside the signed uploader.
+The latest historical full RF
+harness passed on 2026-09-30T12:26:14Z: usage reached
 71,822 of 72,000 ms, and an ordinary advert allocated and reached the
 expected peer in 0.983 s without changing OTA usage. This supersedes
 earlier pressure runs that enforced the quota but failed ordinary advert
 allocation with `ERR_TABLE_FULL`. A numerical quota pass alone is still
 not a passing background-service result.
 
-`scripts/ota_rf_lab.py` drives both boards over serial, sends and waits for
-OTA envelopes and adverts, and writes machine-readable evidence
-(`serial-events.jsonl`, `summary.json`) into the run's artifact directory.
+`scripts/ota_rf_lab.py` writes serial observations and machine-readable
+evidence (`serial-events.jsonl`, `summary.json`) into the run's artifact
+directory. Its earlier two-companion qualification routines sent and
+observed OTA envelopes and adverts; they are not the new signed sender.
 `tools/ota_qspi_hw_test.py` drives the on-device QSPI hardware test firmware
 built from the `Xiao_nrf52_ota_qspi_hardware_test` PlatformIO environment and
 captures its serial evidence log.
@@ -318,6 +422,13 @@ plaintext media nor the encryption key belongs in logs or Git.
 `make test-ota-lab-archive` exercises the archive protocol and failure
 paths without hardware.
 
+To authenticate a preserved capture without discovering or opening a board,
+use `make validate-xiao-nrf52-client-archive` or
+`make validate-xiao-nrf52-target-archive` with the same key and archive
+variables. These commands check full-media integrity and the configured
+role, serial and device UID. They do not compare the running device with
+the capture or establish a recovery image.
+
 The diagnostic replaces the running application, so its internal-flash
 capture contains the diagnostic application and its SDK settings, not the
 previous stock application. Preserve the original immutable application
@@ -325,13 +436,38 @@ artifact separately. These archives are evidence only: they do not
 authorize restoring old counters, floors, identity, or firmware, and
 capturing them does not qualify OTA installation or rollback.
 
+The original 502,300-byte lab application artifact was lost after the
+historical captures. The diagnostic images cannot reconstruct it. Before
+further commissioning, preserve a newly qualified, immutable recovery
+application and verify identity and configuration across the role change.
+
 ## Current hardware evidence
 
 This reflects the most recent lab runs and should be re-checked against
 `docs/lora_ota_design.md` and `docs/lora_ota_nrf52840_qspi.md` before relying
 on it, since hardware qualification is ongoing.
 
-Verified:
+### Current preservation evidence
+
+On 2026-10-01, both approved boards passed the existing Make targets for
+live, read-only comparison with their authenticated encrypted archives.
+Each comparison covered all 1 MiB of internal flash and 2 MiB of QSPI,
+with an exact byte-for-byte match. The boards still run the diagnostic
+applications; neither result establishes production mesh service.
+No flash, reset, power cycle or installation was performed, and the
+protected board was not opened.
+
+Destructive power cuts are deferred while the target shares the protected
+power domain. Simulated recovery and offline artifact qualification do
+not close that physical acceptance gap.
+
+### Historical radio and flash evidence
+
+The paths below identify earlier run directories, not artifacts guaranteed
+to exist in the current qualification tree. These records describe the
+retired transport and do not qualify the replacement.
+
+Previously verified:
 
 - **2026-09-30T12:26:14Z -- full stock-only RF harness**:
   `.tmp/ota-rf-lab/stock-policy-allocation-fixed-qualification/summary.json`
@@ -405,23 +541,13 @@ Verified:
   These are offline artifact checks — they do **not** exercise a custom
   bootloader install on physical hardware, and no such install has
   happened. Do not describe this gate as bootloader-install evidence.
-- The previous 160-byte OTA chunk size, which didn't fit the companion
-  serial frame, has been replaced with a 128-byte chunk (fitting the
-  184-byte `kOtaMaxFrameSize`, the 255-byte LoRa payload limit, and the
-  64-byte mesh path field). The required strong transport is
-  ChaCha20-Poly1305 with a 16-byte tag and a 4-byte sequence number;
-  it has no padding or transmitted IV. Its 156-byte plaintext ceiling
-  includes the 21-byte envelope. A 128-byte chunk therefore becomes a
-  155-byte plaintext, a 178-byte protected payload and up to 248 bytes
-  on the worst-case RF path. The full 156-byte plaintext ceiling becomes
-  a 179-byte protected payload and up to 249 bytes on the wire — under the
-  255-byte RF limit but over the 176-byte companion serial limit. Do not
-  use the smaller, weaker 2-byte MAC variant instead, and do not claim
-  the raw serial link can hold an encrypted, full-path frame at this
-  size. This is a transport budget, not proof of an integrated encrypted
-  transfer. The autonomous updater must cache bounded serial uploads and
-  construct authenticated RF frames locally; that production integration
-  is not yet qualified.
+- Those historical transfers used 128-byte chunks. The signed receiver
+  uses at most 84 data bytes per block, preserving Nordic four-byte
+  alignment. Packet sizing must include the actual outer transport and
+  signature, not an assumed envelope from the retired implementation.
+  The separate ChaCha20-Poly1305 envelope and sequence ledger are removed.
+  Earlier airtime estimates do not establish current campaign duration;
+  repairs, relays, census and lease transitions all add overhead.
 
 **Fixed, previously failed** — a signed wire-descriptor transfer (`recv7`)
 failed in an earlier run. The root cause was a byte-order (little-endian
@@ -429,25 +555,22 @@ vs. big-endian) mismatch in how the descriptor was framed on the wire. As
 described above, the descriptor format is now defined and used as a single
 59-byte big-endian layout end to end, and the fix is exercised by both a
 new native C++ test in `test/test_lora_ota_protocol/` and the RF lab
-harness. The on-flash command-version-2 bootloader record carrying this
-descriptor is 188 bytes; it is not a companion wire frame. Legacy install
-command version 1 uses an independently signed 71-byte little-endian
-descriptor. Command versions are separate from the durable state, floor
-and confirmation record versions: those remain version 1, with the state
-record exactly 152 bytes and the confirmation record 64 bytes.
+harness. The historical command-version-2 bootloader record carrying this
+descriptor is 188 bytes; it is not a companion wire frame. The signed
+application-to-bootloader command retains the app-authorized signer public
+key with the signed manifest. The current boot contract is
+version 3 and 220 bytes, with the admitted key at offset 79, signature at
+111, CRC at 212 over bytes `[0,212)`, and commit marker at 216. The
+application writer and recovery packages remain qualification gates.
 
-The install-attempt contract binds a 32-byte controller public key, a
-32-bit campaign ID, a 32-bit session ID, a 16-bit attempt ID and the
-descriptor's SHA-256 digest. A stable, full 64-bit nonce is reused for the
-same context; retrying a failed image requires a new explicitly
-consented attempt after recovery, with a counter above the confirmed
-floor. Receiving or staging
-group chunks does not by itself grant install authority — only an
-explicit, consented attempt can do that.
+Receiving group chunks grants no install permission. The original
+administrator must issue an explicit per-device commit for the fully
+validated, ready image. A trusted administrator can abort before commit;
+after committed installation begins, the bootloader completes or rolls back.
 
-**Boot-trial and confirmation acceptance criteria — design only, not yet
-implemented or proven.** The adopted (not yet built) contract for
-deciding whether a staged install becomes "Installed/Confirmed" is:
+**nRF boot-trial and confirmation acceptance criteria — physical
+qualification pending.** The contract for deciding whether a staged
+install becomes "Installed/Confirmed" is:
 health is only considered continuously good after 10 uninterrupted
 seconds following an actual readiness/image check (not a stub); any gap
 between health-loop iterations longer than 1 second restarts that
@@ -463,8 +586,9 @@ before the CONFIRMED state, recovering that transaction idempotently after
 interruption. Only once the floor, the state record, and the
 running image hash all subsequently match is an attempt considered
 Installed/Confirmed. None of this sequence has been exercised on
-hardware yet — treat it strictly as acceptance criteria to build and test
-against, not as a result.
+hardware yet — these are acceptance criteria, not a physical result.
+ESP32 uses vendor slot states, an independent RTC watchdog and late
+confirmation rather than the Nordic register and copy/restore sequence.
 
 Not verified, and not to be represented as done in any documentation or
 release notes:
@@ -485,37 +609,29 @@ release notes:
     distinct SenseCAP flash profile **are implemented and covered by
     native tests**. Packaged HEX and UF2 build artifacts with marker
     verification now build separately for both the XIAO and SenseCAP
-    profiles, in their own board-specific output directories/names, for
-    both the 66 KiB fallback and the no-SWD (34,612 of 38,912 bytes
-    used, 4,300 free) package variants.
-  - The boot candidate region is capped at 708,608 bytes, preserving the
-    extra-filesystem range `0xD4000`–`0xED000` until that region is
-    migrated. The full candidate-plus-backup capacity (811,008 bytes) is
-    still permitted, but only as storage/backup space — not as
-    installable code. A fresh, live read of `BANK_VALID`, the app flag,
-    size, and CRC16 is now required before a candidate is trusted; a
-    stale floor value or a guessed extent is no longer accepted.
+    profiles, in their own board/role-specific output directories. All
+    four current no-SWD packages use 37,812 of 38,912 bytes, leaving
+    1,100 bytes free. Historical footprints do not describe this build.
+  - The candidate and backup regions each hold at most 708,608 bytes,
+    preserving the extra-filesystem range `0xD4000`–`0xED000`.
+    The 811,008-byte staging stride includes receiver metadata; it is
+    not image capacity. A fresh, live read of `BANK_VALID`, the app
+    flag, size and CRC16 is required before destructive installation.
+    A stale floor value or a guessed extent is not sufficient.
   - The application-to-bootloader hand-off, and commissioning/installing
     that bootloader on physical hardware, are **not qualified** — no
     device has gone through commissioning, a real install, or a confirmed
-    boot from an image delivered this way. The backend/integrated
-    firmware side of OTA is also still work in progress: there is no
-    installed image, no full-mesh repeater delivery, and none of the
-    three transfer modes are working yet.
+    boot from an image delivered this way. Native tests exercise all three
+    transfer modes, but no mode has completed a firmware installation on
+    physical hardware with the replacement.
   Do not describe the marker or SenseCAP profile as "not implemented" —
   they exist and are tested; the gap is specifically the hand-off and
   physical hardware qualification.
-- Anti-rollback protection is a mix of levels, not uniformly RAM-only:
-  the generic `src/ota/trust/MonotonicCounter.h` is an interface with no
-  backing implementation of its own. The bootloader **does** implement a
-  durable, confirmed A/B floor record — but that has not been exercised
-  through an actual hardware install/confirmation cycle. The currently
-  flashed experimental lab backend increments its counter in RAM and would
-  seed from that durable floor if a valid one is present, but the current
-  lab board pair has no qualified floor flashed, so on today's lab
-  hardware the counter is, in practice, RAM-only and does not survive a
-  reset. Do not describe anti-rollback as entirely unimplemented, and do
-  not describe it as durable on today's lab hardware — both are wrong.
+- Anti-rollback has durable implementations: Nordic uses confirmed A/B
+  floor records, and ESP32 stores its confirmed numeric floor in NVS.
+  Neither has been qualified through a real install/confirmation cycle.
+  The approved lab pair currently runs read-only diagnostics, not the
+  retired RAM-counter backend or the new production receiver.
 - Fleet-state probes and raw QSPI read/write results are evidence of
   protocol and flash-driver correctness — they are **not** evidence of a
   completed firmware installation. Do not conflate the two when reporting
@@ -526,7 +642,7 @@ release notes:
 
 ## Development status and branch
 
-This work lives on the dedicated `feat/lora-ota-nrf52840` branch, built on
+This work lives on the dedicated `feat/lora-ota-lean` branch, built on
 top of companion/repeater v1.17.1 ancestry, and has not been pushed to or
 merged into upstream `main`. Do not treat anything in these guides as
 released or upstream-approved until that branch merges.
@@ -539,11 +655,13 @@ instead of appearing to succeed.
 
 ## Host tooling status
 
-`scripts/ota_rf_lab.py` and `tools/ota_qspi_hw_test.py` are lab test
-scripts, not a production host uploader or client product. If you are
-building a companion app or CLI feature against `CMD_OTA_CONTROL` /
-`CMD_OTA_LAB`, treat these scripts as protocol examples, not as a reference
-implementation to ship.
+`scripts/ota_rf_lab.py` and `tools/ota_qspi_hw_test.py` provide lab
+configuration, monitoring and flash diagnostics, not a production client
+product. The old raw sender and `CMD_OTA_LAB` workflow have been retired.
+`scripts/ota_uploader.py` implements the signed host lifecycle against
+`OtaUsbProtocol.h`; its mocked-host coverage does not qualify firmware
+transport or physical recovery. Use the versioned ABI above when building
+a companion app or CLI, not the removed lab controls.
 
 ## Contributing safely
 

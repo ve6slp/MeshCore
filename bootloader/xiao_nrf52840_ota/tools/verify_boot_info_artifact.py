@@ -6,19 +6,32 @@ helpers under src/xiao_ota_boot_info.c) or reuse prepare_upstream.py's
 CRC-patch logic. It parses the *actual packaged* Intel HEX or UF2 bytes at
 XIAO_OTA_BOOT_INFO_ADDRESS produced by a real build, decodes them against a
 plain, independently-declared 60-byte little-endian layout, and separately
-recomputes and checks the CRC-32 and every profile/key field. If
+recomputes and checks the CRC-32 and every profile/key field.
+
+The marker's embedded public key (reference_signer_public_key_ed25519) is a
+build-identity/provenance fact only -- "which static placeholder value
+include/xiao_ota_public_key.h held, as embedded by prepare_upstream.py's
+CRC-patch step for this specific build" -- NOT a runtime install-command
+trust anchor: the bootloader verifies each install command
+against THAT command's own embedded admitted_signer_public_key_ed25519
+(xiao_ota_command_v2_t), never against this marker. --key-header is
+OPTIONAL and purely an opt-in cross-check of that provenance fact against a
+header file you expected the build to use; omitting it skips the check
+entirely (there is no compiled/default key substituted, and omission is not
+a failure). This never substitutes for or implies anything about the
+bootloader's actual install-time trust decision. If
 prepare_upstream.py's patch step and this validator ever silently agreed on
 the same wrong value (a shared-code bug), or the linker placed the section
-somewhere else, or a real board_target/key value ever drifted from what a
+somewhere else, or a real board_target value ever drifted from what a
 release actually intends to ship, this script -- run against the real
 compiled artifact, not against in-process C helpers -- is meant to still
 catch it.
 
 Usage:
-    verify_boot_info_artifact.py --board xiao_nrf52840 --key-header \\
-        bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h \\
+    verify_boot_info_artifact.py --board xiao_nrf52840 \\
         path/to/xiao_nrf52840_ota_noswd.hex
-    verify_boot_info_artifact.py --board sensecap_solar_p1 --key-header ... \\
+    verify_boot_info_artifact.py --board sensecap_solar_p1 --key-header \\
+        bootloader/xiao_nrf52840_ota/include/xiao_ota_public_key.h \\
         path/to/xiao_nrf52840_ota_noswd.uf2
 
 Exits non-zero with a specific reason on any mismatch. Never writes
@@ -66,7 +79,8 @@ UF2_FLAG_FILE_CONTAINER = 0x00001000
 UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000
 
 # magic, format_version, struct_bytes, board_target_id, role_id,
-# capability_flags, key_id, algorithm_id, trusted_public_key[32], crc32
+# capability_flags, key_id, algorithm_id,
+# reference_signer_public_key_ed25519[32], crc32
 _LAYOUT = "<IHHIIIHH32sI"
 assert struct.calcsize(_LAYOUT) == BOOT_INFO_STRUCT_BYTES, (
     f"golden layout size {struct.calcsize(_LAYOUT)} != "
@@ -255,12 +269,23 @@ def parse_public_key_header(path: Path) -> bytes:
     return bytes(int(v, 16) for v in values)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-def check_artifact(artifact: Path, board: str, key_header: Path,
+def check_artifact(artifact: Path, board: str, key_header: Path | None,
                    expected_role: int) -> list[str]:
     """Decode the boot-info marker out of a real .hex/.uf2 artifact and
-    return a list of mismatch descriptions (empty list == pass)."""
+    return a list of mismatch descriptions (empty list == pass).
+
+    key_header is OPTIONAL and purely an opt-in build-provenance
+    cross-check: if given, the artifact's reference_signer_public_key_ed25519
+    is compared against that header's key as "did this specific build embed
+    the static placeholder value I expected (include/xiao_ota_public_key.h,
+    patched in by prepare_upstream.py)." If key_header is None, that check
+    is skipped entirely (not an error, not a pass-by-default fallback) --
+    there is no compiled/default key this tool requires or substitutes.
+    This field is NEVER what the bootloader actually verifies install
+    commands against at runtime (that is each command's own embedded
+    admitted_signer_public_key_ed25519); a mismatch or absence here says
+    nothing about whether a given signed update will be accepted on-device.
+    """
     suffix = artifact.suffix.lower()
     if suffix == ".hex":
         raw = read_intel_hex_bytes(artifact, BOOT_INFO_ADDRESS, BOOT_INFO_STRUCT_BYTES)
@@ -270,7 +295,7 @@ def check_artifact(artifact: Path, board: str, key_header: Path,
         raise SystemExit(f"unrecognized artifact extension: {artifact}")
 
     (magic, format_version, struct_bytes, board_target_id, role_id,
-     capability_flags, key_id, algorithm_id, trusted_public_key,
+     capability_flags, key_id, algorithm_id, reference_signer_public_key,
      crc32_field) = struct.unpack(_LAYOUT, raw)
 
     errors = []
@@ -296,12 +321,17 @@ def check_artifact(artifact: Path, board: str, key_header: Path,
     if algorithm_id != ALGORITHM_ED25519:
         errors.append(f"algorithm_id {algorithm_id} != golden {ALGORITHM_ED25519}")
 
-    expected_key = parse_public_key_header(key_header)
-    if trusted_public_key != expected_key:
-        errors.append(
-            f"trusted_public_key mismatch vs {key_header} "
-            f"(artifact={trusted_public_key.hex()}, expected={expected_key.hex()})"
-        )
+    if key_header is not None:
+        expected_key = parse_public_key_header(key_header)
+        if reference_signer_public_key != expected_key:
+            errors.append(
+                f"reference_signer_public_key_ed25519 mismatch vs {key_header} "
+                f"(artifact={reference_signer_public_key.hex()}, expected={expected_key.hex()}) "
+                "-- this is an optional build-provenance cross-check only, "
+                "NOT a runtime trust failure: install-command verification "
+                "always uses that command's own embedded "
+                "admitted_signer_public_key_ed25519, never this marker"
+            )
 
     recomputed_crc = binascii.crc32(raw[:56]) & 0xFFFFFFFF
     if crc32_field != recomputed_crc:
@@ -321,8 +351,15 @@ def main() -> int:
     parser.add_argument("--board", choices=sorted(BOARD_TARGET_VALUE),
                         required=True,
                         help="board profile the artifact was built for")
-    parser.add_argument("--key-header", type=Path, required=True,
-                        help="path to xiao_ota_public_key.h used for that build")
+    parser.add_argument("--key-header", type=Path, default=None,
+                        help="OPTIONAL build-provenance cross-check: path to "
+                             "an xiao_ota_public_key.h to compare against "
+                             "this artifact's reference_signer_public_key_ed25519. "
+                             "Omit to skip the check entirely -- there is no "
+                             "compiled/default key here, and this value is "
+                             "never what the bootloader trusts at runtime "
+                             "(that is per-command, see "
+                             "admitted_signer_public_key_ed25519).")
     parser.add_argument("--role-id", type=int, choices=[0, 1], default=0,
                         help="compiled role identity (XIAO_OTA_COMPILED_ROLE_ID) "
                              "this artifact was built with: 0 (companion, "
@@ -347,7 +384,14 @@ def main() -> int:
         f"boot-info marker at 0x{BOOT_INFO_ADDRESS:X} in {args.artifact} "
         f"PASSED independent artifact verification for --board {args.board} "
         f"--role-id {args.role_id} "
-        f"(magic/format/size/CRC/target/role/cap/key all match golden/expected values)"
+        "(magic/format/size/CRC/target/role/cap all match golden values"
+        + (
+            "; reference_signer_public_key_ed25519 matched --key-header "
+            f"{args.key_header})"
+            if args.key_header is not None
+            else "; reference_signer_public_key_ed25519 NOT checked, no "
+                 "--key-header given)"
+        )
     )
     return 0
 

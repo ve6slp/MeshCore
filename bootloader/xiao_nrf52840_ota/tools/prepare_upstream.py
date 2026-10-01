@@ -220,7 +220,7 @@ def main(argv=None):
                         help="compiled role identity (XIAO_OTA_COMPILED_ROLE_ID) to "
                              "bake into this build: 0 (companion, default) or 1 "
                              "(repeater). A role-1 binary's install-command policy "
-                             "check and genesis floor-activation-receipt check both "
+                             "check and compiled-role policy both "
                              "require an exact match to this value, never a wildcard "
                              "or a role<=1 acceptance. Must agree with the same "
                              "--role-id passed to sign_image.py/verify_boot_info_"
@@ -572,7 +572,7 @@ def main(argv=None):
     CFLAGS += -DXIAO_OTA_BOARD_TARGET=0x{BOARD_TARGET_VALUE:08X}u
     # --role-id {args.role_id}: this binary's compiled role identity
     # (XIAO_OTA_COMPILED_ROLE_ID, 0=companion/1=repeater). Checked by both
-    # the install-command policy and the genesis floor-activation-receipt
+    # the install-command policy and the compiled-role policy
     # policy (xiao_ota_record.c / xiao_ota_boot_io.c), and baked into the
     # immutable boot-info marker's role_id field above by this same script.
     CFLAGS += -DXIAO_OTA_COMPILED_ROLE_ID={args.role_id}u

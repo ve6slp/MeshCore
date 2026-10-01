@@ -109,39 +109,19 @@ static bool record_valid(const void *record, size_t size, uint32_t magic,
   return commit == XIAO_OTA_COMMIT_MARKER;
 }
 
-bool xiao_ota_command_valid(const xiao_ota_command_t *record) {
-  return record_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
-                      XIAO_OTA_COMMAND_VERSION_LEGACY_V1, sizeof(*record),
-                      offsetof(xiao_ota_command_t, crc32),
-                      offsetof(xiao_ota_command_t, commit_marker));
-}
-
 bool xiao_ota_command_v2_valid(const xiao_ota_command_v2_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
-                      XIAO_OTA_COMMAND_VERSION_WIRE_V2, sizeof(*record),
+                      XIAO_OTA_COMMAND_VERSION_CURRENT, sizeof(*record),
                       offsetof(xiao_ota_command_v2_t, crc32),
                       offsetof(xiao_ota_command_v2_t, commit_marker));
 }
 
-/*
- * Dispatches on record_version (offset 4) ONLY -- there is no fallback/OR
- * between versions and no version is ever accepted against the other
- * version's validity/size rule. `record` must point to storage at least
- * sizeof(xiao_ota_command_any_t) bytes (both xiao_ota_command_valid() and
- * xiao_ota_command_v2_valid() read exactly sizeof(their own struct) from
- * it, which xiao_ota_command_any_t guarantees is available).
- */
+/* Equivalent to xiao_ota_command_v2_valid(); kept as a distinct name
+ * since callers use it generically, before deciding to trust the record
+ * at all (there is only one command record type now). */
 bool xiao_ota_command_any_valid(const void *record) {
-  uint16_t version;
   if (record == NULL) return false;
-  memcpy(&version, (const uint8_t *)record + 4, sizeof(version));
-  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
-    return xiao_ota_command_valid((const xiao_ota_command_t *)record);
-  }
-  if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
-    return xiao_ota_command_v2_valid((const xiao_ota_command_v2_t *)record);
-  }
-  return false;
+  return xiao_ota_command_v2_valid((const xiao_ota_command_v2_t *)record);
 }
 
 bool xiao_ota_state_valid(const xiao_ota_state_t *record) {
@@ -199,15 +179,6 @@ bool xiao_ota_floor_body_valid(const xiao_ota_floor_t *record) {
   return record_body_valid(record, sizeof(*record), XIAO_OTA_FLOOR_MAGIC,
                            XIAO_OTA_FORMAT_VERSION, sizeof(*record),
                            offsetof(xiao_ota_floor_t, crc32));
-}
-
-bool xiao_ota_floor_activation_receipt_body_valid(
-    const xiao_ota_floor_activation_receipt_t *record) {
-  return record_body_valid(record, sizeof(*record),
-                           XIAO_OTA_FLOOR_ACTIVATION_MAGIC,
-                           XIAO_OTA_FLOOR_ACTIVATION_RECORD_VERSION,
-                           sizeof(*record),
-                           offsetof(xiao_ota_floor_activation_receipt_t, crc32));
 }
 
 bool xiao_ota_bytes_erased(const void *data, size_t length) {
@@ -273,28 +244,6 @@ bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_S
   return true;
 }
 
-bool xiao_ota_install_command_from_v1(const xiao_ota_command_t *cmd,
-                                      xiao_ota_install_command_t *out) {
-  const xiao_ota_canonical_descriptor_t *d = &cmd->descriptor;
-  memset(out, 0, sizeof(*out));
-  out->transaction_nonce = cmd->transaction_nonce;
-  out->target_id = d->target_id_le;
-  out->role_id = d->role_id_le;
-  out->device_address = d->device_address_le;
-  out->allow_broadcast_address = d->allow_broadcast_address;
-  out->required_boot_capability_flags = d->required_boot_capability_flags_le;
-  out->monotonic_counter = d->monotonic_counter_le;
-  out->image_size_bytes = d->image_size_bytes_le;
-  out->app_address = d->app_address_le;
-  out->format_id = d->format_id_le;
-  out->key_id = d->key_id_le;
-  out->algorithm_id = d->algorithm_id_le;
-  memcpy(out->image_hash_sha256, d->image_hash_sha256, 32);
-  out->active_image_extent = cmd->active_image_extent;
-  memcpy(out->active_image_hash_sha256, cmd->active_image_hash_sha256, 32);
-  return true;
-}
-
 bool xiao_ota_install_command_from_v2(const xiao_ota_command_v2_t *cmd,
                                       xiao_ota_install_command_t *out) {
   xiao_ota_wire_descriptor_t w;
@@ -324,18 +273,11 @@ bool xiao_ota_install_command_from_v2(const xiao_ota_command_v2_t *cmd,
   return true; /* w.role is uint8_t, so role<=255 always holds by construction. */
 }
 
+/* Equivalent to xiao_ota_install_command_from_v2(); there is only one
+ * command record type now. */
 bool xiao_ota_install_command_decode(const xiao_ota_command_any_t *any,
                                      xiao_ota_install_command_t *out) {
-  uint16_t version;
-  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
-  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
-    return xiao_ota_install_command_from_v1(&any->v1, out);
-  }
-  if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
-    return xiao_ota_install_command_from_v2(&any->v2, out);
-  }
-  memset(out, 0, sizeof(*out));
-  return false;
+  return xiao_ota_install_command_from_v2(any, out);
 }
 
 bool xiao_ota_install_command_static_identity_valid(

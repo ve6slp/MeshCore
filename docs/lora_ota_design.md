@@ -12,7 +12,15 @@ audience-specific guides, see:
 
 ## Design intent
 
-MeshCore already has the right transport primitives for a robust OTA design: direct delivery, zero-hop local traffic, and routed/flood traffic with transport codes. We should not build a separate radio subsystem; we should build a firmware-update control plane that rides on the existing packet layer and uses the radio only when the update session is permitted.
+MeshCore already provides identities, administrator permissions, direct
+delivery and routed/flood traffic. LoRa OTA reuses those facilities; it does
+not add a second identity or authorization system. Normal radio service and
+recovery from local power failure take priority over update completion.
+
+**Status:** the signed, single-candidate implementation is replacing the
+earlier experimental lab path. Historical results below do not qualify the
+replacement. No LoRa-delivered firmware installation, trial confirmation or
+rollback has been verified on physical hardware.
 
 The design uses three operating modes:
 
@@ -23,8 +31,8 @@ The design uses three operating modes:
 The common design goals are:
 
 - no partial update state that can brick a node
-- signed manifest and signed image validation
-- dual-slot bootloader with rollback
+- an administrator-signed manifest binding the complete image hash
+- durable staging and recoverable installation with rollback
 - transparent local-region and channel negotiation
 - bounded airtime consumption by configurable duty cycle
 - support for solar and battery-powered devices without starving real traffic
@@ -34,21 +42,53 @@ The common design goals are:
 ### 1. Manifest-first, image-second
 A node must receive a signed manifest before it starts accepting chunked data. The manifest declares:
 
-- firmware version and variant
-- target board family / hardware model
-- image size and SHA-256 hash
-- required bootloader version
-- allowed radio modes and regions
-- update mode and duty-cycle budget
-- commit policy and rollback window
+- target board family, variant and firmware role
+- exact image size, application address and SHA-256 hash
+- monotonic update counter and required boot capabilities
+- descriptor format and signature algorithm
 
-This prevents a node from accepting arbitrary packets as firmware.
+Radio settings and airtime policy are separate controls, not additional
+fields to invent in the image descriptor. A signed monotonic counter,
+rather than a display version string, determines whether an image is newer.
+An installed or older image is ignored without acquiring the staging slot.
+
+The signer must already be an administrator trusted by the target through
+MeshCore's policy. Ed25519 lets the administrator sign with a private key
+and the target verify with a public key. HMAC is not a substitute: it
+requires a shared secret and cannot be verified with a public key. The
+administrator's private key is never copied to the target.
+
+Background frames are signed as well. Their signature binds the complete
+manifest identity, message type, block index, length and data. A short wire
+tag is only a correlation aid; knowledge of a channel secret alone does not
+make a sender an administrator.
+
+### One candidate, one owner, explicit install
+
+A device holds one candidate and its original administrator. Another image
+or administrator receives a busy refusal, not an automatic takeover.
+Relays may retransmit the owner's signed frames without becoming owners.
+
+Invalid frames are rejected individually without discarding valid progress
+or stopping normal service. A durably received block is not programmed
+again. After a reboot, the receiver resumes from durable progress. Severe
+loss may require an explicit reupload rather than increasingly complex
+recovery machinery.
+
+All modes use the same complete-image signature, hash, hardware, size and
+version checks. Passing them leaves the device in durable `READY` state.
+Neither the last block nor a census reply installs firmware. The original
+owner, still authorized as an administrator, must issue a commit bound to
+that image and that individual target.
+
+Any currently trusted administrator may abort before commit and suppress
+further multicast for that image until an explicit administrator-directed
+restart. Once installation has begun, boot recovery completes the operation
+or restores the backup; it does not depend on another radio packet.
 
 ### 2. Recoverable update with rollback
-Every target must retain two complete firmware images:
-
-- active image
-- staged image
+The active image stays usable throughout reception and while `READY` waits
+for commit. Installation must retain a verified recovery image.
 
 On ESP32-S3 these can be normal internal A/B application partitions. The
 SenseCAP Solar cannot fit two applications in internal flash, so it uses an
@@ -71,11 +111,11 @@ OTA scheduler cannot override.
 ### 4. Multicast/census/resolution is the fleet mode
 This is the closest analog to LoRaWAN firmware update groups. It uses a phased pattern:
 
-- multicast manifest announcement
-- census of eligible devices
-- resolution into update cohorts
-- block transfer in bounded windows
-- commit after validation
+- signed manifest admission and multicast block transfer
+- census of durable missing blocks
+- selective repair and another census as needed
+- full-image validation into `READY`
+- explicit per-device commit
 
 This keeps background updates from overwhelming the mesh while still allowing broad distribution.
 
@@ -85,11 +125,15 @@ This keeps background updates from overwhelming the mesh while still allowing br
 This is the fast path for a technician or installer who has direct radio reach to a node.
 
 - Use the target’s active channel settings or a negotiated direct OTA channel.
-- Use short, high-speed settings for the transfer window (e.g. SF5, CR4, higher bandwidth where allowed).
-- Transfer is authenticated and chunked; each chunk is checksum-validated before it is accepted.
-- The node stages the image and requests a final validation before commit.
+- Use the uploader's negotiated high-speed profile, such as SF5, coding
+  rate 4/5 and higher bandwidth where the hardware and local rules permit.
+- Transfer uses the same trusted owner and signed blocks as the on-mesh modes.
+- The node stages and validates the image, then waits for explicit commit.
+- The temporary radio lease restores the normal profile on completion,
+  abort or timeout; losing a packet must not leave the node off-channel.
 
-This is best for field service, a node rescue, or first provisioning of a board family.
+This is best for supervised field service on an OTA-capable node. It cannot
+replace local recovery or provision a missing QSPI-aware bootloader.
 
 ### Routed mesh OTA
 This uses the mesh as an infrastructure transport.
@@ -97,7 +141,8 @@ This uses the mesh as an infrastructure transport.
 - The source sends the manifest to the target using the standard mesh packet structure.
 - Route selection uses the existing direct path or known mesh path if available.
 - OTA data is transmitted in bounded blocks using explicit retry and acknowledgements.
-- The manifest includes a target node ID or hash so the route remains unambiguous.
+- Directed control messages identify the individual target. The shared
+  image descriptor need not be re-signed for each fleet member.
 
 This enables remote software updates without physical access to the device.
 
@@ -106,11 +151,13 @@ This is a scheduled, low-priority mode designed for 24-72 hour update cycles.
 
 Phases:
 
-1. Announcement: coordinator broadcasts manifest to an OTA multicast topic or update group.
-2. Census: eligible devices reply with version, variant, region, and update readiness.
-3. Resolution: coordinator groups devices by board family, channel policy, path quality, and window availability.
-4. Transfer: each cohort receives data over a low-duty-cycle queue, with chunk retransmission only for missing blocks.
-5. Commit: after final validation, the device installs the image and reboots into the new firmware.
+1. Admission: the coordinator announces a signed manifest on a known channel.
+2. Multicast: eligible devices stage signed blocks at the configured airtime budget.
+3. Census: devices report durable progress and missing blocks.
+4. Resolution: the coordinator repairs missing blocks and repeats the census
+   as needed. Each device performs the same full-image checks as a routed upload.
+5. Commit: validated devices remain `READY` until the owner commits each
+   target separately, allowing the administrator to sequence reboots.
 
 The traffic budget is enforced at every transmitting node, including relays,
 as a strict OTA share inside the radio's stricter regulatory budget.
@@ -126,17 +173,11 @@ The policy has two nested limits:
 - unused OTA allowance expires instead of accumulating into a later burst
 - normal MeshCore traffic is served before background OTA traffic
 
-The current policy prototype computes:
-
-- `computeAirtimeBudgetMs(update_window_ms, duty_cycle_percent)`
-- `computeUploadWindowMs(...)`
-- `isBackgroundEligible(...)`
-- `buildPlan(...)`
-
-This arithmetic is useful for planning but is not yet the production
-scheduler. The production implementation must debit measured packet airtime
-from both the regulatory bucket and a separate OTA bucket at every forwarding
-node.
+The production path must debit measured packet airtime from the shared radio
+admission policy and a separate OTA budget at every forwarding node. Planning
+arithmetic alone is not enforcement. Qualification must reach the configured
+quota and verify that ordinary traffic still allocates packets and reaches
+its peer under sustained OTA load.
 
 ## Target hardware focus
 
@@ -158,41 +199,38 @@ path IDs. This validates the MCU/radio/QSPI application surface, not OTA
 installation: the stock Adafruit bootloader still cannot consume a QSPI-staged
 image.
 
-The reproducible two-node RF lab entry points are:
+The role-specific lab entry points are:
 
 ```sh
 make build-xiao-nrf52-ota-lab
 make upload-xiao-nrf52-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>
-make configure-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/configure
 make monitor-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/monitor
-make test-xiao-nrf52-ota-lab OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/<run>/test
 ```
 
 These targets are pinned to the two allowlisted USB by-id paths and never
 select a device by a transient tty number. The hardware harness records every
-serial frame and assertion in `serial-events.jsonl` plus a machine-readable
-`summary.json`. It exercises bidirectional adverts and OTA envelopes, direct
-radio leases, routed/flood traffic, fleet census/resolution, malformed-frame
-and foreign-abort rejection, normal-traffic precedence, and the separate 2%
-rolling OTA airtime budget.
+serial frame or repeater text line in `serial-events.jsonl` plus a
+machine-readable `summary.json`. Paired configuration uses the companion's
+binary protocol and the repeater's text CLI; it does not provision an
+administrator, reboot or start an update. The default qualification command
+still refuses before opening either device. Use the signed uploader and
+per-target commit workflow only within the experimental qualification
+process. Earlier runs exercised adverts, staging,
+manual radio leases, fleet-control probes and the 2% rolling airtime
+budget, not installation through the replacement implementation.
 
-`MESHCORE_OTA_LAB_BACKEND` is deliberately a qualification-only backend. It
-uses the reserved 16 KiB candidate-test QSPI region and a deterministic lab
-Ed25519 key so the harness can prove signed descriptor acceptance,
-interrupted/resumed chunk staging, readback hashing, and staging completion.
-It does not install or boot the candidate, does not make the lab key a
-production trust anchor, and does not change the custom-bootloader acceptance
-gate.
+The earlier raw sender, deterministic signing-key fixture and companion-only
+qualification routines have been retired. They are not another supported
+transport or production trust source. The replacement cache is signed by
+the uploader's existing MeshCore identity; receivers authorize that full
+identity through their live administrator policy.
 
-The XIAO nRF52840 application-side QSPI backend is commissioned through
-`Nrf52FlashAdapter`: it owns nrfx QSPI directly, validates the P25Q16H JEDEC
-identity, enforces device bounds and 4 KiB erase alignment, preserves byte
-granularity through word-aligned EasyDMA bounce buffers, rejects NOR 0-to-1
-programming, and waits for asynchronous erase/read/write completion. The
-companion build intentionally no longer mounts `CustomLFS_QSPIFlash`, because
-that implementation exposes and may format the complete chip; companion data
-continues to use internal ExtraFS while the lab OTA backend owns only its
-reserved QSPI test partition.
+The nRF52840 flash adapter validates the P25Q16H JEDEC identity, device
+bounds and 4 KiB erase alignment. Word-aligned EasyDMA buffers preserve
+byte-range operations, and NOR 0-to-1 programming is refused. Candidate,
+backup, boot journal and filesystem regions must remain disjoint according
+to the shared geometry contract. A filesystem implementation that can
+format the complete QSPI chip must not be mounted across these banks.
 
 ## Implementation status for this repository
 
@@ -219,62 +257,33 @@ and run via `make test`.
 The earlier `src/helpers/LoraOtaPolicy.h` planning prototype and its tests have
 been removed; `src/ota/runtime/` supersedes them.
 
-### ESP32-S3 storage checkpoint
+### ESP32-S3 recovery contract
 
-`Esp32FlashAdapter` now uses real IDF partition I/O, restricted to the
-freshly selected inactive application slot in the existing 8 MiB partition
-table. It rechecks running/boot selection, trial state, partition identity
-and exclusive updater ownership before each operation. The compatibility
-geometry-only constructor still refuses I/O. No bulk operation can address
-the running image, filesystem, NVS, otadata or bootloader.
+Stage only in the inactive application partition, never the running image,
+filesystem, NVS, otadata or bootloader. Durable metadata retains the single
+candidate, owner and received blocks; ambiguous storage failures refuse the
+update rather than erasing unrelated state.
 
-Dedicated `nvs/mesh_ota` primitives store versioned, big-endian CRC-protected
-blobs using nonwrapping generations, explicit provisioning and commit plus
-fresh readback. Missing commissioned security state, corrupt records,
-capacity failures and ambiguous durability are explicit refusals, never
-automatic NVS erasure or counter reset. Attempt records preserve the signed
-descriptor, controller/session binding, partition identity, consent and
-progress; resume does not erase the candidate.
+Only explicit commit may call `esp_ota_set_boot_partition()`. After a
+successful trial and late application health checks, confirmation uses
+`esp_ota_mark_app_valid_cancel_rollback()`. Automatic rollback requires a
+bootloader actually built with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`.
+An application-side setting cannot add that capability to a shipped
+bootloader. The selected Arduino/IDF artifact's capability and behaviour
+must be verified before claiming rollback support.
 
-Terminal records are not discarded by ordinary admission.
-`Esp32AttemptStore::replaceTerminal()` explicitly retires an exact winning
-Aborted or policy-qualified Staged checkpoint and persists a fresh attempt
-in one journal generation. It requires a strictly newer session tuple,
-different attempt digest, fresh authorization and consent, and current
-inactive-slot ownership. Staged retirement defaults to denial unless the
-shared policy proves no installer or trial still owns it. Replacement
-never resets security/TX/RX history or erases candidate bytes, and does not
-repair corrupt or uncertain metadata.
+The resolved Arduino-ESP32 2.0.17 ESP32-S3 SDK enables rollback, and
+inspection of its actual QIO/80 MHz bootloader ELF found the compiled
+NEW-to-PENDING_VERIFY and PENDING_VERIFY-to-ABORTED transitions. However,
+the same Arduino core confirms pending images during `initArduino()` by
+default. OTA integration must defer that confirmation through the core's
+`verifyRollbackLater()` hook and confirm only after late health checks.
+Vendor bootloader support does not, by itself, make the application safe
+to install.
 
-Revoked active attempts cannot resume. A separate default-deny
-`abortRevoked()` transition can move an exact Admitted, Erasing or
-Receiving checkpoint to Aborted with explicit policy authorization and
-fresh security, metadata-generation and SDK ownership checks. It preserves
-revoked consent, all progress and immutable fields; it never retires Staged
-installer ownership, grants old consent or erases image bytes. A later
-replacement requires its own fresh authorization and consent.
-
-The bounded storage checkpoint passes 78 native cases and compiles for the
-actual XIAO S3/Wio environment. It is **not connected to the board receiver**:
-the update-ownership arbiter, commissioned security/AEAD ledger schemas and
-local-consent policy must be supplied by shared integration. Unreferenced
-SDK boundary objects are currently discarded by the linker. No boot
-selection or mark-valid call is implemented, and stock Arduino's early
-trial confirmation/watchdog behavior remains an installation blocker.
+Earlier inactive-partition and NVS tests are evidence for those primitives,
+not for the replacement's receiver, explicit commit or trial recovery.
 No ESP32 hardware qualification is claimed.
-
-### Deterministic install-attempt identity
-
-`otaInstallAttemptNonce()` derives the first eight hash bytes as BE64 from
-`"MeshCore/OTA/install-attempt/v1"` (no NUL), controller32, campaignBE32,
-sessionBE32, attemptBE16 and SHA256(canonical59). Independent known-answer
-vectors pin the domain, byte order and each binding component. Retries of
-the same binding are deterministic.
-
-This portable primitive does not authenticate a controller or grant local
-consent. The durable attempt owner must retain the complete immutable
-binding, reject zero/colliding nonces and preserve replay history. Board
-wiring and persistent ownership remain separate acceptance gates.
 
 ### What this does not yet prove
 
@@ -286,8 +295,8 @@ acceptance gates and are deliberately not claimed as done:
   or rollback
 - ESP32 partition/NVS primitives do not qualify receiver integration, trial
   confirmation or installation
-- ESP32 security-counter and AEAD ledgers are not connected to those NVS
-  primitives; boot-enforced eFuse anti-rollback is not qualified
+- the selected ESP32 vendor artifact contains rollback handling, but late
+  application confirmation and actual installed recovery remain unqualified
 - stock nRF RF staging and airtime fairness have hardware evidence (see
   [the lab guide](hardware_lab.md)); actual installation, trial confirmation
   and power-loss rollback remain unqualified

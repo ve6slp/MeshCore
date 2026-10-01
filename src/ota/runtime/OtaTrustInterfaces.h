@@ -46,6 +46,12 @@ public:
   // legacy signature hook.
   virtual bool verifyDescriptorPolicy(const protocol::OtaDescriptor&) { return false; }
 
+  // Policy-only check for lean OTA admission: validates target/role/address/
+  // capabilities/counter without assuming any particular signer identity.
+  virtual bool verifyDescriptorPolicyOnly(const protocol::OtaDescriptor& descriptor) {
+    return verifyDescriptorPolicy(descriptor);
+  }
+
   // Receiver-local authorization gate. This must be a real local decision
   // derived from a previously verified descriptor and a decoded
   // Authorization payload, not merely the presence of an Authorization frame.
@@ -56,6 +62,17 @@ public:
   // Production implementations should delegate to the trust image-hash
   // pipeline over the staging flash region.
   virtual bool verifyStagedImageHash(const protocol::OtaDescriptor&) { return false; }
+
+  // Lean-path counterpart of verifyStagedImageHash(): recomputes/verifies
+  // the staged candidate's image bytes against the descriptor's embedded
+  // sha256, WITHOUT requiring the legacy compiled-anchor
+  // verifyDescriptor()/descriptor_verified_ state (the lean admission path
+  // only ever calls verifyDescriptorPolicyOnly() -- a full legacy
+  // verifyDescriptor() never runs, so a verifyStagedImageHash() that
+  // gates on that flag would fail closed for every lean candidate, not
+  // merely a hostile one). The default remains fail-closed for providers
+  // that only implement the legacy hook.
+  virtual bool verifyStagedImageHashPolicyOnly(const protocol::OtaDescriptor&) { return false; }
 
   // Durably commit the anti-rollback floor after a verified image has been
   // accepted for install. Production implementations should delegate to the
@@ -82,9 +99,24 @@ public:
   virtual ~IOtaStagingSink() = default;
 
   virtual Result beginSession(const protocol::OtaDescriptor& descriptor) = 0;
+  virtual Result resumeSession(const protocol::OtaDescriptor& descriptor) {
+    (void)descriptor;
+    return Result::Rejected;
+  }
   virtual Result writeChunk(uint64_t offset, const uint8_t* data, size_t len) = 0;
   virtual Result commit() = 0;
   virtual void abort() = 0;
+
+  // Optional read-back of previously-written staged bytes. Needed ONLY by
+  // an autonomous RF uploader re-transmitting blocks of a candidate it
+  // itself owns (it re-signs each block fresh at TX time with its own
+  // identity -- see OtaRfUploader.h -- rather than persisting a
+  // pre-computed per-block signature from USB upload time). Default
+  // Rejected keeps this additive: sinks that never act as an uploader
+  // (e.g. a pure RF-only receiver with no local USB cache) need not
+  // implement it, and a sink that lacks a real backing store for
+  // read-back fails closed rather than returning fabricated bytes.
+  virtual Result readChunk(uint64_t /*offset*/, uint8_t* /*out*/, size_t /*len*/) { return Result::Rejected; }
 
   // Optional hook: called once, right after the transport's canonical
   // wire descriptor + Ed25519 signature are authenticated (the same event
@@ -108,6 +140,8 @@ public:
   // no-op keeps this additive for sinks that don't need it.
   virtual void onAuthorizedSession(const OtaSessionId& /*session*/,
                                    const uint8_t /*controller*/[32]) {}
+
+  virtual void onAdmittedOwnerIdentity(const uint8_t /*ownerPublicKey*/[32]) {}
 };
 
 

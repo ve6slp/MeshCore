@@ -52,7 +52,21 @@ typedef struct XIAO_OTA_PACKED {
   uint32_t capability_flags;  /* e.g. XIAO_OTA_CAP_QSPI_INSTALL */
   uint16_t key_id;            /* XIAO_OTA_KEY_ID */
   uint16_t algorithm_id;      /* XIAO_OTA_ALGORITHM_ED25519 */
-  uint8_t trusted_public_key[32]; /* the exact Ed25519 key this binary verifies with */
+  /*
+   * NOT a trust anchor and NOT what this bootloader verifies install
+   * commands against: verification is dynamic, per-command, against
+   * EACH command's own embedded admitted_signer_public_key_ed25519 (see
+   * xiao_ota_command_v2_t, xiao_ota_record.h). This field is purely an
+   * informational record of the public half of whatever key
+   * tools/sign_image.py's --private-key convenience default happened to
+   * use for THIS build/board/role at prepare_upstream.py time -- i.e.
+   * "which lab/test key this artifact's own default signing tool would
+   * sign with," not "the one key this bootloader will accept." Treat it
+   * the same as board_target_id/role_id/capability_flags above: a
+   * qualified-build identity/provenance fact for tooling and app-side
+   * sanity checks, never an install-time authorization input.
+   */
+  uint8_t reference_signer_public_key_ed25519[32];
   uint32_t crc32;             /* IEEE CRC-32 over every byte above (xiao_ota_crc32) */
 } xiao_ota_boot_info_t;
 
@@ -65,10 +79,14 @@ typedef struct XIAO_OTA_PACKED {
  * XIAO_OTA_BOOT_INFO_ADDRESS, and MUST treat any false result -- whatever
  * the actual byte pattern turns out to be on an unqualified/stock image,
  * erased or not -- as "cannot confirm a qualified custom boot" and fail
- * closed rather than assume install capability.
+ * closed rather than assume install capability. Confirming a qualified
+ * custom boot this way is NOT itself an install-command trust decision:
+ * actual install-command signature verification always reads the
+ * admitted key from that specific command (xiao_ota_command_v2_t), never
+ * from reference_signer_public_key_ed25519 below.
  */
 void xiao_ota_boot_info_build(xiao_ota_boot_info_t *out, uint32_t board_target_id,
                               uint32_t role_id, uint32_t capability_flags,
                               uint16_t key_id, uint16_t algorithm_id,
-                              const uint8_t public_key[32]);
+                              const uint8_t reference_signer_public_key[32]);
 bool xiao_ota_boot_info_valid(const xiao_ota_boot_info_t *info);

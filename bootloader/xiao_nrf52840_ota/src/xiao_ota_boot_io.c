@@ -1,11 +1,8 @@
 /* Build this translation unit for minimum code size specifically
  * (GCC14's -Oz, distinct from the project-wide -Os the rest of the
- * bootloader uses) -- this file alone carries the role-continuity
- * evidence/receipt logic that pushed the no-SWD 38 KiB slot over
- * budget; -Oz here is strictly a non-semantic code-generation choice
- * (no crypto, no verification, no write-ordering behaviour is
- * weakened by it) and does not change any other translation unit's
- * own optimization level. */
+ * bootloader uses); -Oz here is strictly a non-semantic code-generation
+ * choice and does not change any other translation unit's own
+ * optimization level. */
 #pragma GCC optimize("Oz")
 
 #include "xiao_ota_boot_io.h"
@@ -18,23 +15,8 @@
 #include "ed25519.h"
 #include "crc16.h"
 #include "xiao_ota_layout.h"
-#include "xiao_ota_public_key.h"
 #include "xiao_ota_record.h"
 #include "xiao_ota_sha256.h"
-
-/*
- * Production always trusts the compiled-in lab public key. A native host
- * test that literally executes command_policy_valid() (not a parallel
- * reimplementation of it) needs to sign real commands without any
- * dependency on that committed key's actual private half, which this
- * bootloader deliberately never has access to at build time -- so the
- * test build alone may override this to a self-generated, test-only
- * keypair via -D. This does not change what a real bootloader binary
- * trusts: the override is never defined outside test builds.
- */
-#ifndef XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY
-#define XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY xiao_ota_lab_public_key_ed25519
-#endif
 
 #define COPY_CHUNK 256u
 
@@ -144,41 +126,40 @@ static bool progress_bytes_consistent(uint32_t progress, uint32_t extent) {
 
 /*
  * Structural decode + Ed25519 signature verification ONLY for a command
- * record of EITHER supported version, with no floor/extent/counter
- * context applied -- the exact subset of command_policy_valid() below
- * that is true or false independent of THIS boot's live admission state,
- * shared so a HISTORICAL (superseded but still physically present)
- * command can be cryptographically authenticated the same way a live one
- * is, without requiring it to also satisfy a floor/extent context it was
- * never evaluated against. Version dispatch/signed-byte-range rules are
- * identical to command_policy_valid(); see that function's doc-comment.
+ * record, with no floor/extent/counter context applied -- the exact
+ * subset of command_policy_valid() below that is true or false
+ * independent of THIS boot's live admission state, shared so a
+ * HISTORICAL (superseded but still physically present) command can be
+ * cryptographically authenticated the same way a live one is, without
+ * requiring it to also satisfy a floor/extent context it was never
+ * evaluated against. Checked against the command's own 59-byte
+ * big-endian wire descriptor and 64-byte Ed25519 signature -- the SAME
+ * bytes and signature the LoRa OTA transport already verified; see
+ * command_policy_valid()'s doc-comment.
  */
 static bool command_cryptographically_decoded(const xiao_ota_command_any_t *any,
                                               xiao_ota_install_command_t *out_intent) {
-  uint16_t version;
-  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
-  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
-    if (!xiao_ota_command_valid(&any->v1)) return false;
-    if (!xiao_ota_install_command_from_v1(&any->v1, out_intent)) return false;
-    if (ed25519_verify(any->v1.signature_ed25519,
-                       (const unsigned char *)&any->v1.descriptor,
-                       sizeof(any->v1.descriptor),
-                       XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY) != 1) {
-      return false;
-    }
-    return true;
+  if (!xiao_ota_command_v2_valid(any)) return false;
+  if (!xiao_ota_install_command_from_v2(any, out_intent)) return false;
+  /*
+   * Verify against the key THIS command itself carries -- the key the
+   * already-trusted, currently-running app durably admitted at COMMIT
+   * time (see xiao_ota_command_v2_t's doc-comment in xiao_ota_record.h).
+   * The bootloader never carries its own independent notion of "which
+   * key is an admin"; it only re-checks that signature_ed25519 is a
+   * genuine Ed25519 signature over wire_descriptor under EXACTLY this
+   * embedded key -- i.e. that the durable record is internally
+   * self-consistent, not that it was torn/corrupted since the app wrote
+   * it. Anti-rollback (a stale command signed under a previously-
+   * admitted but since-rotated key) is enforced separately by the
+   * counter-floor check in xiao_ota_install_command_policy_valid().
+   */
+  if (ed25519_verify(any->signature_ed25519, any->wire_descriptor,
+                     XIAO_OTA_WIRE_DESCRIPTOR_SIZE,
+                     any->admitted_signer_public_key_ed25519) != 1) {
+    return false;
   }
-  if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
-    if (!xiao_ota_command_v2_valid(&any->v2)) return false;
-    if (!xiao_ota_install_command_from_v2(&any->v2, out_intent)) return false;
-    if (ed25519_verify(any->v2.signature_ed25519, any->v2.wire_descriptor,
-                       XIAO_OTA_WIRE_DESCRIPTOR_SIZE,
-                       XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY) != 1) {
-      return false;
-    }
-    return true;
-  }
-  return false;
+  return true;
 }
 
 /*
@@ -204,18 +185,13 @@ static bool command_cryptographically_and_statically_authentic(
 }
 
 /*
- * Authenticates and authorizes a command record of EITHER supported
- * version and produces the normalized install intent. Version is
- * determined at the structural-validity/decode step ONLY, from
- * record_version -- there is no signature-format fallback or "try both"
- * behaviour: v1 is checked exclusively against its own 71-byte
- * little-endian descriptor and signature; v2 is checked exclusively
- * against its own 59-byte big-endian wire descriptor and signature (the
- * SAME bytes and signature the LoRa OTA transport already verified -- see
+ * Authenticates and authorizes a command record and produces the
+ * normalized install intent. Checked against the command's own 59-byte
+ * big-endian wire descriptor and 64-byte Ed25519 signature (the SAME
+ * bytes and signature the LoRa OTA transport already verified -- see
  * xiao_ota_command_v2_t in xiao_ota_record.h). All non-cryptographic
  * policy checks (target/role/address/counter/capability/extent/device)
- * are shared in xiao_ota_install_command_policy_valid() so both versions
- * are held to the exact same install policy.
+ * are in xiao_ota_install_command_policy_valid().
  */
 static bool command_policy_valid(const xiao_ota_io_t *io,
                                  const xiao_ota_command_any_t *any,
@@ -253,14 +229,12 @@ typedef enum {
  * selects which sector_tail_erased()-family helper slot_safe_to_
  * overwrite() uses to decide "genuinely never written" (see that
  * function's doc-comment). NONE is the plain single-record-per-sector
- * case (command, confirmation); STATE excludes the settings sidecar
- * window (state_sector_tail_erased()); FLOOR excludes the
- * BootFloorActivationReceiptV1 window (floor_sector_tail_erased()).
+ * case (command, confirmation, floor); STATE excludes the settings
+ * sidecar window (state_sector_tail_erased()).
  */
 typedef enum {
   XIAO_OTA_SHARED_TAIL_NONE = 0,
   XIAO_OTA_SHARED_TAIL_STATE,
-  XIAO_OTA_SHARED_TAIL_FLOOR,
 } xiao_ota_shared_tail_t;
 
 /* Whole physical 4 KiB erase unit blank FROM `start_offset` onward, not
@@ -326,33 +300,6 @@ static bool state_sector_tail_erased(const xiao_ota_io_t *io,
 }
 
 /*
- * The floor sector now ALSO legitimately holds a second, non-adjacent
- * known window: the floor record itself at offset 0 (sizeof(floor)
- * bytes), and a BootFloorActivationReceiptV1 (xiao_ota_record.h) at the
- * fixed XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET, up to
- * XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE bytes -- reserved sector
- * space main's directive placed deliberately inside the SAME physical 4
- * KiB floor sector. Exactly the same reasoning as
- * state_sector_tail_erased() above: a plain "everything after my own
- * record_size" scan would misread a genuinely present (or torn)
- * genesis receipt as foreign debris, forcing a real genesis-eligible
- * pair to read DAMAGED instead of MISSING. This checks every sector
- * byte EXCEPT both known windows.
- */
-static bool floor_sector_tail_erased(const xiao_ota_io_t *io,
-                                     uint32_t sector_base, bool *out_blank) {
-  *out_blank = true;
-  if (!range_erased(io, sector_base, sizeof(xiao_ota_floor_t),
-                    XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET, out_blank)) {
-    return false;
-  }
-  return range_erased(io, sector_base,
-                      XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET +
-                          XIAO_OTA_FLOOR_ACTIVATION_WINDOW_MAX_SIZE,
-                      XIAO_OTA_QSPI_SECTOR_SIZE, out_blank);
-}
-
-/*
  * A NOR flash program operation can only ever CLEAR bits (1 -> 0); it
  * never sets a bit back to 1 without a full sector erase. Starting from
  * a genuinely erased field (all-1s), a write of `XIAO_OTA_COMMIT_MARKER`
@@ -388,12 +335,11 @@ static bool floor_sector_tail_erased(const xiao_ota_io_t *io,
  * subsequently corrupted (or foreign data), and must never be silently
  * discarded.
  *
- * `shared_tail` selects state_sector_tail_erased() or
- * floor_sector_tail_erased() against `sector_base` instead of the plain
- * single-record tail check, when this record's physical erase unit is
- * known to also legitimately hold a second, non-adjacent window
- * (state+settings-sidecar, or floor+activation-receipt respectively);
- * `sector_base` is unused for XIAO_OTA_SHARED_TAIL_NONE.
+ * `shared_tail` selects state_sector_tail_erased() against `sector_base`
+ * instead of the plain single-record tail check, when this record's
+ * physical erase unit is known to also legitimately hold a second,
+ * non-adjacent window (state+settings-sidecar); `sector_base` is unused
+ * for XIAO_OTA_SHARED_TAIL_NONE.
  *
  * `body_valid`/`binding_ok`/`binding_ctx` resolve a DEEPER ambiguity the
  * marker-reachability test alone cannot fully close: a reachable-but-
@@ -579,11 +525,6 @@ static bool slot_safe_to_overwrite(const xiao_ota_io_t *io, uint32_t address,
       *out_io_error = true;
       return false;
     }
-  } else if (shared_tail == XIAO_OTA_SHARED_TAIL_FLOOR) {
-    if (!floor_sector_tail_erased(io, sector_base, &tail_blank)) {
-      *out_io_error = true;
-      return false;
-    }
   } else if (!sector_tail_erased(io, address, (uint32_t)record_size,
                                  &tail_blank)) {
     *out_io_error = true;
@@ -630,12 +571,10 @@ static bool slot_safe_to_overwrite(const xiao_ota_io_t *io, uint32_t address,
  * `a_sector_base`/`b_sector_base` and `shared_tail` are forwarded to
  * slot_safe_to_overwrite() -- equal to `a_address`/`b_address` with
  * `shared_tail=XIAO_OTA_SHARED_TAIL_NONE` for every single-record-per-
- * sector pair (command/confirmation), the owning STATE sector's own
- * base address with `shared_tail=XIAO_OTA_SHARED_TAIL_STATE` for BOTH
- * the state and the settings-sidecar pairs (one shared physical erase
- * unit), and the owning FLOOR sector's own base address with
- * `shared_tail=XIAO_OTA_SHARED_TAIL_FLOOR` for the floor pair (shares
- * its erase unit with the BootFloorActivationReceiptV1 window).
+ * sector pair (command/confirmation/floor), and the owning STATE
+ * sector's own base address with `shared_tail=XIAO_OTA_SHARED_TAIL_STATE`
+ * for BOTH the state and the settings-sidecar pairs (one shared physical
+ * erase unit).
  *
  * `body_valid`/`binding_ok`/`binding_ctx` are forwarded unchanged to
  * every slot_safe_to_overwrite() call this makes -- see that function's
@@ -925,11 +864,8 @@ typedef struct {
   bool command_b_valid;
 } state_ambiguous_binding_ctx_t;
 
-/* Raw transaction_nonce field, valid for either command wire version --
- * both xiao_ota_command_t (v1) and xiao_ota_command_v2_t (v2) share the
- * identical magic/record_version/record_bytes/sequence/transaction_nonce
- * prefix (see their declarations), so this reads correctly regardless of
- * which union member actually applies. */
+/* Raw transaction_nonce field; offset is fixed for the single command
+ * record type. */
 static uint64_t raw_command_transaction_nonce(const xiao_ota_command_any_t *any) {
   uint64_t nonce;
   memcpy(&nonce, (const uint8_t *)any + 12, sizeof(nonce));
@@ -1411,131 +1347,20 @@ static bool persist_state(const xiao_ota_io_t *io, xiao_ota_state_t *state,
   return true;
 }
 
-/* Forward declaration: defined further below (with its full doc-comment)
- * alongside floor_activation_receipt_binds_floor()/floor_role_evidence_
- * ok(), which both also use it -- persist_floor() needs it earlier in
- * file order to decide what is safe to propagate/erase. */
-static bool floor_activation_receipt_identity_role_ok(
-    const xiao_ota_io_t *io, const xiao_ota_floor_activation_receipt_t *r);
-
-/* Shared by persist_floor() below: reads one physical receipt window
- * into caller-supplied `window_out` (so the raw bytes stay available
- * for a later propagate/readback write) and reports whether it
- * independently identity/role-verifies, collapsing what would
- * otherwise be two duplicated read+parse+verify sequences (one per
- * window) into a single shared call site. */
-static bool floor_activation_window_verify_into(
-    const xiao_ota_io_t *io, uint32_t address, uint8_t *window_out,
-    bool *out_read_ok) {
-  /* window_out is always the caller's own word-aligned
-   * XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES buffer (every call site
-   * declares it `__attribute__((aligned(4)))`), and the receipt's wire
-   * layout is read byte-for-byte with no transform -- reinterpreting
-   * the leading XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES in place avoids a
-   * second, otherwise-pointless full-receipt stack copy on every call. */
-  *out_read_ok = io->qspi_read(io->ctx, address, window_out,
-                               XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES);
-  if (!*out_read_ok) return false;
-  return floor_activation_receipt_identity_role_ok(
-      io, (const xiao_ota_floor_activation_receipt_t *)(const void *)window_out);
-}
-
 static bool persist_floor(const xiao_ota_io_t *io, xiao_ota_floor_t *floor,
                           uint32_t *slot_address) {
   uint32_t target;
-  uint32_t source;
-  uint8_t source_window[XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES]
-      __attribute__((aligned(4)));
-  uint8_t target_window[XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES]
-      __attribute__((aligned(4)));
-  bool source_read_ok, target_read_ok, source_verified, target_verified;
   if (floor->sequence == UINT32_MAX) return false;
-  source = *slot_address;
-  target = (source == XIAO_OTA_FLOOR_A) ? XIAO_OTA_FLOOR_B : XIAO_OTA_FLOOR_A;
-  /* The genesis activation-receipt window shares its physical sector
-   * with this exact floor record body (XIAO_OTA_FLOOR_ACTIVATION_A/B ==
-   * XIAO_OTA_FLOOR_A/B + 0x100 -- see xiao_ota_layout.h), so the
-   * write_record() erase below would otherwise silently destroy
-   * whatever genesis receipt the TARGET slot was carrying. Ordinary
-   * ping-pong eventually revisits every slot as a future erase target,
-   * so after as few as two advances TARGET may be the ONLY slot still
-   * holding a verifying receipt (e.g. a prior advance's best-effort
-   * carry-forward write into what is now SOURCE never durably landed).
-   * Erasing TARGET first in that situation would permanently destroy
-   * this device's sole durable, cryptographically verifiable proof of
-   * its originally-commissioned role -- see floor_role_evidence_ok()'s
-   * doc-comment for why that evidence must stay available at every
-   * floor value, not only genesis. So: read BOTH windows and determine
-   * which (if either) currently verifies BEFORE touching either slot.
-   * If only TARGET verifies, durably program+readback those exact
-   * bytes into SOURCE's window FIRST (SOURCE is never erased by this
-   * call, and its window is only ever written here while still in its
-   * post-erase blank state from a prior round, so this write is always
-   * NOR-safe) and fail this advance closed, with NEITHER slot yet
-   * erased, if that propagation does not itself durably confirm --
-   * never erase TARGET while SOURCE remains unconfirmed. Only once
-   * SOURCE is confirmed to independently hold the evidence is it safe
-   * to erase TARGET and commit the new floor body into it. */
-  source_verified = floor_activation_window_verify_into(
-      io, source + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET, source_window,
-      &source_read_ok);
-  target_verified = floor_activation_window_verify_into(
-      io, target + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET, target_window,
-      &target_read_ok);
-  if (target_verified && !source_verified) {
-    if (!(source_read_ok &&
-         memcmp(source_window, target_window, sizeof(target_window)) == 0)) {
-      if (!io->qspi_write(io->ctx,
-                         source + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET,
-                         target_window, sizeof(target_window))) {
-        return false;
-      }
-      if (!io->qspi_read(io->ctx,
-                        source + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET,
-                        source_window, sizeof(source_window)) ||
-         memcmp(source_window, target_window, sizeof(target_window)) != 0) {
-        return false;
-      }
-    }
-    source_verified = true;
-  }
+  target = (*slot_address == XIAO_OTA_FLOOR_A) ? XIAO_OTA_FLOOR_B : XIAO_OTA_FLOOR_A;
   floor->magic = XIAO_OTA_FLOOR_MAGIC;
   floor->record_version = XIAO_OTA_FORMAT_VERSION;
   floor->record_bytes = sizeof(*floor);
-  /* Single erase of the target sector, then TWO separate writes into it
-   * -- the receipt window FIRST, the floor body+marker SECOND -- never
-   * a second erase-owning call after the receipt lands. This mirrors
-   * write_state_with_sidecar()'s own "one erase, two body writes into
-   * the same sector" shape, but in the opposite priority order: by the
-   * time this point is reached, SOURCE is already confirmed to durably
-   * hold the role evidence (either it always did, or the propagation
-   * above just confirmed it), so TARGET's own in-sector receipt copy is
-   * no longer safety-critical -- it only exists to make TARGET self-
-   * sufficient for a FUTURE advance's own propagate-before-erase check.
-   * It is still written and read back BEFORE the floor body/marker
-   * (never after), so a target floor record can never durably commit
-   * while this sector's own receipt copy is left unwritten or
-   * unconfirmed: a crash between the receipt write and the floor
-   * write leaves TARGET erased/invalid (SOURCE, never touched, is still
-   * the one read_pair() trusts next boot), not a "committed floor,
-   * missing receipt" state. */
   if (!io->qspi_erase_sector(io->ctx, target)) return false;
-  if (source_verified) {
-    if (!io->qspi_write(io->ctx,
-                        target + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET,
-                        source_window, sizeof(source_window)) ||
-       !io->qspi_read(io->ctx,
-                      target + XIAO_OTA_FLOOR_ACTIVATION_WINDOW_OFFSET,
-                      target_window, sizeof(target_window)) ||
-       memcmp(target_window, source_window, sizeof(source_window)) != 0) {
-      return false;
-    }
-  }
   if (!write_body_then_marker(io, target, floor, sizeof(*floor),
-                             offsetof(xiao_ota_floor_t, crc32),
-                             offsetof(xiao_ota_floor_t, commit_marker),
-                             floor->sequence + 1,
-                             (bool (*)(const void *))xiao_ota_floor_valid)) {
+                              offsetof(xiao_ota_floor_t, crc32),
+                              offsetof(xiao_ota_floor_t, commit_marker),
+                              floor->sequence + 1,
+                              (bool (*)(const void *))xiao_ota_floor_valid)) {
     return false;
   }
   *slot_address = target;
@@ -1813,22 +1638,15 @@ static bool xiao_ota_settings_restore_raw(
   return settings_write_raw(io, &raw);
 }
 
-/* Computes SHA-256 over the exact accepted command record's bytes, using
- * its own declared v1/v2 length (sizeof(xiao_ota_command_t) or
- * sizeof(xiao_ota_command_v2_t), matching whichever version it validated
- * as) -- a pure in-memory digest, no io needed. This is an audit/binding
- * value recorded in the settings sidecar to identify which exact signed
+/* Computes SHA-256 over the exact accepted command record's bytes -- a
+ * pure in-memory digest, no io needed. This is an audit/binding value
+ * recorded in the settings sidecar to identify which exact signed
  * command admitted a transaction; it is NOT a substitute for the
  * Ed25519 signature check already performed in command_policy_valid()
  * before this is ever called. */
 static void hash_command_digest(const xiao_ota_command_any_t *any,
                                 uint8_t digest[32]) {
-  uint16_t version;
-  size_t length;
-  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
-  length = (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2)
-               ? sizeof(any->v2) : sizeof(any->v1);
-  sha256_of(any, length, digest);
+  sha256_of(any, sizeof(*any), digest);
 }
 
 /* Shared CRC-16 streaming-scan core: active_extent_from_settings() and
@@ -1985,323 +1803,6 @@ static bool finalize_install_and_verify(const xiao_ota_io_t *io,
   }
   memcpy(state->installed_hash_sha256, out_digest, 32);
   return true;
-}
-
-/*
- * BootFloorActivationReceiptV1 verification (see xiao_ota_record.h's
- * doc-comment): true only if `r` is a fully self-consistent, genuinely
- * signed genesis-activation receipt binding THIS exact device, THIS
- * exact compiled binary's qualification, AND the ALREADY-PERSISTED,
- * already-committed `floor` record passed in here -- never a claim
- * checked against a fresh, live re-derivation of "whatever happens to
- * be running right now". A receipt is provenance for a floor body that
- * genuinely, durably exists; a live hardware match alone (current
- * running image hash/extent) is explicitly NOT proof that floor 0 was
- * ever actually provisioned, and must never substitute for an actual
- * persisted record -- see the XIAO_OTA_PAIR_FOUND/XIAO_OTA_PAIR_MISSING
- * handling in xiao_ota_boot_process_io() for why this function is only
- * ever called once a real, committed floor record is already in hand.
- *
- * original_sdk28_digest is NOT re-derived and compared HERE, inside
- * floor_activation_receipt_binds_floor() itself, against a fresh read of
- * the CURRENT settings page: the 28-byte settings page
- * (xiao_ota_settings_raw_t) includes the bank_0/bank_0_crc/bank_0_size
- * triad, which any in-flight OTA transaction legitimately, durably
- * mutates well before that transaction's own confirmation/rollback ever
- * resolves -- comparing against a fresh live read INSIDE this function
- * (which has no notion of which phase/transaction is currently active)
- * would risk spuriously flipping an already-established, still-
- * genuinely-valid genesis floor untrustworthy mid-transaction. Unlike
- * baseline_hash_sha256/baseline_extent (which this function binds
- * directly against the persisted floor record's own, transaction-
- * invariant fields), there is no equivalent persisted, transaction-
- * invariant snapshot of the settings page available to THIS function
- * alone. original_sdk28_digest IS still actively, independently checked
- * by the caller -- see genesis_sdk28_baseline_ok(), called right after
- * this function succeeds, which has the phase/sidecar context needed to
- * pick the correct baseline (live settings page, or the admission-time
- * sidecar snapshot while a transaction is active) to compare it against.
- *
- * Split into two layers: floor_activation_receipt_identity_role_ok()
- * below verifies everything about `r` that is TRUE FOREVER for this
- * exact device/binary -- genuine Ed25519 signature by the trust anchor,
- * hw_uid/target/profile/layout_id/key_id identity, and (critically)
- * current_role == XIAO_OTA_COMPILED_ROLE_ID -- entirely independent of
- * which floor value happens to be currently persisted. The content
- * binding (baseline_hash_sha256/baseline_extent against one SPECIFIC,
- * already-persisted floor body) is only meaningful for the genesis
- * (floor 0) moment itself, so it stays in floor_activation_receipt_binds_
- * floor(), the genesis-only wrapper. floor_role_evidence_ok() (further
- * below) reuses the identity/role layer alone at ANY floor value, so a
- * role-1-compiled binary can never ride on anti-rollback history that
- * was only ever genesis-certified for role 0 (or vice versa), even
- * after the floor has long since advanced past 0 -- see persist_floor()'s
- * carry-forward of this exact receipt window on every advance, which is
- * what keeps this evidence available for that check beyond genesis. */
-static bool floor_activation_receipt_identity_role_ok(
-    const xiao_ota_io_t *io, const xiao_ota_floor_activation_receipt_t *r) {
-  uint8_t digest[32];
-  uint8_t key_hash[32];
-
-  if (!xiao_ota_floor_activation_receipt_body_valid(r)) return false;
-  if (r->boot_counter_domain != XIAO_OTA_BOOT_COUNTER_DOMAIN) return false;
-  if (r->hw_uid != io->device_address(io->ctx)) return false;
-  if (r->target != XIAO_OTA_BOARD_TARGET) return false;
-#if defined(XIAO_OTA_FLOOR_ACTIVATION_COMPILED_PROFILE)
-  if (r->profile != XIAO_OTA_FLOOR_ACTIVATION_COMPILED_PROFILE) return false;
-#else
-  return false; /* unrecognized compiled board target: refuse, never trust */
-#endif
-  if (r->layout_id != XIAO_OTA_FLOOR_ACTIVATION_LAYOUT_ID) return false;
-  /* The role being genesis-activated must equal THIS binary's own
-   * compiled role identity (XIAO_OTA_COMPILED_ROLE_ID), never a
-   * hardcoded "genesis is always role 0": a role-1 (repeater) binary
-   * must only ever accept a receipt certifying role 1 at genesis, and a
-   * role-0 (companion) binary only role 0 -- see
-   * xiao_ota_install_command_static_identity_valid() for the identical
-   * compiled-role exact-equality discipline on the install-command side.
-   * There is still no 0->1 (or 1->0) runtime role TRANSITION implemented
-   * here or anywhere else: this only governs which role a FIRST,
-   * never-yet-committed genesis floor is allowed to certify, and that
-   * role can never change for an already-committed floor (there is no
-   * code path that re-derives or overwrites current_role after the
-   * floor is durably persisted). */
-  if (r->current_role != XIAO_OTA_COMPILED_ROLE_ID) return false;
-  if (r->key_id != XIAO_OTA_KEY_ID) return false;
-  /* Only genesis (floor 0) activation is implemented; any other declared
-   * activation_floor value is refused rather than trusted. */
-  if (r->activation_floor != 0u) return false;
-
-  /* SHA-256 is a streaming/incremental hash: feeding the domain prefix
-   * and the receipt body as two separate update() calls produces the
-   * IDENTICAL digest to concatenating them into one buffer first (see
-   * the same incremental-update pattern already used by
-   * copy_internal_to_qspi()'s/backup hashing loops above) -- this
-   * avoids a redundant 366-byte stack scratch buffer and two memcpy()
-   * calls for no behavioural difference. */
-  {
-    xiao_ota_sha256_t sha;
-    xiao_ota_sha256_init(&sha);
-    xiao_ota_sha256_update(&sha, XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN,
-                           XIAO_OTA_FLOOR_ACTIVATION_SIGNING_DOMAIN_LEN);
-    xiao_ota_sha256_update(&sha, r,
-                           offsetof(xiao_ota_floor_activation_receipt_t,
-                                   signature_ed25519));
-    xiao_ota_sha256_final(&sha, digest);
-  }
-  if (ed25519_verify(r->signature_ed25519, digest, sizeof(digest),
-                     XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY) != 1) {
-    return false;
-  }
-
-  sha256_of(XIAO_OTA_TRUST_ANCHOR_PUBLIC_KEY, 32, key_hash);
-  return memcmp(r->key_fingerprint, key_hash, sizeof(r->key_fingerprint)) == 0;
-}
-
-static bool floor_activation_receipt_binds_floor(
-    const xiao_ota_io_t *io, const xiao_ota_floor_activation_receipt_t *r,
-    const xiao_ota_floor_t *floor) {
-  if (!floor_activation_receipt_identity_role_ok(io, r)) return false;
-  /* Bind against the ALREADY-PERSISTED floor record's own fields, never
-   * a fresh live re-derivation -- see this function's doc-comment. */
-  if (r->baseline_extent != floor->active_image_extent) return false;
-  return all_equal(floor->confirmed_hash_sha256, r->baseline_hash_sha256);
-}
-
-/*
- * Role-continuity gate for ANY already-trusted floor value, genesis or
- * not: true only if AT LEAST ONE of the two FIXED, physical genesis-
- * receipt windows (XIAO_OTA_FLOOR_ACTIVATION_A/B -- read unconditionally
- * by address, independent of which floor slot is currently "winning")
- * still holds a receipt that identity/role-verifies for THIS exact
- * device and THIS exact compiled role. Deliberately does NOT re-check
- * baseline_hash_sha256/baseline_extent (see floor_activation_receipt_
- * identity_role_ok()'s doc-comment) -- those are meaningless once the
- * floor has advanced past the image the genesis receipt actually
- * describes; only identity+role need to stay true forever.
- *
- * *out_io_error distinguishes a genuine QSPI read failure (fail closed
- * to Recovery, identically to every other IO_ERROR path in this file)
- * from an ordinary "no verifying receipt in either window" result
- * (fail closed to "floor untrustworthy", identically to how a genesis
- * floor's own missing/mismatched receipt is already handled -- see the
- * XIAO_OTA_PAIR_FOUND/floor.confirmed_counter_floor==0 case above).
- * This is the sole defense against a swapped, differently-role-compiled
- * loader binary silently inheriting an existing confirmed floor/anti-
- * rollback history that was only ever genesis-certified for the OTHER
- * role: the install-command's own role_id check alone cannot catch this,
- * since a genuinely, validly signed command for the NEW compiled role
- * would otherwise pass that check on its own. (Calls
- * floor_activation_window_verify_into(), defined earlier alongside
- * persist_floor(), which also uses it.) */
-
-/* Reads both physical activation-receipt windows and reports whether
- * EITHER one verifies as provenance for the ALREADY-PERSISTED `floor`
- * record passed in (see floor_activation_receipt_binds_floor() above);
- * *out_io_error distinguishes a genuine read failure (must fail closed
- * exactly like any other IO_ERROR) from an ordinary absent/invalid
- * receipt. Only ever called once `floor` is already a genuinely
- * committed XIAO_OTA_PAIR_FOUND record -- never to manufacture one.
- * Reuses floor_activation_window_verify_into() (defined earlier,
- * alongside persist_floor() which also needs it) rather than a second,
- * near-identical read+parse+verify helper -- both callers share the
- * exact same "read the full word-aligned physical window, parse only
- * the leading logical bytes, identity/role-verify" sequence. Reads
- * BOTH windows into ONE shared raw scratch buffer sequentially (never
- * both at once), keeping stack usage and code size down. */
-/* Streams a bounded chunk at a time (never a second full-window
- * resident buffer) to compare the bytes durably stored at a FIRST,
- * already-identity/role-verified receipt window's physical address
- * against a SECOND, already-fully-resident verified window's bytes,
- * for exact byte-for-byte provenance equality over the full physical
- * window (all 386 logical signed bytes plus trailing alignment
- * padding) -- not a CRC/hash proxy, which can theoretically collide
- * for genuinely different signed content. Re-reads the first window's
- * address again (a few extra small, 4-byte-aligned QSPI reads) rather
- * than keeping it buffered whole, since this path only runs when BOTH
- * physical windows independently verify (the rare case), not on every
- * ordinary boot. */
-static bool __attribute__((noinline))
-floor_activation_window_content_equal(const xiao_ota_io_t *io,
-                                      uint32_t address,
-                                      const uint8_t *other) {
-  uint8_t chunk[32] __attribute__((aligned(4)));
-  size_t offset = 0;
-  while (offset < XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES) {
-    size_t n = XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES - offset;
-    if (n > sizeof(chunk)) n = sizeof(chunk);
-    if (!io->qspi_read(io->ctx, address + offset, chunk, n)) return false;
-    if (memcmp(chunk, other + offset, n) != 0) return false;
-    offset += n;
-  }
-  return true;
-}
-
-static bool __attribute__((noinline))
-floor_role_evidence_ok(const xiao_ota_io_t *io, bool *out_io_error) {
-  static const uint32_t kWindows[2] = {XIAO_OTA_FLOOR_ACTIVATION_A,
-                                       XIAO_OTA_FLOOR_ACTIVATION_B};
-  uint8_t window[XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES]
-      __attribute__((aligned(4)));
-  uint32_t first_verified_addr = 0;
-  bool any_verified = false;
-  bool read_ok;
-  unsigned i;
-  *out_io_error = false;
-  for (i = 0; i < 2u; ++i) {
-    if (floor_activation_window_verify_into(io, kWindows[i], window,
-                                            &read_ok)) {
-      /* A SECOND independently valid receipt must be the EXACT same
-       * signed bytes as the first, never merely a matching CRC/hash --
-       * legitimate steady-state operation always carries the identical
-       * receipt bytes into both windows (see persist_floor()'s
-       * propagate-before-erase copy), so any byte-level mismatch here
-       * can only mean two distinct, separately signed genesis
-       * authorizations exist for this same device/role -- a provenance
-       * conflict that must never be resolved by silently picking
-       * whichever window happens to verify. */
-      if (any_verified && !floor_activation_window_content_equal(
-                             io, first_verified_addr, window)) {
-        return false;
-      }
-      if (!any_verified) {
-        first_verified_addr = kWindows[i];
-        any_verified = true;
-      }
-    } else if (!read_ok) {
-      *out_io_error = true;
-      return false;
-    }
-  }
-  return any_verified;
-}
-
-/*
- * A verified genesis receipt's original_sdk28_digest is a signed claim
- * about the device's true factory-baseline settings page (see
- * xiao_ota_record.h's field doc-comment) -- but it is opaque unless
- * checked against the RIGHT bytes for the CURRENT boot's phase:
- *
- *  - No transaction is currently active (have_state is false, or the
- *    existing state is in a terminal phase -- EMPTY/CONFIRMED/FAILED):
- *    while confirmed_counter_floor==0, no transaction has EVER been
- *    confirmed (persist_floor() never advances it from 0 except via a
- *    prior CONFIRMED admission, which would have moved the floor off 0
- *    already), and any prior transaction that reached a terminal FAILED
- *    state was, by construction, rolled back verbatim (see
- *    test_rollback_restores_settings_raw_verbatim) -- so the LIVE
- *    settings page is provably still the true original baseline right
- *    now, safe to hash and compare directly.
- *
- *  - A transaction IS currently active (non-terminal phase, e.g.
- *    TRIAL_BOOT): the live settings page may have already been legitimately
- *    mutated by the in-flight candidate itself, so the live page must
- *    NOT be used here. Instead compare against the admission-time
- *    sidecar snapshot (sidecar.original_settings_raw), which froze the
- *    true pre-transaction baseline at the moment this very transaction
- *    began -- but ONLY when that sidecar is itself proven to be the
- *    genuine one bound to the currently-trusted state record
- *    (sidecar_matches_state), never an unrelated or stale one. If no
- *    such proof is available, the baseline is simply unverifiable this
- *    boot -- fail closed (deny genesis trust) rather than assume.
- */
-static bool genesis_sdk28_baseline_ok(
-    const xiao_ota_io_t *io, bool have_state, bool state_phase_active,
-    bool have_sidecar, bool sidecar_matches_state,
-    const xiao_ota_settings_sidecar_t *sidecar,
-    const uint8_t original_sdk28_digest[32]) {
-  uint8_t digest[32];
-  if (have_state && state_phase_active) {
-    if (!have_sidecar || !sidecar_matches_state) return false;
-    xiao_ota_settings_raw_t snapshot;
-    memcpy(&snapshot, sidecar->original_settings_raw, sizeof(snapshot));
-    sha256_of(&snapshot, sizeof(snapshot), digest);
-  } else {
-    xiao_ota_settings_raw_t live;
-    if (!settings_read_raw(io, &live)) return false;
-    sha256_of(&live, sizeof(live), digest);
-  }
-  return memcmp(digest, original_sdk28_digest, 32) == 0;
-}
-
-static bool floor_genesis_receipt_matches(
-    const xiao_ota_io_t *io, const xiao_ota_floor_t *floor, bool *out_io_error,
-    xiao_ota_floor_activation_receipt_t *out_matched) {
-  /* Needs the PARSED receipt back from BOTH windows regardless of
-   * whether either verifies (floor_activation_receipt_binds_floor() is
-   * checked separately, per-window, below) -- a plain word-aligned
-   * raw-read-then-parse, reusing floor_activation_window_verify_into()'s
-   * same read+parse shape via a throwaway raw scratch buffer rather
-   * than a third distinct read helper. */
-  uint8_t window[XIAO_OTA_FLOOR_ACTIVATION_PHYSICAL_BYTES]
-      __attribute__((aligned(4)));
-  xiao_ota_floor_activation_receipt_t ra __attribute__((aligned(4)));
-  xiao_ota_floor_activation_receipt_t rb __attribute__((aligned(4)));
-  bool read_ok;
-  *out_io_error = false;
-  (void)floor_activation_window_verify_into(io, XIAO_OTA_FLOOR_ACTIVATION_A,
-                                            window, &read_ok);
-  if (!read_ok) {
-    *out_io_error = true;
-    return false;
-  }
-  memcpy(&ra, window, XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES);
-  (void)floor_activation_window_verify_into(io, XIAO_OTA_FLOOR_ACTIVATION_B,
-                                            window, &read_ok);
-  if (!read_ok) {
-    *out_io_error = true;
-    return false;
-  }
-  memcpy(&rb, window, XIAO_OTA_FLOOR_ACTIVATION_TOTAL_BYTES);
-  if (floor_activation_receipt_binds_floor(io, &ra, floor)) {
-    if (out_matched != NULL) *out_matched = ra;
-    return true;
-  }
-  if (floor_activation_receipt_binds_floor(io, &rb, floor)) {
-    if (out_matched != NULL) *out_matched = rb;
-    return true;
-  }
-  return false;
 }
 
 /*
@@ -2566,7 +2067,7 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
     floor_binding_ctx.state_candidate_hash_sha256 = state.candidate_hash_sha256;
     floor_status = read_pair(io, XIAO_OTA_FLOOR_A, XIAO_OTA_FLOOR_B,
                              XIAO_OTA_FLOOR_A, XIAO_OTA_FLOOR_B,
-                             XIAO_OTA_SHARED_TAIL_FLOOR,
+                             XIAO_OTA_SHARED_TAIL_NONE,
                              &floor_a,
                              &floor_b, sizeof(floor),
                              offsetof(xiao_ota_floor_t, commit_marker),
@@ -2579,63 +2080,11 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
     case XIAO_OTA_PAIR_FOUND:
       have_floor = true;
       floor_trustworthy = true;
-      if (floor.confirmed_counter_floor == 0u) {
-        /* Floor 0 is the one value an ordinary confirmed-transaction
-         * advance never produces (persist_floor() below is only ever
-         * called with a HIGHER floor derived from a prior CONFIRMED
-         * state) -- it can only ever be established once, out of thin
-         * air, by factory/provisioning. A fully committed, CRC-valid
-         * record merely claiming 0 therefore proves nothing about its
-         * own legitimacy by itself: it must be independently vouched
-         * for by a verified BootFloorActivationReceiptV1 binding THIS
-         * EXACT persisted floor body (never a fresh live-hardware
-         * match alone -- see floor_activation_receipt_binds_floor()).
-         * Absent a matching receipt, this is untrustworthy exactly
-         * like DAMAGED, even though the bytes are otherwise perfectly
-         * well-formed. */
-        bool receipt_io_error = false;
-        xiao_ota_floor_activation_receipt_t matched_receipt
-            __attribute__((aligned(4)));
-        bool genesis_ok = floor_genesis_receipt_matches(
-            io, &floor, &receipt_io_error, &matched_receipt);
-        if (receipt_io_error) {
-          goto recover;
-        }
-        /* The receipt's own fields established structural/cryptographic
-         * provenance above; additionally validate its signed
-         * original_sdk28_digest claim against the true original
-         * settings-page baseline for the current phase (see
-         * genesis_sdk28_baseline_ok()'s doc-comment) -- a legitimate
-         * receipt bound to a WRONG factory baseline must deny genesis
-         * trust exactly like any other tampered/mismatched field, with
-         * no mutation performed either way. */
-        if (genesis_ok &&
-            !genesis_sdk28_baseline_ok(
-                io, have_state,
-                have_state && !xiao_ota_command_acceptable_phase(
-                                  true, (xiao_ota_phase_t)state.phase),
-                have_sidecar, sidecar_matches_state, &sidecar,
-                matched_receipt.original_sdk28_digest)) {
-          genesis_ok = false;
-        }
-        if (!genesis_ok) {
-          have_floor = false;
-          floor_trustworthy = false;
-          memset(&floor, 0, sizeof(floor));
-        }
-      }
       break;
     case XIAO_OTA_PAIR_MISSING:
-      /* Genuinely blank pair of floor slots is ALWAYS untrustworthy,
-       * with no exception: a BootFloorActivationReceiptV1 is provenance
-       * for an already-durable, matching, committed floor body (see the
-       * XIAO_OTA_PAIR_FOUND case above), never an instruction to
-       * conjure one into existence from nothing. Even a receipt that
-       * verifies and even a live hardware match give no proof that
-       * floor 0 was ever actually, durably provisioned -- only an
-       * actual persisted floor record can prove that. A CONFIRMED state
-       * record below may still independently dominate and repair this,
-       * same as for DAMAGED. */
+      /* Genuinely blank pair of floor slots is untrustworthy on its own.
+       * A CONFIRMED state record below may still independently dominate
+       * and repair this, same as for DAMAGED. */
       have_floor = false;
       floor_trustworthy = false;
       memset(&floor, 0, sizeof(floor));
@@ -2697,31 +2146,6 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
     uint8_t running_digest[32];
     if (hash_internal(io, XIAO_OTA_APP_START, expected_active_extent, running_digest) &&
         all_equal(running_digest, state.candidate_hash_sha256)) {
-      /* This block is about to durably MUTATE the floor pair (erase one
-       * physical slot and commit a reconstructed record into it) based
-       * solely on the CONFIRMED state's own say-so. Checking role
-       * evidence only AFTER persist_floor_or_recover() below would be
-       * too late: the mutation (and persist_floor()'s own erase of
-       * whichever slot it targets) would already be durably committed
-       * by the time any failure here could be noticed, and a genuinely
-       * role-unproven/damaged device could have a replacement-role
-       * loader's reconstruction request silently stamp a floor onto
-       * history that was never actually certified for it. Require
-       * verified role evidence to already exist in at least one
-       * physical window BEFORE any reconstruction write is attempted --
-       * exactly like the final gate below, but moved ahead of this
-       * specific mutation path, which that final gate (applied only
-       * after this whole block runs) cannot retroactively undo. A
-       * genuine read failure fails closed to Recovery, identically to
-       * every other IO_ERROR path in this function; an ordinary
-       * absent/non-verifying receipt (e.g. a legacy device whose floor
-       * pair was damaged AND both activation windows are also lost)
-       * fails closed the same way -- conservatively RoleUnproven, never
-       * inferred from the floor/state/loader/command alone. */
-      bool role_io_error = false;
-      if (!floor_role_evidence_ok(io, &role_io_error)) {
-        goto recover;
-      }
       /* Mutate the already-read `floor` record in place rather than
        * building a separate zeroed copy: when !have_floor it was
        * already memset to all-zero by the DAMAGED/MISSING switch case
@@ -2784,43 +2208,6 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
      * floor_trustworthy exactly as read_pair() produced them -- fail
      * closed (refuse new admission below) rather than ever repairing
      * from an unverified assumption. */
-  }
-  /* Final, unconditional role-continuity gate: applies to EVERY path
-   * that could have left floor_trustworthy true above -- a direct
-   * floor>0 XIAO_OTA_PAIR_FOUND read (which, unlike the genesis/floor==0
-   * case, never itself checks a receipt), AND the CONFIRMED-state
-   * repair block just above (which rebuilds floor from state.candidate_
-   * counter/hash/extent with no role check of its own either). Without
-   * this, a physically swapped, differently-role-compiled loader binary
-   * could silently inherit an existing confirmed floor/anti-rollback
-   * history that was only ever genesis-certified for the OTHER role,
-   * admitting a validly signed install command for ITS OWN compiled
-   * role even though THIS device's durable history belongs to the
-   * other one -- the install-command's own role_id check alone cannot
-   * catch that, since a genuinely signed command for the new compiled
-   * role passes it trivially. A floor==0 genesis record that already
-   * passed its own (strictly stronger, content-binding) receipt check
-   * above trivially passes this too; nothing here weakens that path.
-   *
-   * Terminal, not a soft demotion: missing, corrupt, wrong-role or
-   * conflicting receipt evidence (or either required window read
-   * failing) must stop this boot in Recovery with nothing further
-   * mutated -- not merely clear floor_trustworthy and fall through to
-   * "refuse new admission" below. A soft demotion still lets an
-   * already-ACTIVE/TRIAL transaction's resume logic (further down,
-   * keyed off this same floor_trustworthy flag) quietly reinterpret
-   * the failure as an ordinary "command no longer matches" and drive
-   * a ROLLBACK_COPYING state-persist of its own -- a real mutation,
-   * and not the externally-visible Recovery escalation a genuine
-   * role/history conflict demands. force_recovery() every time this
-   * check itself fails, exactly like the equivalent gate already does
-   * inside the CONFIRMED-state repair block above. */
-  if (floor_trustworthy) {
-    bool role_io_error = false;
-    if (!floor_role_evidence_ok(io, &role_io_error)) {
-      (void)role_io_error;
-      goto recover;
-    }
   }
   if (xiao_ota_command_acceptable_phase(have_state, (xiao_ota_phase_t)state.phase)) {
     if (!floor_trustworthy || !have_active_extent ||

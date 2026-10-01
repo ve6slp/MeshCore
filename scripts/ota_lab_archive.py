@@ -28,8 +28,8 @@ This tool NEVER:
     An archive is EVIDENCE ONLY: a snapshot of whatever bytes were on the
     device at capture time. It is never proof that a later-flashed
     diagnostic image (or any other firmware) preserves the original stock
-    application -- MAIN separately keeps the frozen original artifact for
-    that purpose.
+    application. Preserve a validated recovery application separately;
+    a diagnostic capture cannot reconstruct an application it replaced.
 
 Command line only ever takes `--role` (an entry in lab/devices.ini's
 `[roles]` section), never a raw serial device path.
@@ -446,7 +446,7 @@ class DeviceRefused(SystemExit):
     pass
 
 
-def resolve_authorized_device(role: str):
+def authorized_serial(role: str) -> str:
     protected = lab_device.load_protected()
     protected_serials = set(protected.values())
     roles = lab_device.load_roles()  # already refuses role/protected serial collisions itself.
@@ -458,6 +458,11 @@ def resolve_authorized_device(role: str):
     stable_serial = roles[role]
     if stable_serial in protected_serials:
         raise DeviceRefused(f"role '{role}' resolves to a protected serial; refusing")
+    return stable_serial
+
+
+def resolve_authorized_device(role: str):
+    stable_serial = authorized_serial(role)
     device = lab_device.resolve(role, mode=lab_device.MODE_APP)
     if device.serial != stable_serial:
         raise DeviceRefused(
@@ -521,7 +526,7 @@ ARCHIVE_NOTICE = (
     "automatically restore security counters, tails, floors, SDK header, or "
     "image bytes onto any device. It is also NOT proof that a later-flashed "
     "diagnostic or other firmware preserves the original stock application; "
-    "the frozen original artifact remains the authority for that."
+    "a validated recovery application must be preserved separately."
 )
 
 
@@ -890,6 +895,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"{INTERNAL_FLASH_REGION_BYTES} internal + {QSPI_REGION_BYTES} QSPI bytes); "
             "refusing to treat it as valid evidence")
 
+    if args.validate_only:
+        stable_serial = authorized_serial(args.role)
+        if (metadata["role"] != args.role or metadata["stable_serial"] != stable_serial
+                or metadata["device_uid_hex"] != stable_serial.upper()):
+            raise DeviceRefused("archive role, serial or device UID does not match the authorized lab role")
+        print(f"archive valid role={args.role}: authenticated full-media capture; no live device comparison")
+        return 0
+
     region_table = build_region_table()
     port, link, identity, stable_serial = _connect_and_query_identity(args.role, args)
     try:
@@ -1005,6 +1018,8 @@ def main(argv=None) -> int:
     verify = sub.add_parser("verify", help="re-read a live board and compare it to a previously captured archive")
     add_common(verify)
     verify.add_argument("--archive", required=True)
+    verify.add_argument("--validate-only", action="store_true",
+                        help="authenticate the complete archive and role binding without discovering or opening a board")
     verify.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)

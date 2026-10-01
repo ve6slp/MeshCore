@@ -9,7 +9,33 @@ void Mesh::begin() {
 }
 
 void Mesh::loop() {
+#if MESHCORE_LORA_OTA
+  _ota.tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+#endif
   Dispatcher::loop();
+#if MESHCORE_LORA_OTA
+  _ota.loop();
+  // Leave the reply pending on queue/budget pressure. Census is a real RF
+  // exchange even with no USB client connected.
+  uint8_t frame[ota::kOtaDirectFrameBytes];
+  size_t len = 0;
+  if (_mgr->getOutboundTotal() == 0 && !isSendInProgress() &&
+      _ota.peekOutboundControlFrame(frame, sizeof(frame), len, _ms->getMillis())) {
+    const auto category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
+    const auto airtime = _radio->getEstAirtimeFor(static_cast<int>(len + 4));
+    if (_ota.canTransmit(_ms->getMillis(), category, airtime, true, hasQueuedNormalTraffic())) {
+      auto* packet = createOtaData(frame, len);
+      if (packet) {
+        if (_ota.directActive() || frame[0] == ota::kOtaDirectAckKind) {
+          sendZeroHop(packet);
+          _ota.releaseOutboundControlFrame();
+        } else if (sendFlood(packet)) {
+          _ota.releaseOutboundControlFrame();
+        }
+      }
+    }
+  }
+#endif
 }
 
 bool Mesh::allowPacketForward(const mesh::Packet* packet) { 
@@ -371,7 +397,7 @@ DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
 
 void Mesh::onOtaDataRecv(Packet* packet) {
 #if MESHCORE_LORA_OTA
-  _ota.handleReceivedFrame(packet->payload, packet->payload_len);
+  _ota.handleReceivedFrame(packet->payload, packet->payload_len, _ms->getMillis());
 #else
   (void)packet;
 #endif

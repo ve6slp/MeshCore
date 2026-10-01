@@ -38,11 +38,8 @@
 #include "RateLimiter.h"
 
 #if MESHCORE_LORA_OTA
-#include <helpers/ota/OtaBoardBaselineMeasurementSource.h>
 #include <helpers/ota/OtaFirmwareService.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
-#include <helpers/ota/OtaMeasurementControlJobBackend.h>
-#include "ota/runtime/OtaControlSessionRouter.h"
 #endif
 
 #ifdef WITH_BRIDGE
@@ -193,47 +190,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   // real outcomes via notifyOtaTrialIdentityLoadFault()/
   // notifyOtaIdentityConfirmedLoaded() below (called from main.cpp,
   // which is where this board's identity load/generate/save actually
-  // happens) and consumed read-only by _ota_baseline_source_ and
-  // tickOtaTrialHealth().
+  // happens) and consumed read-only by tickOtaTrialHealth().
   mesh::ota::OtaFirmwareService _ota_service_;
   uint32_t _ota_trial_last_radio_fault_count_ = 0;
-  mesh::ota::OtaBoardBaselineMeasurementSource _ota_baseline_source_;
-  mesh::ota::OtaBaselineMeasurementCollector _ota_baseline_collector_;
-  // Mirrors examples/companion_radio/MyMesh.h's identically-purposed
-  // members byte-for-byte: the real MEASURE/POLL/READ_OBJECT
-  // IOtaControlJobBackend bound into _ota_control_backend_slot_ in
-  // begin() below; Certify/Prepare/Activate remain an explicit terminal
-  // NoCapacity until Authority's/Store's own adapters land.
-  meshcore::ota::runtime::OtaMeasurementControlJobBackend _ota_measurement_job_backend_;
-  // Device-side entropy bridge for OtaControlSessionRouter's minted
-  // session ids / CHALLENGE bytes. Deliberately fails closed rather than
-  // reading from any `mesh::RNG&` this instance was constructed with:
-  // the only concrete RNG wired in this firmware (`fast_rng`/`StdRNG`,
-  // see src/helpers/ArduinoHelpers.h) is `::random(0,256)`, exactly the
-  // deterministic-PRNG fallback the commissioning contract disallows.
-  // The genuine real-radio-noise equivalent (`RadioNoiseListener`,
-  // src/helpers/radiolib/RadioLibWrappers.h, and the ready
-  // `mesh::ota::helpers::OtaControlRadioEntropy` adapter in
-  // src/helpers/ota/OtaDeviceAuthorityBoardAdapters.h) needs a
-  // `PhysicalLayer&` that is not reachable from here -- MyMesh only
-  // holds the abstract `mesh::Radio&` (src/Dispatcher.h), and the
-  // concrete `RadioLibWrapper` keeps its `PhysicalLayer*` private; both
-  // files are outside this scope's owned edit surface. Until one of
-  // those (owner-approved) exposes real radio entropy to MyMesh, every
-  // call here fails, so OPEN/CHALLENGE correctly report
-  // NoCapacity/entropy-unavailable rather than ever minting a session
-  // id or challenge from StdRNG.
-  class OtaControlRngEntropy : public meshcore::ota::runtime::IOtaControlEntropySource {
-  public:
-    bool fillRandom(uint8_t*, size_t) override { return false; }
-  };
-  OtaControlRngEntropy _ota_control_entropy_;
-  // Fail-closed by default (see OtaControlNullJobBackend); Authority's/
-  // Store's eventual physical-writer adapter binds here once their own
-  // coordinator APIs stabilize -- no job-bearing USB command can
-  // fabricate progress until then.
-  meshcore::ota::runtime::OtaControlJobBackendSlot _ota_control_backend_slot_;
-  meshcore::ota::runtime::OtaControlSessionRouter _ota_control_router_;
 
   bool isRadioStuckOutOfRecv(uint32_t now_ms);
   // Astra's correction: boot-mount success + the board-level storage-
@@ -315,14 +274,6 @@ public:
 
   void begin(FILESYSTEM* fs);
   void sendNodeDiscoverReq();
-#if MESHCORE_LORA_OTA
-  // Accessor for main.cpp's source-bound USB commissioning adapter (see
-  // helpers/ota/OtaUsbCommissioningSerialInterface.h) to construct its
-  // OtaUsbControlService around the SAME real router this instance owns
-  // and binds its job backend into below -- never a second/duplicate
-  // router/session instance.
-  meshcore::ota::runtime::OtaControlSessionRouter& getOtaControlRouter() { return _ota_control_router_; }
-#endif
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
   const char* getRole() override { return FIRMWARE_ROLE; }
@@ -368,6 +319,28 @@ public:
 
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
+
+#if MESHCORE_LORA_OTA
+  // Real admin control surface reusing the SAME getOtaIntegration()/
+  // getOtaStatus()/radio-revert machinery as companion_radio's CMD_OTA_
+  // CONTROL binary handler -- reached here only via handleCommand()'s
+  // existing gates (local serial trusted-owner, or remote client->
+  // isAdmin() already checked by the PAYLOAD_TYPE_TXT_MSG caller before
+  // handleCommand() is ever invoked). No new admin/auth mechanism.
+  bool setFirmwareOtaMode(const char* mode);
+  bool setFirmwareOtaDutyCycle(float percent);
+  void abortFirmwareOta();
+  void rollbackFirmwareOta();
+#if MESHCORE_LORA_OTA
+  static void otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]);
+  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore);
+  static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
+#endif
+  void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+  bool isOtaAdminKey(const uint8_t key[32]) const;
+  static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
+#endif
+
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {

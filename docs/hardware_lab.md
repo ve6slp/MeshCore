@@ -6,18 +6,18 @@ ad-hoc command names a `ttyACM` number or a literal USB serial.
 
 ## Host dependencies
 
-The lab scripts need Python packages beyond the base toolchain. Install them
-before running any `make lab-*` target or the host-side tests:
+The lab scripts need Python packages beyond the base toolchain. If a command
+reports missing packages, install the declared dependencies:
 
 ```sh
 python3 -m pip install -r requirements-ota.txt
 ```
 
-This pins `cryptography>=43.0` and `pyserial>=3.5`.
+This declares `cryptography>=43.0` and `pyserial>=3.5`.
 
-`make test-ota-lab-host` runs the host-side unit tests for
-`scripts/lab_device.py` and `scripts/ota_rf_lab.py` (`scripts/tests/`),
-including the protected-power-domain behaviour described below. It exercises
+`make test-ota-lab-host` runs the host-side unit tests in `scripts/tests/`,
+including the signed uploader and the protected-power-domain behaviour
+described below. It exercises
 the actual wire/USB-protection logic against mocked device topology, not a
 placeholder or infrastructure-only check. It is part of `make test`/`make
 test-ota` and does not require a board attached.
@@ -60,19 +60,70 @@ of use makes that a non-event.
 | `make lab-bootloader-<role>` | Enter the serial DFU bootloader |
 | `make lab-power-cycle-<role>` | Cut and restore USB port power |
 | `make lab-wait-<role>` | Block until the board enumerates |
-| `make upload-xiao-nrf52-<role>` | Build and flash the companion lab firmware |
-| `make flash-xiao-nrf52-<role>` | Flash an existing companion package without rebuilding |
+| `make upload-xiao-nrf52-<role>` | Build and flash the role's application |
+| `make flash-xiao-nrf52-<role>` | Flash the role's existing package without rebuilding |
 
-For an immutable application snapshot, pass its package path explicitly:
+The client uses `Xiao_nrf52_companion_radio_usb`; the remotely upgraded
+target uses `Xiao_nrf52_repeater_ota_usb` (`simple_repeater`). Override
+`XIAO_NRF52_CLIENT_ENV` or `XIAO_NRF52_TARGET_ENV` only for an intentional
+profile change. The default lab build includes both roles.
+
+For an immutable application snapshot, pass each role's package explicitly:
 
 ```sh
-make flash-xiao-nrf52-lab XIAO_NRF52_LAB_PACKAGE=/absolute/path/to/firmware.zip \
+make flash-xiao-nrf52-lab \
+  XIAO_NRF52_CLIENT_PACKAGE=/absolute/path/to/client/firmware.zip \
+  XIAO_NRF52_TARGET_PACKAGE=/absolute/path/to/repeater/firmware.zip \
   OTA_LAB_ARTIFACT_DIR=.tmp/ota-rf-lab/snapshot-flash
 ```
 
-Use an application-only DFU package. This flashes only the configured
-client and target without rebuilding concurrently edited source. Custom
-bootloader commissioning uses the separate guarded installer.
+Use an application-only DFU package. The helper checks the manifest,
+application bounds and required payloads before entering DFU. Bootloader,
+SoftDevice and combined packages are refused; custom bootloader
+commissioning uses the separate guarded installer. This flashes only the
+configured client and target without rebuilding concurrently edited source.
+The package check does not identify a firmware role: select each role's
+qualified package explicitly.
+
+Extract that package's validated raw application for the signed uploader:
+
+```sh
+make ota-lab-image \
+  XIAO_NRF52_TARGET_PACKAGE=/path/to/repeater/firmware.zip \
+  OTA_UPLOAD_IMAGE=/path/to/new/candidate.bin
+```
+
+This neither rebuilds nor opens a board, and it refuses to overwrite an
+existing image.
+
+The legacy `XIAO_NRF52_LAB_PACKAGE` override still deliberately selects
+the same package for both roles. Do not use it for companion-to-repeater
+qualification. The RF harness now monitors the binary companion client
+and the repeater's text CLI separately.
+
+`make configure-xiao-nrf52-ota-lab` uses each role's actual protocol to
+configure the pair for 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5 and
+three-byte path hashes. It checks both roles and full public keys before
+making changes, then requires unchanged identities and complete
+administrator ACL readbacks. It does not grant administrator permissions,
+transfer an image, commit an update or reboot either board. Client-only
+configuration remains available.
+
+Repeater radio readbacks describe configured preferences, not the live radio
+profile; applying them requires a separate reboot. Neither role's
+configuration readback proves reboot persistence or peer reception.
+The radio setter must return exactly `OK - reboot to apply`; name and path
+hash setters return `OK`. Readbacks use the `> ` value prefix inside the
+text reply. These formats match `CommonCLI.cpp`, not the older mock-only
+assumptions. `make test-xiao-nrf52-ota-lab` continues to refuse
+qualification before opening either port: paired configuration and mocked
+host tests are not an end-to-end OTA result.
+
+The repeater transport also reads `get acl`, whose output has no closing
+marker. It waits for the echoed reply to a following `get role` command
+instead of treating a quiet serial port as a complete ACL. An in-memory
+ACL entry does not prove that `setperm` has saved it: qualification must
+allow the lazy write to finish and verify the permission after a restart.
 
 ## Why these mechanisms
 
@@ -110,32 +161,40 @@ against **any** hub that also carries a device listed under `[protected]`
 in `lab/devices.ini`, even with `-f`, even for a role that isn't itself
 protected.
 
-Right now the `target` role and the protected Pine board are both attached
-under the same physical hub (`target` at `1-4.2.3`, Pine at `1-4.2.1.2`,
-sharing parent hub `1-4.2`). `make lab-power-cycle-target` will refuse and
-print `refusing to power-cycle hub 1-4.2: protected device shares its power
-domain` instead of touching `uhubctl`. Recovering `target` in that state
-needs a physical reset or replug, not a lab command. `make lab-doctor`
-reports this case as `physical reset required`.
-
-`client` is on a separate, isolated bus and is not affected — `uhubctl`
-power-cycling for `client` continues to work normally through the same
-`make lab-power-cycle-client` target. This isolation depends on physical
-wiring, not configuration, and can change if boards are moved to different
-hub ports.
+Hub paths change when boards are reattached. The tool checks the actual
+power domain at the time of the request, using the protected serial
+inventory rather than an old bus number. A refusal means a physical reset
+or replug is required; do not bypass it with a direct `uhubctl` command.
+`make lab-doctor` reports protected shared domains as
+`physical reset required`.
 
 ## What this lab has verified for LoRa OTA
 
-This bench pair is currently used to validate the LoRa OTA subsystem. What is
-proven here is application-level radio behaviour and raw/staged flash
-correctness on the `target` board — not a completed firmware install. The
-custom bootloader that would turn a staged image into a running update is
-built and tested separately and remains unproven end to end. See the
+This bench pair is used to qualify LoRa OTA. Earlier firmware demonstrated
+application-level radio behaviour and raw/staged flash correctness, but
+that transport has been retired. Those captures do not qualify the
+replacement's signed companion-to-repeater transfer or installation.
+The custom bootloader has separate artifact and simulated-recovery evidence;
+installed recovery remains unproven. See the
 [LoRa OTA developer guide](lora_ota_development.md#current-hardware-evidence)
 for the current, dated evidence ledger and its explicit gaps before quoting
 any hardware result from this lab elsewhere.
 
-The **2026-09-30T12:26:14Z stock-only integration qualification passed**:
+On 2026-10-01, the existing read-only diagnostic on each approved board
+returned its full internal-flash and QSPI contents for comparison with its
+authenticated encrypted archive. Both comparisons matched byte for byte.
+No flash, reset, power cycle or install command was issued, and the
+protected board was not opened. This establishes preservation of the
+captured media, not a mesh connection or a working OTA installation.
+The boards still require qualified companion and repeater applications.
+
+The archives contain the diagnostic applications, not the lost original
+application artifact. Preserve newly qualified, role-specific recovery
+packages before commissioning. Destructive power-cut qualification is
+deferred because the target shares a protected power domain; do not bypass
+that protection or describe power-failure recovery as physically qualified.
+
+The **historical 2026-09-30T12:26:14Z stock-only integration run passed**:
 the signed 320-byte RF-to-QSPI fixture completed, and ordinary advert
 allocation and expected-peer reception succeeded under 2% OTA pressure.
 Usage stayed at 71,822/72,000 ms; the ordinary advert arrived in 0.983 s
@@ -145,45 +204,67 @@ all eight boot-journal sectors remained blank. Evidence is in
 `.tmp/ota-boot-preflight/stock-policy-allocation-fixed-after-qualification/`.
 This supersedes the failing `stock-floor-gated-*` artifact, whose missing
 descriptor-format policy and raw-injection allocation reserve were fixed.
-It proves stock-only staging and this two-board fairness witness, not a
-firmware installation, reboot resume or completed multicast repair.
+It proves stock-only staging and that revision's two-board fairness witness,
+not the current receiver, a firmware installation, reboot resume or completed
+multicast repair. The earlier stage, airtime and boot-journal commands have
+been removed; preserved captures remain historical evidence only.
 
-## Bootloader commissioning preflight
+## Bootloader commissioning
 
-The preflight is **read-only by default**, uses the stable `target` identity
-and never resets, flashes or power-cycles a board:
+The obsolete binary boot-journal reader and historical floor-erasure helper
+have been removed. They were written for a different companion-only lab
+protocol, not the current text repeater or durable candidate records.
+Never clear confirmed-floor or transaction sectors to make an update pass.
+An erased journal does not identify the installed bootloader or qualify it.
+
+Before commissioning, preserve identity, configuration and a validated
+recovery package. Use only the guarded installer for a package whose board,
+role, complete flash load and boot-info marker have been checked. Follow the
+[nRF52840 QSPI and bootloader guide](lora_ota_nrf52840_qspi.md) for geometry
+and physical acceptance requirements. Artifact verification alone is not
+installed recovery qualification.
+
+`make validate-xiao-nrf52-client-archive` and
+`make validate-xiao-nrf52-target-archive` authenticate an existing encrypted
+full-media capture without opening either board. Set `OTA_LAB_ARCHIVE_KEY`
+and `OTA_LAB_ARCHIVE_FILE` explicitly. This is an offline evidence check,
+not a live comparison or a firmware recovery package; installing the
+read-only diagnostic replaces the application it is meant to inspect.
+
+`make install-xiao-nrf52-target-ota-bootloader` builds the no-SWD package
+for the authorized XIAO repeater, defaulting to firmware role 1. It refuses
+a companion-role or non-XIAO package. Run it only from the frozen,
+qualified source tree after completing the preservation checks above;
+the target rebuilds its package.
+
+For an immutable, already-qualified bootloader package, use:
 
 ```sh
-make inspect-xiao-nrf52-boot-journal
+make flash-xiao-nrf52-target-ota-bootloader \
+  XIAO_NRF52_TARGET_OTA_BOOTLOADER_PACKAGE=/absolute/path/to/repeater/bootloader.uf2
 ```
 
-It requires the lab firmware's eight-sector read interface; older lab
-images refuse the request rather than returning a successful preflight.
-Each pass archives all 4,096 bytes of both floor sectors and the six
-command, state and confirmation sectors. Two passes must match. Dumps,
-SHA-256 hashes and device/application identity are recorded under
-`.tmp/ota-boot-preflight/`.
-
-The only nonempty floor allowed for historical lab cleanup is the exact
-37-byte diagnostic pattern at floor-A offsets 3–39, with every other byte
-erased. Floor-B and all transaction sectors must be entirely erased.
-Existing counters, unknown bytes, pending transactions or inconsistent
-reads stop the procedure; they must never be reinterpreted as counter zero.
-
-After reviewing that evidence and confirming its historical lab provenance,
-`make clean-xiao-nrf52-legacy-floor` explicitly approves cleanup of that
-single known floor-A sector. It re-reads the journal immediately before the
-request and archives two full post-cleanup passes. This is not routine
-maintenance and never authorizes erasing a valid floor or the wider journal.
-A passing preflight does **not** qualify the bootloader or prove an OTA install.
+This target does not rebuild source or enter DFU. Put the authorized target
+in bootloader mode first. Board and repeater-role guards run before the
+artifact-only validation; the package must pass that validation before
+the Make workflow resolves the target's serial port. The physical
+installer checks the package again, validates the approved serial and
+mounted volume, then copies it. Passing these checks does not establish
+installed recovery.
 
 ## Recovering an unresponsive board
 
-`make lab-reset-client` and `make lab-reset-target` send the companion
-firmware's binary `reboot` command and require USB disconnection followed by
-application re-enumeration. DTR/RTS toggling alone does not reset these
-boards. Firmware without that command, including the QSPI diagnostic image,
-needs DFU entry or a physical reset instead.
+`make lab-reset-client` sends the companion's framed binary `reboot`
+command; `make lab-reset-target` sends the repeater's text `reboot` command.
+Both require USB disconnection followed by application re-enumeration.
+For an intentional role change, select `OTA_LAB_CLIENT_PROTOCOL` or
+`OTA_LAB_TARGET_PROTOCOL` (`companion` or `repeater`) to match the installed
+application. Direct use of `lab_device.py reset` requires an explicit
+`--protocol`; the tool does not guess from USB enumeration.
+
+DTR/RTS toggling alone does not reset these boards. Firmware without the
+selected reboot command, including the QSPI diagnostic image, needs DFU
+entry or a physical reset instead.
 
 ```sh
 make lab-devices           # is it present at all?
@@ -194,12 +275,11 @@ make upload-xiao-nrf52-target
 `lab-power-cycle` locates the board in sysfs by serial rather than by role
 resolution, so it still works on a board that exposes no serial port.
 
-`lab-power-cycle-target` currently refuses, per
-[Protected power domains](#protected-power-domains) above, because `target`
-shares a hub with the protected Pine board. If it refuses, physically reset
-or replug `target` instead, then continue with `make upload-xiao-nrf52-target`.
+If `lab-power-cycle-target` refuses because a protected board shares its
+power domain, physically reset or replug `target` instead, then continue
+with `make upload-xiao-nrf52-target`.
 
 If `make lab-doctor` reports `physical reset required` for a role, that port has
-no software power control (or, as with `target` today, shares a hub with a
+no software power control (or shares a hub with a
 protected device), and the board's reset button or a manual replug is the
 only recovery.

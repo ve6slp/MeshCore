@@ -73,16 +73,31 @@
 #include <helpers/BaseChatMesh.h>
 #include <helpers/TransportKeyStore.h>
 #include "helpers/ota/OtaTrialSafeIdentityBoot.h"
-#include "helpers/ota/OtaBoardBaselineMeasurementSource.h"
 #include "helpers/ota/OtaFirmwareService.h"
-#include "helpers/ota/OtaMeasurementControlJobBackend.h"
-#include "ota/runtime/OtaControlSessionRouter.h"
+#include "helpers/ota/OtaUsbProtocol.h"
+#include "helpers/ota/OtaRfUploader.h"
 
 /* -------------------------------------------------------------------------------------- */
 
 #define REQ_TYPE_GET_STATUS             0x01 // same as _GET_STATS
 #define REQ_TYPE_KEEP_ALIVE             0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA     0x03
+
+// ContactInfo::flags bit layout: bit0 (0x01) is the pre-existing
+// 'favourite' flag; bits1-3 (0x02/0x04/0x08) are the pre-existing
+// per-contact telemetry permission mask (see onContactRequest() below
+// and SensorManager.h's TELEM_PERM_BASE/LOCATION/ENVIRONMENT, which are
+// compared against `contact.flags >> 1`). Bit4 (0x10) is NEW and otherwise
+// unused by any existing consumer: it marks this contact as locally
+// authorized to issue OTA admin control commands (abort/rollback/mode/
+// duty/commit) over an authenticated pairwise session -- being merely a
+// contact is NEVER sufficient on its own. See DataStoreRecordCodec.h's
+// per-record format marker for why a legacy/short on-disk record can
+// never silently grant this bit, and MyMesh::handleCommand()'s
+// OTA_CTRL_SET_ADMIN handler for the only way this bit may be set,
+// which requires the request to already be local-owner/admin-trusted
+// AND an actual saveContacts() success before replying OK.
+#define CONTACT_FLAG_OTA_ADMIN          0x10
 
 struct AdvertPath {
   uint8_t pubkey_prefix[7];
@@ -104,8 +119,7 @@ public:
   // \param allow_identity_generation -- DELIBERATELY SEPARATE permit from
   // the above (never derive one from the other): even a future boot
   // classification that permits ordinary existing-userdata behavior
-  // (e.g. a positively-certified stock baseline, see
-  // OtaBaselineCertificationEvidence.h) must NOT thereby also authorize
+  // (e.g. a positively-certified stock baseline) must NOT thereby also authorize
   // creating a brand-new identity or persisting it -- that requires its
   // own, still-unwired install/counter authority. When false, a failed
   // loadMainIdentity() does NOT regenerate+persist a new identity (a
@@ -135,6 +149,15 @@ public:
   void abortFirmwareOta();
   void rollbackFirmwareOta();
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+
+  // Dispatches CMD_OTA_CONTROL subops 0x10..0x18 (the lean local-USB
+  // uploader/status wire contract; see helpers/ota/OtaUsbProtocol.h).
+  // Writes the fixed 86-byte reply via _serial directly; does not use
+  // writeOKFrame()/writeErrFrame() (those are 1-2 byte legacy shapes,
+  // incompatible with this contract's fixed-layout reply requirement).
+  void handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int len);
+  bool isOtaAdminKey(const uint8_t key[32]) const;
+  static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #if MESHCORE_LORA_OTA
   bool attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
                                 meshcore::ota::runtime::IOtaStagingSink& staging_sink);
@@ -164,14 +187,31 @@ public:
   // services ran this pass would latch a false-healthy outcome even if
   // one of them had silently failed or stalled earlier in the same tick.
   void tickOtaTrialHealth();
-  // Baseline measurement collector instance for this board, driven once
-  // per tick from tickOtaTrialHealth() below (radio-independent -- see
-  // OtaBaselineMeasurementCollector.h). The USB MEASURE/POLL/READ_OBJECT
-  // commissioning surface calls begin()/readCompletedEvidence()/cancel()
-  // on this SAME instance via _ota_measurement_job_backend_ (bound into
-  // _ota_control_backend_slot_ in begin()), rather than a second,
-  // un-driven collector.
-  mesh::ota::OtaBaselineMeasurementCollector& otaBaselineMeasurementCollector() { return _ota_baseline_collector_; }
+  // Autonomous RF uploader pump: called once per outer loop() pass (see
+  // loop() below), entirely independent of whether a USB host is still
+  // connected -- a Start that was issued and then the cable unplugged
+  // keeps running exactly the same way, matching the "autonomous on
+  // disconnect" requirement. Sends AT MOST one frame per call (either a
+  // periodic Authorization re-broadcast or the next repair-sweep block),
+  // always airtime-budget-gated via getOtaIntegration().canTransmit().
+  void pumpOtaRfUpload();
+  // Initial background multicast only. Directed repair/control uses
+  // known contact paths, and negotiated off-frequency uses zero-hop.
+  bool floodOtaFrame(const uint8_t* frame, size_t frame_len, meshcore::ota::protocol::OtaAirtimeCategory category);
+  // Transmits a target-bound control frame (Commit/Abort/StatusPoll, all
+  // of which DO carry an explicit target field): prefers a known direct
+  // path to that contact (ordinary unicast routing, lower airtime cost)
+  // and falls back to an un-scoped flood (the embedded target field makes
+  // this safe -- every OTHER receiver's own self-check already rejects a
+  // frame not addressed to its own real identity, see OtaLeanReceiver::
+  // commit()/abort()).
+  bool sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t* frame, size_t frame_len,
+                                   meshcore::ota::protocol::OtaAirtimeCategory category);
+  static void otaSelfIdSignThunk(void* ctx, const uint8_t* message, size_t message_len, uint8_t signature_out[64]);
+  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore);
+  static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
+  static bool otaSendThunk(void* ctx, mesh::ota::OtaRfRoute route, const uint8_t target[32],
+                            const uint8_t* frame, size_t len, meshcore::ota::protocol::OtaAirtimeCategory category);
 #endif
 
 protected:
@@ -272,15 +312,6 @@ public:
   // To check if there is pending work
   bool hasPendingWork() const;
 
-#if MESHCORE_LORA_OTA
-  // Accessor for main.cpp's source-bound USB commissioning adapter (see
-  // helpers/ota/OtaUsbCommissioningSerialInterface.h) to construct its
-  // OtaUsbControlService around the SAME real router this instance owns
-  // and binds its job backend into below -- never a second/duplicate
-  // router/session instance.
-  meshcore::ota::runtime::OtaControlSessionRouter& getOtaControlRouter() { return _ota_control_router_; }
-#endif
-
 private:
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
@@ -346,7 +377,11 @@ private:
     (void)ok;
 #endif
   }
-  void saveContacts();
+  // Returns the real, synchronous result of the underlying filesystem
+  // write (never a fabricated/optimistic true) -- see OTA_CTRL_SET_ADMIN
+  // in handleCommand(), which must not reply OK for an admin-flag change
+  // that did not actually make it to durable storage.
+  bool saveContacts();
 
   DataStore* _store;
   NodePrefs _prefs;
@@ -375,6 +410,20 @@ private:
   float pending_bw;
   uint8_t pending_sf;
   uint8_t pending_cr;
+  uint8_t _ota_selected_targets[mesh::ota::usb::kMaxSelectedTargets][32] = {};
+  uint8_t _ota_selected_target_count = 0;
+#if MESHCORE_LORA_OTA
+  // Autonomous RF uploader state -- deliberately survives a USB
+  // disconnect (nothing here is reset/paused by checkSerialInterface()'s
+  // connection tracking), matching the "autonomous on disconnect"
+  // requirement. Reset to inactive on CacheBegin (a fresh/competing
+  // candidate invalidates any in-flight push) and on successful Start.
+  bool _ota_upload_active = false;
+  mesh::ota::OtaRfUploader _ota_rf_uploader;
+  bool _ota_cache_reupload = false;
+  bool _ota_stop_upload_when_idle = false;
+  uint8_t _ota_upload_channel = 0xFF;
+#endif
 
   // False only when begin() hit a genuine identity-load failure during an
   // OTA trial/unknown boot (allow_destructive_boot_writes == false) --
@@ -394,8 +443,7 @@ private:
   // identity-confirmed-loaded facts previously tracked as two separate
   // role-local bools here (see helpers/ota/OtaFirmwareService.h) --
   // fed real outcomes below and by every ordinary persisted-write call
-  // site in this file; consumed read-only by _ota_baseline_source_ and
-  // tickOtaTrialHealth().
+  // site in this file; consumed read-only by tickOtaTrialHealth().
   mesh::ota::OtaFirmwareService _ota_service_;
   // The driverFaultCount() value as of the end of the previous
   // tickOtaTrialHealth() call. Used ONLY as a per-tick comparison
@@ -408,55 +456,6 @@ private:
   // must be free to start accumulating a fresh window on the very next
   // pass.
   uint32_t _ota_trial_last_radio_fault_count_ = 0;
-  // Real per-board source adapter + collector instance (see
-  // helpers/ota/OtaBoardBaselineMeasurementSource.h), constructed once
-  // with a pointer to self_id.pub_key (already-loaded, never generated
-  // here). Driven once per tick from tickOtaTrialHealth(), independent of
-  // any USB activity -- the backend below never calls serviceStep()
-  // itself (see OtaMeasurementControlJobBackend.h), only begin()/poll()/
-  // readObject() wired through to this same collector from begin().
-  mesh::ota::OtaBoardBaselineMeasurementSource _ota_baseline_source_;
-  mesh::ota::OtaBaselineMeasurementCollector _ota_baseline_collector_;
-  // The real MEASURE/POLL/READ_OBJECT IOtaControlJobBackend, bound into
-  // _ota_control_backend_slot_ in begin() below. Certify/Prepare/Activate
-  // remain an explicit terminal NoCapacity from this same backend until
-  // Authority's/Store's own adapters land -- never a fake Ok/Pending.
-  meshcore::ota::runtime::OtaMeasurementControlJobBackend _ota_measurement_job_backend_;
-
-  // Device-side entropy bridge for OtaControlSessionRouter's minted
-  // session ids / CHALLENGE bytes. IMPORTANT: this intentionally does
-  // NOT read from `_rng` (== `fast_rng`, a `StdRNG` wrapping
-  // `::random(0,256)` seeded once at boot -- see
-  // src/helpers/ArduinoHelpers.h) or any other millis()/counter-based
-  // source; that is exactly the deterministic-PRNG fallback the
-  // commissioning contract disallows ("device-generated", never a
-  // predictable/host-chosen source). The genuine real-radio-noise
-  // equivalent already exists (`RadioNoiseListener`, see
-  // src/helpers/radiolib/RadioLibWrappers.h, and the ready
-  // `mesh::ota::helpers::OtaControlRadioEntropy` adapter in
-  // src/helpers/ota/OtaDeviceAuthorityBoardAdapters.h) but needs a
-  // `PhysicalLayer&`, which is NOT reachable from here: MyMesh only
-  // holds the abstract `mesh::Radio&` (src/Dispatcher.h), which exposes
-  // no entropy seam, and the concrete `RadioLibWrapper`
-  // (src/helpers/radiolib/RadioLibWrappers.h) keeps its `PhysicalLayer*`
-  // private -- both files are outside this scope's owned edit surface.
-  // Until one of those (owner-approved) exposes real radio entropy to
-  // MyMesh, this bridge fails closed: every call reports failure, so
-  // OPEN/CHALLENGE correctly report NoCapacity/entropy-unavailable
-  // rather than ever minting a session id or challenge from StdRNG.
-  class OtaControlRngEntropy : public meshcore::ota::runtime::IOtaControlEntropySource {
-  public:
-    bool fillRandom(uint8_t*, size_t) override { return false; }
-  };
-  OtaControlRngEntropy _ota_control_entropy_;
-
-  // Fail-closed by default (see OtaControlNullJobBackend); Authority's/
-  // Store's eventual physical-writer adapter binds here via
-  // _ota_control_backend_slot_.bind(...) once their own coordinator APIs
-  // stabilize -- no job-bearing USB command can fabricate progress until
-  // then.
-  meshcore::ota::runtime::OtaControlJobBackendSlot _ota_control_backend_slot_;
-  meshcore::ota::runtime::OtaControlSessionRouter _ota_control_router_;
 
   // True iff the radio has been continuously out of Rx mode for longer
   // than is legitimate right now -- bounded by the real in-flight send's
