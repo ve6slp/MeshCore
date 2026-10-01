@@ -43,7 +43,9 @@ BOOT_INFO_ADDRESS = 0xFDC00
 BOOT_INFO_MAGIC = 0x584F4249  # "XOBI"
 BOOT_INFO_FORMAT_VERSION = 1
 BOOT_INFO_STRUCT_BYTES = 60
-ROLE_ANY = 0
+# role_id's expected value is now a caller-supplied --role-id (0=companion,
+# 1=repeater), not a single fixed golden constant -- see check_artifact()'s
+# expected_role parameter. There is no separate "any role" golden value.
 CAP_QSPI_INSTALL = 1
 KEY_ID = 1
 ALGORITHM_ED25519 = 1
@@ -52,6 +54,16 @@ BOARD_TARGET_VALUE = {
     "xiao_nrf52840": 0x584E3430,
     "sensecap_solar_p1": 0x53435031,
 }
+
+# UF2 block flags (offset 8; see https://github.com/microsoft/uf2). Every
+# block a real build of this artifact emits sets exactly
+# UF2_FLAG_FAMILY_ID_PRESENT -- checked here so a crafted marker block
+# cannot pass this independent verifier by looking byte-correct while
+# carrying a flag that tells a real UF2 bootloader to never actually write
+# it to flash.
+UF2_FLAG_NOT_MAIN_FLASH = 0x00000001
+UF2_FLAG_FILE_CONTAINER = 0x00001000
+UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000
 
 # magic, format_version, struct_bytes, board_target_id, role_id,
 # capability_flags, key_id, algorithm_id, trusted_public_key[32], crc32
@@ -142,10 +154,14 @@ def read_intel_hex_bytes(path: Path, address: int, length: int) -> bytes:
 
 def read_uf2_bytes(path: Path, address: int, length: int) -> bytes:
     """Minimal UF2 reader: standard 512-byte blocks. Validates start/end
-    magic, payload_size <= 476 (the maximum a 512-byte block can carry:
-    512 - 32-byte header - 4-byte trailing magic), and rejects (rather than
-    silently overwrites) two blocks that disagree about the same address
-    inside our target range."""
+    magic, the per-block flags word (rejecting "not main flash"/"file
+    container" blocks and requiring "familyID present", since a crafted
+    file can leave the address map and marker payload bytes looking
+    byte-correct while flagging a block so a real UF2 bootloader never
+    actually writes it to flash), payload_size <= 476 (the maximum a
+    512-byte block can carry: 512 - 32-byte header - 4-byte trailing
+    magic), and rejects (rather than silently overwrites) two blocks that
+    disagree about the same address inside our target range."""
     data = path.read_bytes()
     if len(data) % 512 != 0:
         raise SystemExit(f"{path}: not a whole number of 512-byte UF2 blocks")
@@ -159,6 +175,33 @@ def read_uf2_bytes(path: Path, address: int, length: int) -> bytes:
             raise SystemExit(f"{path}: bad UF2 start magic at offset {off}")
         if magic_end != 0x0AB16F30:
             raise SystemExit(f"{path}: bad UF2 trailing magic at offset {off}")
+        flags, = struct.unpack_from("<I", block, 8)
+        # Checked independently of whether the payload bytes below happen
+        # to look like a correct marker: a real UF2 bootloader skips any
+        # block with "not main flash" set (never writes it to flash) and
+        # treats "file container" blocks as a virtual filesystem entry, not
+        # a flash write -- either flag would mean this verifier is reading
+        # bytes that would never actually reach the device.
+        if flags & UF2_FLAG_NOT_MAIN_FLASH:
+            raise SystemExit(
+                f"{path}: block at offset {off} sets UF2 flag "
+                f"0x{UF2_FLAG_NOT_MAIN_FLASH:08X} (not main flash) -- a real UF2 "
+                "bootloader never writes this block to flash, so its payload "
+                "bytes cannot be trusted as what the device will actually hold"
+            )
+        if flags & UF2_FLAG_FILE_CONTAINER:
+            raise SystemExit(
+                f"{path}: block at offset {off} sets UF2 flag "
+                f"0x{UF2_FLAG_FILE_CONTAINER:08X} (file container), not a flash "
+                "write"
+            )
+        if not (flags & UF2_FLAG_FAMILY_ID_PRESENT):
+            raise SystemExit(
+                f"{path}: block at offset {off} does not set UF2 flag "
+                f"0x{UF2_FLAG_FAMILY_ID_PRESENT:08X} (familyID present) -- a "
+                "genuine artifact from this project's packaging step always "
+                "sets it"
+            )
         target_addr, payload_size = struct.unpack_from("<II", block, 12)
         if payload_size > 476:
             raise SystemExit(
@@ -214,7 +257,8 @@ def parse_public_key_header(path: Path) -> bytes:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-def check_artifact(artifact: Path, board: str, key_header: Path) -> list[str]:
+def check_artifact(artifact: Path, board: str, key_header: Path,
+                   expected_role: int) -> list[str]:
     """Decode the boot-info marker out of a real .hex/.uf2 artifact and
     return a list of mismatch descriptions (empty list == pass)."""
     suffix = artifact.suffix.lower()
@@ -243,8 +287,8 @@ def check_artifact(artifact: Path, board: str, key_header: Path) -> list[str]:
             f"board_target_id 0x{board_target_id:08X} != golden 0x{expected_target:08X} "
             f"for --board {board}"
         )
-    if role_id != ROLE_ANY:
-        errors.append(f"role_id {role_id} != golden {ROLE_ANY}")
+    if role_id != expected_role:
+        errors.append(f"role_id {role_id} != expected {expected_role} (--role-id)")
     if capability_flags != CAP_QSPI_INSTALL:
         errors.append(f"capability_flags 0x{capability_flags:X} != golden 0x{CAP_QSPI_INSTALL:X}")
     if key_id != KEY_ID:
@@ -279,9 +323,15 @@ def main() -> int:
                         help="board profile the artifact was built for")
     parser.add_argument("--key-header", type=Path, required=True,
                         help="path to xiao_ota_public_key.h used for that build")
+    parser.add_argument("--role-id", type=int, choices=[0, 1], default=0,
+                        help="compiled role identity (XIAO_OTA_COMPILED_ROLE_ID) "
+                             "this artifact was built with: 0 (companion, "
+                             "default) or 1 (repeater). Must match the "
+                             "--role-id passed to prepare_upstream.py/"
+                             "sign_image.py for this exact artifact.")
     args = parser.parse_args()
 
-    errors = check_artifact(args.artifact, args.board, args.key_header)
+    errors = check_artifact(args.artifact, args.board, args.key_header, args.role_id)
 
     if errors:
         for e in errors:
@@ -296,7 +346,8 @@ def main() -> int:
     print(
         f"boot-info marker at 0x{BOOT_INFO_ADDRESS:X} in {args.artifact} "
         f"PASSED independent artifact verification for --board {args.board} "
-        f"(magic/format/size/CRC/target/role/cap/key all match golden values)"
+        f"--role-id {args.role_id} "
+        f"(magic/format/size/CRC/target/role/cap/key all match golden/expected values)"
     )
     return 0
 

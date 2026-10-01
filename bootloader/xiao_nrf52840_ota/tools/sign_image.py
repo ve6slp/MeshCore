@@ -5,9 +5,13 @@ import argparse
 import binascii
 import hashlib
 from pathlib import Path
+import re
 import secrets
 import struct
 import subprocess
+
+ROOT = Path(__file__).resolve().parents[3]
+CANONICAL_LAYOUT_CONTRACT = ROOT / "src" / "ota" / "platform" / "Nrf52FlashLayoutContract.h"
 
 MAGIC = 0x584F5441
 COMMIT = 0x434F4D54
@@ -26,10 +30,15 @@ BOARD_TARGETS = {
 }
 CAP_QSPI_INSTALL = 1
 APP_START = 0x27000
-# Full internal app-region extent (0x27000..0xED000): safe as a BACKUP/
-# active-image reference size (see xiao_ota_boot.c's
-# active_extent_from_settings() -- backing up this many bytes is just a
-# protective read+copy of whatever is really there, filesystem included).
+# Full internal app-region extent (0x27000..0xED000): the largest size
+# active_extent_from_settings() (xiao_ota_boot_io.c) will ever itself
+# derive/read+copy for an actual physical backup at runtime. It is NOT,
+# by itself, a valid bound for the SIGNED active_image_extent field
+# below -- that field is bounded by the stricter INSTALL_MAX_SIZE (see
+# its check below and xiao_ota_record.c's xiao_ota_install_command_
+# static_identity_valid()). BACKUP_MAX_SIZE remains meaningful only as
+# the fixed physical bank-to-bank placement stride cross-checked against
+# the canonical layout contract's OTA_NRF52_PHYSICAL_BANK_STRIDE_BYTES.
 BACKUP_MAX_SIZE = 0xC6000
 # Candidate/install cap (0x27000..0xD4000 = 708,608 bytes): v1.17's actual
 # code region, distinct from and smaller than BACKUP_MAX_SIZE.
@@ -47,7 +56,48 @@ COMMAND_VERSION_WIRE_V2 = 2
 WIRE_DESCRIPTOR_SIZE = 59
 
 
+def _canonical_hex_define(header_text, macro):
+    m = re.search(rf"#define\s+{re.escape(macro)}\s+(0[xX][0-9A-Fa-f]+)u?\b", header_text)
+    if not m:
+        raise SystemExit(
+            f"canonical shared layout contract {CANONICAL_LAYOUT_CONTRACT} no longer "
+            f"defines {macro} -- update sign_image.py's cross-check"
+        )
+    return int(m.group(1), 16)
+
+
+def assert_matches_canonical_layout_contract():
+    """Refuse to sign anything if this tool's own APP_START/INSTALL_MAX_SIZE/
+    BACKUP_MAX_SIZE literals have silently drifted from the single,
+    authoritative shared contract (src/ota/platform/Nrf52FlashLayoutContract.h,
+    owned by MAIN, never edited here). A missing canonical header is a hard
+    error, never a silent fallback to these locally duplicated literals --
+    they exist only for a Python tool that cannot #include a C header, and
+    must always be re-verified against the live contract, not trusted on
+    their own."""
+    if not CANONICAL_LAYOUT_CONTRACT.is_file():
+        raise SystemExit(
+            f"canonical shared layout contract missing: {CANONICAL_LAYOUT_CONTRACT} "
+            "-- refusing to sign against possibly-stale local literals"
+        )
+    text = CANONICAL_LAYOUT_CONTRACT.read_text()
+    checks = (
+        ("OTA_NRF52_INTERNAL_IMAGE_OFFSET", APP_START),
+        ("OTA_NRF52_IMAGE_CAPACITY_BYTES", INSTALL_MAX_SIZE),
+        ("OTA_NRF52_PHYSICAL_BANK_STRIDE_BYTES", BACKUP_MAX_SIZE),
+    )
+    for macro, expected in checks:
+        actual = _canonical_hex_define(text, macro)
+        if actual != expected:
+            raise SystemExit(
+                f"sign_image.py's {expected:#x} no longer matches canonical "
+                f"{macro}={actual:#x} in {CANONICAL_LAYOUT_CONTRACT} -- update "
+                "sign_image.py's local constant, do not sign against a stale value"
+            )
+
+
 def main() -> None:
+    assert_matches_canonical_layout_contract()
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--active-image", required=True, type=Path)
@@ -91,10 +141,26 @@ def main() -> None:
             "(0xD4000..0xED000) is out of bounds for a candidate install until "
             "an explicit migration proof allows raising this cap"
         )
-    if not active or len(active) > BACKUP_MAX_SIZE or len(active) % 4:
+    # active_image_extent (the signed, durable byte-count of the OLD/backup
+    # image the bootloader will restore on rollback) is written verbatim
+    # from len(active) below. The bootloader's own admission check
+    # (xiao_ota_install_command_static_identity_valid(), xiao_ota_record.c)
+    # bounds that field by XIAO_OTA_INSTALL_MAX_SIZE (0xAD000) -- the SAME
+    # destructive-write capacity bound as the candidate image above -- NOT
+    # by BACKUP_MAX_SIZE/0xC6000, which is only the fixed physical bank-to-
+    # bank placement stride, never itself an accepted extent value. An
+    # --active-image between INSTALL_MAX_SIZE and BACKUP_MAX_SIZE (e.g.
+    # exactly 0xAE000) would otherwise pass this check, get validly signed,
+    # and then be unconditionally refused by the bootloader at install
+    # time -- a signed-but-permanently-uninstallable artifact. Reject it
+    # here instead, before signing.
+    if not active or len(active) > INSTALL_MAX_SIZE or len(active) % 4:
         raise SystemExit(
             f"active-image reference must be word aligned and in "
-            f"1..{BACKUP_MAX_SIZE} (0x{BACKUP_MAX_SIZE:X}) bytes"
+            f"1..{INSTALL_MAX_SIZE} (0x{INSTALL_MAX_SIZE:X}) bytes -- "
+            f"{BACKUP_MAX_SIZE:#x} is only the physical bank stride, not an "
+            "accepted active_image_extent value; the bootloader refuses "
+            "anything larger than the shared install-capacity bound"
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     candidate = args.output_dir / "candidate.bin"

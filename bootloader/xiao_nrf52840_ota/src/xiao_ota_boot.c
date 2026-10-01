@@ -1,36 +1,221 @@
 #include "xiao_ota_boot.h"
+#include "xiao_ota_boot_io.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "ed25519.h"
 #include "nrf.h"
-#include "bootloader_settings.h"
-#include "crc16.h"
-#include "dfu_types.h"
 #include "xiao_ota_layout.h"
-#include "xiao_ota_public_key.h"
 #include "xiao_ota_record.h"
-#include "xiao_ota_sha256.h"
 
-#define COPY_CHUNK 256u
-
-static uint8_t io_buffer[COPY_CHUNK] __attribute__((aligned(4)));
 /*
- * QSPI EasyDMA (NRF_QSPI->WRITE.SRC / READ.DST) can only address Data RAM on
- * the nRF52840; it cannot DMA directly out of internal code flash. This
- * staging buffer lets copy_internal_to_qspi() read a chunk of the running
- * application (code flash) with the CPU first, then hand QSPI a RAM pointer.
+ * Real nRF52840 QSPI/NVMC/WDT/FICR/GPREGRET register access. Thin,
+ * unchanged register-level adapters implementing the xiao_ota_io_t
+ * contract (xiao_ota_boot_io.h) -- all actual OTA transaction decision
+ * logic lives in xiao_ota_boot_io.c's xiao_ota_boot_process_io(), which
+ * this file only wires up to real hardware and calls unmodified. A
+ * native host test builds the exact same xiao_ota_boot_process_io()
+ * against a fake, in-memory xiao_ota_io_t instead (tests/fake_io.c) --
+ * this file is never part of that build, since it has no SDK-independent
+ * host build target of its own.
  */
-static uint8_t flash_stage_buffer[COPY_CHUNK] __attribute__((aligned(4)));
 
-static void qspi_wait(void) {
-  while (NRF_QSPI->EVENTS_READY == 0) {}
-  NRF_QSPI->EVENTS_READY = 0;
+/*
+ * Bounded register-busy-wait timeouts, calibrated per operation class from
+ * documented worst-case device timings (not one arbitrary iteration count
+ * shared by every operation) -- a wedged/faulty external QSPI chip or NVMC
+ * page-erase must never hang the bootloader forever with no watchdog feed
+ * during an install; that would defeat the entire trial/rollback safety
+ * design. Deadlines are measured against the Cortex-M4's DWT free-running
+ * cycle counter (`DWT->CYCCNT`), not an estimated spin-loop iteration
+ * count: an *overestimated* cycles-per-iteration guess would silently
+ * shrink the real wall-clock timeout instead of only ever padding it
+ * generously, so a real hardware clock is used instead of any estimate.
+ * `DWT->CYCCNT` requires no interrupts and needs no periodic servicing;
+ * elapsed time is computed as `(uint32_t)(DWT->CYCCNT - start)`, which
+ * stays correct across a 32-bit wrap by plain unsigned-subtraction
+ * arithmetic as long as the actual elapsed time never exceeds the full
+ * 32-bit cycle range (over a minute at 64 MHz) -- far beyond any timeout
+ * used here. A timeout firing always means "hardware fault", handled by
+ * the caller exactly like any other IO failure (never advance phase/
+ * floor, trust a hash from it, or continue as if the operation happened).
+ */
+#define XIAO_OTA_HW_CPU_HZ (64000000u)
+
+static bool g_dwt_cycle_counter_enabled = false;
+
+/* Idempotent: enables the DWT cycle counter once, on first use. Safe to
+ * call from every wait function -- a single register read decides
+ * whether anything needs to be done. */
+static void hw_ensure_cycle_counter_enabled(void) {
+  if (g_dwt_cycle_counter_enabled) return;
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  g_dwt_cycle_counter_enabled = true;
 }
 
-static void qspi_init(void) {
+static inline uint32_t hw_deadline_cycles(uint32_t timeout_ms) {
+  return (uint32_t)(((uint64_t)timeout_ms * XIAO_OTA_HW_CPU_HZ) / 1000u);
+}
+
+/* QSPI peripheral bring-up (PSEL/IFCONFIG/ENABLE/ACTIVATE): sub-millisecond
+ * in practice; bounded generously at 10 ms. */
+#define XIAO_OTA_HW_QSPI_ACTIVATE_TIMEOUT_MS (10u)
+/* P25Q16H custom single-byte status-register read/write instructions:
+ * bounded generously at 10 ms (far above any real SPI-NOR status-register
+ * command turnaround). */
+#define XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS (10u)
+/* P25Q16H page-program worst case (datasheet tPP, up to a 256-byte page):
+ * a few milliseconds typical; bounded at 20 ms. */
+#define XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS (20u)
+/* P25Q16H 4 KiB sector-erase worst case (datasheet tSE): hundreds of ms
+ * typical; bounded generously at 3000 ms. */
+#define XIAO_OTA_HW_QSPI_ERASE_TIMEOUT_MS (3000u)
+/* nRF52840 NVMC page-erase worst case (product specification tERASEPAGE):
+ * bounded generously at 200 ms. */
+#define XIAO_OTA_HW_NVMC_ERASE_TIMEOUT_MS (200u)
+/* nRF52840 NVMC single 32-bit word write worst case (product
+ * specification tWRITE): bounded generously at 5 ms per word. */
+#define XIAO_OTA_HW_NVMC_WRITE_TIMEOUT_MS (5u)
+
+static bool qspi_wait_for(uint32_t timeout_ms) {
+  hw_ensure_cycle_counter_enabled();
+  const uint32_t start = DWT->CYCCNT;
+  const uint32_t deadline_cycles = hw_deadline_cycles(timeout_ms);
+  while (NRF_QSPI->EVENTS_READY == 0) {
+    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
+  }
+  NRF_QSPI->EVENTS_READY = 0;
+  return true;
+}
+
+static bool nvmc_wait_for(uint32_t timeout_ms) {
+  hw_ensure_cycle_counter_enabled();
+  const uint32_t start = DWT->CYCCNT;
+  const uint32_t deadline_cycles = hw_deadline_cycles(timeout_ms);
+  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {
+    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
+  }
+  return true;
+}
+
+/*
+ * P25Q16H external QSPI flash custom (single-lane SPI) instructions used
+ * only to confirm/set the chip's own Quad Enable bit at bring-up -- the
+ * nRF52840 QSPI peripheral's own EVENTS_READY/IFCONFIG quad-mode
+ * configuration says nothing about whether the FLASH CHIP ITSELF will
+ * actually honour IO2/IO3 as data lines; that is controlled entirely by
+ * this status-register bit inside the flash part, which is not
+ * guaranteed to still be set after a power loss or an unrelated prior
+ * firmware. Opcodes and the Status-Register-2 QE bit position are per the
+ * P25Q16H datasheet (Read Status Register-2 0x35, Write Enable 0x06,
+ * Write Status Register-2 0x31, QE = SR2 bit 1), corroborated against
+ * this repository's own vendored `CustomLFS_QSPIFlash.cpp` flash-chip
+ * table and status-register helpers -- reasoned from documented/real
+ * in-repo reference behaviour, not re-confirmed against a physical chip
+ * by this change.
+ *
+ * Every CINSTRCONF write below explicitly drives IO2/IO3 HIGH
+ * (`QSPI_CINSTRCONF_LIO2_Msk`/`LIO3_Msk`) for the duration of the
+ * transfer. In single/dual SPI mode those lines are wired to the flash's
+ * WP#/HOLD# pins; leaving them at their register-reset LOW level would
+ * assert write-protect/hold on the part during exactly the commands that
+ * need to reach it, which can silently block WREN/WRSR2 rather than
+ * report any error. This matches `CustomLFS_QSPIFlash.cpp`'s
+ * `readStatus()`/`writeStatus()` (`io2_level = true, io3_level = true`)
+ * and the same fields set in `nrf_qspi_cinstr_transfer_start()`
+ * (`hal/nrf_qspi.h`).
+ */
+#define XIAO_OTA_P25Q16H_OPCODE_RDSR1 (0x05u)
+#define XIAO_OTA_P25Q16H_OPCODE_RDSR2 (0x35u)
+#define XIAO_OTA_P25Q16H_OPCODE_WREN (0x06u)
+#define XIAO_OTA_P25Q16H_OPCODE_WRSR2 (0x31u)
+#define XIAO_OTA_P25Q16H_SR2_QE_BIT (0x02u)
+#define XIAO_OTA_P25Q16H_SR1_WIP_BIT (0x01u)
+#define XIAO_OTA_HW_QSPI_CINSTR_LEVELS \
+  (QSPI_CINSTRCONF_LIO2_Msk | QSPI_CINSTRCONF_LIO3_Msk)
+
+static bool qspi_cinstr_read_byte(uint8_t opcode, uint8_t *out_byte) {
+  NRF_QSPI->EVENTS_READY = 0;
+  NRF_QSPI->CINSTRCONF =
+      ((uint32_t)opcode << QSPI_CINSTRCONF_OPCODE_Pos) |
+      (QSPI_CINSTRCONF_LENGTH_2B << QSPI_CINSTRCONF_LENGTH_Pos) |
+      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
+  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS)) return false;
+  *out_byte = (uint8_t)(NRF_QSPI->CINSTRDAT0 & 0xFFu);
+  return true;
+}
+
+/* Polls the flash's OWN Write-In-Progress bit (status register 1, bit 0)
+ * until it clears. `NRF_QSPI->EVENTS_READY`/CINSTRCONF's WIPWAIT option
+ * only prove the *peripheral's* custom-instruction transfer completed, or
+ * (per the vendored `nrfx_qspi.c` driver's own comment at the WIPWAIT
+ * check) that a *previously issued* write finished before this new
+ * instruction started -- neither proves the write this function just
+ * issued has itself finished committing inside the flash part. This is
+ * the only way to actually confirm that. */
+static bool qspi_wait_flash_write_complete(void) {
+  hw_ensure_cycle_counter_enabled();
+  const uint32_t start = DWT->CYCCNT;
+  const uint32_t deadline_cycles =
+      hw_deadline_cycles(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS);
+  for (;;) {
+    uint8_t status = 0;
+    if (!qspi_cinstr_read_byte(XIAO_OTA_P25Q16H_OPCODE_RDSR1, &status)) {
+      return false;
+    }
+    if ((status & XIAO_OTA_P25Q16H_SR1_WIP_BIT) == 0) return true;
+    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
+  }
+}
+
+static bool qspi_cinstr_write_enable(void) {
+  NRF_QSPI->EVENTS_READY = 0;
+  NRF_QSPI->CINSTRCONF =
+      ((uint32_t)XIAO_OTA_P25Q16H_OPCODE_WREN << QSPI_CINSTRCONF_OPCODE_Pos) |
+      (QSPI_CINSTRCONF_LENGTH_1B << QSPI_CINSTRCONF_LENGTH_Pos) |
+      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
+  return qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS);
+}
+
+static bool qspi_cinstr_write_sr2(uint8_t value) {
+  if (!qspi_cinstr_write_enable()) return false;
+  NRF_QSPI->CINSTRDAT0 = value;
+  NRF_QSPI->EVENTS_READY = 0;
+  NRF_QSPI->CINSTRCONF =
+      ((uint32_t)XIAO_OTA_P25Q16H_OPCODE_WRSR2 << QSPI_CINSTRCONF_OPCODE_Pos) |
+      (QSPI_CINSTRCONF_LENGTH_2B << QSPI_CINSTRCONF_LENGTH_Pos) |
+      (QSPI_CINSTRCONF_WIPWAIT_Enable << QSPI_CINSTRCONF_WIPWAIT_Pos) |
+      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
+  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS)) return false;
+  /* WIPWAIT above only guaranteed the flash was idle BEFORE this WRSR2
+   * instruction was issued (see the comment on
+   * qspi_wait_flash_write_complete()); explicitly poll WIP now to prove
+   * this status-register write itself has actually committed before any
+   * caller trusts a subsequent QE readback. */
+  return qspi_wait_flash_write_complete();
+}
+
+/* Confirms the external flash's Quad Enable bit is set, setting it if
+ * necessary, instead of assuming a previous boot (or the factory default)
+ * left it that way. Returns false (bring-up must fail closed) if the bit
+ * cannot be read, cannot be written, or still reads back unset after an
+ * explicit write attempt. */
+static bool qspi_confirm_quad_enable(void) {
+  uint8_t status = 0;
+  if (!qspi_cinstr_read_byte(XIAO_OTA_P25Q16H_OPCODE_RDSR2, &status)) return false;
+  if ((status & XIAO_OTA_P25Q16H_SR2_QE_BIT) != 0) return true;
+  if (!qspi_cinstr_write_sr2((uint8_t)(status | XIAO_OTA_P25Q16H_SR2_QE_BIT))) {
+    return false;
+  }
+  if (!qspi_cinstr_read_byte(XIAO_OTA_P25Q16H_OPCODE_RDSR2, &status)) return false;
+  return (status & XIAO_OTA_P25Q16H_SR2_QE_BIT) != 0;
+}
+
+static bool hw_qspi_init(void *ctx) {
+  (void)ctx;
   NRF_QSPI->PSEL.SCK = XIAO_OTA_QSPI_SCK_PIN;
   NRF_QSPI->PSEL.CSN = XIAO_OTA_QSPI_CS_PIN;
   NRF_QSPI->PSEL.IO0 = XIAO_OTA_QSPI_IO0_PIN;
@@ -47,258 +232,85 @@ static void qspi_init(void) {
   NRF_QSPI->ENABLE = QSPI_ENABLE_ENABLE_Enabled;
   NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->TASKS_ACTIVATE = 1;
-  qspi_wait();
+  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_ACTIVATE_TIMEOUT_MS)) return false;
+  /* IFCONFIG0 above already programs the NRF QSPI PERIPHERAL for quad
+   * read/program, but that says nothing about the FLASH CHIP's own Quad
+   * Enable bit -- confirm/set it explicitly rather than assuming a prior
+   * boot (or the factory default) left it that way. */
+  return qspi_confirm_quad_enable();
 }
 
-static void qspi_read(uint32_t address, void *destination, size_t length) {
+static bool hw_qspi_read(void *ctx, uint32_t address, void *destination,
+                         size_t length) {
+  (void)ctx;
   NRF_QSPI->READ.SRC = address;
   NRF_QSPI->READ.DST = (uint32_t)destination;
   NRF_QSPI->READ.CNT = length;
   NRF_QSPI->TASKS_READSTART = 1;
-  qspi_wait();
+  return qspi_wait_for(XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
 }
 
-static void qspi_write(uint32_t address, const void *source, size_t length) {
+static bool hw_qspi_write(void *ctx, uint32_t address, const void *source,
+                          size_t length) {
+  (void)ctx;
   NRF_QSPI->WRITE.SRC = (uint32_t)source;
   NRF_QSPI->WRITE.DST = address;
   NRF_QSPI->WRITE.CNT = length;
   NRF_QSPI->TASKS_WRITESTART = 1;
-  qspi_wait();
+  return qspi_wait_for(XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
 }
 
-static void qspi_erase_sector(uint32_t address) {
+static bool hw_qspi_erase_sector(void *ctx, uint32_t address) {
+  (void)ctx;
   NRF_QSPI->ERASE.PTR = address;
   NRF_QSPI->ERASE.LEN = QSPI_ERASE_LEN_LEN_4KB;
   NRF_QSPI->TASKS_ERASESTART = 1;
-  qspi_wait();
+  return qspi_wait_for(XIAO_OTA_HW_QSPI_ERASE_TIMEOUT_MS);
 }
 
-static void internal_erase(uint32_t address) {
+static bool hw_internal_erase_page(void *ctx, uint32_t address) {
+  bool ok;
+  (void)ctx;
   NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Een;
-  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
-  NRF_NVMC->ERASEPAGE = address;
-  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
-  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
-}
-
-static void internal_write(uint32_t address, const uint8_t *source, size_t length) {
-  size_t i;
-  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
-  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
-  for (i = 0; i < length; i += 4) {
-    uint32_t word;
-    memcpy(&word, source + i, sizeof(word));
-    *(volatile uint32_t *)(address + i) = word;
-    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
-  }
-  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
-}
-
-static void hash_qspi(uint32_t address, uint32_t length, uint8_t digest[32]) {
-  xiao_ota_sha256_t sha;
-  xiao_ota_sha256_init(&sha);
-  while (length != 0) {
-    uint32_t n = length > COPY_CHUNK ? COPY_CHUNK : length;
-    qspi_read(address, io_buffer, n);
-    xiao_ota_sha256_update(&sha, io_buffer, n);
-    address += n;
-    length -= n;
-  }
-  xiao_ota_sha256_final(&sha, digest);
-}
-
-static void hash_internal(uint32_t address, uint32_t length, uint8_t digest[32]) {
-  xiao_ota_sha256_t sha;
-  xiao_ota_sha256_init(&sha);
-  xiao_ota_sha256_update(&sha, (const void *)address, length);
-  xiao_ota_sha256_final(&sha, digest);
-}
-
-static bool all_equal(const uint8_t a[32], const uint8_t b[32]) {
-  uint8_t difference = 0;
-  unsigned i;
-  for (i = 0; i < 32; ++i) difference |= a[i] ^ b[i];
-  return difference == 0;
-}
-
-/*
- * Authenticates and authorizes a command record of EITHER supported
- * version and produces the normalized install intent. Version is
- * determined at the structural-validity/decode step ONLY, from
- * record_version -- there is no signature-format fallback or "try both"
- * behaviour: v1 is checked exclusively against its own 71-byte
- * little-endian descriptor and signature; v2 is checked exclusively
- * against its own 59-byte big-endian wire descriptor and signature (the
- * SAME bytes and signature the LoRa OTA transport already verified -- see
- * xiao_ota_command_v2_t in xiao_ota_record.h). All non-cryptographic
- * policy checks (target/role/address/counter/capability/extent/device)
- * are shared in xiao_ota_install_command_policy_valid() so both versions
- * are held to the exact same install policy.
- */
-static bool command_policy_valid(const xiao_ota_command_any_t *any,
-                                 uint32_t counter_floor,
-                                 uint32_t expected_active_extent,
-                                 xiao_ota_install_command_t *out_intent) {
-  uint16_t version;
-  const uint64_t device_address =
-      ((uint64_t)NRF_FICR->DEVICEID[1] << 32) | NRF_FICR->DEVICEID[0];
-  memcpy(&version, (const uint8_t *)any + 4, sizeof(version));
-  if (version == XIAO_OTA_COMMAND_VERSION_LEGACY_V1) {
-    if (!xiao_ota_command_valid(&any->v1)) return false;
-    if (!xiao_ota_install_command_from_v1(&any->v1, out_intent)) return false;
-    if (ed25519_verify(any->v1.signature_ed25519,
-                       (const unsigned char *)&any->v1.descriptor,
-                       sizeof(any->v1.descriptor),
-                       xiao_ota_lab_public_key_ed25519) != 1) {
-      return false;
-    }
-  } else if (version == XIAO_OTA_COMMAND_VERSION_WIRE_V2) {
-    if (!xiao_ota_command_v2_valid(&any->v2)) return false;
-    if (!xiao_ota_install_command_from_v2(&any->v2, out_intent)) return false;
-    if (ed25519_verify(any->v2.signature_ed25519, any->v2.wire_descriptor,
-                       XIAO_OTA_WIRE_DESCRIPTOR_SIZE,
-                       xiao_ota_lab_public_key_ed25519) != 1) {
-      return false;
-    }
-  } else {
+  if (!nvmc_wait_for(XIAO_OTA_HW_NVMC_ERASE_TIMEOUT_MS)) {
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
     return false;
   }
-  return xiao_ota_install_command_policy_valid(out_intent, counter_floor,
-                                               expected_active_extent,
-                                               device_address);
+  NRF_NVMC->ERASEPAGE = address;
+  ok = nvmc_wait_for(XIAO_OTA_HW_NVMC_ERASE_TIMEOUT_MS);
+  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+  return ok;
 }
 
-static bool read_pair(uint32_t a_address, uint32_t b_address, void *a, void *b,
-                      size_t size, bool (*valid)(const void *), void *out) {
-  const void *newest;
-  qspi_read(a_address, a, size);
-  qspi_read(b_address, b, size);
-  newest = xiao_ota_newest_valid(a, b, size, valid);
-  if (newest == NULL) return false;
-  memcpy(out, newest, size);
+static bool hw_internal_write(void *ctx, uint32_t address, const void *source,
+                              size_t length) {
+  size_t i;
+  bool ok = true;
+  (void)ctx;
+  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
+  if (!nvmc_wait_for(XIAO_OTA_HW_NVMC_WRITE_TIMEOUT_MS)) {
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+    return false;
+  }
+  for (i = 0; i < length; i += 4) {
+    uint32_t word;
+    memcpy(&word, (const uint8_t *)source + i, sizeof(word));
+    *(volatile uint32_t *)(address + i) = word;
+    if (!nvmc_wait_for(XIAO_OTA_HW_NVMC_WRITE_TIMEOUT_MS)) { ok = false; break; }
+  }
+  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+  return ok;
+}
+
+static bool hw_internal_read(void *ctx, uint32_t address, void *destination,
+                             size_t length) {
+  (void)ctx;
+  memcpy(destination, (const void *)address, length);
   return true;
 }
 
-static void write_record(uint32_t a_address, uint32_t b_address, void *record,
-                         size_t size, size_t crc_offset, size_t commit_offset,
-                         uint32_t sequence) {
-  uint32_t crc;
-  uint32_t marker = XIAO_OTA_COMMIT_MARKER;
-  uint32_t address = (sequence & 1u) ? b_address : a_address;
-  uint8_t *bytes = (uint8_t *)record;
-  memcpy(bytes + 8, &sequence, sizeof(sequence));
-  memset(bytes + commit_offset, 0xFF, sizeof(marker));
-  crc = xiao_ota_crc32(record, crc_offset);
-  memcpy(bytes + crc_offset, &crc, sizeof(crc));
-  qspi_erase_sector(address);
-  qspi_write(address, record, commit_offset);
-  qspi_write(address + commit_offset, &marker, sizeof(marker));
-  memcpy(bytes + commit_offset, &marker, sizeof(marker));
-  (void)size;
-}
-
-static void persist_state(xiao_ota_state_t *state) {
-  state->magic = XIAO_OTA_RECORD_MAGIC;
-  state->record_version = XIAO_OTA_FORMAT_VERSION;
-  state->record_bytes = sizeof(*state);
-  write_record(XIAO_OTA_STATE_A, XIAO_OTA_STATE_B, state, sizeof(*state),
-               offsetof(xiao_ota_state_t, crc32),
-               offsetof(xiao_ota_state_t, commit_marker), state->sequence + 1);
-}
-
-static void persist_floor(xiao_ota_floor_t *floor) {
-  floor->magic = XIAO_OTA_FLOOR_MAGIC;
-  floor->record_version = XIAO_OTA_FORMAT_VERSION;
-  floor->record_bytes = sizeof(*floor);
-  write_record(XIAO_OTA_FLOOR_A, XIAO_OTA_FLOOR_B, floor, sizeof(*floor),
-               offsetof(xiao_ota_floor_t, crc32),
-               offsetof(xiao_ota_floor_t, commit_marker), floor->sequence + 1);
-}
-
-static void force_recovery(void) {
-  NRF_POWER->GPREGRET = XIAO_OTA_DFU_MAGIC_UF2;
-  NVIC_SystemReset();
-  while (true) {}
-}
-
-static bool write_boot_settings(uint16_t bank_0, uint16_t bank_0_crc,
-                                uint32_t bank_0_size) {
-  bootloader_settings_t settings __attribute__((aligned(4)));
-  const bootloader_settings_t *current;
-  bootloader_util_settings_get(&current);
-  memcpy(&settings, current, sizeof(settings));
-  settings.bank_0 = bank_0;
-  settings.bank_0_crc = bank_0_crc;
-  settings.bank_0_size = bank_0_size;
-  internal_erase(BOOTLOADER_SETTINGS_ADDRESS);
-  internal_write(BOOTLOADER_SETTINGS_ADDRESS, (const uint8_t *)&settings,
-                 sizeof(settings));
-  return memcmp((const void *)BOOTLOADER_SETTINGS_ADDRESS, &settings,
-                sizeof(settings)) == 0;
-}
-
-/* Thin wrapper: reads real internal flash (fresh CRC-16 recompute) and
- * defers the fail-closed decision to xiao_ota_resolve_active_extent()
- * (xiao_ota_record.c), which is what test_record.c exercises host-side. */
-static bool active_extent_from_settings(
-    const bootloader_settings_t *settings, uint32_t *out_extent) {
-  uint16_t recomputed_crc16 = 0xFFFFu;
-  if (settings->bank_0 == BANK_VALID_APP && settings->bank_0_size != 0 &&
-      settings->bank_0_size <= XIAO_OTA_APP_MAX_SIZE) {
-    recomputed_crc16 = crc16_compute((const uint8_t *)XIAO_OTA_APP_START,
-                                     settings->bank_0_size, NULL);
-  }
-  return xiao_ota_resolve_active_extent(
-      settings->bank_0 == BANK_VALID_APP, settings->bank_0_crc,
-      settings->bank_0_size, recomputed_crc16, XIAO_OTA_APP_MAX_SIZE,
-      out_extent);
-}
-
-static bool copy_internal_to_qspi(xiao_ota_state_t *state) {
-  uint32_t offset = state->progress_bytes;
-  while (offset < state->active_image_extent) {
-    uint32_t sector_end = (offset + XIAO_OTA_QSPI_SECTOR_SIZE) &
-                          ~(XIAO_OTA_QSPI_SECTOR_SIZE - 1u);
-    uint32_t end = sector_end < state->active_image_extent
-                       ? sector_end : state->active_image_extent;
-    qspi_erase_sector(XIAO_OTA_BACKUP_BASE + offset);
-    while (offset < end) {
-      uint32_t n = end - offset > COPY_CHUNK ? COPY_CHUNK : end - offset;
-      memcpy(flash_stage_buffer, (const void *)(XIAO_OTA_APP_START + offset), n);
-      qspi_write(XIAO_OTA_BACKUP_BASE + offset, flash_stage_buffer, n);
-      qspi_read(XIAO_OTA_BACKUP_BASE + offset, io_buffer, n);
-      if (memcmp(io_buffer, flash_stage_buffer, n) != 0)
-        return false;
-      offset += n;
-    }
-    state->progress_bytes = offset;
-    persist_state(state);
-  }
-  return true;
-}
-
-static bool copy_qspi_to_internal(xiao_ota_state_t *state, uint32_t source,
-                                  uint32_t length) {
-  uint32_t offset = state->progress_bytes;
-  while (offset < length) {
-    uint32_t end = offset + XIAO_OTA_QSPI_SECTOR_SIZE;
-    if (end > length) end = length;
-    internal_erase(XIAO_OTA_APP_START + offset);
-    while (offset < end) {
-      uint32_t n = end - offset > COPY_CHUNK ? COPY_CHUNK : end - offset;
-      qspi_read(source + offset, io_buffer, n);
-      internal_write(XIAO_OTA_APP_START + offset, io_buffer, n);
-      if (memcmp((const void *)(XIAO_OTA_APP_START + offset), io_buffer, n) != 0)
-        return false;
-      offset += n;
-    }
-    state->progress_bytes = offset;
-    persist_state(state);
-  }
-  return true;
-}
-
-static void start_trial_watchdog(void) {
+static void hw_start_trial_watchdog(void *ctx) {
+  (void)ctx;
   NRF_WDT->CONFIG = WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos;
   NRF_WDT->CRV = 60u * 32768u;
   NRF_WDT->RREN = WDT_RREN_RR0_Msk;
@@ -306,213 +318,38 @@ static void start_trial_watchdog(void) {
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 }
 
+static void hw_force_recovery(void *ctx) {
+  (void)ctx;
+  NRF_POWER->GPREGRET = XIAO_OTA_DFU_MAGIC_UF2;
+  NVIC_SystemReset();
+  while (true) {}
+}
+
+static uint64_t hw_device_address(void *ctx) {
+  (void)ctx;
+  return ((uint64_t)NRF_FICR->DEVICEID[1] << 32) | NRF_FICR->DEVICEID[0];
+}
+
+static bool hw_explicit_dfu_requested(void *ctx) {
+  (void)ctx;
+  return xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET);
+}
+
+
 void xiao_ota_boot_process(void) {
-  xiao_ota_command_any_t command_a __attribute__((aligned(4)));
-  xiao_ota_command_any_t command_b __attribute__((aligned(4)));
-  xiao_ota_command_any_t command __attribute__((aligned(4)));
-  xiao_ota_install_command_t intent __attribute__((aligned(4)));
-  xiao_ota_state_t state_a __attribute__((aligned(4)));
-  xiao_ota_state_t state_b __attribute__((aligned(4)));
-  xiao_ota_state_t state __attribute__((aligned(4)));
-  xiao_ota_confirmation_t confirm_a __attribute__((aligned(4)));
-  xiao_ota_confirmation_t confirm_b __attribute__((aligned(4)));
-  xiao_ota_confirmation_t confirmation __attribute__((aligned(4)));
-  xiao_ota_floor_t floor_a __attribute__((aligned(4)));
-  xiao_ota_floor_t floor_b __attribute__((aligned(4)));
-  xiao_ota_floor_t floor __attribute__((aligned(4)));
-  uint8_t digest[32] __attribute__((aligned(4)));
-  bool have_state, have_floor, confirmed, floor_trustworthy;
-  bool have_active_extent;
-  uint32_t expected_active_extent = 0;
-  const bootloader_settings_t *boot_settings;
-
-  /*
-   * Upstream consumes and clears these requests in check_dfu_mode(), which runs
-   * after this hook. Never let a persistent OTA transaction intercept recovery.
-   */
-  if (xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET)) return;
-
-  qspi_init();
-  if (!read_pair(XIAO_OTA_COMMAND_A, XIAO_OTA_COMMAND_B, &command_a, &command_b,
-                 sizeof(command), xiao_ota_command_any_valid, &command)) {
-    memset(&command, 0, sizeof(command));
-  }
-  /* Structural-only decode (no signature check yet); zeroed on failure so
-   * downstream field reads below see 0, matching the pre-refactor behaviour
-   * of an all-zero `command` when read_pair() failed. */
-  if (!xiao_ota_install_command_decode(&command, &intent)) {
-    memset(&intent, 0, sizeof(intent));
-  }
-  have_state = read_pair(XIAO_OTA_STATE_A, XIAO_OTA_STATE_B, &state_a, &state_b,
-                         sizeof(state), (bool (*)(const void *))xiao_ota_state_valid,
-                         &state);
-  if (!have_state) memset(&state, 0, sizeof(state));
-  have_floor = read_pair(XIAO_OTA_FLOOR_A, XIAO_OTA_FLOOR_B, &floor_a, &floor_b,
-                         sizeof(floor), (bool (*)(const void *))xiao_ota_floor_valid,
-                         &floor);
-  if (!have_floor) {
-    /*
-     * Fail-closed distinction (see is_erased_bytes()): only a genuinely
-     * blank pair of floor slots (both fully erased, i.e. this device has
-     * never completed an OTA install) is safe to treat as "counter floor
-     * 0". Anything else that failed structural validation -- a torn
-     * write, bit rot, or leftover unrelated data from before OTA
-     * provisioning -- is floor damage, not "no floor yet", and must not
-     * silently reopen the anti-rollback counter at 0.
-     */
-    floor_trustworthy = xiao_ota_bytes_erased(&floor_a, sizeof(floor_a)) &&
-                        xiao_ota_bytes_erased(&floor_b, sizeof(floor_b));
-    memset(&floor, 0, sizeof(floor));
-  } else {
-    floor_trustworthy = true;
-  }
-  bootloader_util_settings_get(&boot_settings);
-  /* Always re-derive the active extent from what is actually in internal
-   * flash right now (fresh BANK_VALID_APP + nonzero bounded size + a
-   * recomputed CRC-16 over that exact extent) -- never from
-   * floor.active_image_extent, which only reflects whatever OTA install
-   * last completed and goes stale the moment a user reflashes a different
-   * image over USB/CDC without going through this bootloader at all.
-   * Missing/invalid fresh metadata fails closed (have_active_extent=false)
-   * rather than silently substituting a guessed extent. This does not
-   * touch floor.confirmed_counter_floor, which remains the sole
-   * anti-rollback authority regardless of bank-0 state. */
-  have_active_extent = active_extent_from_settings(boot_settings,
-                                                    &expected_active_extent);
-  if (xiao_ota_command_acceptable_phase(have_state, (xiao_ota_phase_t)state.phase)) {
-    if (!floor_trustworthy || !have_active_extent ||
-        !command_policy_valid(&command, floor.confirmed_counter_floor,
-                              expected_active_extent, &intent)) {
-      return;
-    }
-    hash_qspi(XIAO_OTA_CANDIDATE_BASE, intent.image_size_bytes, digest);
-    if (!all_equal(digest, intent.image_hash_sha256)) return;
-    hash_internal(XIAO_OTA_APP_START, intent.active_image_extent, digest);
-    if (!all_equal(digest, intent.active_image_hash_sha256)) return;
-    memset(&state, 0, sizeof(state));
-    state.transaction_nonce = intent.transaction_nonce;
-    state.phase = XIAO_OTA_PHASE_BACKUP_COPYING;
-    state.active_image_extent = intent.active_image_extent;
-    state.candidate_counter = intent.monotonic_counter;
-    state.previous_bank_0 = boot_settings->bank_0;
-    state.previous_bank_0_crc = boot_settings->bank_0_crc;
-    state.previous_bank_0_size = boot_settings->bank_0_size;
-    memcpy(state.candidate_hash_sha256, intent.image_hash_sha256, 32);
-    memcpy(state.backup_hash_sha256, intent.active_image_hash_sha256, 32);
-    persist_state(&state);
-  }
-
-  if (state.phase == XIAO_OTA_PHASE_BACKUP_COPYING) {
-    if (!copy_internal_to_qspi(&state)) force_recovery();
-    hash_qspi(XIAO_OTA_BACKUP_BASE, state.active_image_extent, digest);
-    if (!all_equal(digest, state.backup_hash_sha256)) force_recovery();
-    state.phase = XIAO_OTA_PHASE_BACKUP_READY;
-    state.progress_bytes = 0;
-    persist_state(&state);
-  }
-  if (state.phase == XIAO_OTA_PHASE_BACKUP_READY ||
-      state.phase == XIAO_OTA_PHASE_INSTALL_COPYING) {
-    /* have_active_extent is re-checked explicitly (not just relying on the
-     * expected_active_extent==0 default) so a bank-0 metadata failure mid-
-     * transaction always rolls back, defense-in-depth alongside the
-     * initial acceptance gate above. */
-    if (!floor_trustworthy || !have_active_extent ||
-        !command_policy_valid(&command, floor.confirmed_counter_floor,
-                              expected_active_extent, &intent) ||
-        intent.transaction_nonce != state.transaction_nonce ||
-        !all_equal(intent.image_hash_sha256, state.candidate_hash_sha256)) {
-      state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-      state.progress_bytes = 0;
-      persist_state(&state);
-    }
-    if (state.phase != XIAO_OTA_PHASE_ROLLBACK_COPYING &&
-        state.progress_bytes == 0) {
-      hash_qspi(XIAO_OTA_CANDIDATE_BASE, intent.image_size_bytes, digest);
-      if (!all_equal(digest, state.candidate_hash_sha256)) {
-        state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-        persist_state(&state);
-      }
-    }
-    if (state.phase != XIAO_OTA_PHASE_ROLLBACK_COPYING) {
-      state.phase = XIAO_OTA_PHASE_INSTALL_COPYING;
-      persist_state(&state);
-      if (!copy_qspi_to_internal(&state, XIAO_OTA_CANDIDATE_BASE,
-                                 intent.image_size_bytes)) {
-        state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-        state.progress_bytes = 0;
-        persist_state(&state);
-      } else {
-        hash_internal(XIAO_OTA_APP_START, intent.image_size_bytes, digest);
-        if (!all_equal(digest, state.candidate_hash_sha256)) {
-          state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-          state.progress_bytes = 0;
-          persist_state(&state);
-        } else {
-          const uint32_t candidate_size = intent.image_size_bytes;
-          const uint16_t candidate_crc =
-              crc16_compute((const uint8_t *)XIAO_OTA_APP_START,
-                            candidate_size, NULL);
-          if (!write_boot_settings(BANK_VALID_APP, candidate_crc,
-                                   candidate_size)) {
-            state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-            state.progress_bytes = 0;
-            persist_state(&state);
-          } else {
-            memcpy(state.installed_hash_sha256, digest, 32);
-            state.phase = XIAO_OTA_PHASE_TRIAL_BOOT;
-            state.progress_bytes = 0;
-            state.trial_attempts = 0;
-            persist_state(&state);
-            start_trial_watchdog();
-            return;
-          }
-        }
-      }
-    }
-  }
-
-  confirmed = read_pair(XIAO_OTA_CONFIRM_A, XIAO_OTA_CONFIRM_B,
-                        &confirm_a, &confirm_b, sizeof(confirmation),
-                        (bool (*)(const void *))xiao_ota_confirmation_valid,
-                        &confirmation) &&
-              xiao_ota_confirmation_matches(&state, &confirmation);
-  if (state.phase == XIAO_OTA_PHASE_TRIAL_BOOT && confirmed) {
-    floor.confirmed_counter_floor = state.candidate_counter;
-    /* Not read back for extent derivation above (see
-     * active_extent_from_settings()'s comment); kept only as a durable
-     * record of the size this install last committed. */
-    floor.active_image_extent = intent.image_size_bytes;
-    memcpy(floor.confirmed_hash_sha256, state.candidate_hash_sha256, 32);
-    persist_floor(&floor);
-    state.phase = XIAO_OTA_PHASE_CONFIRMED;
-    persist_state(&state);
-    return;
-  }
-  if (state.phase == XIAO_OTA_PHASE_TRIAL_BOOT) {
-    state.trial_attempts++;
-    if (state.trial_attempts < XIAO_OTA_MAX_TRIAL_BOOTS) {
-      persist_state(&state);
-      start_trial_watchdog();
-      return;
-    }
-    state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
-    state.progress_bytes = 0;
-    persist_state(&state);
-  }
-  if (state.phase == XIAO_OTA_PHASE_ROLLBACK_COPYING) {
-    if (!copy_qspi_to_internal(&state, XIAO_OTA_BACKUP_BASE,
-                               state.active_image_extent))
-      force_recovery();
-    hash_internal(XIAO_OTA_APP_START, state.active_image_extent, digest);
-    if (!all_equal(digest, state.backup_hash_sha256)) force_recovery();
-    if (!write_boot_settings(state.previous_bank_0,
-                             state.previous_bank_0_crc,
-                             state.previous_bank_0_size))
-      force_recovery();
-    state.phase = XIAO_OTA_PHASE_FAILED;
-    persist_state(&state);
-    return;
-  }
-  if (state.phase == XIAO_OTA_PHASE_FAILED) return;
-  force_recovery();
+  static const xiao_ota_io_t hardware_io = {
+      .ctx = NULL,
+      .device_address = hw_device_address,
+      .explicit_dfu_requested = hw_explicit_dfu_requested,
+      .qspi_init = hw_qspi_init,
+      .qspi_read = hw_qspi_read,
+      .qspi_write = hw_qspi_write,
+      .qspi_erase_sector = hw_qspi_erase_sector,
+      .internal_read = hw_internal_read,
+      .internal_write = hw_internal_write,
+      .internal_erase_page = hw_internal_erase_page,
+      .start_trial_watchdog = hw_start_trial_watchdog,
+      .force_recovery = hw_force_recovery,
+  };
+  xiao_ota_boot_process_io(&hardware_io);
 }

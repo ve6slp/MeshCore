@@ -1,6 +1,7 @@
 
 #define RADIOLIB_STATIC_ONLY 1
 #include "RadioLibWrappers.h"
+#include "RadioLibDriverFaultClassification.h"
 
 #define STATE_IDLE       0
 #define STATE_RX         1
@@ -113,13 +114,19 @@ void RadioLibWrapper::startRecv() {
   int err = _radio->startReceive();
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_RX;
+    _driver_health.recordOutcome(true);
   } else {
     MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
+    _driver_health.recordOutcome(false);
   }
 }
 
 bool RadioLibWrapper::isInRecvMode() const {
   return (state & ~STATE_INT_READY) == STATE_RX;
+}
+
+bool RadioLibWrapper::isTransmitPending() const {
+  return (state & ~STATE_INT_READY) == STATE_TX_WAIT;
 }
 
 int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
@@ -130,12 +137,24 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
       if (len > sz) { len = sz; }
       int err = _radio->readData(bytes, len);
       if (err != RADIOLIB_ERR_NONE) {
-        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
         len = 0;
         n_recv_errors++;
+        if (radiolib_health::isGenuineRadioDriverFault(err)) {
+          MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
+          _driver_health.recordOutcome(false);
+        } else {
+          // Expected, ordinary over-the-air PHY decode rejection (e.g.
+          // RADIOLIB_ERR_CRC_MISMATCH): the driver call itself completed
+          // fine, only the packet's payload was corrupted on-air -- not
+          // evidence of an SPI/driver fault, so it must not reset the
+          // OTA trial-boot health window. The packet is still discarded
+          // and still counted in n_recv_errors above, unchanged.
+          _driver_health.recordOutcome(true);
+        }
       } else {
       //  Serial.print("  readData() -> "); Serial.println(len);
         n_recv++;
+        _driver_health.recordOutcome(true);
       }
     }
     #if defined(USE_LR2021)
@@ -149,8 +168,10 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
     int err = _radio->startReceive();
     if (err == RADIOLIB_ERR_NONE) {
       state = STATE_RX;
+      _driver_health.recordOutcome(true);
     } else {
       MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
+      _driver_health.recordOutcome(false);
     }
   }
   return len;
@@ -165,9 +186,11 @@ bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
   int err = _radio->startTransmit((uint8_t *) bytes, len);
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_TX_WAIT;
+    _driver_health.recordOutcome(true);
     return true;
   }
   MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startTransmit(%d)", err);
+  _driver_health.recordOutcome(false);
   idle();   // trigger another startRecv()
   _board->onAfterTransmit();
   return false;

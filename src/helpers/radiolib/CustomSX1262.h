@@ -2,6 +2,7 @@
 
 #include <RadioLib.h>
 #include "MeshCore.h"
+#include <helpers/radiolib/Sx126xGetStatusTransaction.h>
 
 class CustomSX1262 : public SX1262 {
   uint32_t _preambleMillis = 66;
@@ -161,5 +162,106 @@ class CustomSX1262 : public SX1262 {
       uint8_t rxGain = 0;
       readRegister(RADIOLIB_SX126X_REG_RX_GAIN, &rxGain, 1);
       return (rxGain == RADIOLIB_SX126X_RX_GAIN_BOOSTED);
+    }
+
+    /**
+     * \brief  Genuine, CHECKED replica of SX126x::getDeviceErrors(): unlike
+     *         the base RadioLib implementation (which calls
+     *         `mod->SPIreadStream()` but completely discards its returned
+     *         int16_t status, then unconditionally decodes whatever bytes
+     *         are left in the buffer), this surfaces the REAL underlying
+     *         SPI transaction status so a genuinely failed transfer (bus
+     *         fault, GPIO/busy timeout, ...) is never silently mistaken
+     *         for "zero errors" success just because the untouched buffer
+     *         still reads back as zero.
+     * \param  out_errors OUT - decoded device-error bits; ONLY meaningful
+     *                    when the returned status == RADIOLIB_ERR_NONE.
+     * \returns  the real RadioLib SPI transaction status.
+    */
+    int16_t getDeviceErrorsChecked(uint16_t* out_errors) {
+      // Poisoned (non-zero, NOT the success-shaped {0,0}) default: if the
+      // SPI transaction genuinely fails before ever touching the buffer,
+      // the decoded value must not accidentally look like "zero errors".
+      uint8_t data[2] = { 0xFF, 0xFF };
+      int16_t status = mod->SPIreadStream(RADIOLIB_SX126X_CMD_GET_DEVICE_ERRORS, data, 2);
+      *out_errors = (((uint16_t)data[0] & 0xFF) << 8) | (uint16_t)data[1];
+      return status;
+    }
+
+    /**
+     * \brief  Genuine, CHECKED replica of SX126x::getIrqFlags(): a SECOND,
+     *         independent real SPI register read (distinct command/
+     *         register from getDeviceErrorsChecked() above) that also
+     *         surfaces its actual transaction status instead of
+     *         discarding it -- so a driver-health probe can require TWO
+     *         genuinely-successful, independent hardware SPI round trips
+     *         before reporting healthy, not merely "one error-accumulator
+     *         register happened to read back as zero".
+     * \param  out_flags OUT - decoded IRQ status bits; ONLY meaningful
+     *                   when the returned status == RADIOLIB_ERR_NONE.
+     * \returns  the real RadioLib SPI transaction status.
+    */
+    int16_t getIrqFlagsChecked(uint32_t* out_flags) {
+      uint8_t data[2] = { 0xFF, 0xFF };  // poisoned, same rationale as above.
+      int16_t status = mod->SPIreadStream(RADIOLIB_SX126X_CMD_GET_IRQ_STATUS, data, 2);
+      *out_flags = (((uint32_t)data[0]) << 8) | (uint32_t)data[1];
+      return status;
+    }
+
+    /**
+     * \brief  Genuine, CHECKED replica of SX126x::getStatus(): the base
+     *         RadioLib implementation calls
+     *         `mod->SPIreadStream(RADIOLIB_SX126X_CMD_GET_STATUS, &data, 0)`
+     *         -- numBytes==0 -- and Module::SPItransferStream() gates
+     *         BOTH its real-status parsing (`numBytes > 0`) AND its
+     *         data-copy-out (`memcpy(dataIn, ..., numBytes)`) on that
+     *         same numBytes, so with numBytes==0 `data` is structurally
+     *         NEVER written to and the transaction's status is never
+     *         parsed either -- base getStatus() cannot provide real
+     *         chip-mode evidence at all in this vendored version.
+     *
+     *         This performs the IDENTICAL physical transaction (same
+     *         GET_STATUS command byte, same bytes on the wire) but asks
+     *         for the status byte as an ordinary 1-byte DATA payload
+     *         instead: `mod->spiConfig`'s configured STATUS bit-width is
+     *         temporarily zeroed for the duration of this single,
+     *         synchronous call only -- so the transfer's automatic
+     *         status-byte-count contribution drops out and
+     *         cmdLen(1)+numBytes(1) lines up exactly on the real status
+     *         byte, at the SAME wire position SX126x::SPIparseStatus()/
+     *         `statusPos==1` already expect -- then immediately restored,
+     *         even if the transfer itself failed, before returning.
+     *         `mod->spiConfig` is shared, single-threaded main-loop
+     *         state (this firmware never calls into the radio driver
+     *         from an ISR, and never re-enters it); the mutation window
+     *         is bounded to this one call's owning thread -- no OTHER
+     *         caller can begin a second, concurrent SPI transaction
+     *         while this one is in flight, even though the underlying
+     *         HAL may internally spin/yield while waiting for it to
+     *         complete -- so no other SPI caller can ever observe the
+     *         transiently-zeroed width.
+     * \param  out_status OUT - the real, decoded status byte (chip mode
+     *                    in bits 6:4, command status in bits 3:1); ONLY
+     *                    meaningful when the returned status ==
+     *                    RADIOLIB_ERR_NONE.
+     * \returns  the real RadioLib SPI transaction status, as genuinely
+     *           parsed by SX126x::SPIparseStatus() from that same byte
+     *           (so a 0x00/0xFF "chip not found" byte, or a byte
+     *           indicating a timed-out/invalid/failed SPI command, is
+     *           already reported as a non-success status here, not left
+     *           for the caller to separately decode).
+     *
+     *         The actual scoped-width-trick transaction is implemented
+     *         ONCE, module-type-agnostically, in
+     *         Sx126xGetStatusTransaction.h's
+     *         performSx126xGetStatusTransaction() -- this method is a
+     *         thin, real-RadioLib-Module-typed instantiation of it, so
+     *         the SAME transaction logic (not a second reimplementation)
+     *         is exercised by native host unit tests against a plain
+     *         FakeModule double.
+    */
+    int16_t getStatusChecked(uint8_t* out_status) {
+      return performSx126xGetStatusTransaction(mod, (uint16_t)RADIOLIB_SX126X_CMD_GET_STATUS,
+                                                out_status, Module::BITS_0);
     }
 };

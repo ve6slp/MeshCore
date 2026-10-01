@@ -24,12 +24,12 @@ TEST_SERIAL = "LABTESTSERIAL0001"
 TEST_KEY_BYTES = bytes(range(32))
 
 
-def _build_marker_bytes(board="xiao_nrf52840", key_bytes=TEST_KEY_BYTES):
+def _build_marker_bytes(board="xiao_nrf52840", key_bytes=TEST_KEY_BYTES, role_id=0):
     before_crc = struct.pack(
         "<IHHIIIHH32s",
         BOOT_INFO.BOOT_INFO_MAGIC, BOOT_INFO.BOOT_INFO_FORMAT_VERSION,
         BOOT_INFO.BOOT_INFO_STRUCT_BYTES, BOOT_INFO.BOARD_TARGET_VALUE[board],
-        BOOT_INFO.ROLE_ANY, BOOT_INFO.CAP_QSPI_INSTALL, BOOT_INFO.KEY_ID,
+        role_id, BOOT_INFO.CAP_QSPI_INSTALL, BOOT_INFO.KEY_ID,
         BOOT_INFO.ALGORITHM_ED25519, key_bytes,
     )
     crc = binascii.crc32(before_crc) & 0xFFFFFFFF
@@ -37,11 +37,11 @@ def _build_marker_bytes(board="xiao_nrf52840", key_bytes=TEST_KEY_BYTES):
 
 
 def _uf2_block(target_addr, payload, block_no, num_blocks,
-               family_id=None):
+               family_id=None, flags=0x2000):
     family_id = INSTALLER.UF2_FAMILY_ID_BOOTLOADER if family_id is None else family_id
     header = struct.pack(
         "<IIIIIIII", INSTALLER.UF2_MAGIC_START0, INSTALLER.UF2_MAGIC_START1,
-        0x2000, target_addr, len(payload), block_no, num_blocks, family_id,
+        flags, target_addr, len(payload), block_no, num_blocks, family_id,
     )
     body = header + payload
     body += b"\x00" * (512 - len(body) - 4)
@@ -243,6 +243,37 @@ class GuardedInstallerTest(unittest.TestCase):
             struct.pack_into("<I", blocks, off + 28, 0xADA52840)
         artifact = self._replace_artifact(bytes(blocks))
         with self.assertRaisesRegex(ValueError, "family_id"):
+            INSTALLER.install(self.args(artifact=artifact, dry_run=False))
+        self.assertFalse((self.volume / "replacement.uf2").exists())
+
+    def test_rejects_not_main_flash_block(self):
+        # A block with this flag set (0x00000001) would otherwise look
+        # structurally identical to a real one (correct magic, address,
+        # family, and marker bytes) -- but a real UF2 bootloader skips
+        # writing it to flash entirely, so this artifact would not
+        # actually program what its address map appears to promise.
+        block = bytearray(_uf2_block(0xF4000, b"\x11" * 32, 0, 1))
+        struct.pack_into("<I", block, 8, 0x00002001)  # familyID present + not-main-flash
+        artifact = self._replace_artifact(bytes(block))
+        with self.assertRaisesRegex(ValueError, "not main flash"):
+            INSTALLER.install(self.args(artifact=artifact, dry_run=False))
+        self.assertFalse((self.volume / "replacement.uf2").exists())
+
+    def test_rejects_file_container_block(self):
+        block = bytearray(_uf2_block(0xF4000, b"\x11" * 32, 0, 1))
+        struct.pack_into("<I", block, 8, 0x00003000)  # familyID present + file-container
+        artifact = self._replace_artifact(bytes(block))
+        with self.assertRaisesRegex(ValueError, "file container"):
+            INSTALLER.install(self.args(artifact=artifact, dry_run=False))
+        self.assertFalse((self.volume / "replacement.uf2").exists())
+
+    def test_rejects_missing_family_id_present_flag(self):
+        # Without this bit, offset 28 is a fileSize per the UF2 spec, not
+        # a family ID -- the family_id check elsewhere would be checking
+        # the wrong semantic field entirely.
+        block = bytearray(_uf2_block(0xF4000, b"\x11" * 32, 0, 1, flags=0))
+        artifact = self._replace_artifact(bytes(block))
+        with self.assertRaisesRegex(ValueError, "familyID present"):
             INSTALLER.install(self.args(artifact=artifact, dry_run=False))
         self.assertFalse((self.volume / "replacement.uf2").exists())
 

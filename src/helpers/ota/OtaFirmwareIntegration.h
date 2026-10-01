@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cmath>
 
 #include <ota/protocol/OtaDescriptor.h>
 #include <ota/protocol/OtaEnvelope.h>
@@ -92,6 +93,16 @@ struct FirmwareOtaStatus {
   uint32_t abortedSessions = 0;
   bool rollbackRequested = false;
   bool backendAvailable = false;
+  // Real, decoded fleet (background) campaign progress, populated only from
+  // validated Census/CohortResolution frames bound to the active campaign
+  // (see handleCensus/handleCohortResolution); never advanced on unparsed
+  // or foreign-campaign traffic.
+  uint32_t fleetCensusReports = 0;
+  bool fleetHasCohort = false;
+  uint16_t fleetCohortId = 0;
+  uint16_t fleetCohortSize = 0;
+  uint16_t fleetCohortIndex = 0;
+  uint16_t fleetMissingRangeCount = 0;
 };
 
 class OtaFirmwareIntegration {
@@ -108,7 +119,11 @@ public:
   uint32_t dutyWindowMs() const { return window_ms_; }
 
   bool setDutyCyclePercent(float percent) {
-    if (percent <= 0.0f || percent > 100.0f) return false;
+    // Reject non-finite input (NaN, +-Inf) explicitly: NaN fails both
+    // `<= 0.0f` and `> 100.0f` (all NaN comparisons are false), so without
+    // this guard a NaN would silently pass the bounds check below and then
+    // hit undefined behavior in the float->integer budget conversion.
+    if (!std::isfinite(percent) || percent <= 0.0f || percent > 100.0f) return false;
     duty_percent_ = percent;
     const uint64_t budget = (static_cast<uint64_t>(window_ms_) * static_cast<uint32_t>(percent * 1000.0f + 0.5f)) / 100000u;
     budget_ms_ = budget > 0 ? static_cast<uint32_t>(budget) : 1;
@@ -180,27 +195,19 @@ public:
         return true;
 
       case OtaMessageType::LeaseNegotiation:
-        if (lease_.state() == OtaLeaseState::Normal) lease_.handle(OtaLeaseEvent::RequestLease);
-        lease_.handle(OtaLeaseEvent::Granted);
-        return true;
+        return handleLeaseNegotiation(payload, payload_len);
 
       case OtaMessageType::Announcement:
-        if (fleet_.state() == OtaFleetState::Idle) fleet_.beginCampaign(id);
-        return true;
+        return handleAnnouncement(id, payload, payload_len);
 
       case OtaMessageType::Census:
-        fleet_.handle(OtaFleetEvent::AnnounceComplete, id);
-        fleet_.handle(OtaFleetEvent::CensusComplete, id);
-        return true;
+        return handleCensus(id, payload, payload_len);
 
       case OtaMessageType::CohortResolution:
-        fleet_.handle(OtaFleetEvent::CohortResolved, id);
-        return true;
+        return handleCohortResolution(id, payload, payload_len);
 
       case OtaMessageType::MissingRange:
-        coordinator_.handle(OtaCoordinatorEvent::ReceiptMissingDetected, id);
-        fleet_.handle(OtaFleetEvent::SomeMissing, id);
-        return true;
+        return handleMissingRange(id, payload, payload_len);
 
       case OtaMessageType::Commit:
         return handleCommit(id, payload, payload_len);
@@ -238,6 +245,12 @@ public:
     s.abortedSessions = aborted_sessions_;
     s.rollbackRequested = rollback_requested_;
     s.backendAvailable = backendAvailable();
+    s.fleetCensusReports = fleet_census_reports_;
+    s.fleetHasCohort = fleet_has_cohort_;
+    s.fleetCohortId = fleet_cohort_.cohortId;
+    s.fleetCohortSize = fleet_cohort_.cohortSize;
+    s.fleetCohortIndex = fleet_cohort_.cohortIndex;
+    s.fleetMissingRangeCount = static_cast<uint16_t>(fleet_last_census_.missingRangeCount);
     return s;
   }
 
@@ -248,6 +261,18 @@ private:
     using meshcore::ota::runtime::OtaReceiverState;
     return state == OtaReceiverState::Complete || state == OtaReceiverState::Failed ||
            state == OtaReceiverState::Aborted;
+  }
+
+  // True only if a campaign is active AND `id` is exactly that campaign's
+  // session identity. Every handler that mutates shared session state
+  // (authorization grant, staged bytes, receipt bitmap) MUST check this
+  // first and return false without side effects otherwise: this is what
+  // stops a foreign, stale, or replayed frame from corrupting the state of
+  // a legitimately in-progress transfer, since OtaReceiverStateMachine's own
+  // id check only runs (and only fails closed) *after* any code that already
+  // ran ahead of it.
+  bool isActiveSession(const meshcore::ota::runtime::OtaSessionId& id) const {
+    return session_active_ && meshcore::ota::runtime::otaSessionEquals(id, active_session_);
   }
 
   bool ensureReceiverCampaign(const meshcore::ota::runtime::OtaSessionId& id) {
@@ -269,8 +294,13 @@ private:
     if (payload == nullptr || payload_len < kDescriptorFragmentHeaderSize) return false;
     frag_index = payload[0];
     frag_count = payload[1];
-    total_len = static_cast<uint16_t>(payload[2]) | (static_cast<uint16_t>(payload[3]) << 8);
-    fragment_payload_size = static_cast<uint16_t>(payload[4]) | (static_cast<uint16_t>(payload[5]) << 8);
+    // All OTA wire codecs (OtaWireTypes.h, OtaMessages.h) and the RF lab
+    // reference sender use explicit big-endian ("network order") multi-byte
+    // fields. This header must match that convention exactly, or a real
+    // signed-wire descriptor sent by any conformant peer is silently
+    // misparsed (wrong lengths) and rejected.
+    total_len = meshcore::ota::protocol::getOtaBE16(payload + 2);
+    fragment_payload_size = meshcore::ota::protocol::getOtaBE16(payload + 4);
     fragment_data = payload + kDescriptorFragmentHeaderSize;
     fragment_data_len = payload_len - kDescriptorFragmentHeaderSize;
     return true;
@@ -310,6 +340,22 @@ private:
       return false;
     }
 
+    // Idempotency for an exact-duplicate completed descriptor: a lost final
+    // ACK legitimately causes a sender to retransmit every fragment of an
+    // already-accepted descriptor while the receiver is mid-transfer
+    // (Receiving/authorized, chunks already staged). Re-running verify +
+    // stagingBeginFailClosed + receipt_map_.reset() below would erase the
+    // candidate image and destroy in-flight progress for no protocol
+    // reason. Detect this case by comparing the freshly reassembled blob
+    // byte-for-byte against the last blob this exact session already
+    // verified, and short-circuit to a harmless re-ack that preserves all
+    // staged bytes, the receipt bitmap, and authorization state.
+    if (descriptor_verified_ && isActiveSession(id) && blob_len == verified_blob_len_ &&
+        memcmp(blob, verified_blob_, blob_len) == 0) {
+      receiver_.handle(OtaReceiverEvent::DescriptorFragmentReceived, id);
+      return true;
+    }
+
     OtaDescriptor descriptor;
     if (decodeOtaDescriptorCanonical(blob, kOtaDescriptorCanonicalSize, descriptor) != OtaDescriptorCodecResult::Ok) {
       receiver_.handle(OtaReceiverEvent::DescriptorRejected, id);
@@ -332,6 +378,11 @@ private:
     receipt_map_.reset(geometry_.chunkCount);
     descriptor_verified_ = true;
     authorized_ = false;
+    verified_blob_len_ = blob_len;
+    memcpy(verified_blob_, blob, blob_len);
+    if (staging_sink_ != nullptr) {
+      staging_sink_->onVerifiedWireDescriptor(blob, kOtaDescriptorCanonicalSize, signature, signature_len);
+    }
     if (coordinator_.state() == OtaCoordinatorState::Idle) coordinator_.beginCampaign(id);
     coordinator_.handle(OtaCoordinatorEvent::DescriptorDeliveryConfirmed, id);
     return receiver_.handle(OtaReceiverEvent::DescriptorComplete, id);
@@ -341,6 +392,12 @@ private:
                            const uint8_t* payload, size_t payload_len) {
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
+
+    // Reject foreign/stale/replayed session ids before touching anything:
+    // otherwise a spoofed authorization for an unrelated campaign would
+    // still flip `authorized_` true and abort the real session's staging
+    // sink once the (correctly failing) state-machine check ran below.
+    if (!isActiveSession(id)) return false;
 
     OtaAuthorizationPayload authorization;
     if (!descriptor_verified_ || !decodeOtaAuthorization(payload, payload_len, authorization) ||
@@ -353,6 +410,12 @@ private:
     }
 
     authorized_ = true;
+    if (trust_provider_ != nullptr && staging_sink_ != nullptr) {
+      uint8_t controller[32];
+      if (trust_provider_->controllerIdentity(controller)) {
+        staging_sink_->onAuthorizedSession(id, controller);
+      }
+    }
     bool receiver_ok = receiver_.handle(OtaReceiverEvent::AuthorizationGranted, id);
     bool coordinator_ok = coordinator_.handle(OtaCoordinatorEvent::AuthorizationGranted, id);
     return receiver_ok && coordinator_ok;
@@ -362,6 +425,14 @@ private:
                    const uint8_t* payload, size_t payload_len) {
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
+
+    // Reject foreign/stale/replayed chunks before writing anything to the
+    // staging sink or setting bits in the receipt bitmap: without this
+    // gate, an interleaved chunk carrying a foreign session id would still
+    // be written to the active campaign's staged image and marked received
+    // before the state machine's own id check (which only runs afterward,
+    // in receiver_.handle()) had a chance to reject it.
+    if (!isActiveSession(id)) return false;
 
     OtaChunkHeader chunk;
     const uint8_t* data = nullptr;
@@ -405,6 +476,12 @@ private:
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
 
+    // Reject foreign/stale/replayed commits before evaluating anything else:
+    // commit drives image-hash verification and the final flash commit, so
+    // it must be bound to the active session first, defense-in-depth on top
+    // of the campaignId check below and receiver_.handle()'s own id check.
+    if (!isActiveSession(id)) return false;
+
     OtaCommitPayload commit;
     if (!descriptor_verified_ || !authorized_ ||
         !decodeOtaCommit(payload, payload_len, commit) ||
@@ -441,6 +518,186 @@ private:
     return true;
   }
 
+  // Real subtype-aware lease negotiation. Every branch requires a legal
+  // (state, subtype) combination per OtaLeaseStateMachine's own transition
+  // table before advancing, so a malformed frame or a frame that does not
+  // fit the current negotiation phase is rejected rather than blindly
+  // granting/advancing regardless of content.
+  //
+  // Note: this only drives the local lease *state machine*. Actually
+  // applying the negotiated off-frequency radio profile (frequency,
+  // bandwidth, SF, CR) and its automatic expiry/revert is the integrator's
+  // responsibility via the same OtaDirectLeaseHandler/OtaDirectLeaseParams
+  // path already used for the locally-issued (USB) direct lease command;
+  // wiring a remote-negotiated profile table through to that handler is a
+  // separate, explicitly tracked follow-up (see status report).
+  bool handleLeaseNegotiation(const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
+
+    OtaLeaseNegotiationPayload negotiation;
+    if (!decodeOtaLeaseNegotiation(payload, payload_len, negotiation)) return false;
+
+    switch (negotiation.subtype) {
+      case OtaLeaseSubtype::Request:
+        if (lease_.state() != OtaLeaseState::Normal) return false;
+        return lease_.handle(OtaLeaseEvent::RequestLease);
+
+      case OtaLeaseSubtype::Grant:
+        if (lease_.state() != OtaLeaseState::Requesting) return false;
+        return lease_.handle(OtaLeaseEvent::Granted);
+
+      case OtaLeaseSubtype::Deny:
+        if (lease_.state() != OtaLeaseState::Requesting) return false;
+        return lease_.handle(OtaLeaseEvent::Denied);
+
+      case OtaLeaseSubtype::Renew:
+        // Renewal only makes sense while a lease is actually active; it does
+        // not itself change state (duration bookkeeping is owned by the
+        // transport-layer revert timer).
+        return lease_.state() == OtaLeaseState::Active;
+
+      case OtaLeaseSubtype::Release:
+        if (lease_.state() == OtaLeaseState::Active) {
+          return lease_.handle(OtaLeaseEvent::Release) && lease_.handle(OtaLeaseEvent::ReleaseAcked);
+        }
+        if (lease_.state() == OtaLeaseState::Releasing) {
+          return lease_.handle(OtaLeaseEvent::ReleaseAcked);
+        }
+        return false;
+    }
+    return false;
+  }
+
+  // Announcement/Census/CohortResolution/MissingRange are real,
+  // fully-decoded and campaign-bound below: every one of these rejects
+  // (returns false, no state change) frames that fail to decode or that
+  // name a campaign other than the one addressed by the envelope. This
+  // replaces the previous behavior of advancing the fleet state machine on
+  // receipt of any frame of the right *type*, irrespective of its payload.
+  bool handleAnnouncement(const meshcore::ota::runtime::OtaSessionId& id,
+                          const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
+
+    OtaAnnouncementPayload announcement;
+    if (!decodeOtaAnnouncement(payload, payload_len, announcement) ||
+        announcement.campaignId != id.campaignId) {
+      return false;
+    }
+
+    if (fleet_.state() == OtaFleetState::Idle) {
+      if (!fleet_.beginCampaign(id)) return false;
+      fleet_census_reports_ = 0;
+      fleet_has_cohort_ = false;
+    } else if (!meshcore::ota::runtime::otaSessionEquals(id, fleet_.activeSession())) {
+      return false;
+    }
+    fleet_last_announcement_ = announcement;
+    return true;
+  }
+
+  bool handleCensus(const meshcore::ota::runtime::OtaSessionId& id,
+                    const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
+
+    OtaCensusPayload census;
+    if (!decodeOtaCensus(payload, payload_len, census) ||
+        census.campaignId != id.campaignId ||
+        !meshcore::ota::runtime::otaSessionEquals(id, fleet_.activeSession())) {
+      return false;
+    }
+    ++fleet_census_reports_;
+    fleet_last_census_ = census;
+
+    switch (fleet_.state()) {
+      case OtaFleetState::Announcing:
+        if (!fleet_.handle(OtaFleetEvent::AnnounceComplete, id)) return false;
+        if (census.haveDescriptor == 0) return true;
+        return fleet_.handle(OtaFleetEvent::CensusComplete, id);
+      case OtaFleetState::Census:
+        // A real census report that shows the reporter still lacks the
+        // descriptor is a legal no-op: it does not (falsely) advance the
+        // phase, unlike blindly trusting every Census-typed frame.
+        if (census.haveDescriptor == 0) return true;
+        return fleet_.handle(OtaFleetEvent::CensusComplete, id);
+      case OtaFleetState::Multicasting:
+        // No dedicated wire message marks "the multicast round is over";
+        // the coordinator re-polls with the SAME Census message it used
+        // pre-multicast, and its arrival while we're in Multicasting is
+        // itself the round-end signal. Fold the MulticastComplete
+        // transition and the immediate missing/no-missing evaluation into
+        // this one frame rather than requiring a new message type (which
+        // would be a wire-format change, not a surgical fix).
+        if (!fleet_.handle(OtaFleetEvent::MulticastComplete, id)) return false;
+        return fleet_.handle(census.missingRangeCount == 0 ? OtaFleetEvent::NoneMissing
+                                                            : OtaFleetEvent::SomeMissing,
+                              id);
+      case OtaFleetState::MissingCensus:
+        return fleet_.handle(census.missingRangeCount == 0 ? OtaFleetEvent::NoneMissing
+                                                            : OtaFleetEvent::SomeMissing,
+                              id);
+      case OtaFleetState::Repairing:
+        // Same round-end-via-Census pattern as Multicasting above: a fresh
+        // Census poll arriving while we're mid-repair means the coordinator
+        // considers this repair round finished, so fold
+        // RepairRoundComplete + the next missing/no-missing decision into
+        // this one frame (re-census -> either converge to Committing or
+        // start another repair round).
+        if (!fleet_.handle(OtaFleetEvent::RepairRoundComplete, id)) return false;
+        return fleet_.handle(census.missingRangeCount == 0 ? OtaFleetEvent::NoneMissing
+                                                            : OtaFleetEvent::SomeMissing,
+                              id);
+      default:
+        return false;
+    }
+  }
+
+  bool handleCohortResolution(const meshcore::ota::runtime::OtaSessionId& id,
+                              const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
+
+    OtaCohortResolutionPayload cohort;
+    if (!decodeOtaCohortResolution(payload, payload_len, cohort) ||
+        cohort.campaignId != id.campaignId ||
+        !meshcore::ota::runtime::otaSessionEquals(id, fleet_.activeSession()) ||
+        cohort.cohortSize == 0 || cohort.cohortIndex >= cohort.cohortSize) {
+      return false;
+    }
+    if (!fleet_.handle(OtaFleetEvent::CohortResolved, id)) return false;
+    fleet_cohort_ = cohort;
+    fleet_has_cohort_ = true;
+    return true;
+  }
+
+  bool handleMissingRange(const meshcore::ota::runtime::OtaSessionId& id,
+                          const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
+
+    OtaMissingRangePayload missing;
+    if (!decodeOtaMissingRange(payload, payload_len, missing) ||
+        missing.campaignId != id.campaignId ||
+        missing.chunkCount == 0 ||
+        !meshcore::ota::runtime::otaSessionEquals(id, fleet_.activeSession())) {
+      return false;
+    }
+    fleet_last_missing_range_ = missing;
+    coordinator_.handle(OtaCoordinatorEvent::ReceiptMissingDetected, id);
+    // SomeMissing is only a legal fleet-state transition out of
+    // MissingCensus (-> Repairing). A directed MissingRange detail frame
+    // received WHILE already Repairing is a normal, additional repair
+    // target (there can be more than one missing range per round) rather
+    // than a new phase transition, so it must not be forced through
+    // fleet_.handle() a second time -- that would always fail (Repairing
+    // has no SomeMissing case) and reject an otherwise legitimate repair
+    // request.
+    if (fleet_.state() == OtaFleetState::Repairing) return true;
+    return fleet_.handle(OtaFleetEvent::SomeMissing, id);
+  }
+
   void resetTransferSession() {
     descriptor_reassembler_.reset();
     receipt_map_.reset(0);
@@ -449,7 +706,9 @@ private:
     descriptor_verified_ = false;
     authorized_ = false;
     session_active_ = false;
+    verified_blob_len_ = 0;
   }
+
 
   static constexpr uint32_t kChunkPayloadSize = meshcore::ota::runtime::kOtaDefaultChunkPayloadSize;
   FirmwareOtaMode mode_ = FirmwareOtaMode::Fleet;
@@ -470,11 +729,19 @@ private:
   meshcore::ota::runtime::OtaGeometry geometry_;
   meshcore::ota::runtime::OtaMaxImageBitmap receipt_map_;
   bool descriptor_verified_ = false;
+  uint8_t verified_blob_[meshcore::ota::protocol::OtaDescriptorReassembler::kMaxBlobSize] = {};
+  size_t verified_blob_len_ = 0;
   bool authorized_ = false;
   uint32_t rx_frames_ = 0;
   uint32_t bad_frames_ = 0;
   uint32_t aborted_sessions_ = 0;
   bool rollback_requested_ = false;
+  meshcore::ota::protocol::OtaAnnouncementPayload fleet_last_announcement_{};
+  meshcore::ota::protocol::OtaCensusPayload fleet_last_census_{};
+  meshcore::ota::protocol::OtaCohortResolutionPayload fleet_cohort_{};
+  meshcore::ota::protocol::OtaMissingRangePayload fleet_last_missing_range_{};
+  uint32_t fleet_census_reports_ = 0;
+  bool fleet_has_cohort_ = false;
 };
 
 }  // namespace ota

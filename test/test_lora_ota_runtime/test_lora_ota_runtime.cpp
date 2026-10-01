@@ -30,19 +30,21 @@ using meshcore::ota::protocol::OtaAirtimeCategory;
 // Geometry: checked arithmetic, exact final chunk length, overflow cases
 // ---------------------------------------------------------------------
 
-TEST(OtaGeometry, MaxImageAt160ByteChunksMatchesExpectedGeometry) {
+TEST(OtaGeometry, MaxImageAtDefaultChunkSizeMatchesExpectedGeometry) {
   OtaGeometry g;
   ASSERT_EQ(OtaGeometryResult::Ok, OtaGeometry::compute(kOtaMaxImageBytes, kOtaDefaultChunkPayloadSize, kOtaMaxImageBytes, g));
-  EXPECT_EQ(5069u, g.chunkCount);
+  // kOtaMaxImageBytes is an exact multiple of kOtaDefaultChunkPayloadSize
+  // (708608 / 128 = 5536 exactly), so the final chunk is full-size too.
+  EXPECT_EQ(5536u, g.chunkCount);
   EXPECT_EQ(128u, g.finalChunkLength);
   EXPECT_EQ(kOtaMaxChunkCount, static_cast<size_t>(g.chunkCount));
 
   uint32_t len = 0;
   ASSERT_TRUE(g.chunkLength(0, len));
-  EXPECT_EQ(160u, len);
-  ASSERT_TRUE(g.chunkLength(5067, len));
-  EXPECT_EQ(160u, len);
-  ASSERT_TRUE(g.chunkLength(5068, len)); // last index (0-based), chunkCount-1
+  EXPECT_EQ(128u, len);
+  ASSERT_TRUE(g.chunkLength(5534, len));
+  EXPECT_EQ(128u, len);
+  ASSERT_TRUE(g.chunkLength(5535, len)); // last index (0-based), chunkCount-1
   EXPECT_EQ(128u, len);
 }
 
@@ -114,9 +116,9 @@ TEST(OtaGeometry, ChunkOffsetIsExact) {
   OtaGeometry g;
   ASSERT_EQ(OtaGeometryResult::Ok, OtaGeometry::compute(kOtaMaxImageBytes, kOtaDefaultChunkPayloadSize, kOtaMaxImageBytes, g));
   uint64_t offset = 0;
-  ASSERT_TRUE(g.chunkOffset(5068, offset));
-  EXPECT_EQ(5068ull * 160ull, offset);
-  EXPECT_EQ(810880ull, offset);
+  ASSERT_TRUE(g.chunkOffset(5535, offset));
+  EXPECT_EQ(5535ull * 128ull, offset);
+  EXPECT_EQ(708480ull, offset);
   EXPECT_EQ(kOtaMaxImageBytes, static_cast<uint32_t>(offset + 128));
 }
 
@@ -723,13 +725,19 @@ TEST(OtaAirtimeLimiter, RegulatoryDenialOverridesAvailableBudget) {
   EXPECT_FALSE(limiter.canAdmit(0, OtaAirtimeCategory::Control, 1, decision));
 }
 
-TEST(OtaAirtimeLimiter, NormalTrafficPrecedenceBlocksRepairAndRelayButNotControl) {
+TEST(OtaAirtimeLimiter, NormalTrafficPrecedenceBlocksAllOtaCategoriesIncludingControl) {
+  // Ready normal (non-OTA) mesh traffic takes absolute precedence over
+  // every OTA airtime category -- Control (session negotiation, auth,
+  // receipts, lease, census, etc.) included. An earlier version exempted
+  // Control from this check, letting OTA session-control frames preempt
+  // ready normal traffic; that violated the "normal traffic is never
+  // starved by OTA" guarantee this limiter exists to enforce.
   OtaAirtimeLimiter limiter;
   OtaAirtimeDecisionInput decision;
   decision.normalTrafficActive = true;
   EXPECT_FALSE(limiter.canAdmit(0, OtaAirtimeCategory::Repair, 100, decision));
   EXPECT_FALSE(limiter.canAdmit(0, OtaAirtimeCategory::Relay, 100, decision));
-  EXPECT_TRUE(limiter.canAdmit(0, OtaAirtimeCategory::Control, 100, decision));
+  EXPECT_FALSE(limiter.canAdmit(0, OtaAirtimeCategory::Control, 100, decision));
 }
 
 TEST(OtaAirtimeLimiter, ClockWrapIsHandledCorrectly) {

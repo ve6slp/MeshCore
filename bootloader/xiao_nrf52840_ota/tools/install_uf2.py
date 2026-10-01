@@ -25,6 +25,15 @@ UF2_PAYLOAD_MAX_SIZE = 476
 # produced by this project's bootloader packaging step.
 UF2_FAMILY_ID_BOOTLOADER = 0xD663823C
 
+# UF2 block flags (offset 8 in each 512-byte block; see
+# https://github.com/microsoft/uf2#file-containers). Every block this
+# project's packaging step actually emits sets exactly
+# UF2_FLAG_FAMILY_ID_PRESENT and nothing else (confirmed against real
+# packaged artifacts).
+UF2_FLAG_NOT_MAIN_FLASH = 0x00000001
+UF2_FLAG_FILE_CONTAINER = 0x00001000
+UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000
+
 # Address ranges a genuine no-SWD bootloader-update UF2 is allowed to
 # target, derived from (a) this target's documented flash layout and (b) a
 # byte-exact read of a real packaged artifact
@@ -101,6 +110,7 @@ def validate_uf2(path):
         for index in range(expected_blocks):
             block = stream.read(512)
             start0, start1 = struct.unpack_from("<II", block, 0)
+            flags = struct.unpack_from("<I", block, 8)[0]
             target_addr, payload_size = struct.unpack_from("<II", block, 12)
             block_number, block_count = struct.unpack_from("<II", block, 20)
             family_id = struct.unpack_from("<I", block, 28)[0]
@@ -113,6 +123,34 @@ def validate_uf2(path):
                 raise ValueError(f"invalid UF2 magic in block {index}")
             if block_count != expected_blocks or block_number >= block_count:
                 raise ValueError(f"invalid UF2 block numbering in block {index}")
+            # A crafted file can change only this flags word and leave the
+            # address map, marker bytes, and every other field looking
+            # exactly like a genuine artifact, while a real UF2 bootloader
+            # silently skips writing that block to flash (or treats it as
+            # a virtual-filesystem file container, not a flash write at
+            # all) -- so these bits must be checked independently of the
+            # address/family/marker comparisons below, never inferred from
+            # them passing.
+            if flags & UF2_FLAG_NOT_MAIN_FLASH:
+                raise ValueError(
+                    f"block {index} sets UF2 flag 0x{UF2_FLAG_NOT_MAIN_FLASH:08X} "
+                    "(not main flash) -- a real UF2 bootloader skips writing this "
+                    "block to flash entirely, so this artifact would not actually "
+                    "program what its address map/marker appear to promise"
+                )
+            if flags & UF2_FLAG_FILE_CONTAINER:
+                raise ValueError(
+                    f"block {index} sets UF2 flag 0x{UF2_FLAG_FILE_CONTAINER:08X} "
+                    "(file container) -- this artifact must be a flat flash image, "
+                    "never a virtual-filesystem file container block"
+                )
+            if not (flags & UF2_FLAG_FAMILY_ID_PRESENT):
+                raise ValueError(
+                    f"block {index} does not set UF2 flag "
+                    f"0x{UF2_FLAG_FAMILY_ID_PRESENT:08X} (familyID present) -- "
+                    "without it, offset 28 is a fileSize, not a family ID, which "
+                    "would make the family_id check below meaningless"
+                )
             if family_id != UF2_FAMILY_ID_BOOTLOADER:
                 raise ValueError(
                     f"block {index} declares family_id 0x{family_id:08X}, "
@@ -173,15 +211,15 @@ def authorized_serials():
     return set(lab_device.load_roles().values())
 
 
-def validate_artifact(artifact_path, board, key_header):
+def validate_artifact(artifact_path, board, key_header, role_id=0):
     """Artifact-only checks: UF2 structure/whitelist plus the boot-info
-    marker/board/key. Runs with no serial, port, or mounted-device
+    marker/board/key/role. Runs with no serial, port, or mounted-device
     resolution -- callable standalone (e.g. in CI, before any board is
     connected) via --validate-only.
     """
     artifact = Path(artifact_path)
     validate_uf2(artifact)
-    marker_errors = boot_info.check_artifact(artifact, board, Path(key_header))
+    marker_errors = boot_info.check_artifact(artifact, board, Path(key_header), role_id)
     if marker_errors:
         raise ValueError(
             "boot-info marker in artifact failed independent verification: "
@@ -195,7 +233,8 @@ def install(args):
         args, "key_header",
         Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",
     )
-    validate_artifact(args.artifact, board, key_header)
+    role_id = getattr(args, "role_id", 0)
+    validate_artifact(args.artifact, board, key_header, role_id)
 
     if args.validate_only:
         print(f"VALIDATE-ONLY: artifact {args.artifact} passed all artifact checks")
@@ -283,6 +322,10 @@ def parse_args():
     parser.add_argument("--board", choices=sorted(boot_info.BOARD_TARGET_VALUE),
                         default="xiao_nrf52840",
                         help="board profile the artifact's boot-info marker must match")
+    parser.add_argument("--role-id", type=int, choices=[0, 1], default=0,
+                        help="compiled role identity (XIAO_OTA_COMPILED_ROLE_ID) "
+                             "the artifact's boot-info marker must match: 0 "
+                             "(companion, default) or 1 (repeater)")
     parser.add_argument(
         "--key-header", type=Path,
         default=Path(__file__).resolve().parents[1] / "include/xiao_ota_public_key.h",

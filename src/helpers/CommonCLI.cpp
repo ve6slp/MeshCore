@@ -30,12 +30,12 @@ static bool isValidName(const char *n) {
   return true;
 }
 
-void CommonCLI::loadPrefs(FILESYSTEM* fs) {
-  if (fs->exists("/prefs.json")) {
+void CommonCLI::loadPrefs(FILESYSTEM* fs, const char* prefs_filename) {
+  if (fs->exists(prefs_filename)) {
 #if defined(RP2040_PLATFORM)
-    File file = fs->open("/prefs.json", "r");
+    File file = fs->open(prefs_filename, "r");
 #else
-    File file = fs->open("/prefs.json");
+    File file = fs->open(prefs_filename);
 #endif
     if (file) {
       _prefs->loadSerial(file);   // new Serial prefs
@@ -43,7 +43,7 @@ void CommonCLI::loadPrefs(FILESYSTEM* fs) {
     }
   } else if (fs->exists("/com_prefs")) {
     loadPrefsInt(fs, "/com_prefs");
-    if (savePrefs(fs)) {  // save to new Serial prefs
+    if (savePrefs(fs, prefs_filename)) {  // save to new Serial prefs
   //    fs->remove("/com_prefs");  // remove old
     }
   }
@@ -143,14 +143,14 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy 
   }
 }
 
-bool CommonCLI::savePrefs(FILESYSTEM* fs) {
+bool CommonCLI::savePrefs(FILESYSTEM* fs, const char* prefs_filename) {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  fs->remove("/prefs.json");
-  File file = fs->open("/prefs.json", FILE_O_WRITE);
+  fs->remove(prefs_filename);
+  File file = fs->open(prefs_filename, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
-  File file = fs->open("/prefs.json", "w");
+  File file = fs->open(prefs_filename, "w");
 #else
-  File file = fs->open("/prefs.json", "w", true);
+  File file = fs->open(prefs_filename, "w", true);
 #endif
   if (file) {
     bool success = _prefs->saveSerial(file);

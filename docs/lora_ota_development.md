@@ -33,10 +33,26 @@ examples/companion_radio/  CLI/binary command handling and lifecycle hooks
 test/test_lora_ota_{protocol,runtime,storage,trust,boot,integration}/
 ```
 
-`src/ota/` is header-only. It is gated everywhere by the `MESHCORE_LORA_OTA`
+The portable OTA core is mostly header-only. ESP32 partition and NVS
+adapters also have `.cpp` SDK boundaries. It is gated by the `MESHCORE_LORA_OTA`
 build flag, currently set in `variants/xiao_nrf52/platformio.ini`,
 `variants/sensecap_solar/platformio.ini`, and
 `variants/xiao_s3_wio/platformio.ini`.
+
+Campaign staging delegates to `OtaFirmwareStorageSink`, including its
+optional durable command handoff. `beginSession()` erases the candidate;
+`resumeSession()` only attaches RAM state to existing bytes and clears
+prior authorization. The receiver must re-verify durable metadata and
+restore the exact verified descriptor and consented session before
+committing a resumed install. Attaching alone proves neither image
+integrity nor installation.
+
+The shared nRF install nonce derives the first BE64 hash bytes from
+`"MeshCore/OTA/install-attempt/v1"` (no NUL), controller32, campaignBE32,
+sessionBE32, attemptBE16 and SHA256(canonical59). Independent golden
+vectors cover each binding component. This pure calculation does not
+authenticate the controller: durable immutable attempt ownership,
+collision refusal and integration remain separate acceptance gates.
 
 ## Building and testing
 
@@ -53,9 +69,13 @@ make test-ota-trust
 make test-ota-aead-cipher     # actual firmware Crypto library, not native mocks
 make test-ota-boot
 make test-ota-integration
+make test-ota-campaign       # portable controller/receiver and install handoff
 make test-ota-lab-host        # host-side unittest suite for lab scripts (below)
+make test-ota-maintenance-host # host maintenance wire-codec tests
+make test-ota-maintenance     # shared protocol and native maintenance codecs
 
 make build-ota-targets        # compile the OTA-enabled firmware targets
+make build-ota-nrf52-targets  # XIAO/SenseCAP, companion and repeater roles
 make build-ota-baseline-targets  # same targets, OTA disabled, for size diffing
 make build-non-ota-targets    # regression guard: platforms that never enable OTA
 
@@ -65,6 +85,56 @@ make verify-ota-software      # native tests + both build passes, in one gate
 `verify-ota-software` is explicitly a **software-only** qualification gate.
 Its own summary output says so: passing it means native tests are green and
 firmware links, not that any device can be updated.
+
+`build-ota-nrf52-targets` builds all four nRF52840 USB application profiles.
+It does not substitute the ESP32-S3 profile for the XIAO nRF52840 companion
+or qualify custom-loader installation.
+
+### Public nRF52840 boot references
+
+```sh
+make generate-ota-boot-catalogue
+make test-ota-boot-catalogue
+```
+
+Generation first validates and clean-builds the unmodified pinned public loader,
+its ELF flash load addresses, and the public MBR/SoftDevice artifacts.
+It does not read a device or approve an observed loader hash. The generated
+header contains the XIAO USB profile's reference bytes; the provenance
+sidecar records artifact hashes, source/submodule pins, compiler identity,
+build options, and fixed build epoch. Pre-existing HEX/ELF pairs are replaced
+by that fresh build, not trusted as proof of their source. A shared memory
+layout does not authorize another board profile.
+
+`XIAO_OTA_UPSTREAM` selects the public checkout. Override
+`OTA_BOOT_CATALOGUE_HEADER` and `OTA_BOOT_CATALOGUE_PROVENANCE` to write
+qualification outputs beneath `.tmp/` instead of replacing the source
+header. Generation neither flashes hardware nor grants commissioning
+authority. Acceptance still requires fresh live measurements of the
+complete catalogue conjunction, the raw MBR/UICR selector policy, and the
+separate blank retained-command parameter page.
+
+For a complete stock-plus-custom catalogue:
+
+```sh
+make generate-ota-boot-catalogue-custom \
+  OTA_BOOT_CATALOGUE_CUSTOM_MANIFEST=/absolute/path/to/qualified-builds.json
+```
+
+The explicit manifest must contain all four board/role pairs, their exact
+ELF/packaged HEX/UF2 paths, trusted public-key header and qualified overlay
+provenance. Missing, duplicate or unapproved custom inputs refuse generation;
+neither shared pins nor successful compilation licenses a SenseCAP stock row.
+Both outputs are generated into staging before publication, with the source
+header replaced last. Stock-only generation remains available without a
+custom manifest.
+
+`make qualify-xiao-ota-bootloader` builds and packages both nRF board
+profiles for companion role 0 and repeater role 1, then runs each native
+gate with matching boot-process identity. Its metadata harness must run
+against that board/role's actual prepared source; a missing tree fails
+qualification rather than silently skipping. This remains an offline
+gate, not an installation or live-commissioning result.
 
 `test-ota-aead-cipher` links the installed firmware Crypto library's actual
 ChaCha20-Poly1305 implementation in a separate host executable, so ordinary

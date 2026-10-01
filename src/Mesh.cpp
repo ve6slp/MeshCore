@@ -626,7 +626,11 @@ Packet* Mesh::createRawData(const uint8_t* data, size_t len) {
 Packet* Mesh::createOtaData(const uint8_t* data, size_t len) {
   if (len > sizeof(Packet::payload)) return NULL;
 
-  Packet* packet = obtainNewPacket();
+  // OTA's own outbound bulk traffic must never starve the ordinary
+  // sender/raw-ingress/delayed-RX/relay paths of buffers -- allocate
+  // against the reserved-below-threshold OTA path (see PacketManager::
+  // allocNew()).
+  Packet* packet = obtainNewPacket(true);
   if (packet == NULL) {
     MESH_DEBUG_PRINTLN("%s Mesh::createOtaData(): error, packet pool empty", getLogDateTime());
     return NULL;
@@ -671,14 +675,14 @@ Packet* Mesh::createControlData(const uint8_t* data, size_t len) {
   return packet;
 }
 
-void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
+bool Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
-    return;
+    return false;
   }
   if (path_hash_size == 0 || path_hash_size > 3) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
-    return;
+    return false;
   }
 
   packet->header &= ~PH_ROUTE_MASK;
@@ -688,17 +692,17 @@ void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_si
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   uint8_t pri = mesh::ota::floodPriorityForPayload(packet->getPayloadType(), 0);
-  sendPacket(packet, pri, delay_millis);
+  return sendPacket(packet, pri, delay_millis);
 }
 
-void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis, uint8_t path_hash_size) {
+bool Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
-    return;
+    return false;
   }
   if (path_hash_size == 0 || path_hash_size > 3) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
-    return;
+    return false;
   }
 
   packet->header &= ~PH_ROUTE_MASK;
@@ -710,7 +714,7 @@ void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_m
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
   uint8_t pri = mesh::ota::floodPriorityForPayload(packet->getPayloadType(), 0);
-  sendPacket(packet, pri, delay_millis);
+  return sendPacket(packet, pri, delay_millis);
 }
 
 void Mesh::sendDirect(Packet* packet, const uint8_t* path, uint8_t path_len, uint32_t delay_millis) {

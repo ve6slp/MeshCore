@@ -41,7 +41,23 @@ bool xiao_ota_resolve_active_extent(bool bank_0_marker_valid,
                                     uint16_t recomputed_crc16,
                                     uint32_t app_region_size,
                                     uint32_t *out_extent) {
-  if (!bank_0_marker_valid || bank_0_crc == 0 || bank_0_size == 0 ||
+  /*
+   * CRC-16-CCITT (the algorithm crc16_compute()/Nordic's own bank_0_crc
+   * use) has no reserved "invalid" codomain value: 0 is a perfectly
+   * reachable, legitimate CRC for real image bytes (including after a
+   * signed candidate's own pad-fixup step deliberately drives its
+   * trailing bytes to land on a zero remainder). Treating stored/
+   * recomputed 0 as automatically invalid is not a real integrity check
+   * at all -- it is a policy that silently REJECTS a subset of correctly
+   * signed, correctly installed images for no cryptographic reason,
+   * while doing nothing to catch corruption (a corrupted-to-0 CRC still
+   * gets caught below by the equality compare, exactly like any other
+   * corrupted value). The only real sentinel here is bank_0_marker_valid
+   * itself (whether bank-0 even claims to hold a valid app); once that
+   * is true, the ONLY authoritative check is recomputed_crc16 ==
+   * bank_0_crc, uniformly, including when both sides are 0.
+   */
+  if (!bank_0_marker_valid || bank_0_size == 0 ||
       bank_0_size > app_region_size || recomputed_crc16 != bank_0_crc) {
     return false;
   }
@@ -49,23 +65,48 @@ bool xiao_ota_resolve_active_extent(bool bank_0_marker_valid,
   return true;
 }
 
-static bool record_valid(const void *record, size_t size, uint32_t magic,
-                         uint16_t expected_version, uint16_t record_bytes,
-                         size_t crc_offset, size_t commit_offset) {
+/*
+ * Everything a fully-formed, self-consistent record must satisfy EXCEPT
+ * the commit-marker exact match: magic/version/record_bytes/CRC. A
+ * record whose body passes this is either (a) durably committed and
+ * otherwise intact (only its marker field disagrees, whether because the
+ * marker write is still genuinely in flight or because it was corrupted
+ * some time after a real commit), or (b) an extraordinarily unlikely
+ * coincidental CRC collision on foreign data -- CRC32 makes that
+ * negligible in practice, so in effect this predicate answers "is this
+ * byte-for-byte a real record of this type, modulo its commit state".
+ * See record_body_valid_and_committed() below for why this split matters:
+ * a record passing THIS check can NEVER be resolved as safe-to-discard
+ * from its own bytes alone (see xiao_ota_boot_io.c's slot_safe_to_
+ * overwrite() doc-comment).
+ */
+static bool record_body_valid(const void *record, size_t size, uint32_t magic,
+                              uint16_t expected_version, uint16_t record_bytes,
+                              size_t crc_offset) {
   const uint8_t *bytes = (const uint8_t *)record;
   uint32_t stored_crc;
-  uint32_t commit;
   if (record == NULL || size != record_bytes) {
     return false;
   }
   memcpy(&stored_crc, bytes + crc_offset, sizeof(stored_crc));
-  memcpy(&commit, bytes + commit_offset, sizeof(commit));
   return memcmp(bytes, &magic, sizeof(magic)) == 0 &&
          bytes[4] == (uint8_t)expected_version &&
          bytes[5] == (uint8_t)(expected_version >> 8) &&
          bytes[6] == (uint8_t)record_bytes && bytes[7] == (uint8_t)(record_bytes >> 8) &&
-         commit == XIAO_OTA_COMMIT_MARKER &&
          stored_crc == xiao_ota_crc32(record, crc_offset);
+}
+
+static bool record_valid(const void *record, size_t size, uint32_t magic,
+                         uint16_t expected_version, uint16_t record_bytes,
+                         size_t crc_offset, size_t commit_offset) {
+  const uint8_t *bytes = (const uint8_t *)record;
+  uint32_t commit;
+  if (!record_body_valid(record, size, magic, expected_version, record_bytes,
+                         crc_offset)) {
+    return false;
+  }
+  memcpy(&commit, bytes + commit_offset, sizeof(commit));
+  return commit == XIAO_OTA_COMMIT_MARKER;
 }
 
 bool xiao_ota_command_valid(const xiao_ota_command_t *record) {
@@ -111,6 +152,20 @@ bool xiao_ota_state_valid(const xiao_ota_state_t *record) {
          record->phase <= XIAO_OTA_PHASE_FAILED;
 }
 
+/*
+ * Everything xiao_ota_state_valid() checks EXCEPT the commit-marker
+ * exact match -- see record_body_valid()'s doc-comment. Used by
+ * slot_safe_to_overwrite() (xiao_ota_boot_io.c) to detect the
+ * genuinely-ambiguous case (a fully-formed record whose marker alone
+ * disagrees) that NOR-reachability-only reasoning cannot safely resolve.
+ */
+bool xiao_ota_state_body_valid(const xiao_ota_state_t *record) {
+  return record_body_valid(record, sizeof(*record), XIAO_OTA_RECORD_MAGIC,
+                           XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                           offsetof(xiao_ota_state_t, crc32)) &&
+         record->phase <= XIAO_OTA_PHASE_FAILED;
+}
+
 bool xiao_ota_confirmation_valid(const xiao_ota_confirmation_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_CONFIRM_MAGIC,
                       XIAO_OTA_FORMAT_VERSION, sizeof(*record),
@@ -118,11 +173,41 @@ bool xiao_ota_confirmation_valid(const xiao_ota_confirmation_t *record) {
                       offsetof(xiao_ota_confirmation_t, commit_marker));
 }
 
+bool xiao_ota_settings_sidecar_valid(const xiao_ota_settings_sidecar_t *record) {
+  return record_valid(record, sizeof(*record), XIAO_OTA_SIDECAR_MAGIC,
+                      XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                      offsetof(xiao_ota_settings_sidecar_t, crc32),
+                      offsetof(xiao_ota_settings_sidecar_t, commit_marker));
+}
+
+/* See xiao_ota_state_body_valid()'s doc-comment; sidecar counterpart. */
+bool xiao_ota_settings_sidecar_body_valid(const xiao_ota_settings_sidecar_t *record) {
+  return record_body_valid(record, sizeof(*record), XIAO_OTA_SIDECAR_MAGIC,
+                           XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                           offsetof(xiao_ota_settings_sidecar_t, crc32));
+}
+
 bool xiao_ota_floor_valid(const xiao_ota_floor_t *record) {
   return record_valid(record, sizeof(*record), XIAO_OTA_FLOOR_MAGIC,
                       XIAO_OTA_FORMAT_VERSION, sizeof(*record),
                       offsetof(xiao_ota_floor_t, crc32),
                       offsetof(xiao_ota_floor_t, commit_marker));
+}
+
+/* See xiao_ota_state_body_valid()'s doc-comment; floor counterpart. */
+bool xiao_ota_floor_body_valid(const xiao_ota_floor_t *record) {
+  return record_body_valid(record, sizeof(*record), XIAO_OTA_FLOOR_MAGIC,
+                           XIAO_OTA_FORMAT_VERSION, sizeof(*record),
+                           offsetof(xiao_ota_floor_t, crc32));
+}
+
+bool xiao_ota_floor_activation_receipt_body_valid(
+    const xiao_ota_floor_activation_receipt_t *record) {
+  return record_body_valid(record, sizeof(*record),
+                           XIAO_OTA_FLOOR_ACTIVATION_MAGIC,
+                           XIAO_OTA_FLOOR_ACTIVATION_RECORD_VERSION,
+                           sizeof(*record),
+                           offsetof(xiao_ota_floor_activation_receipt_t, crc32));
 }
 
 bool xiao_ota_bytes_erased(const void *data, size_t length) {
@@ -173,7 +258,6 @@ void xiao_ota_wire_descriptor_encode(const xiao_ota_wire_descriptor_t *d,
 
 bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_SIZE],
                                      xiao_ota_wire_descriptor_t *out) {
-  uint8_t reencoded[XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
   size_t pos = 0;
   out->board_family = get_be16(in + pos); pos += 2;
   out->board_variant = get_be16(in + pos); pos += 2;
@@ -186,8 +270,7 @@ bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_S
   out->format_id = get_be16(in + pos); pos += 2;
   out->key_id = get_be16(in + pos); pos += 2;
   out->algorithm_id = get_be16(in + pos); pos += 2;
-  xiao_ota_wire_descriptor_encode(out, reencoded);
-  return memcmp(reencoded, in, XIAO_OTA_WIRE_DESCRIPTOR_SIZE) == 0;
+  return true;
 }
 
 bool xiao_ota_install_command_from_v1(const xiao_ota_command_t *cmd,
@@ -255,38 +338,71 @@ bool xiao_ota_install_command_decode(const xiao_ota_command_any_t *any,
   return false;
 }
 
-bool xiao_ota_install_command_policy_valid(const xiao_ota_install_command_t *cmd,
-                                           uint32_t counter_floor,
-                                           uint32_t expected_active_extent,
-                                           uint64_t this_device_address) {
+bool xiao_ota_install_command_static_identity_valid(
+    const xiao_ota_install_command_t *cmd, uint64_t this_device_address) {
   if (cmd == NULL) return false;
   /* Checked against this build's compiled-in board profile, never a
    * wildcard/"matches anything" value -- see XIAO_OTA_BOARD_TARGET. */
   if (cmd->target_id != XIAO_OTA_BOARD_TARGET) return false;
-  if (cmd->role_id != XIAO_OTA_ROLE_ANY) return false;
+  /* Checked against THIS build's compiled role identity
+   * (XIAO_OTA_COMPILED_ROLE_ID, 0=companion/1=repeater), never a
+   * wildcard -- a role-1 binary refuses a role-0-targeted command and
+   * vice versa. XIAO_OTA_ROLE_ANY (0) is simply the companion role's own
+   * wire value under this exact-equality check, not a separate
+   * "matches anything" case. */
+  if (cmd->role_id != XIAO_OTA_COMPILED_ROLE_ID) return false;
   if (cmd->app_address != XIAO_OTA_APP_START) return false;
   if (cmd->format_id != XIAO_OTA_DESCRIPTOR_FORMAT) return false;
   if (cmd->key_id != XIAO_OTA_KEY_ID) return false;
   if (cmd->algorithm_id != XIAO_OTA_ALGORITHM_ED25519) return false;
   if ((cmd->required_boot_capability_flags & XIAO_OTA_CAP_QSPI_INSTALL) == 0) return false;
-  if (cmd->monotonic_counter <= counter_floor) return false;
   /* Candidate/install size capped to XIAO_OTA_INSTALL_MAX_SIZE (708,608
    * bytes, 0x27000..0xD4000), not the full XIAO_OTA_CANDIDATE_SIZE
    * (811,008 bytes, 0x27000..0xED000): 0xD4000..0xED000 is where v1.17's
    * own internal filesystem lives today, and letting an otherwise-valid
-   * install erase/overwrite into it would be unsafe. This does not change
-   * XIAO_OTA_CANDIDATE_SIZE/XIAO_OTA_BACKUP_SIZE, which remain correct as
-   * the full-extent bound for the QSPI staging slot and for the
-   * always-safe backup/active-image-reference size below. */
+   * install erase/overwrite into it would be unsafe. XIAO_OTA_CANDIDATE_
+   * SIZE/XIAO_OTA_BACKUP_SIZE remain a separate, larger PHYSICAL
+   * placement stride only (see the active/backup extent comment right
+   * below) -- never a writable-capacity bound in their own right. */
   if (cmd->image_size_bytes == 0 || cmd->image_size_bytes > XIAO_OTA_INSTALL_MAX_SIZE) return false;
   if ((cmd->image_size_bytes & 3u) != 0) return false;
-  if (cmd->active_image_extent == 0 || cmd->active_image_extent > XIAO_OTA_BACKUP_SIZE) return false;
+  /*
+   * The active/backup image extent is bounded by the SAME writable
+   * image-capacity contract as the install size above
+   * (XIAO_OTA_INSTALL_MAX_SIZE, 0xAD000, matching the shared
+   * src/ota/platform/Nrf52FlashLayoutContract.h's
+   * OTA_NRF52_IMAGE_CAPACITY_BYTES -- see xiao_ota_layout.h's
+   * cross-check static assertions), NOT XIAO_OTA_BACKUP_SIZE/
+   * XIAO_OTA_CANDIDATE_SIZE (0xC6000): those two describe the fixed
+   * PHYSICAL bank-to-bank placement stride only, and the 0xC6000-
+   * 0xAD000 = 0x19000 tail past the capacity boundary in each bank is a
+   * separate, foreign, global identity/security store this project must
+   * never erase or write into. A backup/restore extent this large would
+   * do exactly that on the external QSPI backup bank (and, on restore,
+   * would also overwrite v1.17's own internal filesystem region) -- so
+   * this bound is not "the always-safe read+copy size" it once was
+   * assumed to be; it is a real destructive-write bound like the
+   * install size above.
+   */
+  if (cmd->active_image_extent == 0 || cmd->active_image_extent > XIAO_OTA_INSTALL_MAX_SIZE) return false;
   if ((cmd->active_image_extent & 3u) != 0) return false;
-  if (cmd->active_image_extent != expected_active_extent) return false;
   if (cmd->device_address != this_device_address &&
       !(cmd->device_address == 0 && cmd->allow_broadcast_address == 1)) {
     return false;
   }
+  return true;
+}
+
+bool xiao_ota_install_command_policy_valid(const xiao_ota_install_command_t *cmd,
+                                           uint32_t counter_floor,
+                                           uint32_t expected_active_extent,
+                                           uint64_t this_device_address) {
+  if (cmd == NULL) return false;
+  if (!xiao_ota_install_command_static_identity_valid(cmd, this_device_address)) {
+    return false;
+  }
+  if (cmd->monotonic_counter <= counter_floor) return false;
+  if (cmd->active_image_extent != expected_active_extent) return false;
   return true;
 }
 
@@ -352,4 +468,24 @@ xiao_ota_phase_t xiao_ota_recovery_phase(const xiao_ota_state_t *state,
 bool xiao_ota_command_acceptable_phase(bool have_state, xiao_ota_phase_t phase) {
   return !have_state || phase == XIAO_OTA_PHASE_EMPTY ||
          phase == XIAO_OTA_PHASE_CONFIRMED || phase == XIAO_OTA_PHASE_FAILED;
+}
+
+bool xiao_ota_command_is_retry_of_failed_transaction(
+    bool have_state, xiao_ota_phase_t phase,
+    uint64_t state_transaction_nonce, uint32_t state_candidate_counter,
+    const uint8_t state_candidate_hash[32], uint64_t intent_transaction_nonce,
+    uint32_t intent_monotonic_counter, const uint8_t intent_image_hash[32]) {
+  return have_state && phase == XIAO_OTA_PHASE_FAILED &&
+         state_transaction_nonce == intent_transaction_nonce &&
+         state_candidate_counter == intent_monotonic_counter &&
+         memcmp(state_candidate_hash, intent_image_hash, 32) == 0;
+}
+
+bool xiao_ota_confirmation_hash_bound_extent_valid(
+    bool fresh_active_extent_valid, uint32_t fresh_active_extent,
+    uint32_t max_candidate_extent, const uint8_t fresh_hash[32],
+    const uint8_t installed_hash[32]) {
+  return fresh_active_extent_valid && fresh_active_extent != 0 &&
+         fresh_active_extent <= max_candidate_extent &&
+         memcmp(fresh_hash, installed_hash, 32) == 0;
 }

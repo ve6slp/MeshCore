@@ -7,16 +7,27 @@
 #include <ota/platform/Nrf52FlashAdapter.h>
 #include <ota/platform/SenseCapQspiLayout.h>
 #include <ota/storage/StorageManager.h>
+#include <ota/storage/Journal.h>
+#include <ota/storage/XiaoOtaCommissioningGuard.h>
+#include <ota/storage/XiaoOtaBootInfoReader.h>
 #include <ota/trust/CanonicalDescriptor.h>
 #include <ota/trust/DescriptorVerifier.h>
 #include <ota/trust/Sha256.h>
+#include <helpers/ota/OtaBoardBackendCommon.h>
 
 namespace {
 
 constexpr uint32_t kImageBytes = 8192u;
 constexpr uint32_t kChunkBytes = 160u;
-constexpr uint32_t kTargetId = 0x52840001u;
-constexpr uint32_t kRoleId = 1u;
+// Canonical boot-side identity for the XIAO lab target (must match
+// bootloader/xiao_nrf52840_ota/include/xiao_ota_record.h's
+// XIAO_OTA_TARGET_XIAO_NRF52840 / XIAO_OTA_ROLE_ANY, and
+// variants/xiao_nrf52/OtaLabBackend.cpp's trust anchor) so this
+// factory/lab qualification harness rehearses a genuinely representative
+// signed descriptor rather than a self-invented value that happens to
+// only ever get compared against itself.
+constexpr uint32_t kTargetId = 0x584E3430u;
+constexpr uint32_t kRoleId = 0u;
 constexpr uint32_t kSecurityCounter = 1u;
 constexpr uint8_t kLabPublicKey[32] = {
     0x79, 0xB5, 0x56, 0x2E, 0x8F, 0xE6, 0x54, 0xF9,
@@ -65,10 +76,39 @@ public:
 };
 
 ota::platform::Nrf52FlashAdapter flash;
+// Maintenance/lab-only destructive scratch, gated below on
+// deviceAlreadyCommissioned() -- see SenseCapQspiLayout.h's extended
+// comment on kCandidateTestOffset for why this range is safe to reuse
+// (candidate-owned space, entirely inside the candidate bank's own
+// writable image capacity, never inside its securityA tail).
 ota::platform::FlashRegion candidate =
-    ota::platform::SenseCapQspiLayout::candidateTestRegion(flash);
-ota::platform::FlashRegion journal_region =
-    ota::platform::SenseCapQspiLayout::journalTestRegion(flash);
+    ota::platform::SenseCapQspiLayout::candidateMaintenanceScratchRegion(flash);
+// The real (non-test) journal region is opened read-only-in-practice here:
+// it is only ever scanned via Journal::recoverLatest() and per-sub-slot
+// raw reads for the commissioning guard below, never written by this
+// harness. The destructive raw-semantics probe deliberately reuses
+// `candidate` (the same reserved sacrificial carve-out as the
+// signed-image rehearsal) instead of a separate journal-partition
+// carve-out: the journal holds the durable, redundant antirollback
+// "floor"/state/command/confirmation records and must never be a target
+// of routine hardware-qualification erasing (see SenseCapQspiLayout.h).
+//
+// Deliberately NOT aliased to journalTestRegion()/candidateRecordScratchRegion():
+// that legacy/relocated name is now candidate-owned scratch space and
+// contains none of the real journal's checkpoint data, so redirecting
+// this read-only commissioning-evidence scan there would silently defeat
+// the guard's fail-closed "generic checkpoint present" signal.
+ota::platform::FlashRegion real_journal =
+    ota::platform::SenseCapQspiLayout::journalRegion(flash);
+ota::platform::FlashRegion xiao_journal_full_region =
+    ota::platform::SenseCapQspiLayout::xiaoJournalFullRegion(flash);
+// Canonical target identity for the commissioning-guard boot-marker
+// qualification check below -- deliberately the SAME kTargetId/kRoleId
+// this harness rehearses as a signed descriptor, and the SAME
+// kExpectedCapabilityFlags variants/xiao_nrf52/OtaLabBackend.cpp expects,
+// so "is this device already commissioned" reflects the exact same
+// custom-bootloader identity the real companion firmware would trust.
+constexpr uint32_t kExpectedCapabilityFlags = 1u;
 
 void fillImageChunk(uint32_t image_offset, uint8_t* out, uint32_t len) {
   for (uint32_t i = 0; i < len; ++i) {
@@ -98,15 +138,77 @@ bool expectStatus(const char* name, ota::platform::FlashStatus actual,
   return actual == expected;
 }
 
+// Refuses to proceed with any destructive operation if there is ANY
+// evidence this device has already been commissioned via a real custom
+// bootloader / OTA campaign -- checked three independent ways (see
+// ota::storage::XiaoOtaCommissioningInputs for the full rationale):
+//   (a) a genuinely qualified custom bootloader marker is present
+//       (XiaoOtaBootInfoReader magic/format/CRC + identity match);
+//   (b) ANY of the 8 xiao_ota_* journal sub-slots (install command/
+//       state/confirmation/floor A+B) is non-blank -- this is the
+//       format the custom bootloader actually writes on real hardware,
+//       and a prior version of this guard never checked it at all;
+//   (c) the separate generic ota::storage::Journal/JournalCheckpoint
+//       format (used by the portable ota::boot::BootTransaction
+//       self-install path) has a valid checkpoint.
+// Any ONE of these being true refuses the whole harness; this is a
+// factory/lab qualification tool only, and running it destructively
+// against an already-commissioned device could otherwise silently roll
+// back the device's antirollback floor or destroy live staged/installed
+// campaign data.
+bool deviceAlreadyCommissioned() {
+  const mesh::ota::OtaBoardBootQualification qualification =
+      mesh::ota::resolveOtaBoardBootQualification(kTargetId, kRoleId, kExpectedCapabilityFlags);
+
+  ota::storage::Journal journal(real_journal);
+  bool generic_checkpoint_present = false;
+  if (!journal.isValid()) {
+    // Journal geometry mismatch (e.g. running against a device whose
+    // journal partition isn't erase-unit aligned the way this layout
+    // expects) is treated as "cannot prove it's safe" -- fail closed.
+    generic_checkpoint_present = true;
+  } else {
+    ota::storage::JournalCheckpoint existing;
+    generic_checkpoint_present = journal.recoverLatest(existing);
+  }
+
+  const uint32_t erase_unit = xiao_journal_full_region.eraseUnitBytes();
+  uint8_t sub_slot_buf[8][4096];
+  const uint8_t* sub_slots[8];
+  bool any_subslot_read_ok = erase_unit == sizeof(sub_slot_buf[0]);
+  if (any_subslot_read_ok) {
+    for (int i = 0; i < 8; ++i) {
+      if (!ota::platform::isOk(
+              xiao_journal_full_region.read(static_cast<uint32_t>(i) * erase_unit, sub_slot_buf[i], erase_unit))) {
+        any_subslot_read_ok = false;
+        break;
+      }
+      sub_slots[i] = sub_slot_buf[i];
+    }
+  }
+  // An unreadable/unexpected-geometry journal partition fails closed
+  // (treated as non-blank / "cannot prove it's safe"), matching
+  // anyXiaoJournalSubSlotNonBlank()'s own null-pointer fail-closed rule.
+  const bool any_subslot_nonblank =
+      !any_subslot_read_ok || ota::storage::anyXiaoJournalSubSlotNonBlank(sub_slots, erase_unit);
+
+  ota::storage::XiaoOtaCommissioningInputs inputs;
+  inputs.boot_marker_qualified = qualification.qualified;
+  inputs.generic_journal_checkpoint_present = generic_checkpoint_present;
+  inputs.any_xiao_subslot_nonblank = any_subslot_nonblank;
+  return ota::storage::isDeviceAlreadyCommissioned(inputs);
+}
+
+
 bool testRawSemantics() {
   using ota::platform::FlashStatus;
-  bool ok = ota::storage::StorageManager::erasePartition(journal_region);
-  Serial.printf("CHECK journal_erase %s\n", ok ? "PASS" : "FAIL");
+  bool ok = ota::storage::StorageManager::erasePartition(candidate);
+  Serial.printf("CHECK candidate_test_erase %s\n", ok ? "PASS" : "FAIL");
   if (!ok) return false;
 
   uint8_t erased_probe[16] = {0};
   const ota::platform::FlashStatus erased_probe_status =
-      journal_region.read(0, erased_probe, sizeof(erased_probe));
+      candidate.read(0, erased_probe, sizeof(erased_probe));
   Serial.printf("ERASE_PROBE status=%s bytes=", statusName(erased_probe_status));
   for (uint8_t value : erased_probe) Serial.printf("%02X", value);
   Serial.println();
@@ -116,17 +218,17 @@ bool testRawSemantics() {
     pattern[i] = static_cast<uint8_t>(0xE7u ^ (i * 11u));
   }
   uint8_t pre_program[sizeof(pattern)] = {0};
-  journal_region.read(3, pre_program, sizeof(pre_program));
+  candidate.read(3, pre_program, sizeof(pre_program));
   Serial.printf("PROGRAM_PROBE old=");
   for (uint8_t value : pre_program) Serial.printf("%02X", value);
   Serial.printf(" new=");
   for (uint8_t value : pattern) Serial.printf("%02X", value);
   Serial.println();
   ok &= expectStatus("unaligned_program_supported",
-                     journal_region.program(3, pattern, sizeof(pattern)), FlashStatus::Ok);
+                     candidate.program(3, pattern, sizeof(pattern)), FlashStatus::Ok);
 
   uint8_t readback[sizeof(pattern)] = {0};
-  ok &= expectStatus("raw_read", journal_region.read(3, readback, sizeof(readback)),
+  ok &= expectStatus("raw_read", candidate.read(3, readback, sizeof(readback)),
                      FlashStatus::Ok);
   const bool bytes_match = std::memcmp(pattern, readback, sizeof(pattern)) == 0;
   Serial.printf("CHECK raw_readback %s\n", bytes_match ? "PASS" : "FAIL");
@@ -135,12 +237,12 @@ bool testRawSemantics() {
   uint8_t erased_value[sizeof(pattern)];
   std::memset(erased_value, 0xFF, sizeof(erased_value));
   ok &= expectStatus("zero_to_one_rejected",
-                     journal_region.program(3, erased_value, sizeof(erased_value)),
+                     candidate.program(3, erased_value, sizeof(erased_value)),
                      FlashStatus::PartialProgramViolation);
-  ok &= expectStatus("unaligned_erase_rejected", journal_region.eraseSector(1),
+  ok &= expectStatus("unaligned_erase_rejected", candidate.eraseSector(1),
                      FlashStatus::Unaligned);
   ok &= expectStatus("bounds_rejected",
-                     journal_region.read(journal_region.sizeBytes() - 8u, readback, 16u),
+                     candidate.read(candidate.sizeBytes() - 8u, readback, 16u),
                      FlashStatus::OutOfRange);
   return ok;
 }
@@ -172,9 +274,16 @@ bool stageAndVerifySignedImage() {
 
   ota::trust::DeviceTrustAnchor anchor;
   std::memcpy(anchor.trusted_signer_public_key_ed25519, kLabPublicKey, sizeof(kLabPublicKey));
-  anchor.expected_target_id = kTargetId;
-  anchor.expected_role_id = kRoleId;
-  anchor.supported_boot_capability_flags = 0;
+  // Must match the descriptor's own format_id/key_id/algorithm_id above
+  // (all explicitly 1): DescriptorVerifier::verifyPolicy() checks these
+  // against the anchor, not the descriptor's own claim, so leaving these
+  // at their zero default would fail-closed reject this genuinely signed
+  // fixture with FormatIdMismatch before ever reaching the signature it
+  // was built to exercise. Uses the shared helper so all six identity
+  // fields are always populated together (see OtaBoardBackendCommon.h).
+  mesh::ota::configureOtaTrustAnchorIdentity(anchor, kTargetId, kRoleId, /*supported_boot_capability_flags=*/0,
+                                             descriptor.format_id, descriptor.key_id,
+                                             descriptor.algorithm_id);
 
   LabCounter counter;
   ota::trust::Sha256 verifier_hash;
@@ -256,6 +365,17 @@ void runTest() {
     Serial.println("OTA_QSPI_TEST RESULT FAIL");
     return;
   }
+
+  // Commissioning guard: refuse all destructive operations below if the
+  // real (non-test) journal partition already holds a valid antirollback
+  // checkpoint. See deviceAlreadyCommissioned()'s comment for why.
+  if (deviceAlreadyCommissioned()) {
+    Serial.println("CHECK commissioning_guard FAIL device_already_commissioned");
+    Serial.println("OTA_QSPI_TEST RESULT FAIL");
+    return;
+  }
+  Serial.println("CHECK commissioning_guard PASS device_not_commissioned");
+
 
   uint8_t jedec[3] = {0, 0, 0};
   const ota::platform::FlashStatus jedec_status = flash.readJedecId(jedec);

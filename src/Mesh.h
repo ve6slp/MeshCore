@@ -216,14 +216,18 @@ public:
 
   /**
    * \brief  send a locally-generated Packet with flood routing
+   * \return true if the packet was actually queued for transmission,
+   *         false if it was rejected/dropped (already freed in that case)
   */
-  void sendFlood(Packet* packet, uint32_t delay_millis=0, uint8_t path_hash_size=1);
+  bool sendFlood(Packet* packet, uint32_t delay_millis=0, uint8_t path_hash_size=1);
 
   /**
    * \brief  send a locally-generated Packet with flood routing
    * \param transport_codes   array of 2 codes to attach to packet
+   * \return true if the packet was actually queued for transmission,
+   *         false if it was rejected/dropped (already freed in that case)
   */
-  void sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis=0, uint8_t path_hash_size=1);
+  bool sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis=0, uint8_t path_hash_size=1);
 
   /**
    * \brief  send a locally-generated Packet with Direct routing

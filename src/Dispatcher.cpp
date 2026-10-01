@@ -212,10 +212,25 @@ void Dispatcher::checkRecv() {
         MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): WARNING: received data, no unused packets available!", getLogDateTime());
       } else {
         if (tryParsePacket(pkt, raw, len)) {
-          pkt->_snr = _radio->getLastSNR() * 4.0f;
-          score = _radio->packetScore(_radio->getLastSNR(), len);
-          air_time = _radio->getEstAirtimeFor(len);
-          rx_air_time += air_time;
+          // Raw ingress alloc above can't know the payload type ahead of
+          // time (is_ota_bulk=false), so OTA classification/reserve
+          // enforcement happens here instead, right after parsing -- this
+          // single check covers raw ingress, immediate-RX, and delayed-RX
+          // (the flood path below queues this same 'pkt' unchanged), so a
+          // sustained burst of *incoming* OTA traffic can never push the
+          // pool below the reserve out from under ordinary traffic, exactly
+          // like the existing is_ota_bulk reserve does for OTA's own
+          // outbound bulk allocations. See PacketManager::kOtaAllocReserve.
+          if (mesh::ota::isOtaPacket(pkt) && _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
+            MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): dropping inbound OTA packet, pool at/below ordinary-traffic reserve", getLogDateTime());
+            _mgr->free(pkt);
+            pkt = NULL;
+          } else {
+            pkt->_snr = _radio->getLastSNR() * 4.0f;
+            score = _radio->packetScore(_radio->getLastSNR(), len);
+            air_time = _radio->getEstAirtimeFor(len);
+            rx_air_time += air_time;
+          }
         } else {
           _mgr->free(pkt);  // put back into pool
           pkt = NULL;
@@ -273,6 +288,16 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
     _mgr->free(pkt);
   } else if (action == ACTION_MANUAL_HOLD) {
     // sub-class is wanting to manually hold Packet instance, and call releasePacket() at appropriate time
+  } else if (mesh::ota::isOtaPacket(pkt) && _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
+    // ACTION_RETRANSMIT* for an OTA packet (relay/forward), but the pool is
+    // at/below the ordinary-traffic reserve: queueing this for outbound
+    // relay would hold its buffer for as long as it sits in the send queue
+    // awaiting duty-cycle airtime budget (potentially many seconds), which
+    // is exactly how sustained background OTA traffic starved ordinary
+    // sends under physical test. Drop it instead of relaying -- OTA is
+    // retry/repair-capable, ordinary traffic is not allowed to be starved.
+    MESH_DEBUG_PRINTLN("%s Dispatcher::processRecvPacket(): dropping relayed OTA packet, pool at/below ordinary-traffic reserve", getLogDateTime());
+    _mgr->free(pkt);
   } else {   // ACTION_RETRANSMIT*
     uint8_t priority = (action >> 24) - 1;
     uint32_t _delay = action & 0xFFFFFF;
@@ -313,7 +338,7 @@ void Dispatcher::checkSend() {
   }
   cad_busy_start = 0;  // reset busy state
 
-  outbound = _mgr->getNextOutbound(_ms->getMillis());
+  outbound = _mgr->getNextOutbound(_ms->getMillis(), &outbound_priority);
   if (outbound) {
     int len = 0;
     uint8_t raw[MAX_TRANS_UNIT];
@@ -340,9 +365,22 @@ void Dispatcher::checkSend() {
         unsigned long needed = prospective_airtime - tx_budget_ms;
         unsigned long delay = duty_cycle > 0.0f ? (unsigned long)(needed / duty_cycle) : getDutyCycleWindowMs();
         Packet* held = outbound;
+        // Preserve the packet's ORIGINAL queue priority on requeue instead
+        // of collapsing every non-OTA packet to priority 1: that used to
+        // silently discard direct/high-priority/path/trace/flood ordering
+        // for any packet that happened to be budget-gated even once.
+        uint8_t held_priority = held->getPayloadType() == PAYLOAD_TYPE_LORA_OTA
+                                    ? mesh::ota::kOtaForwardPriority
+                                    : outbound_priority;
         outbound = NULL;
-        sendPacket(held, held->getPayloadType() == PAYLOAD_TYPE_LORA_OTA ? mesh::ota::kOtaForwardPriority : 1, delay);
-        next_tx_time = futureMillis(delay);
+        sendPacket(held, held_priority, delay);
+        // Retry again soon (not after the full duty-cycle `delay`): other,
+        // smaller/lower-priority-numbered packets already in the queue may
+        // still be immediately budget-admissible even though this one
+        // isn't yet, and they must not be starved for the whole `delay`
+        // window just because this pass happened to select the larger
+        // packet first.
+        next_tx_time = futureMillis(delay < 1000 ? delay : 1000);
         return;
       }
 
@@ -364,7 +402,11 @@ void Dispatcher::checkSend() {
           outbound = NULL;
           outbound_is_ota = false;
           sendPacket(held, mesh::ota::kOtaForwardPriority, 60000);
-          next_tx_time = futureMillis(1000);
+          // Do not impose a global next_tx_time stall here: this OTA
+          // packet is now shelved for 60s regardless, and normal traffic
+          // taking absolute precedence (per canAdmit()) must be able to
+          // send on the very next tick rather than waiting out an
+          // arbitrary fixed delay behind a single deferred OTA frame.
           return;
         }
       }
@@ -399,8 +441,8 @@ void Dispatcher::checkSend() {
   }
 }
 
-Packet* Dispatcher::obtainNewPacket() {
-  auto pkt = _mgr->allocNew();  // TODO: zero out all fields
+Packet* Dispatcher::obtainNewPacket(bool is_ota_bulk) {
+  auto pkt = _mgr->allocNew(is_ota_bulk);  // TODO: zero out all fields
   if (pkt == NULL) {
     _err_flags |= ERR_EVENT_FULL;
   } else {
@@ -414,20 +456,31 @@ void Dispatcher::releasePacket(Packet* packet) {
   _mgr->free(packet);
 }
 
-void Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis) {
+bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis) {
   if (!Packet::isValidPathLen(packet->path_len) || packet->payload_len > MAX_PACKET_PAYLOAD) {
     MESH_DEBUG_PRINTLN("%s Dispatcher::sendPacket(): ERROR: invalid packet... path_len=%d, payload_len=%d", getLogDateTime(), (uint32_t) packet->path_len, (uint32_t) packet->payload_len);
     _mgr->free(packet);
+    return false;
   } else {
-    _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));
+    return _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));
   }
 }
 
 #if MESHCORE_LORA_OTA
 bool Dispatcher::hasQueuedNormalTraffic() {
+  // getOutboundCount(now) only tells us *some* entry (of any kind) is
+  // ready now; it does NOT mean the specific entries this loop finds
+  // below are ready. The previous implementation scanned every queued
+  // entry unconditionally, so a normal packet scheduled arbitrarily far
+  // in the future (e.g. a delayed advert) would still count as "queued
+  // normal traffic" and block OTA relay/repair transmission even though
+  // no normal packet was actually ready to send. Skip any entry whose
+  // scheduled_for has not arrived yet.
   if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;
+  const uint32_t now = _ms->getMillis();
   const int total = _mgr->getOutboundTotal();
   for (int i = 0; i < total; ++i) {
+    if ((int32_t)(_mgr->getOutboundScheduledForByIdx(i) - now) > 0) continue;  // not ready yet
     Packet* packet = _mgr->getOutboundByIdx(i);
     if (packet != nullptr && !mesh::ota::isOtaPacket(packet)) return true;
   }
@@ -436,8 +489,10 @@ bool Dispatcher::hasQueuedNormalTraffic() {
 
 bool Dispatcher::hasQueuedOtaTraffic() {
   if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;
+  const uint32_t now = _ms->getMillis();
   const int total = _mgr->getOutboundTotal();
   for (int i = 0; i < total; ++i) {
+    if ((int32_t)(_mgr->getOutboundScheduledForByIdx(i) - now) > 0) continue;  // not ready yet
     Packet* packet = _mgr->getOutboundByIdx(i);
     if (packet != nullptr && mesh::ota::isOtaPacket(packet)) return true;
   }

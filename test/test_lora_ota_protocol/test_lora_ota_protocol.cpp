@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "ota/protocol/OtaWireTypes.h"
+#include "ota/protocol/OtaCommissioningAbi.h"
 #include "ota/protocol/OtaByteStream.h"
 #include "ota/protocol/OtaEnvelope.h"
 #include "ota/protocol/OtaDescriptor.h"
@@ -581,6 +582,146 @@ TEST(OtaWireTypes, KnownMessageTypeBoundsAreExact) {
   EXPECT_TRUE(isKnownOtaMessageType(kOtaMessageTypeMax));
   EXPECT_FALSE(isKnownOtaMessageType(kOtaMessageTypeMax + 1));
 }
+
+// ---------------------------------------------------------------------
+// Commissioning USB control-channel ABI (section E wire layout)
+// ---------------------------------------------------------------------
+
+TEST(OtaCommissioningAbi, RequestHeaderIsExactly37Bytes) {
+  OtaControlRequestHeader h;
+  uint8_t buf[64];
+  ASSERT_TRUE(encodeOtaControlRequestHeader(h, buf, sizeof(buf)));
+  EXPECT_EQ(kOtaControlRequestHeaderSize, 37u);
+}
+
+TEST(OtaCommissioningAbi, ReplyHeaderIsExactly40Bytes) {
+  OtaControlReplyHeader h;
+  uint8_t buf[64];
+  ASSERT_TRUE(encodeOtaControlReplyHeader(h, buf, sizeof(buf)));
+  EXPECT_EQ(kOtaControlReplyHeaderSize, 40u);
+}
+
+TEST(OtaCommissioningAbi, MaxReplyPlusOuterFramingStaysUnderTransportCeiling) {
+  // header(40) + data(128) + outer '<'/len16/'>' framing(3) = 171 <= 176.
+  EXPECT_EQ(kOtaControlMaxReplyWireSize, 168u);
+  EXPECT_LE(kOtaControlMaxReplyWireSize + 3, 176u);
+}
+
+TEST(OtaCommissioningAbi, RequestHeaderRoundTripsAllFields) {
+  OtaControlRequestHeader h;
+  h.sub = OtaControlSubcommand::PutFragment;
+  for (size_t i = 0; i < kOtaControlSessionIdBytes; ++i)
+    h.session[i] = static_cast<uint8_t>(0xA0 + i);
+  h.requestId = 0x11223344;
+  h.jobTicket = 0x55667788;
+  h.objectKind = OtaControlObjectKind::PreparedRootP683;
+  h.total = 683;
+  h.offset = 128;
+  h.dataLen = 100;
+
+  uint8_t buf[kOtaControlRequestHeaderSize];
+  ASSERT_TRUE(encodeOtaControlRequestHeader(h, buf, sizeof(buf)));
+
+  OtaControlRequestHeader decoded;
+  ASSERT_TRUE(decodeOtaControlRequestHeader(buf, sizeof(buf), decoded));
+  EXPECT_EQ(kOtaControlCommand, decoded.cmd);
+  EXPECT_EQ(OtaControlSubcommand::PutFragment, decoded.sub);
+  EXPECT_EQ(kOtaControlAbiVersion, decoded.version);
+  for (size_t i = 0; i < kOtaControlSessionIdBytes; ++i)
+    EXPECT_EQ(h.session[i], decoded.session[i]);
+  EXPECT_EQ(h.requestId, decoded.requestId);
+  EXPECT_EQ(h.jobTicket, decoded.jobTicket);
+  EXPECT_EQ(OtaControlObjectKind::PreparedRootP683, decoded.objectKind);
+  EXPECT_EQ(h.total, decoded.total);
+  EXPECT_EQ(h.offset, decoded.offset);
+  EXPECT_EQ(h.dataLen, decoded.dataLen);
+}
+
+TEST(OtaCommissioningAbi, ReplyHeaderRoundTripsAllFieldsIncludingStatusAndReason) {
+  OtaControlReplyHeader h;
+  h.sub = OtaControlSubcommand::Activate;
+  h.status = OtaControlStatus::Uncertain;
+  h.reason = 0xBEEF;
+  h.requestId = 7;
+  h.jobTicket = 9;
+  h.objectKind = OtaControlObjectKind::ActivateAck80;
+  h.total = 80;
+  h.offset = 0;
+  h.dataLen = 80;
+
+  uint8_t buf[kOtaControlReplyHeaderSize];
+  ASSERT_TRUE(encodeOtaControlReplyHeader(h, buf, sizeof(buf)));
+
+  OtaControlReplyHeader decoded;
+  ASSERT_TRUE(decodeOtaControlReplyHeader(buf, sizeof(buf), decoded));
+  EXPECT_EQ(kOtaControlResponseCode, decoded.response);
+  EXPECT_EQ(OtaControlSubcommand::Activate, decoded.sub);
+  EXPECT_EQ(OtaControlStatus::Uncertain, decoded.status);
+  EXPECT_EQ(h.reason, decoded.reason);
+  EXPECT_EQ(h.requestId, decoded.requestId);
+  EXPECT_EQ(h.jobTicket, decoded.jobTicket);
+  EXPECT_EQ(OtaControlObjectKind::ActivateAck80, decoded.objectKind);
+  EXPECT_EQ(h.total, decoded.total);
+  EXPECT_EQ(h.dataLen, decoded.dataLen);
+}
+
+TEST(OtaCommissioningAbi, RequestHeaderDecodeRejectsTruncatedBuffer) {
+  uint8_t buf[kOtaControlRequestHeaderSize - 1] = { 0 };
+  OtaControlRequestHeader decoded;
+  EXPECT_FALSE(decodeOtaControlRequestHeader(buf, sizeof(buf), decoded));
+}
+
+TEST(OtaCommissioningAbi, StructuralHeaderDecodeIsDistinctFromStrictFrameAdmission) {
+  uint8_t wire[kOtaControlRequestHeaderSize + kOtaControlChallengeBytes] = {
+    66, 0x20, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0,
+    0,  1,    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 16
+  };
+  OtaControlRequestHeader parsed;
+  ASSERT_TRUE(decodeOtaControlRequestHeader(wire, sizeof(wire), parsed));
+  EXPECT_EQ(2u, parsed.version); // Structural parsing preserves unsupported values.
+  OtaControlRequestFrameView view;
+  view.header.requestId = 0xfeedbeefu;
+  EXPECT_EQ(OtaControlCodecResult::UnsupportedVersion,
+            decodeOtaControlRequestFrame(wire, sizeof(wire), view));
+  EXPECT_EQ(0xfeedbeefu, view.header.requestId); // Strict refusal is transactional.
+}
+
+TEST(OtaCommissioningAbi, ReplyHeaderDecodeRejectsTruncatedBuffer) {
+  uint8_t buf[kOtaControlReplyHeaderSize - 1] = { 0 };
+  OtaControlReplyHeader decoded;
+  EXPECT_FALSE(decodeOtaControlReplyHeader(buf, sizeof(buf), decoded));
+}
+
+TEST(OtaCommissioningAbi, ObjectKindFixedSizesMatchContractExactly) {
+  EXPECT_EQ(0u, otaControlObjectKindFixedSize(OtaControlObjectKind::None));
+  EXPECT_EQ(235u, otaControlObjectKindFixedSize(OtaControlObjectKind::Measurement));
+  EXPECT_EQ(117u, otaControlObjectKindFixedSize(OtaControlObjectKind::BaselineManifestB117));
+  EXPECT_EQ(238u, otaControlObjectKindFixedSize(OtaControlObjectKind::GrantOrCertificate238));
+  EXPECT_EQ(267u, otaControlObjectKindFixedSize(OtaControlObjectKind::PrepareAuth267));
+  EXPECT_EQ(267u, otaControlObjectKindFixedSize(OtaControlObjectKind::ActivateAuth267));
+  EXPECT_EQ(683u, otaControlObjectKindFixedSize(OtaControlObjectKind::PreparedRootP683));
+  EXPECT_EQ(112u, otaControlObjectKindFixedSize(OtaControlObjectKind::PrepareAck112));
+  EXPECT_EQ(80u, otaControlObjectKindFixedSize(OtaControlObjectKind::ActivateAck80));
+  EXPECT_EQ(386u, otaControlObjectKindFixedSize(OtaControlObjectKind::BootReceipt386));
+  EXPECT_EQ(626u, otaControlObjectKindFixedSize(OtaControlObjectKind::PrepareInput626));
+}
+
+TEST(OtaCommissioningAbi, SubcommandAndResponseCodeValuesMatchContractExactly) {
+  EXPECT_EQ(66u, kOtaControlCommand);
+  EXPECT_EQ(31u, kOtaControlResponseCode);
+  EXPECT_EQ(0x20u, static_cast<uint8_t>(OtaControlSubcommand::Open));
+  EXPECT_EQ(0x21u, static_cast<uint8_t>(OtaControlSubcommand::Measure));
+  EXPECT_EQ(0x22u, static_cast<uint8_t>(OtaControlSubcommand::PutFragment));
+  EXPECT_EQ(0x23u, static_cast<uint8_t>(OtaControlSubcommand::Certify));
+  EXPECT_EQ(0x24u, static_cast<uint8_t>(OtaControlSubcommand::Prepare));
+  EXPECT_EQ(0x25u, static_cast<uint8_t>(OtaControlSubcommand::Activate));
+  EXPECT_EQ(0x26u, static_cast<uint8_t>(OtaControlSubcommand::Poll));
+  EXPECT_EQ(0x27u, static_cast<uint8_t>(OtaControlSubcommand::ReadObject));
+  EXPECT_EQ(0x28u, static_cast<uint8_t>(OtaControlSubcommand::Cancel));
+  EXPECT_EQ(0x29u, static_cast<uint8_t>(OtaControlSubcommand::Challenge));
+  EXPECT_EQ(0x2Au, static_cast<uint8_t>(OtaControlSubcommand::Close));
+}
+
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

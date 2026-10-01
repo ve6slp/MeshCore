@@ -12,6 +12,7 @@
 #include <cstddef>
 #include "../protocol/OtaDescriptor.h"
 #include "../protocol/OtaMessages.h"
+#include "OtaSessionIdentity.h"
 
 namespace meshcore {
 namespace ota {
@@ -60,6 +61,18 @@ public:
   // accepted for install. Production implementations should delegate to the
   // monotonic counter backend via ota::trust::DescriptorVerifier.
   virtual bool commitSecurityCounter(uint32_t) { return false; }
+
+  // The only genuinely cryptographically-verified identity anywhere in
+  // this transport: the Ed25519 public key that verified the descriptor's
+  // signature (see verifyDescriptorSignature()/verifyDescriptor() above).
+  // Returns true and fills `out[32]` iff a descriptor has actually been
+  // verified against a known key; returns false (leaving `out` untouched)
+  // otherwise -- callers must treat false as "no controller identity is
+  // available yet", never silently substitute an all-zero/placeholder key.
+  virtual bool controllerIdentity(uint8_t out[32]) {
+    (void)out;
+    return false;
+  }
 };
 
 class IOtaStagingSink {
@@ -72,7 +85,31 @@ public:
   virtual Result writeChunk(uint64_t offset, const uint8_t* data, size_t len) = 0;
   virtual Result commit() = 0;
   virtual void abort() = 0;
+
+  // Optional hook: called once, right after the transport's canonical
+  // wire descriptor + Ed25519 signature are authenticated (the same event
+  // that flips descriptor_verified_ true), with the EXACT verified bytes
+  // -- never re-derived or re-signed. Sinks that can durably hand a
+  // signed install command to a custom bootloader (see
+  // IOtaInstallCommandProviderV2 in OtaFirmwareBackend.h) use this to
+  // capture the bytes they need to embed verbatim at commit() time.
+  // Default no-op keeps this additive for sinks that don't need it.
+  virtual void onVerifiedWireDescriptor(const uint8_t* /*wireDescriptor59*/, size_t /*wireDescriptorLen*/,
+                                        const uint8_t* /*signature64*/, size_t /*signatureLen*/) {}
+
+  // Optional hook: called once, right after a locally-authorized
+  // Authorization payload is accepted for the given (campaignId,
+  // sessionId, attemptId), with the controller identity that verified the
+  // descriptor's signature (see IOtaTrustProvider::controllerIdentity()).
+  // Sinks that durably bind an install-command transaction identity to
+  // "this specific authenticated authorized attempt" (see
+  // IOtaInstallCommandProviderV2 in OtaFirmwareBackend.h) use this to
+  // capture the session+controller they need at commit() time. Default
+  // no-op keeps this additive for sinks that don't need it.
+  virtual void onAuthorizedSession(const OtaSessionId& /*session*/,
+                                   const uint8_t /*controller*/[32]) {}
 };
+
 
 // Fail-closed helpers: return the "denied"/"rejected" outcome whenever the
 // provider/sink pointer is null, so call sites never need a separate

@@ -27,6 +27,9 @@ enum class TrustFailureReason : uint8_t {
   CounterNotStrictlyIncreasing = 8,
   ImageSizeMismatch = 9,
   Unsupported = 10,
+  FormatIdMismatch = 11,
+  KeyIdMismatch = 12,
+  AlgorithmIdMismatch = 13,
 };
 
 struct VerificationResult {
@@ -74,6 +77,20 @@ struct DeviceTrustAnchor {
   uint32_t expected_role_id = 0;
   uint64_t device_address = 0;
   uint32_t supported_boot_capability_flags = 0;  // bitmask of capabilities this device's bootloader actually has
+
+  // The exact (formatId, keyId, algorithmId) triple this device's boot
+  // policy trusts. A descriptor claiming any other value must be
+  // rejected BEFORE any flash write, even if its signature verifies
+  // against `trusted_signer_public_key_ed25519` -- otherwise a
+  // differently-keyed/algorithm-tagged-but-still-verifiable descriptor
+  // could slip past intent-level policy (e.g. a lab STAGING_ONLY key
+  // being accepted on a qualified-production device, or vice versa).
+  // 0 in any of these fields is a valid, explicit configured value (not
+  // "unset"/"don't care") -- callers MUST populate all three from the
+  // device's actual boot-marker-qualified or lab STAGING_ONLY identity.
+  uint16_t expected_format_id = 0;
+  uint16_t expected_key_id = 0;
+  uint16_t expected_algorithm_id = 0;
 };
 
 }  // namespace trust

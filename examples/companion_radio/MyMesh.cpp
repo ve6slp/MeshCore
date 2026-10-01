@@ -1,8 +1,15 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
+#include <cmath>
 #include <Mesh.h>
+#include <helpers/ota/OtaBoardBackendCommon.h>
 #include <helpers/ota/OtaDirectLease.h>
+#include <helpers/ota/OtaMeshHooks.h>
+#include <helpers/ota/OtaMeshTrialHealthTick.h>
+#if MESHCORE_LORA_OTA
+#include <helpers/radiolib/OtaTrialRadioReadiness.h>
+#endif
 
 #define PUSH_CODE_OTA_EVENT             0x91 // hardware-lab OTA receive evidence
 
@@ -10,6 +17,118 @@
 __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
   return false;
 }
+// Lab-only diagnostics (see variants/xiao_nrf52/OtaLabBackend.cpp for the
+// real implementations); the weak defaults here mean any other backend
+// (e.g. production SenseCAP) exposes NO raw-flash-read or erase surface
+// at all -- CMD_OTA_LAB's new subtypes below simply report ERR_CODE_NOT_FOUND
+// there instead of silently doing nothing.
+__attribute__((weak)) bool otaLabReadFloorRaw(uint8_t, uint32_t, uint8_t*, uint32_t) {
+  return false;
+}
+__attribute__((weak)) bool otaLabEraseFloorASector(uint32_t) {
+  return false;
+}
+// Compact install-capability+reason string, provided by whichever backend
+// is linked in (see variants/xiao_nrf52/OtaLabBackend.cpp /
+// variants/sensecap_solar/OtaProductionBackend.cpp); weak default covers
+// any build with no OTA backend compiled in at all.
+__attribute__((weak)) const char* otaBoardInstallCapabilityStatus() {
+  return "backend not configured";
+}
+// Genuine trial-boot health confirmation entry point (see
+// src/ota/storage/XiaoOtaTrialHealthMonitor.h for the full continuous-
+// window/deadline/incremental-hash gate); weak default covers any build
+// with no OTA backend compiled in at all (always Pending, since there is
+// no state/confirm region to consult).
+__attribute__((weak)) mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(
+    uint32_t, bool, bool, bool) {
+  return mesh::ota::OtaBoardTrialHealthOutcome::Pending;
+}
+// True only while a genuine trial-boot health window is in progress (see
+// variants/*/Ota*Backend.cpp); weak default covers any build with no OTA
+// backend compiled in at all.
+__attribute__((weak)) bool otaBoardTrialHealthWindowActive() {
+  return false;
+}
+
+// Genuine EARLIEST-boot-phase preflight, called from main.cpp strictly
+// BEFORE store.begin()/the_mesh.begin() ever touch identity/prefs/blob
+// storage: true iff this device is qualified AND a persisted OTA
+// trial-boot record is genuinely TRIAL-phase, OR the qualified device's
+// trial state cannot yet be established (fail closed -- "unknown" is
+// never treated as "definitely not a trial"). The weak default here
+// covers a build with MESHCORE_LORA_OTA=1 but NO board-specific
+// Ota*Backend.cpp linked in at all (e.g. variants/xiao_s3_wio, which
+// currently sets the feature flag with no QSPI backend written yet):
+// such a build claims OTA capability but has no bootloader-tracked
+// trial/qualification concept actually wired -- there is no positive
+// evidence available of ANY kind, so it must stay UNKNOWN (fail closed,
+// block destructive identity/prefs/migration writes for the whole boot)
+// rather than being silently treated as ordinary legacy/no-OTA-concept
+// hardware. Only a genuinely unqualified board's REAL backend
+// implementation (resolveOtaBoardStartupDecision()'s NotQualified
+// reason, reached via the real variants/*/Ota*Backend.cpp code, not this
+// weak stub) is permitted to report Unknown-but-otherwise-ordinary via
+// its own explicit qualification check.
+__attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
+  return true;
+}
+
+// True once the wrapped staging sink has observed a genuine IoError on
+// any writeChunk()/commit() this boot (see OtaBoardTrialGuardedStagingSink
+// in OtaBoardBackendCommon.h); weak default covers any build with no OTA
+// backend compiled in at all (no storage to ever fault).
+__attribute__((weak)) bool otaBoardStorageIoFaultObserved() {
+  return false;
+}
+
+// Baseline-measurement-collector source hooks (see
+// helpers/ota/OtaBoardBaselineMeasurementSource.h /
+// OtaBaselineMeasurementCollector.h): weak defaults fail closed so any
+// build with no real backend override never produces fabricated
+// evidence -- the collector simply cannot progress past whichever phase
+// first hits a weak default.
+namespace mesh {
+namespace ota {
+__attribute__((weak)) bool otaBoardBaselineReadUid8(uint8_t[8]) { return false; }
+__attribute__((weak)) bool otaBoardBaselineReadCompiledProfile(uint32_t&, uint32_t&, uint32_t&, uint32_t&) {
+  return false;
+}
+__attribute__((weak)) bool otaBoardBaselineReadRawCurrentSdkSettings(uint8_t[kOtaCurrentSdkSettingsRecordBytes]) {
+  return false;
+}
+__attribute__((weak)) bool otaBoardBaselineReadValidatedBank0Extent(uint32_t&, uint32_t&, uint16_t&) {
+  return false;
+}
+__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepAppImageAccess(uint32_t, uint32_t* out_bytes_consumed,
+                                                                                       const uint8_t**, uint32_t*) {
+  *out_bytes_consumed = 0;
+  return OtaBaselineMeasurementSubStep::Failed;
+}
+__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepStockLoaderRangeHash(
+    uint32_t, uint32_t* out_bytes_consumed, uint32_t&, uint32_t&, uint8_t*) {
+  *out_bytes_consumed = 0;
+  return OtaBaselineMeasurementSubStep::Failed;
+}
+__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepBootConfigSelection(
+    uint32_t, uint32_t* out_bytes_consumed, uint32_t&, bool& out_catalogue_unavailable, bool& out_mismatch) {
+  *out_bytes_consumed = 0;
+  out_catalogue_unavailable = true;
+  out_mismatch = false;
+  return OtaBaselineMeasurementSubStep::Failed;
+}
+__attribute__((weak)) OtaBaselineMeasurementSubStep otaBoardBaselineStepQspiStateInspection(
+    uint32_t, uint32_t* out_bytes_consumed) {
+  *out_bytes_consumed = 0;
+  return OtaBaselineMeasurementSubStep::Failed;
+}
+__attribute__((weak)) bool otaBoardBaselineGetPlatformEntropy16(uint8_t[16]) { return false; }
+__attribute__((weak)) OtaBaselineMeasurementArbiterResult otaBoardBaselineAcquireMediaArbiter() {
+  return OtaBaselineMeasurementArbiterResult::Unavailable;
+}
+__attribute__((weak)) void otaBoardBaselineReleaseMediaArbiter() {}
+}  // namespace ota
+}  // namespace mesh
 
 void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
 #if MESHCORE_LORA_OTA
@@ -132,6 +251,7 @@ void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
 #define RESP_CODE_OTA_STATUS          29
+#define RESP_CODE_OTA_LAB_FLOOR_DATA  30  // reply to CMD_OTA_LAB / OTA_LAB_READ_FLOOR_RAW
 
 #define OTA_CTRL_GET_STATUS           0
 #define OTA_CTRL_SET_MODE             1
@@ -141,6 +261,36 @@ void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
 #define OTA_CTRL_DIRECT_LEASE         5
 
 #define OTA_LAB_QUEUE_PRECEDENCE       0
+// LAB-ONLY, read-only: dump up to 128 raw bytes from any of the 8 fixed
+// logical sub-slots of the bootloader-owned journal partition, for
+// commissioning-time inspection before any custom-bootloader install is
+// attempted. Logical index (NOT physical on-flash order) is fixed as:
+//   0=floorA  1=floorB  2=commandA 3=commandB
+//   4=stateA  5=stateB  6=confirmA 7=confirmB
+// Request:
+//   cmd_frame[2]   logical_index (0..7)
+//   cmd_frame[3:4] offset within the slot, u16 big-endian (0..4095)
+//   cmd_frame[5]   length, 1..128
+// Reply (success): RESP_CODE_OTA_LAB_FLOOR_DATA, logical_index, offset (BE
+// u16), length, then `length` raw bytes.
+#define OTA_LAB_READ_FLOOR_RAW         1
+// LAB-ONLY, gated destructive diagnostic: erase EXACTLY the floor A
+// erase-unit sector (logical index 0) -- never floor B, never any other
+// sub-slot. Beyond the confirm token, the backend independently re-reads
+// and re-verifies floor A matches the EXACT known historical
+// contamination residue pattern and that floor B plus all six
+// transaction sectors are entirely blank before erasing anything; any
+// valid floor record, unrecognized content, or pending transaction
+// anywhere in the journal refuses the erase. Request:
+//   cmd_frame[2:5] confirm_token, u32 big-endian, must equal the fixed
+//                  token the lab backend expects -- this is intentionally
+//                  not a value a routine/looping probe would ever send,
+//                  so this can only fire when a host operator has
+//                  explicitly chosen to invoke it after independently
+//                  reviewing an OTA_LAB_READ_FLOOR_RAW dump of all 8
+//                  logical indices.
+#define OTA_LAB_ERASE_FLOOR_A          2
+
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -205,6 +355,36 @@ void MyMesh::writeDisabledFrame() {
   uint8_t buf[1];
   buf[0] = RESP_CODE_DISABLED;
   _serial->writeFrame(buf, 1);
+}
+
+bool MyMesh::refusePersistIfDisallowed() {
+  if (_store->destructiveWritesDisallowed()) {
+    // OTA trial/unknown boot: reject BEFORE the caller mutates any RAM
+    // state, so a policy refusal is never masked by a later fabricated
+    // OK reply (or by RAM/disk drift) -- see doc comment in MyMesh.h.
+    writeErrFrame(ERR_CODE_BAD_STATE);
+    return true;
+  }
+  return false;
+}
+
+bool MyMesh::refuseSendIfDispatchUnavailable() {
+  if (!_identity_available_) {
+    // Mesh::loop() (invoked only via BaseChatMesh::loop(), see loop()
+    // below) is what actually drains the outbound packet queue over the
+    // radio. MyMesh::loop() skips BaseChatMesh::loop() entirely whenever
+    // identity is unavailable, so any packet already handed to
+    // sendFlood()/sendDirect()/sendZeroHop()/sendPacket() in that state
+    // would sit queued and never transmit -- refuse BEFORE packet
+    // allocation/enqueue rather than reply SENT/OK for work that can
+    // never be serviced. This single flag/guard also covers the subset
+    // of sends that separately need self_id for crypto (e.g.
+    // getSharedSecret(self_id)): that failure mode is a strict subset of
+    // "dispatch unavailable", so one shared guard suffices for both.
+    writeErrFrame(ERR_CODE_BAD_STATE);
+    return true;
+  }
+  return false;
 }
 
 void MyMesh::writeContactRespFrame(uint8_t code, const ContactInfo &contact) {
@@ -906,7 +1086,13 @@ void MyMesh::onSendTimeout() {}
 
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
-      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
+      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0)
+#if MESHCORE_LORA_OTA
+      , _ota_baseline_source_(self_id.pub_key, _ota_service_), _ota_baseline_collector_(_ota_baseline_source_)
+      , _ota_measurement_job_backend_(_ota_baseline_collector_)
+      , _ota_control_entropy_(), _ota_control_router_(_ota_control_entropy_, _ota_control_backend_slot_)
+#endif
+{
   _iter_started = false;
   _cli_rescue = false;
   offline_queue_len = 0;
@@ -949,17 +1135,71 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 #endif
 }
 
-void MyMesh::begin(bool has_display) {
+void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool allow_identity_generation) {
   BaseChatMesh::begin();
 
-  if (!_store->loadMainIdentity(self_id)) {
-    self_id = radio_new_identity(); // create new random identity
-    int count = 0;
-    while (count < 10 && (self_id.pub_key[0] == 0x00 || self_id.pub_key[0] == 0xFF)) { // reserved id hashes
-      self_id = radio_new_identity();
-      count++;
+  const bool identity_initially_loaded = _store->loadMainIdentity(self_id);
+#if MESHCORE_LORA_OTA
+  // Hoisted so the fallback branch below can also update it from the
+  // actual resolveIdentityTrialSafe() outcome (see after the branch).
+  // Also latches fault evidence unconditionally on a genuine load
+  // failure -- see OtaFirmwareService::noteIdentityLoadAttempted()'s doc
+  // comment (even a legitimately blank/never-configured device reaches
+  // this: a failed read cannot be distinguished from storage corruption
+  // caused by an in-progress OTA candidate).
+  _ota_service_.noteIdentityLoadAttempted(identity_initially_loaded);
+#endif
+  if (!identity_initially_loaded) {
+    bool save_ok = false;
+    const ota_identity_boot::Outcome outcome = ota_identity_boot::resolveIdentityTrialSafe(
+        allow_identity_generation,
+        [this]() { return false; },  // load_fn: already known-failed above, never re-invoked.
+        [this]() {
+          self_id = radio_new_identity();  // create new random identity (RAM-only, until persisted below)
+          int count = 0;
+          while (count < 10 && (self_id.pub_key[0] == 0x00 || self_id.pub_key[0] == 0xFF)) {  // reserved id hashes
+            self_id = radio_new_identity();
+            count++;
+          }
+        },
+        [this, &save_ok]() {
+          save_ok = _store->saveMainIdentity(self_id);
+          return save_ok;
+        });
+    if (outcome == ota_identity_boot::Outcome::IdentityUnavailable) {
+#if MESHCORE_LORA_OTA
+      // OTA trial/unknown boot (see otaBoardEarlyBootTrialOrUnknown(),
+      // queried by main.cpp BEFORE this call): the ORIGINAL persisted
+      // identity might merely be transiently unreadable, not genuinely
+      // corrupt/absent -- generating ANY identity now (even RAM-only)
+      // and using it for mesh TX/crypto would violate the trial's
+      // read-only contract and could itself destroy the real secret's
+      // only chance of recovery if this trial later fails and rolls
+      // back. Perform ZERO generation and ZERO writes: self_id is left
+      // at its default/unset value, and loop() suppresses all ordinary
+      // (identity-dependent) mesh dispatch for the rest of this boot,
+      // leaving only the bounded serial/diagnostic/trial-health path
+      // running until a genuine future reboot.
+      _identity_available_ = false;
+#endif
+    } else if (outcome == ota_identity_boot::Outcome::GeneratedAndSaved ||
+               outcome == ota_identity_boot::Outcome::GeneratedRamOnlyNoWrites) {
+#if MESHCORE_LORA_OTA
+      // Real, already-performed ordinary filesystem write at boot -- its
+      // ACTUAL outcome is genuine trial-boot-health evidence (see
+      // tickOtaTrialHealth()); this runs before configureCompanionFirmware
+      // OtaBackend() below constructs the confirmer, so the service is
+      // already correctly updated for that confirmer's very first tick.
+      // (This branch is only reachable when identity generation WAS
+      // permitted, so a failed save here is always a genuine I/O fault,
+      // never a policy refusal -- the destructiveWritesDisallowed()
+      // check inside noteIdentityResolution() is defensive/future-
+      // proofing only, kept consistent with every other save-site below.)
+      _ota_service_.noteIdentityResolution(outcome, _store->destructiveWritesDisallowed());
+#else
+      (void)save_ok;
+#endif
     }
-    _store->saveMainIdentity(self_id);
   }
 
 // if name is provided as a build flag, use that as default node name instead
@@ -984,7 +1224,14 @@ void MyMesh::begin(bool has_display) {
 #endif
 
   // load persisted prefs
-  _store->loadPrefs(_prefs);
+  {
+    const bool prefs_ok = _store->loadPrefs(_prefs, allow_destructive_boot_writes);
+#if MESHCORE_LORA_OTA
+    if (!prefs_ok) _ota_service_.noteStorageIoResult(false);
+#else
+    (void)prefs_ok;
+#endif
+  }
   sensors.node_lat = _prefs.node_lat;
   sensors.node_lon = _prefs.node_lon;
 
@@ -999,12 +1246,24 @@ void MyMesh::begin(bool has_display) {
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
   _prefs.ota_mode = constrain(_prefs.ota_mode, 0, 2);
-  _prefs.ota_duty_percent = constrain(_prefs.ota_duty_percent <= 0.0f ? 2.0f : _prefs.ota_duty_percent, 0.1f, 100.0f);
+  // Migrate any non-finite (NaN/Inf, e.g. from erased-flash 0xFF bytes
+  // reinterpreted as float) or non-positive persisted value to the default
+  // 2% before constrain(), since NaN silently passes a `<= 0.0f` check
+  // (all NaN comparisons are false) and would otherwise reach constrain()
+  // and the airtime-budget float->integer conversion undefined.
+  if (!std::isfinite(_prefs.ota_duty_percent) || _prefs.ota_duty_percent <= 0.0f) {
+    _prefs.ota_duty_percent = 2.0f;
+  }
+  _prefs.ota_duty_percent = constrain(_prefs.ota_duty_percent, 0.1f, 100.0f);
 #if MESHCORE_LORA_OTA
   getOtaIntegration().setMode(static_cast<mesh::ota::FirmwareOtaMode>(_prefs.ota_mode));
   getOtaIntegration().setDutyCyclePercent(_prefs.ota_duty_percent);
   setOtaAirtimeDutyCyclePercent(_prefs.ota_duty_percent);
   configureCompanionFirmwareOtaBackend(getOtaIntegration());
+  // Real MEASURE/POLL/READ_OBJECT job backend for the USB commissioning
+  // router -- Certify/Prepare/Activate remain NoCapacity from this same
+  // backend until Authority's/Store's adapters are bound separately.
+  _ota_control_backend_slot_.bind(&_ota_measurement_job_backend_);
 #endif
 
 #ifdef BLE_PIN_CODE // 123456 by default
@@ -1027,10 +1286,24 @@ void MyMesh::begin(bool has_display) {
 #endif
 
   resetContacts();
-  _store->loadContacts(this);
+  {
+    const bool contacts_ok = _store->loadContacts(this);
+#if MESHCORE_LORA_OTA
+    if (!contacts_ok) _ota_service_.noteStorageIoResult(false);
+#else
+    (void)contacts_ok;
+#endif
+  }
   bootstrapRTCfromContacts();
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
-  _store->loadChannels(this);
+  {
+    const bool channels_ok = _store->loadChannels(this);
+#if MESHCORE_LORA_OTA
+    if (!channels_ok) _ota_service_.noteStorageIoResult(false);
+#else
+    (void)channels_ok;
+#endif
+  }
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
@@ -1084,7 +1357,21 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
-  revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000);
+
+  // Checked, overflow-safe arithmetic: timeout_mins can arrive unclamped
+  // from either the binary CMD_OTA_CONTROL path (uint16, up to 65535) or a
+  // text CLI path, and the naive `2000 + timeout_mins * 60 * 1000` here was
+  // computed entirely in (signed 32-bit) int, silently overflowing for
+  // timeout_mins >= 35792 (INT32_MAX ms is ~35791.4 minutes). Dispatcher::
+  // futureMillis()/millisHasNowPassed() also require the resulting offset
+  // to stay within INT32_MAX ms for their wrap-safe comparison to hold, so
+  // the multiplication is done in int64_t and the final offset is clamped
+  // to that bound before narrowing back to the int futureMillis() expects.
+  constexpr int64_t kSetDelayMs = 2000;
+  constexpr int64_t kMaxRevertOffsetMs = 2147483647LL - kSetDelayMs; // INT32_MAX - kSetDelayMs
+  int64_t requested_ms = timeout_mins > 0 ? static_cast<int64_t>(timeout_mins) * 60LL * 1000LL : 0LL;
+  if (requested_ms > kMaxRevertOffsetMs) requested_ms = kMaxRevertOffsetMs;
+  revert_radio_at = futureMillis(static_cast<int>(kSetDelayMs + requested_ms));
 }
 
 bool MyMesh::setFirmwareOtaMode(const char* mode) {
@@ -1111,7 +1398,7 @@ const char* MyMesh::getFirmwareOtaMode() const {
 
 bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
 #if MESHCORE_LORA_OTA
-  if (percent <= 0.0f || percent > 100.0f) return false;
+  if (!std::isfinite(percent) || percent <= 0.0f || percent > 100.0f) return false;
   if (!getOtaIntegration().setDutyCyclePercent(percent)) return false;
   if (!setOtaAirtimeDutyCyclePercent(percent)) return false;
   _prefs.ota_duty_percent = percent;
@@ -1162,7 +1449,7 @@ void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
 #if MESHCORE_LORA_OTA
   auto status = getOtaStatus(_ms->getMillis());
   snprintf(reply, reply_size,
-           "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu aborts=%lu recv=%u coord=%u fleet=%u lease=%u rollback=%u backend=%u",
+           "mode=%s duty=%.1f%% used=%lu/%lu rx=%lu bad=%lu aborts=%lu recv=%u coord=%u fleet=%u lease=%u rollback=%u backend=%u cap=%s",
            mesh::ota::firmwareOtaModeName(status.mode),
            status.dutyCyclePercent,
            (unsigned long)status.dutyUsedMs,
@@ -1175,11 +1462,13 @@ void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
            (uint32_t)status.fleetState,
            (uint32_t)status.leaseState,
            status.rollbackRequested ? 1 : 0,
-           status.backendAvailable ? 1 : 0);
+           status.backendAvailable ? 1 : 0,
+           otaBoardInstallCapabilityStatus());
 #else
   snprintf(reply, reply_size, "OTA unsupported");
 #endif
 }
+
 
 void MyMesh::handleCmdFrame(size_t len) {
   if (cmd_frame[0] == CMD_DEVICE_QUERY && len >= 2) { // sent when app establishes connection
@@ -1250,6 +1539,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     i += tlen;
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. sendMessage()/sendCommandData()
+      // also derive the per-contact shared secret from self_id, but the
+      // shared guard covers dispatch-unavailability regardless.
+    } else {
     int i = 1;
     uint8_t txt_type = cmd_frame[i++];
     uint8_t attempt = cmd_frame[i++];
@@ -1295,7 +1589,15 @@ void MyMesh::handleCmdFrame(size_t len) {
                         ? ERR_CODE_NOT_FOUND
                         : ERR_CODE_UNSUPPORTED_CMD); // unknown recipient, or unsupported TXT_TYPE_*
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_CHANNEL_TXT_MSG) { // send GroupChannel text msg
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. sendGroupMessage() does not
+      // itself need self_id (channel pre-shared secret only), but the
+      // packet it enqueues via sendFlood() would never be drained by
+      // Mesh::loop() while dispatch is unavailable -- refuse BEFORE
+      // enqueue rather than reply OK for work that can never be sent.
+    } else {
     int i = 1;
     uint8_t txt_type = cmd_frame[i++]; // should be TXT_TYPE_PLAIN
     uint8_t channel_idx = cmd_frame[i++];
@@ -1315,7 +1617,13 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
       }
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_CHANNEL_DATA) { // send GroupChannel datagram
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. sendGroupData() does not
+      // itself need self_id, but the enqueued packet would never be
+      // drained by Mesh::loop() while dispatch is unavailable.
+    } else {
     if (len < 4) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       return;
@@ -1355,6 +1663,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+    }
   } else if (cmd_frame[0] == CMD_GET_CONTACTS) { // get Contact list
     if (_iter_started) {
       writeErrFrame(ERR_CODE_BAD_STATE); // iterator is currently busy
@@ -1377,13 +1686,20 @@ void MyMesh::handleCmdFrame(size_t len) {
       _most_recent_lastmod = 0;
     }
   } else if (cmd_frame[0] == CMD_SET_ADVERT_NAME && len >= 2) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.node_name.
+    } else {
     int nlen = len - 1;
     if (nlen > sizeof(_prefs.node_name) - 1) nlen = sizeof(_prefs.node_name) - 1; // max len
     memcpy(_prefs.node_name, &cmd_frame[1], nlen);
     _prefs.node_name[nlen] = 0; // null terminator
     savePrefs();
     writeOKFrame();
+    }
   } else if (cmd_frame[0] == CMD_SET_ADVERT_LATLON && len >= 9) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate sensors.node_lat/lon.
+    } else {
     int32_t lat, lon, alt = 0;
     memcpy(&lat, &cmd_frame[1], 4);
     memcpy(&lon, &cmd_frame[5], 4);
@@ -1397,6 +1713,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG); // invalid geo coordinate
+    }
     }
   } else if (cmd_frame[0] == CMD_GET_DEVICE_TIME) {
     uint8_t reply[5];
@@ -1415,6 +1732,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
   } else if (cmd_frame[0] == CMD_SEND_SELF_ADVERT) {
+    if (!_identity_available_) {
+      // No real identity was established this boot (trial/unknown, see
+      // begin()) -- signing and sending an advert from the default/unset
+      // self_id would broadcast a bogus identity as if it were genuine.
+      writeErrFrame(ERR_CODE_BAD_STATE);
+    } else {
     mesh::Packet* pkt;
     if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
       pkt = createSelfAdvert(_prefs.node_name);
@@ -1434,7 +1757,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+    }
   } else if (cmd_frame[0] == CMD_RESET_PATH && len >= 1 + 32) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate the contact table.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1445,7 +1772,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // unknown contact
     }
+    }
   } else if (cmd_frame[0] == CMD_ADD_UPDATE_CONTACT && len >= 1 + 32 + 2 + 1) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate the contact table.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     uint32_t last_mod = getRTCClock()->getCurrentTime();  // fallback value if not present in cmd_frame
@@ -1466,7 +1797,11 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_TABLE_FULL);
       }
     }
+    }
   } else if (cmd_frame[0] == CMD_REMOVE_CONTACT) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate the contact table.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient && removeContact(*recipient)) {
@@ -1476,7 +1811,13 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // not found, or unable to remove
     }
+    }
   } else if (cmd_frame[0] == CMD_SHARE_CONTACT) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. shareContactZeroHop() does not
+      // need self_id, but it enqueues via sendZeroHop() -> sendPacket(),
+      // which Mesh::loop() would never drain while dispatch is unavailable.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1487,6 +1828,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
+    }
     }
   } else if (cmd_frame[0] == CMD_GET_CONTACT_BY_KEY) {
     uint8_t *pub_key = &cmd_frame[1];
@@ -1499,6 +1841,11 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_EXPORT_CONTACT) {
     if (len < 1 + PUB_KEY_SIZE) {
       // export SELF
+      if (!_identity_available_) {
+        // No real identity this boot -- exporting/signing a card for the
+        // default/unset self_id would hand the caller a bogus identity.
+        writeErrFrame(ERR_CODE_BAD_STATE);
+      } else {
       mesh::Packet* pkt;
       if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
         pkt = createSelfAdvert(_prefs.node_name);
@@ -1515,6 +1862,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         writeErrFrame(ERR_CODE_TABLE_FULL); // Error
       }
+      }
     } else {
       uint8_t *pub_key = &cmd_frame[1];
       ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
@@ -1527,7 +1875,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     }
   } else if (cmd_frame[0] == CMD_IMPORT_CONTACT && len > 2 + 32 + 64) {
-    if (importContact(&cmd_frame[1], len - 1)) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate the contact table.
+    } else if (importContact(&cmd_frame[1], len - 1)) {
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
@@ -1544,6 +1894,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       _serial->writeFrame(out_frame, 1);
     }
   } else if (cmd_frame[0] == CMD_SET_RADIO_PARAMS) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs/radio params.
+    } else {
     int i = 1;
     uint32_t freq;
     memcpy(&freq, &cmd_frame[i], 4);
@@ -1579,7 +1932,11 @@ void MyMesh::handleCmdFrame(size_t len) {
                          (uint32_t)cr);
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
+    }
   } else if (cmd_frame[0] == CMD_SET_RADIO_TX_POWER) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.tx_power_dbm.
+    } else {
     int8_t power = (int8_t)cmd_frame[1];
     if (power < -9 || power > MAX_LORA_TX_POWER) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
@@ -1589,7 +1946,11 @@ void MyMesh::handleCmdFrame(size_t len) {
       radio_driver.setTxPower(_prefs.tx_power_dbm);
       writeOKFrame();
     }
+    }
   } else if (cmd_frame[0] == CMD_SET_TUNING_PARAMS) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs tuning params.
+    } else {
     int i = 1;
     uint32_t rx, af;
     memcpy(&rx, &cmd_frame[i], 4);
@@ -1600,6 +1961,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     _prefs.airtime_factor = ((float)af) / 1000.0f;
     savePrefs();
     writeOKFrame();
+    }
   } else if (cmd_frame[0] == CMD_GET_TUNING_PARAMS) {
     uint32_t rx = _prefs.rx_delay_base * 1000, af = _prefs.airtime_factor * 1000;
     int i = 0;
@@ -1608,6 +1970,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], &af, 4); i += 4;
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_SET_OTHER_PARAMS) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs other params.
+    } else {
     _prefs.manual_add_contacts = cmd_frame[1];
     if (len >= 3) {
       _prefs.telemetry_mode_base = cmd_frame[2] & 0x03; // v5+
@@ -1623,8 +1988,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     savePrefs();
     writeOKFrame();
+    }
   } else if (cmd_frame[0] == CMD_SET_PATH_HASH_MODE && cmd_frame[1] == 0 && len >= 3) {
-    if (cmd_frame[2] >= 3) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.path_hash_mode.
+    } else if (cmd_frame[2] >= 3) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     } else {
       _prefs.path_hash_mode = cmd_frame[2];
@@ -1632,7 +2000,11 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_REBOOT && memcmp(&cmd_frame[1], "reboot", 6) == 0) {
-    if (dirty_contacts_expiry) { // is there are pending dirty contacts write needed?
+    // Read-only trial/unknown: skip the pending lazy contacts write (no
+    // IO fault, no fake-persisted claim) rather than attempting a
+    // disallowed save right before rebooting; permitted boots keep the
+    // existing real-IO-fault behavior of saveContacts() unchanged.
+    if (dirty_contacts_expiry && !_store->destructiveWritesDisallowed()) { // is there are pending dirty contacts write needed?
       saveContacts();
     }
     board.reboot();
@@ -1649,16 +2021,32 @@ void MyMesh::handleCmdFrame(size_t len) {
     _serial->writeFrame(reply, i);
   } else if (cmd_frame[0] == CMD_EXPORT_PRIVATE_KEY) {
 #if ENABLE_PRIVATE_KEY_EXPORT
+    if (!_identity_available_) {
+      // No real identity this boot -- self_id is default/unset; exporting
+      // it would hand the caller a bogus, non-recoverable key.
+      writeErrFrame(ERR_CODE_BAD_STATE);
+    } else {
     uint8_t reply[65];
     reply[0] = RESP_CODE_PRIVATE_KEY;
     self_id.writeTo(&reply[1], 64);
     _serial->writeFrame(reply, 65);
+    }
 #else
     writeDisabledFrame();
 #endif
   } else if (cmd_frame[0] == CMD_IMPORT_PRIVATE_KEY && len >= 65) {
 #if ENABLE_PRIVATE_KEY_IMPORT
-    if (!mesh::LocalIdentity::validatePrivateKey(&cmd_frame[1])) {
+    if (!_identity_available_ || _store->destructiveWritesDisallowed()) {
+      // Importing/replacing the identity in RAM during a trial/unknown
+      // boot is exactly the temporary-identity substitution the trial's
+      // read-only contract forbids -- reject BEFORE touching self_id or
+      // `identity` at all. `_identity_available_` alone is insufficient:
+      // it only reflects whether THIS device's own identity failed to
+      // load, not the broader "destructive writes are disallowed this
+      // boot" policy (e.g. a qualified-but-no-install-history board can
+      // load its existing identity fine yet still be Unknown/read-only).
+      writeErrFrame(ERR_CODE_BAD_STATE);
+    } else if (!mesh::LocalIdentity::validatePrivateKey(&cmd_frame[1])) {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG); // invalid key
     } else {
         mesh::LocalIdentity identity;
@@ -1666,17 +2054,45 @@ void MyMesh::handleCmdFrame(size_t len) {
         if (_store->saveMainIdentity(identity)) {
           self_id = identity;
           writeOKFrame();
+#if MESHCORE_LORA_OTA
+          // A real, durable identity write just succeeded -- the exact
+          // same category of evidence as begin()'s GeneratedAndSaved
+          // outcome, so this is genuine "confirmed loaded" evidence too
+          // (not merely leaving the previous, possibly now-stale,
+          // boot-time answer in place).
+          _ota_service_.noteIdentityPersisted();
+#endif
           // re-load contacts, to invalidate ecdh shared_secrets
           resetContacts();
-          _store->loadContacts(this);
+          {
+            const bool reload_ok = _store->loadContacts(this);
+#if MESHCORE_LORA_OTA
+            if (!reload_ok) _ota_service_.noteStorageIoResult(false);
+#else
+            (void)reload_ok;
+#endif
+          }
         } else {
+          // Already excluded the policy-refusal case above (rejected
+          // with BAD_STATE before reaching here), so a `false` here is
+          // always a genuine I/O fault.
           writeErrFrame(ERR_CODE_FILE_IO_ERROR);
+#if MESHCORE_LORA_OTA
+          // Real, already-performed ordinary filesystem write genuinely
+          // failed -- same latch as savePrefs(); see tickOtaTrialHealth().
+          _ota_service_.noteStorageIoResult(false);
+#endif
         }
     }
 #else
     writeDisabledFrame();
 #endif
   } else if (cmd_frame[0] == CMD_SEND_RAW_DATA && len >= 6) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. createRawData()/sendDirect()
+      // need no self_id, but the enqueued packet would never be drained
+      // by Mesh::loop() while dispatch is unavailable.
+    } else {
     int i = 1;
     int8_t path_len = cmd_frame[i++];
     if (path_len >= 0 && i + path_len + 4 <= len) { // minimum 4 byte payload
@@ -1692,7 +2108,12 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); // flood, not supported (yet)
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_LOGIN && len >= 1 + PUB_KEY_SIZE) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendLogin() also derives the
+      // shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     char *password = (char *)&cmd_frame[1 + PUB_KEY_SIZE];
@@ -1714,7 +2135,12 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_ANON_REQ && len > 1 + PUB_KEY_SIZE) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendAnonReq() also derives
+      // the shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     ContactInfo anon;
@@ -1745,7 +2171,12 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL); // contacts full
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_STATUS_REQ && len >= 1 + PUB_KEY_SIZE) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendRequest() also derives
+      // the shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1766,7 +2197,12 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_PATH_DISCOVERY_REQ && cmd_frame[1] == 0 && len >= 2 + PUB_KEY_SIZE) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendRequest() also derives
+      // the shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[2];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1795,7 +2231,12 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
+    }
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len >= 4 + PUB_KEY_SIZE) {  // can deprecate, in favour of CMD_SEND_BINARY_REQ
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendRequest() also derives
+      // the shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[4];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1814,6 +2255,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
+    }
     }
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
     telemetry.reset();
@@ -1836,6 +2278,10 @@ void MyMesh::handleCmdFrame(size_t len) {
     i += tlen;
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_SEND_BINARY_REQ && len >= 2 + PUB_KEY_SIZE) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE; sendRequest() also derives
+      // the shared secret from self_id.
+    } else {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
@@ -1855,6 +2301,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
+    }
     }
   } else if (cmd_frame[0] == CMD_HAS_CONNECTION && len >= 1 + PUB_KEY_SIZE) {
     uint8_t *pub_key = &cmd_frame[1];
@@ -1885,6 +2332,9 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_SET_CHANNEL && len >= 2 + 32 + 32) {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); // not supported (yet)
   } else if (cmd_frame[0] == CMD_SET_CHANNEL && len >= 2 + 32 + 16) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate the channel table.
+    } else {
     uint8_t channel_idx = cmd_frame[1];
     ChannelDetails channel;
     StrHelper::strncpy(channel.name, (char *)&cmd_frame[2], 32);
@@ -1895,6 +2345,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
+    }
     }
   } else if (cmd_frame[0] == CMD_SIGN_START) {
     out_frame[0] = RESP_CODE_SIGN_START;
@@ -1917,7 +2368,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_SIGN_FINISH) {
-    if (sign_data) {
+    if (!_identity_available_) {
+      // No real identity this boot -- signing with the default/unset
+      // self_id would return a meaningless signature as if genuine.
+      if (sign_data) { free(sign_data); sign_data = NULL; }
+      writeErrFrame(ERR_CODE_BAD_STATE);
+    } else if (sign_data) {
       self_id.sign(&out_frame[1], sign_data, sign_data_len);
 
       free(sign_data); // don't need sign_data now
@@ -1929,6 +2385,11 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_BAD_STATE);
     }
   } else if (cmd_frame[0] == CMD_SEND_TRACE_PATH && len > 10 && len - 10 < MAX_PACKET_PAYLOAD-5) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. createTrace()/sendDirect()
+      // need no self_id, but the enqueued packet would never be drained
+      // by Mesh::loop() while dispatch is unavailable.
+    } else {
     uint8_t path_len = len - 10;
     uint8_t flags = cmd_frame[9];
     uint8_t path_sz = flags & 0x03;  // NEW v1.11+
@@ -1954,7 +2415,11 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_TABLE_FULL);
       }
     }
+    }
   } else if (cmd_frame[0] == CMD_SET_DEVICE_PIN && len >= 5) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.ble_pin.
+    } else {
 
     // get pin from command frame
     uint32_t pin;
@@ -1967,6 +2432,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    }
     }
   } else if (cmd_frame[0] == CMD_GET_CUSTOM_VARS) {
     out_frame[0] = RESP_CODE_CUSTOM_VARS;
@@ -1989,19 +2455,32 @@ void MyMesh::handleCmdFrame(size_t len) {
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
       bool success = sensors.setSettingValue(sp, np);
+      bool persist_refused = false;
       if (success) {
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings
         if (strcmp(sp, "gps") == 0) {
-          _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
-          savePrefs();
+          if (refusePersistIfDisallowed()) {
+            // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.gps_enabled.
+            persist_refused = true;
+          } else {
+            _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
+            savePrefs();
+          }
         } else if (strcmp(sp, "gps_interval") == 0) {
-          uint32_t interval_seconds = atoi(np);
-          _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
-          savePrefs();
+          if (refusePersistIfDisallowed()) {
+            // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.gps_interval.
+            persist_refused = true;
+          } else {
+            uint32_t interval_seconds = atoi(np);
+            _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
+            savePrefs();
+          }
         }
         #endif
-        writeOKFrame();
+        if (!persist_refused) {
+          writeOKFrame();
+        }
       } else {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
@@ -2081,6 +2560,13 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG); // invalid stats sub-type
     }
   } else if (cmd_frame[0] == CMD_FACTORY_RESET && memcmp(&cmd_frame[1], "reset", 5) == 0) {
+    if (_store->formatDisallowed()) {
+      // No explicit, separately-verified format authority for this boot
+      // -- refuse BEFORE disabling serial, so the reply is actually
+      // reachable (a disabled serial link cannot be un-disabled without
+      // a genuine reboot, which we must not trigger for a denied reset).
+      writeErrFrame(ERR_CODE_BAD_STATE);
+    } else {
     if (_serial) {
       MESH_DEBUG_PRINTLN("Factory reset: disabling serial interface to prevent reconnects (BLE/WiFi)");
       _serial->disable(); // Phone app disconnects before we can send OK frame so it's safe here
@@ -2092,6 +2578,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       board.reboot();  // doesn't return
     } else {
       writeErrFrame(ERR_CODE_FILE_IO_ERROR);
+    }
     }
   } else if (cmd_frame[0] == CMD_SET_FLOOD_SCOPE_KEY && len >= 2 && cmd_frame[1] == 0) {
     if (len >= 2 + 16) {
@@ -2105,7 +2592,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     send_unscoped = true;
     writeOKFrame();
   } else if (cmd_frame[0] == CMD_SET_DEFAULT_FLOOD_SCOPE && len >= 1) {
-    if (len >= 1+31+16) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs default flood scope.
+    } else if (len >= 1+31+16) {
       int n = strlen((char *) &cmd_frame[1]);
       if (n > 0 && n < 31) {
         strcpy(_prefs.default_scope_name, (char *) &cmd_frame[1]);
@@ -2131,6 +2620,11 @@ void MyMesh::handleCmdFrame(size_t len) {
       _serial->writeFrame(out_frame, 1);   // no name or key means null
     }
   } else if (cmd_frame[0] == CMD_SEND_CONTROL_DATA && len >= 2 && (cmd_frame[1] & 0x80) != 0) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. createControlData()/
+      // sendZeroHop() need no self_id, but the enqueued packet would
+      // never be drained by Mesh::loop() while dispatch is unavailable.
+    } else {
     auto resp = createControlData(&cmd_frame[1], len - 1);
     if (resp) {
       sendZeroHop(resp);
@@ -2138,13 +2632,18 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+    }
   } else if (cmd_frame[0] == CMD_SET_AUTOADD_CONFIG) {
+    if (refusePersistIfDisallowed()) {
+      // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.autoadd_config.
+    } else {
     _prefs.autoadd_config = cmd_frame[1];
     if (len >= 3) {
       _prefs.autoadd_max_hops = min(cmd_frame[2], (uint8_t)64);
     }
     savePrefs();
     writeOKFrame();
+    }
   } else if (cmd_frame[0] == CMD_GET_AUTOADD_CONFIG) {
     int i = 0;
     out_frame[i++] = RESP_CODE_AUTOADD_CONFIG;
@@ -2161,18 +2660,37 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 4) {
+    if (refuseSendIfDispatchUnavailable()) {
+      // already replied ERR_CODE_BAD_STATE. A raw parsed packet needs no
+      // self_id, but sendPacket() enqueues it and Mesh::loop() would
+      // never drain it while dispatch is unavailable.
+    } else {
+    // Payload type isn't known until after allocation+parse, exactly like
+    // raw radio ingress (Dispatcher::checkRecv()) -- so a raw packet that
+    // turns out to be OTA traffic must be re-checked against the same
+    // ordinary-traffic reserve post-parse and released (not queued) if
+    // accepting it would leave the pool at/below the reserve. Without
+    // this, OTA traffic injected via this command bypasses the reserve
+    // entirely and can exhaust the whole pool. See PacketManager::
+    // kOtaAllocReserve.
     auto pkt = obtainNewPacket();
     if (pkt) {
       uint8_t priority = cmd_frame[1];
       if (tryParsePacket(pkt, &cmd_frame[2], len - 2)) {
-        sendPacket(pkt, priority, 0);
-        writeOKFrame();
+        if (mesh::ota::exceedsOtaAllocReserveAfterParse(pkt, _mgr->getFreeCount(), mesh::PacketManager::kOtaAllocReserve)) {
+          releasePacket(pkt);
+          writeErrFrame(ERR_CODE_TABLE_FULL);
+        } else {
+          sendPacket(pkt, priority, 0);
+          writeOKFrame();
+        }
       } else {
         releasePacket(pkt);
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
+    }
     }
   } else if (cmd_frame[0] == CMD_OTA_CONTROL && len >= 2) {
 #if MESHCORE_LORA_OTA
@@ -2184,12 +2702,20 @@ void MyMesh::handleCmdFrame(size_t len) {
       i += strlen((char*)&out_frame[i]);
       _serial->writeFrame(out_frame, i);
     } else if (op == OTA_CTRL_SET_MODE && len >= 3) {
-      const char* mode = cmd_frame[2] == 0 ? "direct" : (cmd_frame[2] == 1 ? "routed" : (cmd_frame[2] == 2 ? "fleet" : ""));
-      if (setFirmwareOtaMode(mode)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      if (refusePersistIfDisallowed()) {
+        // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.ota_mode.
+      } else {
+        const char* mode = cmd_frame[2] == 0 ? "direct" : (cmd_frame[2] == 1 ? "routed" : (cmd_frame[2] == 2 ? "fleet" : ""));
+        if (setFirmwareOtaMode(mode)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      }
     } else if (op == OTA_CTRL_SET_DUTY && len >= 6) {
-      uint32_t milli_percent;
-      memcpy(&milli_percent, &cmd_frame[2], 4);
-      if (setFirmwareOtaDutyCycle(((float)milli_percent) / 1000.0f)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      if (refusePersistIfDisallowed()) {
+        // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.ota_duty_percent.
+      } else {
+        uint32_t milli_percent;
+        memcpy(&milli_percent, &cmd_frame[2], 4);
+        if (setFirmwareOtaDutyCycle(((float)milli_percent) / 1000.0f)) writeOKFrame(); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      }
     } else if (op == OTA_CTRL_ABORT) {
       abortFirmwareOta();
       writeOKFrame();
@@ -2197,6 +2723,14 @@ void MyMesh::handleCmdFrame(size_t len) {
       rollbackFirmwareOta();
       writeOKFrame();
     } else if (op == OTA_CTRL_DIRECT_LEASE && len >= 14) {
+      if (refusePersistIfDisallowed()) {
+        // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.ota_mode
+        // or the live radio engine. DIRECT_LEASE currently reuses
+        // setFirmwareOtaMode("direct"), which persists _prefs.ota_mode via
+        // savePrefs() -- refuse BEFORE any mutation rather than silently
+        // applying the lease and replying OK while the persisted mode is
+        // left stale/rolled back.
+      } else {
       int i = 2;
       uint32_t freq;
       uint32_t bw;
@@ -2228,6 +2762,27 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
+      }
+    } else if (op >= static_cast<uint8_t>(meshcore::ota::runtime::OtaControlSubcommand::Open) &&
+               op <= static_cast<uint8_t>(meshcore::ota::runtime::OtaControlSubcommand::Close)) {
+      // Source-bound USB commissioning session router (contract section
+      // E): the full 37B request header IS cmd_frame[0..37) (cmd_frame[0]
+      // doubles as both the outer CMD_OTA_CONTROL multiplexer byte and
+      // the ABI header's own cmd field, since they are the same position
+      // on the wire), followed by up to 128B of inline object data.
+      // dispatch() never performs cryptographic signing/verification or
+      // touches flash itself -- see OtaControlSessionRouter.h for the
+      // typed IOtaControlJobBackend seam Authority/Store bind into.
+      if (len < meshcore::ota::protocol::kOtaControlRequestHeaderSize) {
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      } else {
+        size_t reply_len = _ota_control_router_.dispatch(cmd_frame, len, out_frame, sizeof(out_frame));
+        if (reply_len == 0) {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        } else {
+          _serial->writeFrame(out_frame, reply_len);
+        }
+      }
     } else {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     }
@@ -2236,8 +2791,50 @@ void MyMesh::handleCmdFrame(size_t len) {
 #endif
   } else if (cmd_frame[0] == CMD_OTA_LAB && len >= 2) {
 #if MESHCORE_LORA_OTA
-    if (cmd_frame[1] != OTA_LAB_QUEUE_PRECEDENCE) {
+    if (cmd_frame[1] == OTA_LAB_READ_FLOOR_RAW) {
+      if (len < 6) {
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      } else {
+        uint8_t logical_index = cmd_frame[2];
+        uint32_t offset = (static_cast<uint32_t>(cmd_frame[3]) << 8) | cmd_frame[4];
+        uint8_t length = cmd_frame[5];
+        uint8_t data[128];
+        if (length == 0 || length > sizeof(data) ||
+            !otaLabReadFloorRaw(logical_index, offset, data, length)) {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        } else {
+          uint8_t out_frame[6 + sizeof(data)];
+          int i = 0;
+          out_frame[i++] = RESP_CODE_OTA_LAB_FLOOR_DATA;
+          out_frame[i++] = logical_index;
+          out_frame[i++] = static_cast<uint8_t>((offset >> 8) & 0xFF);
+          out_frame[i++] = static_cast<uint8_t>(offset & 0xFF);
+          out_frame[i++] = length;
+          memcpy(&out_frame[i], data, length); i += length;
+          _serial->writeFrame(out_frame, i);
+        }
+      }
+    } else if (cmd_frame[1] == OTA_LAB_ERASE_FLOOR_A) {
+      if (len < 6) {
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      } else {
+        uint32_t confirm_token = (static_cast<uint32_t>(cmd_frame[2]) << 24) |
+                                  (static_cast<uint32_t>(cmd_frame[3]) << 16) |
+                                  (static_cast<uint32_t>(cmd_frame[4]) << 8) |
+                                  static_cast<uint32_t>(cmd_frame[5]);
+        if (!otaLabEraseFloorASector(confirm_token)) {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        } else {
+          writeOKFrame();
+        }
+      }
+    } else if (cmd_frame[1] != OTA_LAB_QUEUE_PRECEDENCE) {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    } else if (!_identity_available_) {
+      // No real identity this boot -- the campaign advert_packet below is
+      // signed via createSelfAdvert(), which must not run against the
+      // default/unset self_id during a trial/unknown boot.
+      writeErrFrame(ERR_CODE_BAD_STATE);
     } else {
       using namespace meshcore::ota::protocol;
       uint8_t announcement_payload[kOtaAnnouncementPayloadSize] = {};
@@ -2271,9 +2868,17 @@ void MyMesh::handleCmdFrame(size_t len) {
         if (advert_packet != nullptr) releasePacket(advert_packet);
         writeErrFrame(ERR_CODE_TABLE_FULL);
       } else {
-        sendFlood(ota_packet, static_cast<uint32_t>(0), 3);
-        sendFlood(advert_packet, static_cast<uint32_t>(0), 3);
-        writeOKFrame();
+        // Both queueOutbound() attempts must be checked: a full send
+        // queue drops (and frees) the packet silently at the manager
+        // level, and an unconditional OK here would otherwise report
+        // success for a lab probe that was never actually transmitted.
+        bool ota_queued = sendFlood(ota_packet, static_cast<uint32_t>(0), 3);
+        bool advert_queued = sendFlood(advert_packet, static_cast<uint32_t>(0), 3);
+        if (!ota_queued || !advert_queued) {
+          writeErrFrame(ERR_CODE_TABLE_FULL);
+        } else {
+          writeOKFrame();
+        }
       }
     }
 #else
@@ -2290,7 +2895,15 @@ static bool save_filter(const ContactInfo& c) {
 }
 
 void MyMesh::saveContacts() {
-  _store->saveContacts(this, save_filter);
+  const bool ok = _store->saveContacts(this, save_filter);
+#if MESHCORE_LORA_OTA
+  // Same latch/rationale as savePrefs() -- a real, already-performed
+  // ordinary filesystem write, never a fabricated probe. A policy-
+  // refused write must never be misread as a storage fault.
+  if (!ok && !_store->destructiveWritesDisallowed()) _ota_service_.noteStorageIoResult(false);
+#else
+  (void)ok;
+#endif
 }
 
 void MyMesh::enterCLIRescue() {
@@ -2319,16 +2932,34 @@ void MyMesh::checkCLIRescueCmd() {
     if (memcmp(cli_command, "set ", 4) == 0) {
       const char* config = &cli_command[4];
       if (memcmp(config, "pin ", 4) == 0) {
-        _prefs.ble_pin = atoi(&config[4]);
-        savePrefs();
-        Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
+        if (_store->destructiveWritesDisallowed()) {
+          // OTA trial/unknown boot: refuse BEFORE mutating _prefs.ble_pin,
+          // and do not echo any pin value -- the write did not persist.
+          Serial.println("  Error: refused (read-only boot state)");
+        } else {
+          _prefs.ble_pin = atoi(&config[4]);
+          savePrefs();
+          Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
+        }
       } else {
         Serial.printf("  Error: unknown config: %s\n", config);
       }
     } else if (strcmp(cli_command, "rebuild") == 0) {
       bool success = _store->formatFileSystem();
       if (success) {
-        _store->saveMainIdentity(self_id);
+        const bool id_ok = _store->saveMainIdentity(self_id);
+#if MESHCORE_LORA_OTA
+        if (id_ok) {
+          // Re-persists the SAME already-held identity after an
+          // erase+rebuild -- a real, durable write just succeeded, the
+          // same category of evidence as begin()'s GeneratedAndSaved.
+          _ota_service_.noteIdentityPersisted();
+        } else {
+          _ota_service_.noteStorageIoResult(false);
+        }
+#else
+        (void)id_ok;
+#endif
         savePrefs();
         saveContacts();
         saveChannels();
@@ -2499,8 +3130,19 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
-  BaseChatMesh::loop();
-  checkTempRadioLease();
+  if (_identity_available_) {
+    // Ordinary mesh dispatch (packet TX/RX scheduling, advertising,
+    // signing) is entirely identity-dependent -- suppressed whenever
+    // begin() could not establish a real identity during a trial/
+    // unknown boot (see the ota_identity_boot::Outcome::IdentityUnavailable
+    // branch above). The bounded serial/diagnostic/trial-health
+    // maintenance path below still runs either way.
+    BaseChatMesh::loop();
+    checkTempRadioLease();
+  }
+  // Lease restoration must not be identity-gated -- see
+  // revertTempRadioLeaseIfDue()'s doc comment.
+  revertTempRadioLeaseIfDue();
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
@@ -2508,10 +3150,20 @@ void MyMesh::loop() {
     checkSerialInterface();
   }
 
-  // is there are pending dirty contacts write needed?
+  // is there are pending dirty contacts write needed? A denied/failed
+  // write must never be silently labeled "saved" -- gate BEFORE mutation
+  // (mirrors the CMD_REBOOT handler's existing identical guard above)
+  // rather than calling saveContacts() unconditionally and only
+  // propagating its fault afterward. Astra's correction: the previous
+  // version cleared dirty_contacts_expiry unconditionally even when the
+  // gate denied the write, permanently discarding the pending save
+  // instead of retrying once writes are allowed again -- only clear the
+  // flag on the branch that actually performed the write.
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
-    saveContacts();
-    dirty_contacts_expiry = 0;
+    if (!_store->destructiveWritesDisallowed()) {
+      saveContacts();
+      dirty_contacts_expiry = 0;
+    }
   }
 
 #ifdef DISPLAY_CLASS
@@ -2519,11 +3171,177 @@ void MyMesh::loop() {
 #endif
 }
 
+#if MESHCORE_LORA_OTA
+void MyMesh::setOtaTrialBootHealthSignals(bool radio_ready, bool filesystem_ready) {
+  _ota_trial_radio_ready = radio_ready;
+  _ota_trial_filesystem_ready = filesystem_ready;
+}
+
+bool MyMesh::isRadioStuckOutOfRecv(uint32_t now_ms) {
+  if (_radio != nullptr && _radio->isInRecvMode()) return false;
+  if (isSendInProgress()) {
+    // Genuinely transmitting right now: bound by the real per-packet
+    // airtime+margin deadline Dispatcher already computed for this send
+    // (see checkSend()), so a legitimately long TX (e.g. SF12) is never
+    // mistaken for "stuck", instead of a single fixed constant.
+    return millisHasNowPassed(getCurrentSendDeadlineMs());
+  }
+  // Neither receiving nor sending: fall back to the same conservative
+  // floor Dispatcher's own generic watchdog uses (see Dispatcher.cpp
+  // loop()'s ERR_EVENT_STARTRX_TIMEOUT), computed independently here
+  // from the Dispatcher-tracked Rx-mode-transition timestamp, rather
+  // than depending on that sticky/global `_err_flags` bit (shared with
+  // unrelated error reporting and never proactively re-cleared).
+  return (now_ms - getRadioNonRecvSinceMs()) > 8000;
+}
+
+void MyMesh::tickOtaTrialHealth() {
+  // Drive whichever baseline-measurement job (if any) is currently
+  // Pending, exactly once this tick -- BEFORE the trial-boot health
+  // logic below, and entirely independent of radio_ready/filesystem_
+  // ready: the collector itself has zero radio dependency and must
+  // remain serviceable even while trial-boot health is still unresolved
+  // (see OtaBaselineMeasurementCollector.h). No begin() caller is wired
+  // yet (future USB-bound surface), so on most ticks this is simply a
+  // no-op (status() == Idle).
+  if (_ota_baseline_collector_.status() == mesh::ota::OtaBaselineMeasurementStatus::Pending) {
+    _ota_baseline_collector_.serviceStep(_ota_baseline_collector_.currentTicketId(),
+                                        _ota_baseline_collector_.currentOwnerToken());
+  }
+
+  // Reaching this call at all, on every outer-loop pass, IS the
+  // "loop_healthy" liveness proof (a crashed/hung/watchdog-reset
+  // firmware never gets here again) -- AND, because main.cpp's loop()
+  // now calls this only AFTER mesh dispatch, every interface, sensors/
+  // UI, RTC, the external watchdog, and WiFi reconnect have already run
+  // to completion THIS SAME PASS, it is a genuinely complete "this whole
+  // outer service loop finished" signal, not merely "some earlier code
+  // in this tick ran." The genuinely CONTINUOUS 10-second window and the
+  // 45-second overall deadline are both tracked, tick-to-tick-gap-aware,
+  // inside XiaoOtaTrialHealthMonitor itself (see that header), driven
+  // purely by the wall-clock `now_ms` passed in below; this call site
+  // only reacts to the LATCHED terminal outcome.
+  const uint32_t now_ms = _ms->getMillis();
+  // Real, per-tick (not just cached-at-boot) grounded signals:
+  //
+  // Radio: `_radio->isInRecvMode()` ALONE would incorrectly disqualify a
+  // perfectly healthy node the instant it transmits an ordinary packet
+  // (TX briefly leaves Rx mode -- see RadioLibWrapper's STATE_TX_WAIT/
+  // STATE_TX_DONE/brief STATE_IDLE window before the next startReceive()),
+  // resetting the continuous window on completely normal traffic. A
+  // SINGLE fixed "stuck out of Rx" constant is ALSO insufficient on its
+  // own: a genuinely healthy transmission at a supported SF (e.g. SF12)
+  // can legitimately take longer than any one fixed constant, so the
+  // stuck check below is bounded by the ACTUAL per-packet airtime+margin
+  // deadline Dispatcher already computes for the send currently in
+  // flight (`getCurrentSendDeadlineMs()`, see checkSend()) whenever one
+  // is genuinely in progress (`isSendInProgress()`), falling back to the
+  // same conservative floor as Dispatcher's own generic watchdog only
+  // when neither receiving nor sending. Driver health itself is now a
+  // genuine, ACTIVE, per-tick probe (`Radio::probeDriverStatus()`) --
+  // for CustomSX1262Wrapper this is a real bounded hardware error-flag
+  // read taken THIS tick (see CustomSX1262Wrapper::probeDriverStatus()),
+  // not merely a passively-latched reaction to whichever ordinary op
+  // happened to run last, and not merely an "unobserved default" during
+  // a quiet period with no ordinary traffic at all. A null radio is
+  // never treated as healthy.
+  //
+  // Filesystem: the boot-time mount flag never re-validates itself, and
+  // the OTA candidate-sink IoError latch (`otaBoardStorageIoFaultObserved()`)
+  // is never actually exercised WHILE a trial is active -- the guarded
+  // staging sink deliberately refuses to even begin a session (let alone
+  // reach writeChunk()/commit()) whenever a trial-boot health window is
+  // active/unknown (see OtaBoardTrialGuardedStagingSink), so it can never
+  // observe an ordinary filesystem fault during exactly the window that
+  // matters. Instead, reuse the ACTUAL outcome of genuine, already-
+  // performed ordinary filesystem writes/reads this boot -- NodePrefs
+  // saves (`savePrefs()`), contact/channel saves (`saveContacts()`/
+  // `saveChannels()`), identity-import saves (`CMD_IMPORT_PRIVATE_KEY`)
+  // and identity load at startup (`_store->saveMainIdentity()`/loadMain
+  // paths) all already call bool-returning DataStore methods and now
+  // report into `_ota_service_` (see helpers/ota/OtaFirmwareService.h)
+  // on a genuine failure
+  // (see MyMesh.h/DataStore.h/checkSerialInterface()/main.cpp) -- never a
+  // fabricated dummy probe write, and never assumed to stay "ready"
+  // forever just because the mount once succeeded. Those writes only
+  // happen when the USER actually triggers one, though, so a window with
+  // no user activity would otherwise see stale (boot-time-only)
+  // evidence; `DataStore::probeStorageReadiness()` closes that gap with
+  // a genuinely bounded, side-effect-free (single File::read(), never a
+  // write) fresh MANDATORY-identity-integrity check (persisted key bytes
+  // compared against `self_id`, actually in RAM, not just a read-length
+  // check) plus a real prefs.json open-then-immediately-close, performed
+  // on EVERY tick during the window, so a real mid-trial storage failure
+  // is still observed even if the user never happens to save anything.
+  if (_store != nullptr && !_store->probeStorageReadiness(self_id)) {
+    _ota_service_.noteStorageIoResult(false);
+  }
+  const bool radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
+  // Sampled fresh THIS tick only -- never persisted across ticks (see
+  // OtaTrialRadioReadiness.h for why a sticky "fault observed" bool
+  // would wrongly abort the whole boot on one transient failure).
+  const uint32_t radio_fault_count_before_probe = (_radio != nullptr) ? _radio->driverFaultCount() : _ota_trial_last_radio_fault_count_;
+  const bool radio_driver_healthy = (_radio != nullptr) && _radio->probeDriverStatus();
+  const uint32_t radio_fault_count_after_probe = (_radio != nullptr) ? _radio->driverFaultCount() : radio_fault_count_before_probe;
+  // Genuine ACTIVE service proof for this pass: an internally-consistent
+  // "idle" chip status is NOT proof the radio is actually doing its job
+  // -- only an active Rx or a genuinely in-flight Tx counts (see
+  // OtaTrialRadioReadiness.h's "INDEFINITE-IDLE ACCEPTANCE" note). A
+  // lone idle pass simply fails this pass (resetting the window like
+  // any other readiness drop), it is never a terminal failure.
+  const bool radio_genuinely_servicing = (_radio != nullptr) && (_radio->isInRecvMode() || isSendInProgress());
+  const bool filesystem_ready_now = _ota_trial_filesystem_ready && !otaBoardStorageIoFaultObserved() &&
+                                    !_ota_service_.trialFilesystemFaultObserved() &&
+                                    !(_store != nullptr && _store->blobIoFaultObserved());
+  // Shared with every other MESHCORE_LORA_OTA MyMesh (e.g.
+  // examples/simple_repeater/MyMesh.cpp's role-1 build) -- see
+  // helpers/ota/OtaMeshTrialHealthTick.h: this call is the single place
+  // the readiness-this-pass evaluation and the terminal-outcome-to-
+  // reboot mapping live, never hand-copied a second time.
+  const mesh::ota::OtaMeshTrialHealthTickInputs tick_in{
+      now_ms, _radio != nullptr, _ota_trial_radio_ready, radio_stuck_non_recv, radio_driver_healthy,
+      radio_genuinely_servicing, radio_fault_count_before_probe, radio_fault_count_after_probe,
+      filesystem_ready_now};
+  const auto tick_result =
+      mesh::ota::evaluateOtaMeshTrialHealthTick(tick_in, _ota_trial_last_radio_fault_count_);
+  // Exactly one deliberate, controlled reboot on any of the three
+  // terminal outcomes -- Confirmed (durable confirmation already
+  // written+read back), DeadlineExpired (never touch/rely on the
+  // bootloader's own watchdog reload; issue our own reboot instead so
+  // its unconfirmed-trial rollback path runs cleanly on the next boot),
+  // ConfirmationUncertain (a confirmation write attempt itself failed --
+  // never retried; the next boot re-reads the actual durable token from
+  // flash rather than this process attempting a second flash
+  // transaction), or StateUnreadable (the eager at-construction state-
+  // record read itself came back ambiguous -- an unreadable or corrupt
+  // slot -- so whether a trial is genuinely in progress could not be
+  // determined at all; fails closed rather than running indefinitely).
+  // Latched via _ota_trial_reboot_issued so this can never fire twice.
+  if (!_ota_trial_reboot_issued && tick_result.should_reboot) {
+    _ota_trial_reboot_issued = true;
+    board.reboot();
+  }
+}
+#endif
+
 void MyMesh::checkTempRadioLease() {
   if (set_radio_at && millisHasNowPassed(set_radio_at)) {
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
     set_radio_at = 0;
   }
+}
+
+// Astra's correction: restoring an ALREADY-APPLIED temporary lease back
+// to the node's normal configured radio params needs no identity/
+// authorization -- only granting a NEW lease (checkTempRadioLease()'s
+// set_radio_at, above, which loop() still gates under
+// _identity_available_) does. Keeping this outside that gate means an
+// active off-frequency/high-speed lease is never left stuck applied
+// forever merely because identity became unavailable mid-lease. main.cpp
+// halt()s on a failed radio_init() before MyMesh is ever reached, so (
+// unlike simple_repeater's _radio_available_) no further radio-liveness
+// gate is needed here.
+void MyMesh::revertTempRadioLeaseIfDue() {
   if (revert_radio_at && millisHasNowPassed(revert_radio_at)) {
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     revert_radio_at = 0;
@@ -2531,6 +3349,13 @@ void MyMesh::checkTempRadioLease() {
 }
 
 bool MyMesh::advert() {
+  if (!_identity_available_) {
+    // No real identity this boot (trial/unknown) -- called from UI
+    // button-press handlers outside loop()'s identity gate; behave like
+    // any other "couldn't advertise" failure rather than signing with
+    // the default/unset self_id.
+    return false;
+  }
   mesh::Packet* pkt;
   if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
     pkt = createSelfAdvert(_prefs.node_name);
@@ -2547,5 +3372,14 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+  bool trial_active = false;
+#if MESHCORE_LORA_OTA
+  // Never let this device deep-sleep while a trial-boot health window is
+  // genuinely in progress -- sleeping would starve the continuous
+  // radio/filesystem/loop readiness this window requires, and could
+  // stall the whole confirmation past the 45-second deadline for no
+  // reason other than an otherwise-idle radio queue.
+  trial_active = otaBoardTrialHealthWindowActive();
+#endif
+  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || trial_active;
 }

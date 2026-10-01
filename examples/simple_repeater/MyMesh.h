@@ -37,8 +37,30 @@
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
 
+#if MESHCORE_LORA_OTA
+#include <helpers/ota/OtaBoardBaselineMeasurementSource.h>
+#include <helpers/ota/OtaFirmwareService.h>
+#include <helpers/ota/OtaMeshTrialHealthTick.h>
+#include <helpers/ota/OtaMeasurementControlJobBackend.h>
+#include "ota/runtime/OtaControlSessionRouter.h"
+#endif
+
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
+#endif
+
+// A role-1 (repeater) OTA build on the SAME physical Xiao nRF52840
+// hardware family as companion_radio (role 0) must never share its
+// prefs file with a role-0 image that might coexist on the same
+// candidate-bank-capable device during genesis/commissioning -- see
+// CommonCLI::loadPrefs/savePrefs's filename parameter. Every OTHER
+// simple_repeater build (ESP32/RAK/etc, where XIAO_OTA_COMPILED_ROLE_ID
+// is simply never defined) is completely unaffected and keeps the
+// original "/prefs.json" path byte-for-byte.
+#if defined(XIAO_OTA_COMPILED_ROLE_ID) && XIAO_OTA_COMPILED_ROLE_ID == 1
+static constexpr const char* kRepeaterPrefsFilename = "/repeater_prefs.json";
+#else
+static constexpr const char* kRepeaterPrefsFilename = "/prefs.json";
 #endif
 
 struct RepeaterStats {
@@ -120,6 +142,115 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ESPNowBridge bridge;
 #endif
 
+  // Mirrors examples/companion_radio/MyMesh.h's `_identity_available_`
+  // degraded-dispatch flag byte-for-byte (same default, same meaning):
+  // false only when main.cpp's setup() hit a genuine identity-load
+  // failure (ota_identity_boot::Outcome::IdentityUnavailable) and chose
+  // to perform ZERO generation/writes rather than halt() -- see
+  // notifyIdentityUnavailableForDispatch() below. loop() uses this to
+  // suppress ordinary mesh dispatch (identity-dependent TX/signing/
+  // advert) entirely, keeping only the bounded serial/CLI/maintenance/
+  // trial-health path running, rather than operating on an unset
+  // identity. Unconditional (not MESHCORE_LORA_OTA-gated), same as
+  // companion's, since a non-OTA build's identity-generation permission
+  // is always granted and essentially never reaches this state.
+  bool _identity_available_ = true;
+  // Repeater-specific (companion has no equivalent): false only when
+  // this boot's radio_init() genuinely failed. Previously main.cpp
+  // halt()ed in that case, stranding the serial/CLI/maintenance path
+  // along with RF dispatch; gates the same set of real RF-touching
+  // begin()/loop() operations as _identity_available_ so the device can
+  // still serve USB maintenance/CLI/OTA-trial-health with radio absent.
+  bool _radio_available_ = true;
+
+  // Mirrors companion_radio's DataStore::_destructive_writes_disallowed_
+  // (same OtaWriteGate.h contract, same meaning): true only during an
+  // OTA trial/unknown boot (ota_allow_destructive_boot_writes computed
+  // in main.cpp's setup() via otaBoardEarlyBootTrialOrUnknown()), set
+  // once via notifyDestructiveWritesDisallowed() below. Repeater has no
+  // DataStore-equivalent wrapper, so loop()'s own acl.save(_fs) call
+  // must consult this flag directly (via ota_write_gate::guardedPersist)
+  // rather than unconditionally mutating storage and mislabeling a
+  // policy-refused write as persisted. Unconditional (not
+  // MESHCORE_LORA_OTA-gated) so it compiles identically whether or not
+  // OTA is enabled; defaults to false (writes allowed) for ordinary
+  // non-OTA builds.
+  bool _ota_destructive_writes_disallowed_ = false;
+
+#if MESHCORE_LORA_OTA
+  // Mirrors examples/companion_radio/MyMesh.h's identically-named/
+  // purposed members byte-for-byte (see that header's doc comments);
+  // the DECISION logic both boards drive is the same shared function
+  // (helpers/ota/OtaMeshTrialHealthTick.h) -- only this per-instance
+  // latched state is necessarily duplicated, since MyMesh here and
+  // companion_radio's MyMesh are unrelated C++ classes.
+  bool _ota_trial_radio_ready = false;
+  bool _ota_trial_filesystem_ready = false;
+  bool _ota_trial_reboot_issued = false;
+  // Single authoritative owner of the latched filesystem-fault and
+  // identity-confirmed-loaded facts previously tracked as two separate
+  // role-local bools here (see helpers/ota/OtaFirmwareService.h) -- fed
+  // real outcomes via notifyOtaTrialIdentityLoadFault()/
+  // notifyOtaIdentityConfirmedLoaded() below (called from main.cpp,
+  // which is where this board's identity load/generate/save actually
+  // happens) and consumed read-only by _ota_baseline_source_ and
+  // tickOtaTrialHealth().
+  mesh::ota::OtaFirmwareService _ota_service_;
+  uint32_t _ota_trial_last_radio_fault_count_ = 0;
+  mesh::ota::OtaBoardBaselineMeasurementSource _ota_baseline_source_;
+  mesh::ota::OtaBaselineMeasurementCollector _ota_baseline_collector_;
+  // Mirrors examples/companion_radio/MyMesh.h's identically-purposed
+  // members byte-for-byte: the real MEASURE/POLL/READ_OBJECT
+  // IOtaControlJobBackend bound into _ota_control_backend_slot_ in
+  // begin() below; Certify/Prepare/Activate remain an explicit terminal
+  // NoCapacity until Authority's/Store's own adapters land.
+  meshcore::ota::runtime::OtaMeasurementControlJobBackend _ota_measurement_job_backend_;
+  // Device-side entropy bridge for OtaControlSessionRouter's minted
+  // session ids / CHALLENGE bytes. Deliberately fails closed rather than
+  // reading from any `mesh::RNG&` this instance was constructed with:
+  // the only concrete RNG wired in this firmware (`fast_rng`/`StdRNG`,
+  // see src/helpers/ArduinoHelpers.h) is `::random(0,256)`, exactly the
+  // deterministic-PRNG fallback the commissioning contract disallows.
+  // The genuine real-radio-noise equivalent (`RadioNoiseListener`,
+  // src/helpers/radiolib/RadioLibWrappers.h, and the ready
+  // `mesh::ota::helpers::OtaControlRadioEntropy` adapter in
+  // src/helpers/ota/OtaDeviceAuthorityBoardAdapters.h) needs a
+  // `PhysicalLayer&` that is not reachable from here -- MyMesh only
+  // holds the abstract `mesh::Radio&` (src/Dispatcher.h), and the
+  // concrete `RadioLibWrapper` keeps its `PhysicalLayer*` private; both
+  // files are outside this scope's owned edit surface. Until one of
+  // those (owner-approved) exposes real radio entropy to MyMesh, every
+  // call here fails, so OPEN/CHALLENGE correctly report
+  // NoCapacity/entropy-unavailable rather than ever minting a session
+  // id or challenge from StdRNG.
+  class OtaControlRngEntropy : public meshcore::ota::runtime::IOtaControlEntropySource {
+  public:
+    bool fillRandom(uint8_t*, size_t) override { return false; }
+  };
+  OtaControlRngEntropy _ota_control_entropy_;
+  // Fail-closed by default (see OtaControlNullJobBackend); Authority's/
+  // Store's eventual physical-writer adapter binds here once their own
+  // coordinator APIs stabilize -- no job-bearing USB command can
+  // fabricate progress until then.
+  meshcore::ota::runtime::OtaControlJobBackendSlot _ota_control_backend_slot_;
+  meshcore::ota::runtime::OtaControlSessionRouter _ota_control_router_;
+
+  bool isRadioStuckOutOfRecv(uint32_t now_ms);
+  // Astra's correction: boot-mount success + the board-level storage-
+  // fault latch alone is stale evidence beyond the exact tick a user
+  // happens to trigger a real write -- mirrors companion_radio's
+  // DataStore::probeStorageReadiness(), but against repeater's plain
+  // IdentityStore (no DataStore-equivalent persistent wrapper here).
+  // Bounded, side-effect-free (single IdentityStore::checkIntegrity()
+  // read against the identity ACTUALLY in RAM, plus a prefs-file open-
+  // then-immediately-close, never a write): see
+  // probeIdentityStorageReadiness()'s definition for exactly what each
+  // outcome means. Returns false (never true) whenever
+  // !_identity_available_ -- a probe against an unbound identity would
+  // only ever "pass" vacuously, never real evidence.
+  bool probeIdentityStorageReadiness() const;
+#endif
+
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -184,6 +315,14 @@ public:
 
   void begin(FILESYSTEM* fs);
   void sendNodeDiscoverReq();
+#if MESHCORE_LORA_OTA
+  // Accessor for main.cpp's source-bound USB commissioning adapter (see
+  // helpers/ota/OtaUsbCommissioningSerialInterface.h) to construct its
+  // OtaUsbControlService around the SAME real router this instance owns
+  // and binds its job backend into below -- never a second/duplicate
+  // router/session instance.
+  meshcore::ota::runtime::OtaControlSessionRouter& getOtaControlRouter() { return _ota_control_router_; }
+#endif
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
   const char* getRole() override { return FIRMWARE_ROLE; }
@@ -193,7 +332,7 @@ public:
   }
 
   void savePrefs() override {
-    _cli.savePrefs(_fs);
+    _cli.savePrefs(_fs, kRepeaterPrefsFilename);
   }
 
   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
@@ -252,6 +391,54 @@ public:
 
   // To check if there is pending work
   bool hasPendingWork() const;
+
+#if MESHCORE_LORA_OTA
+  // Same contract as examples/companion_radio/MyMesh.h's identically-
+  // named methods -- see helpers/ota/OtaMeshTrialHealthTick.h for the
+  // shared decision logic both boards' loop() glue delegates to.
+  void setOtaTrialBootHealthSignals(bool radio_ready, bool filesystem_ready) {
+    _ota_trial_radio_ready = radio_ready;
+    _ota_trial_filesystem_ready = filesystem_ready;
+  }
+  // Companion's equivalent latch is set inline inside its own DataStore
+  // wrapper/begin() methods (private member access); repeater's identity
+  // load instead happens in main.cpp's setup(), outside any MyMesh member
+  // function, so a narrow public setter is needed to report the same
+  // "a genuine load failure happened this boot" evidence without widening
+  // _ota_service_ itself to public access.
+  void notifyOtaTrialIdentityLoadFault() {
+    _ota_service_.noteIdentityLoadAttempted(/*loaded_ok=*/false);
+  }
+  // Same reasoning as notifyOtaTrialIdentityLoadFault() above: main.cpp's
+  // setup() (not a MyMesh member function) is where repeater's identity
+  // load/generate/save actually happens, so it must report the final
+  // confirmed-loaded fact through this narrow setter rather than main.cpp
+  // reaching into a private member directly.
+  void notifyOtaIdentityConfirmedLoaded(bool loaded) {
+    if (loaded) {
+      _ota_service_.noteIdentityPersisted();
+    }
+    // `false` here is only ever reached via the already-false default
+    // (see main.cpp's call sites) -- nothing further to latch.
+  }
+  void tickOtaTrialHealth();
+#endif
+
+  // Called from main.cpp's setup() in place of the previous halt() on
+  // ota_identity_boot::Outcome::IdentityUnavailable -- see
+  // _identity_available_'s doc comment above. Unconditional (not
+  // MESHCORE_LORA_OTA-gated): main.cpp only ever calls this inside its
+  // own #if MESHCORE_LORA_OTA branch today, but the setter itself stays
+  // plain so it compiles identically to companion's equivalent path.
+  void notifyIdentityUnavailableForDispatch() { _identity_available_ = false; }
+  // Called from main.cpp's setup() in place of the previous halt() on a
+  // failed radio_init() -- see _radio_available_'s doc comment above.
+  void notifyRadioUnavailableForDispatch() { _radio_available_ = false; }
+  // Called from main.cpp's setup() with !ota_allow_destructive_boot_writes
+  // -- see _ota_destructive_writes_disallowed_'s doc comment above.
+  // Unconditional (not MESHCORE_LORA_OTA-gated), same rationale as
+  // notifyIdentityUnavailableForDispatch()/notifyRadioUnavailableForDispatch().
+  void notifyDestructiveWritesDisallowed() { _ota_destructive_writes_disallowed_ = true; }
 
   bool setRxBoostedGain(bool enable) override;
 

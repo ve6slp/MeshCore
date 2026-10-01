@@ -48,7 +48,7 @@ typedef struct XIAO_OTA_PACKED {
   uint16_t format_version;    /* XIAO_OTA_BOOT_INFO_FORMAT_VERSION */
   uint16_t struct_bytes;      /* sizeof(xiao_ota_boot_info_t), for forward compat */
   uint32_t board_target_id;   /* XIAO_OTA_BOARD_TARGET this binary enforces */
-  uint32_t role_id;           /* XIAO_OTA_ROLE_ANY */
+  uint32_t role_id;           /* XIAO_OTA_COMPILED_ROLE_ID (0 or 1) */
   uint32_t capability_flags;  /* e.g. XIAO_OTA_CAP_QSPI_INSTALL */
   uint16_t key_id;            /* XIAO_OTA_KEY_ID */
   uint16_t algorithm_id;      /* XIAO_OTA_ALGORITHM_ED25519 */

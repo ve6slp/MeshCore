@@ -75,6 +75,26 @@ public:
       return VerificationResult::fail(TrustFailureReason::RoleMismatch);
     }
 
+    // Signature-scheme policy binding (Sol finding): a descriptor's
+    // (formatId, keyId, algorithmId) are the fields that tell the trust
+    // provider WHICH key/algorithm was used to sign it; without checking
+    // them here, a descriptor claiming a different keyId/algorithmId than
+    // this device's actual boot policy could still pass IF its signature
+    // happens to verify against the one key this build compiled in --
+    // e.g. a lab STAGING_ONLY-tagged descriptor being silently accepted
+    // on a qualified-production device. Checked as plain equality against
+    // the device's own provisioned anchor, never against anything the
+    // descriptor itself supplies as "expected".
+    if (descriptor.format_id != anchor_.expected_format_id) {
+      return VerificationResult::fail(TrustFailureReason::FormatIdMismatch);
+    }
+    if (descriptor.key_id != anchor_.expected_key_id) {
+      return VerificationResult::fail(TrustFailureReason::KeyIdMismatch);
+    }
+    if (descriptor.algorithm_id != anchor_.expected_algorithm_id) {
+      return VerificationResult::fail(TrustFailureReason::AlgorithmIdMismatch);
+    }
+
     // Address binding: the descriptor must either name this exact device,
     // or explicitly opt into broadcast -- there is no implicit wildcard.
     if (!descriptor.allow_broadcast_address && descriptor.device_address != anchor_.device_address) {

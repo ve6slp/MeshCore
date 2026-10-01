@@ -294,8 +294,16 @@ public:
   CommonCLI(mesh::MainBoard& board, mesh::RTCClock& rtc, SensorManager& sensors, RegionMap& region_map, ClientACL& acl, NodePrefs* prefs, CommonCLICallbacks* callbacks)
       : _board(&board), _rtc(&rtc), _sensors(&sensors), _region_map(&region_map), _acl(&acl), _prefs(prefs), _callbacks(callbacks) { }
 
-  void loadPrefs(FILESYSTEM* _fs);
-  bool savePrefs(FILESYSTEM* _fs);
+  // `prefs_filename` defaults to the long-established "/prefs.json" used
+  // by every existing example (companion_radio etc.) -- passing a
+  // distinct filename (e.g. "/repeater_prefs.json") lets a DIFFERENT
+  // sketch (same board family) keep its own prefs file genuinely
+  // separate, never loading/overwriting another role's file on the
+  // same filesystem. Legacy "/com_prefs" migration is unaffected (still
+  // only consulted when the (possibly non-default) prefs_filename
+  // itself doesn't exist).
+  void loadPrefs(FILESYSTEM* _fs, const char* prefs_filename = "/prefs.json");
+  bool savePrefs(FILESYSTEM* _fs, const char* prefs_filename = "/prefs.json");
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
 };

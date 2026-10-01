@@ -11,10 +11,43 @@ namespace meshcore {
 namespace ota {
 namespace runtime {
 
-inline constexpr uint32_t kOtaMaxImageBytes = 811008;
-inline constexpr uint32_t kOtaDefaultChunkPayloadSize = 160;
-// ceil(811008 / 160)
-inline constexpr size_t kOtaMaxChunkCount = 5069;
+// Hard ceiling on any single OTA image, protocol-wide. NOT the full 792 KiB
+// (811008-byte) external QSPI candidate/backup partition capacity -- this
+// is deliberately capped at 708608 bytes (0xAD000) because on nRF52840
+// targets the running app is installed at internal-flash address 0x27000,
+// and MeshCore v1.17+'s InternalExtraFS partition occupies internal flash
+// 0xD4000..0xED000 (100 KiB). 0x27000 + 0xAD000 == 0xD4000 exactly: any
+// installed image larger than this would silently overlap/corrupt
+// InternalExtraFS. Raise this only once a durable migration of that
+// filesystem into the external QSPI FS partition has landed and is
+// verified; until then, every backend (XIAO and SenseCAP alike) must
+// reject any descriptor whose exactSizeBytes exceeds this bound, even
+// though the external staging partition can physically hold more.
+inline constexpr uint32_t kOtaMaxImageBytes = 708608;
+// Chunk payload size is bounded by the *host<->companion USB serial* link,
+// not the LoRa air interface: the RF lab harness (and any other host tool)
+// injects/observes OTA chunk traffic by wrapping a raw mesh packet inside a
+// CMD_SEND_RAW_PACKET serial command, and BaseSerialInterface.h enforces a
+// hard, shared, non-OTA-specific MAX_FRAME_SIZE of 176 bytes on that link
+// (not increased here: additive compatibility with all existing serial
+// consumers takes priority over a larger OTA chunk). Zero-hop overhead for
+// a single chunk frame on that path is:
+//   2  command header   (CMD_SEND_RAW_PACKET + priority)
+//   2  raw packet header (header byte + path_len byte, 0 hops)
+//   17 kOtaHeaderSize (OTA envelope header)
+//   6  kOtaChunkHeaderSize (chunk index + length)
+//   -----------------------------------------------
+//   27 fixed overhead -> 176 - 27 = 149 bytes max at zero hops.
+// Routed/directed-mode packets add getPathHashSize() bytes (up to 3, per
+// Packet::getPathHashSize()) PER HOP to the path field, shrinking the
+// budget further. 128 is chosen so up to 7 hops of 3-byte path hashes
+// still fit (128 + 7*3 = 149 <= 149), it divides kOtaMaxImageBytes evenly
+// (keeping the final chunk full-size), and it leaves 21 bytes of slack at
+// zero/low hop counts for other optional header fields (e.g. transport
+// codes) without ever exceeding the shared serial frame limit.
+inline constexpr uint32_t kOtaDefaultChunkPayloadSize = 128;
+// exact: 708608 / 128
+inline constexpr size_t kOtaMaxChunkCount = 5536;
 
 enum class OtaGeometryResult : uint8_t {
   Ok = 0,

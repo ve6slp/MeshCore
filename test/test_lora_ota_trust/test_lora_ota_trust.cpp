@@ -352,6 +352,58 @@ TEST_F(DescriptorVerifierFixture, WrongRoleIdFailsClosed) {
   EXPECT_EQ(result.reason, ota::trust::TrustFailureReason::RoleMismatch);
 }
 
+TEST_F(DescriptorVerifierFixture, WrongKeyIdFailsClosedEvenWithGenuineSignature) {
+  anchor_.expected_key_id = 5;
+  anchor_.expected_algorithm_id = 1;
+  verifier_.reset(new ota::trust::DescriptorVerifier(*hasher_, *sig_verifier_, *counter_, anchor_));
+
+  std::vector<uint8_t> image(512, 0x55);
+  ota::trust::ImageDescriptor descriptor = buildValidDescriptor(image, 11);
+  descriptor.key_id = 6;  // wrong -- signed with the genuine key, but tagged with the wrong key id.
+  descriptor.algorithm_id = 1;
+  uint8_t message[ota::trust::CanonicalDescriptor::kMessageBytes];
+  size_t written = ota::trust::CanonicalDescriptor::serialize(descriptor, message, sizeof(message));
+  signer_->sign(message, written, descriptor.signature_ed25519);
+
+  ota::trust::VerificationResult result = verifier_->verifyDescriptor(descriptor);
+  EXPECT_FALSE(result.ok);
+  EXPECT_EQ(result.reason, ota::trust::TrustFailureReason::KeyIdMismatch);
+}
+
+TEST_F(DescriptorVerifierFixture, WrongAlgorithmIdFailsClosedEvenWithGenuineSignature) {
+  anchor_.expected_key_id = 1;
+  anchor_.expected_algorithm_id = 1;
+  verifier_.reset(new ota::trust::DescriptorVerifier(*hasher_, *sig_verifier_, *counter_, anchor_));
+
+  std::vector<uint8_t> image(512, 0x66);
+  ota::trust::ImageDescriptor descriptor = buildValidDescriptor(image, 11);
+  descriptor.key_id = 1;
+  descriptor.algorithm_id = 2;  // wrong algorithm -- e.g. claims a non-Ed25519 scheme.
+  uint8_t message[ota::trust::CanonicalDescriptor::kMessageBytes];
+  size_t written = ota::trust::CanonicalDescriptor::serialize(descriptor, message, sizeof(message));
+  signer_->sign(message, written, descriptor.signature_ed25519);
+
+  ota::trust::VerificationResult result = verifier_->verifyDescriptor(descriptor);
+  EXPECT_FALSE(result.ok);
+  EXPECT_EQ(result.reason, ota::trust::TrustFailureReason::AlgorithmIdMismatch);
+}
+
+TEST_F(DescriptorVerifierFixture, WrongFormatIdFailsClosedEvenWithGenuineSignature) {
+  anchor_.expected_format_id = 1;
+  verifier_.reset(new ota::trust::DescriptorVerifier(*hasher_, *sig_verifier_, *counter_, anchor_));
+
+  std::vector<uint8_t> image(512, 0x77);
+  ota::trust::ImageDescriptor descriptor = buildValidDescriptor(image, 11);
+  descriptor.format_id = 2;  // wrong format.
+  uint8_t message[ota::trust::CanonicalDescriptor::kMessageBytes];
+  size_t written = ota::trust::CanonicalDescriptor::serialize(descriptor, message, sizeof(message));
+  signer_->sign(message, written, descriptor.signature_ed25519);
+
+  ota::trust::VerificationResult result = verifier_->verifyDescriptor(descriptor);
+  EXPECT_FALSE(result.ok);
+  EXPECT_EQ(result.reason, ota::trust::TrustFailureReason::FormatIdMismatch);
+}
+
 TEST_F(DescriptorVerifierFixture, WrongDeviceAddressFailsClosedUnlessBroadcast) {
   std::vector<uint8_t> image(512, 0x44);
   ota::trust::ImageDescriptor descriptor = buildValidDescriptor(image, 11);

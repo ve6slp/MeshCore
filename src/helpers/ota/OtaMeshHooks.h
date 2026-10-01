@@ -30,5 +30,19 @@ inline uint8_t directPriorityForPayload(uint8_t payload_type) {
   return 0;
 }
 
+// Locally-originated raw packet injection (e.g. CMD_SEND_RAW_PACKET) can't
+// know its payload type until after allocation+parse, exactly like raw
+// radio ingress (Dispatcher::checkRecv()). This mirrors the identical
+// post-parse reserve check already enforced there and at
+// Dispatcher::processRecvPacket() (see PacketManager::kOtaAllocReserve):
+// once a parsed packet turns out to be OTA traffic, and accepting it would
+// leave the pool at/below the shared ordinary-traffic reserve, the caller
+// must release it (not queue it for send) instead of relying on
+// allocNew()'s is_ota_bulk reserve check, which only fires when the
+// caller already knew at allocation time that the packet was OTA traffic.
+inline bool exceedsOtaAllocReserveAfterParse(const Packet* packet, int free_count_after_alloc, int reserve) {
+  return isOtaPacket(packet) && free_count_after_alloc <= reserve;
+}
+
 }  // namespace ota
 }  // namespace mesh

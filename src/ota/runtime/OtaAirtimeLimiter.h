@@ -68,10 +68,16 @@ public:
   // right now would keep (still-valid stored usage + prospective) within
   // budget, AND the regulatory input allows it, AND normal mesh traffic
   // precedence (if asserted) does not block this category.
-  bool canAdmit(uint32_t nowMs, protocol::OtaAirtimeCategory category, uint32_t prospectiveDurationMs,
+  bool canAdmit(uint32_t nowMs, protocol::OtaAirtimeCategory /*category*/, uint32_t prospectiveDurationMs,
                 const OtaAirtimeDecisionInput& decision) const {
     if (!decision.regulatoryAllowed) return false;
-    if (decision.normalTrafficActive && category != protocol::OtaAirtimeCategory::Control) return false;
+    // Ready normal (non-OTA) mesh traffic takes absolute precedence over
+    // ALL OTA airtime categories, Control included. An earlier version
+    // exempted Control here so that OTA session-control frames (auth,
+    // receipts, lease negotiation, census, etc.) could preempt ready
+    // normal traffic; that violates the "normal traffic is never starved
+    // by OTA" guarantee this limiter exists to enforce.
+    if (decision.normalTrafficActive) return false;
     if (!hasAccountingCapacity(nowMs)) return false;
 
     const uint32_t used = storedUsageMs(nowMs);

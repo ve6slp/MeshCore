@@ -106,9 +106,13 @@ build, package, sign, and install each artifact, live in the overlay's own
 
 The preferred profile keeps the mandatory USB UF2 mass storage and CDC serial
 DFU recovery paths, leaves out optional BLE DFU, and fits inside the stock
-38 KiB bootloader slot. Its FLASH load footprint is 34,612 bytes (88.95
-percent used, 4,300 bytes free): 33,980 bytes of code and read-only data,
-plus 632 bytes of initialized data. It keeps the stock `0xF4000` UICR boot
+38 KiB bootloader slot. Its FLASH load footprint is 38,900 bytes (99.97
+percent used, **12 bytes free**): 38,652 bytes of code and read-only data,
+plus 248 bytes of initialized data. This margin is razor-thin; see the
+overlay's own `README.md` "Size and boot start" section for the exact
+refactors that closed a real 452-byte overflow down to this fit, and for
+the caveat that any future addition to this profile needs a matching size
+reduction elsewhere first. It keeps the stock `0xF4000` UICR boot
 start address, verifies signatures with a compact TweetNaCl-based Ed25519
 implementation, and is packaged as a bootloader-update UF2 file. The older
 BLE-enabled 66 KiB SWD build is still available and behaves the same as
@@ -400,22 +404,262 @@ hardware: no real signed install, trial boot, confirmation, or rollback has
 happened on a physical board. Step 3 also depends entirely on the "app
 bridge" described in `bootloader/xiao_nrf52840_ota/README.md`, which does not
 exist yet; without it, no application can currently reach step 3 at all. A
-code review of this transaction also caught four real correctness bugs, all
+code review of this transaction also caught six real correctness bugs, all
 now fixed: the backup step's QSPI write was sourcing internal code flash
 directly through EasyDMA, which the nRF52840 cannot do reliably; a device
 that rolled back once could never accept another signed install afterward;
 a corrupt (not erased) anti-rollback floor sector silently defaulted the
-floor counter to 0 instead of refusing new installs; and the active-image
+floor counter to 0 instead of refusing new installs; the active-image
 extent preferred a stale post-install floor value over freshly-verified
 bank-0 metadata, which a later USB/CDC reflash could leave disagreeing with
-reality. See
+reality; the exact same failed (rolled-back) signed command could be
+silently re-accepted forever, since its counter never advanced the floor,
+producing an endless reinstall loop instead of a controlled failure; and a
+trial-boot confirmation token could advance the durable anti-rollback
+floor without re-verifying that the image *actually running* still
+matched what was installed, which a USB/CDC reflash during the trial
+window could defeat. A follow-up review then caught a regression in that
+last fix: the initial version compared the fresh post-install extent
+against the OLD image's extent (required unchanged for a correctly-sized
+rollback restore), not the NEW candidate's own recorded size, which made
+every differently-sized update always roll back. The corrected version
+relies on `installed_hash_sha256` already cryptographically binding both
+the new image's content and its exact length (a fresh hash match at a
+given extent proves that extent is correct), so no new durable state
+field or ABI change was needed -- the 152-byte v1 state layout is
+unchanged -- with a boot-decision sequence regression test (using a real
+SHA-256 over real buffer content, not a placeholder digest) covering both
+growth and shrink updates and a real isolated ARM cross-compile
+re-verifying the fix links, fits flash, and preserves the 152-byte
+layout. See
 `bootloader/xiao_nrf52840_ota/README.md`'s "Fixed" sections for the details.
+A separate review of the same transaction's host-side installer,
+`install_uf2.py`, found it checked only UF2 magic bytes and block
+numbering -- not payload size, UF2 family ID, or the target flash
+address -- so a malformed or mistargeted UF2 could in principle reach the
+application image, ExtraFS, or this project's own durable
+bootloader-settings page. That validator now enforces a payload-size
+bound, the real bootloader-update family ID, and a target-address
+whitelist derived from a genuine packaged artifact, plus an independent
+boot-info marker/board/key check, all before any volume copy, and now also
+supports a `--validate-only` mode that runs those artifact checks with no
+serial/port/device resolution at all; see the same README section for
+details.
 Separately, the real target board's floor-A sector currently holds
 leftover pre-commissioning diagnostic bytes from earlier hardware harness
 runs, not a genuine confirmed floor -- the third fix above means this now
 correctly fails closed (refuses new installs) rather than defaulting to
 counter 0, but the sector still needs a deliberate commissioning
 erase/re-provision before a real install can proceed on that board.
+
+The transaction processor above is now also verified by literally
+compiling and running it (not a parallel re-simulation): `xiao_ota_boot.c`
+is split into a portable `xiao_ota_boot_io.c` (the processor itself,
+zero SDK dependency) and a thin hardware-adapter `xiao_ota_boot.c`, and a
+host test drives the exact same `xiao_ota_boot_process_io()` entry point
+against an in-memory fake device, covering resize confirmations both
+directions, failed-command replay refusal with genuine-new-nonce
+acceptance, crash-mid-install fail-closed rollback, stale-confirmation
+rejection, and DFU/recovery bypass. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Literal-execution
+boot-process tests" section for the design and build recipe.
+
+A subsequent review of that same processor found every IO callback
+returning `void`, so a real failed/timed-out flash read, erase, or write
+had no way to be reported: the processor could confirm a transaction, or
+advance the anti-rollback floor, on top of a write that never actually
+landed. Every callback in `xiao_ota_boot_io.h` now returns `bool`, and
+`xiao_ota_boot_io.c` checks every call; `write_record()` reads back both
+the record body and its commit marker before either is trusted; the
+first `persist_state()` at fresh command-acceptance time may safely just
+refuse on failure, but every later persist call forces bounded recovery
+instead of proceeding. The same review found trial confirmation was not
+re-deriving `freshHash == candidateHash` (only `== installedHash`, which
+should always agree but was never re-checked), had no floor
+non-regression/idempotent-finish handling for a cut between the floor and
+state writes, and found `ROLLBACK_COPYING` erasing the live application
+before ever authenticating the QSPI backup it was about to restore from
+-- a corrupt backup could lose the only remaining valid image. All three
+are now fixed: confirmation requires
+`freshHash == installedHash == candidateHash` plus a bounded non-zero
+extent and matching nonce/counter, never regresses or double-writes an
+already-durable floor, and the backup is hashed and authenticated before
+the first destructive erase. A last-found gap, `state.sequence` being
+reset to zero on every new transaction, could make a fresh transaction's
+first record lose the A/B tie-break to a stale record left over in the
+other slot; `sequence` now carries forward monotonically across
+transactions. The literal-execution test harness above grew from 6 to 14
+scenarios covering all of the above (idempotent floor/state resume,
+sequence continuity, backup authentication before erase, pure I/O
+failure, torn writes, corrupt/newer floor refusal, floor non-regression,
+and no-CONFIRMED-without-durable-floor), and a fresh isolated ARM
+cross-compile re-verified a clean link with the 152-byte v1 state layout
+unchanged. See `bootloader/xiao_nrf52840_ota/README.md`'s "Fixed:
+unchecked IO..." and "Fixed: trial confirmation..." sections for the
+full detail.
+
+A further review pass corrected five more gaps in the same processor:
+metadata reads that conflated "missing" with "unreadable" (now a typed
+Found/Missing/Damaged/IO-error result per slot pair, checked before any
+buffer is trusted); a confirmation shortcut that could set `CONFIRMED`
+on an idempotent floor-already-set resume without re-verifying the live
+image; slot selection that inferred the physical A/B slot from sequence
+parity instead of tracking it, with no sequence-wrap guard; persisted
+phase/progress/extent used as an erase/copy address without being
+bounds-checked first, and backup authenticated only once instead of on
+every resumed rollback boot; and `qspi_init` returning `void` with one
+coarse busy-wait timeout instead of per-operation calibrated bounds and
+a real P25Q16H Quad-Enable check. The transaction processor now has 21
+native scenarios, all passing, plus a settings-page torn-write test that
+exercises a previously-unused fault model. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Fixed: five review
+regressions..." section for full detail, including the grounding of the
+Quad-Enable opcodes/completion-signal choice against this repo's real
+vendored `nrfx_qspi.c` driver and the companion firmware's own
+`CustomLFS_QSPIFlash.cpp` flash-chip table -- read-only cross-checks,
+not physical hardware confirmation.
+
+A further hardware-grounded pass corrected QSPI custom-instruction
+WP#/HOLD# pin levels, replaced a guessed loop-count timeout with a real
+DWT cycle-counter deadline, and closed an idempotent-`CONFIRMED` gap that
+skipped re-checking the floor's stored image extent. The same pass then
+found the settings-page install/rollback path was still a read-modify-
+write against whatever the settings page currently held, not a frozen
+snapshot from when the transaction was admitted -- so a rollback could
+durably re-commit unrelated page damage instead of recovering the
+device's real prior settings. This is now closed with a new 88-byte
+"settings sidecar" record, co-located inside each existing state sector,
+that captures the exact 28-byte settings page once at admission and is
+what every later install/rollback restores from or overlays onto,
+alongside a new pre-erase check that the settings page's unused tail
+reads genuinely blank, and a boot-time gate that force-recovers any
+active transaction whose sidecar is missing or does not match its state
+record. None of this changes the 152-byte state-v1 or 188-byte command-v2
+wire layouts. The transaction processor now has 26 native scenarios, all
+passing; a fresh isolated ARM cross-compile links cleanly at
+36,916/38,912 bytes FLASH. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Fixed: QSPI WP#/HOLD#..." and
+"Fixed: settings-page rollback rebuilt from whatever the page currently
+held..." sections for the full detail. As with every fix in this
+document, this has been exercised only in the native fault-injected test
+harness and cross-compiles -- it has not run on either authorized lab
+board.
+
+A follow-up security review found that once the anti-rollback floor
+advances past 0, the boot processor stopped checking which compiled
+role the surviving floor-activation receipt belonged to. A physical
+swap of the compiled loader for the OTHER role (same device, same
+floor/backup sectors left untouched) could present a validly signed
+install command for its own role and have it silently accepted against
+the other role's already-confirmed floor history -- a cross-role
+anti-rollback bypass, even though the install itself is explicitly
+unsupported. This is now closed: the role carried in the durable
+floor-activation receipt is re-verified identity+signature+role before
+every floor-dependent accept, the receipt is carried forward into the
+other physical window on every floor advance (so both ping-pong windows
+independently attest the compiled role, not just the genesis one), and
+a single unconditional gate at the end of `xiao_ota_boot_process_io`
+refuses the command whenever neither window's receipt matches this
+binary's own compiled role -- signature verification still runs first,
+and only a role mismatch is newly refused, never a reset of the floor,
+counter, or trust anchor. Two new native regressions exercise this
+directly: a real genesis-to-CONFIRMED flow is driven to floor 1, both
+physical receipt windows are overwritten with a validly-signed
+wrong-role receipt (simulating a loader swap), and a fresh counter-
+advancing command signed for this binary's own role is asserted
+refused with the floor, hash, and state unchanged; a second test drives
+six real confirm/advance cycles and asserts both windows independently
+verify role-correctly after every single advance, proving ordinary
+same-role continuity is unaffected. The transaction processor now has
+28 native scenarios for each compiled role, all passing for both roles.
+
+This fix could not be re-qualified on real hardware this pass: an
+isolated ARM cross-compile of all four board x role combinations
+(`xiao_nrf52840` and `sensecap_solar_p1`, role 0 and role 1) now fails
+to link, identically across all four, with a fixed-address overlap --
+`section .bootloaderConfig LMA [000fd800,000fd857] overlaps section
+.data LMA [000fd7fc,000fd8f3]`, a 243-byte overrun past the fixed
+`0xfd800` `.bootloaderConfig` address (reported FLASH usage
+38,908/38,912 bytes, 99.99%, which understates the real geometric
+constraint). Disabling only this fix's new role-evidence gate (and
+letting the linker garbage-collect the now-unreachable code) still
+fails to link, at 38,716 bytes with a 51-byte overlap -- so roughly
+51 of the 243 overflow bytes pre-exist this fix in the current
+uncommitted tree (most likely from other in-flight role-1 work layered
+on top of the 36,916-byte baseline recorded above), and this fix adds
+the remaining 192 bytes on top. No code-size reduction attempted so
+far (removing an `__attribute__((noinline))` hint, and sharing one
+stack buffer across both receipt-window reads instead of two) recovered
+any of this margin without touching the fix's behaviour, and no
+crypto/recovery/slot-layout shortcut was used to make it fit artificially.
+**Flashing any of the four combinations from the current source tree is
+therefore unsafe and blocked on either a genuine size reduction found
+elsewhere in the bootloader or an explicit decision upstream about the
+pre-existing (fix-independent) 51-byte overrun**; this has been
+reported, not silently resolved.
+
+A follow-up review of this same fix (Root/Astra) found two further
+gaps, both now closed, both of which make the ARM overflow above
+strictly worse, not better: (1) the CONFIRMED-state floor-reconstruction
+path could durably erase/rewrite a floor slot *before* the final
+role-continuity gate ran, so a role-unproven or damaged device's
+reconstruction request could complete before anything caught it --
+`floor_role_evidence_ok()` is now checked, fail-closed to Recovery, as a
+precondition of that reconstruction, not only after it; (2)
+`persist_floor()`'s own receipt carry-forward could itself erase the
+ONLY remaining physical window still holding a verifying receipt, if an
+earlier advance's best-effort copy into the other window had silently
+failed -- it now reads and classifies BOTH windows before touching
+either slot, and if only the about-to-be-erased TARGET window still
+verifies, durably programs and reads back those exact bytes into the
+non-erased SOURCE window first, failing the advance closed (nothing
+erased) if that propagation does not durably confirm. Both are
+behavioural-only; no schema, wire, or trust-anchor change. A fresh ARM
+rebuild with both of these closed now reports a *clean, linker-computed*
+`region FLASH overflowed by 188 bytes` at 39,100/38,912 bytes (100.48%)
+for `xiao_nrf52840`/role0 -- up from the 38,908-byte/243-byte-geometric-
+overrun figure above, confirming this status remains unresolved and has
+gotten larger, not smaller. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Fixed: cross-role
+floor-continuity bypass..." section for full detail.
+
+A closer re-read of this same property found two further gaps, both now
+closed, both behavioural-only (no schema/wire/trust-anchor change): the
+final role-continuity gate now calls `force_recovery()` directly on
+*any* evidence failure (not only a QSPI read failure) instead of
+quietly demoting trust and letting an already-active trial/confirmation
+resume reinterpret that as an ordinary "command no longer matches";
+and `persist_floor()` now erases the target floor sector exactly once
+and then writes the receipt into that target's own window *before*
+committing the floor body and its final marker, never after -- matching
+`write_state_with_sidecar()`'s existing "one erase, two body writes"
+shape. Both roles still pass `TMPDIR=.tmp make test-xiao-ota-bootloader`
+(80/80, exit 0). A fresh ARM rebuild of all four board x role
+combinations confirms this reordering is size-neutral: all four report
+the identical `region FLASH overflowed by 188 bytes` at 39,100/38,912
+bytes (100.48%). The four-combination ARM blocker remains open and
+unresolved. See `bootloader/xiao_nrf52840_ota/README.md`'s matching
+"Fixed: role-evidence failure was a soft trust demotion..." section for
+full detail.
+
+Two further file-scoped, behaviour-preserving size reductions were then
+tried (a `-Oz` compiler pragma for this one translation unit only, and
+removing a redundant stack copy in the shared receipt-window helper) --
+both verified test-neutral (80/80, both roles). They also exposed and
+corrected a measurement error in this document and the README: the
+earlier "188 bytes"/"39,100 bytes" figures came from the linker's
+summary table, which stops accounting for the vendor `.data` section
+(a fixed 248-byte TinyUSB/CDC block, unrelated to this work) once
+`.text` itself no longer overlaps the fixed `.bootloaderConfig` window.
+Reading the true overflow directly from the linker's explicit
+`.data`/`.bootloaderConfig` overlap diagnostic shows the real remaining
+gap, after both reductions, is **243 bytes** on all four combinations
+-- not 60. The known-good qualified baseline rebuilds clean with no
+such overlap at all (`38,652 B`/`99.33%`, 260 bytes of genuine
+headroom), confirming the summary line is reliable only in the
+no-overlap case. The four-combination ARM artifact remains **not safe
+to flash**; see the README's "Size reduction, and a correction to the
+real remaining gap" section for the full accounting and next options.
 
 ## Migration for the BLE-enabled 66 KiB fallback
 
@@ -525,6 +769,52 @@ this or any board -- that remains untested on hardware; see the "Lab and
 hardware gap" notes earlier in this document for exactly what is still
 missing. Do not read the pass above as evidence that installing this
 bootloader, or running an OTA install through it, is proven safe yet.
+
+**Journal-blank preflight is not bootloader qualification.**
+`scripts/ota_boot_preflight.py` (host tooling, outside this section's scope)
+reads the eight boot-journal sectors (COMMAND/STATE/CONFIRMATION/FLOOR,
+`0x18C000..0x194000`) and, when all of them read as fully erased, records
+`journal_transactions_blank=True` alongside `bootloader_qualification=
+"not-evaluated"` rather than asserting the loader is unqualified or that no
+custom bootloader is installed. A blank journal establishes only that its
+bytes currently read as erased, not that no transaction was ever recorded
+or that destructive maintenance is authorized. This is
+exactly what a factory-fresh stock Adafruit bootloader looks like, but it is
+*also* exactly what this custom bootloader looks like immediately after a
+correct install that has simply never processed a transaction yet. Journal
+purity cannot distinguish "no custom bootloader present" from "custom
+bootloader present, never yet used." Whether a qualified MeshCore custom
+bootloader is actually installed is a separate, independent check: the
+fixed-address boot-info/capability marker at `0xFDC00` (see
+`bootloader/xiao_nrf52840_ota/README.md`'s "Boot-info/capability marker"
+section and `tools/verify_boot_info_artifact.py`), which a stock bootloader
+can never satisfy (that address reads all-`0xFF`) but which journal state
+alone says nothing about either way. Preflight tooling correctly leaves
+qualification unevaluated rather than inferring it from journal blankness.
+
+**Further bootloader-side correctness fixes (read-only source review,
+no device access).** A follow-up review found, and this pass corrected,
+four more gaps in the bootloader's QSPI register adapter and confirmation
+logic: custom QSPI instructions were leaving IO2/IO3 at their register-
+reset LOW level (asserting the flash's WP#/HOLD# pins during exactly the
+commands meant to reach it) and a status-register write's completion was
+verified only at the peripheral level, not the flash's own WIP bit; the
+busy-wait timeout calibration used an overestimated cycles-per-iteration
+guess (which produces a *shorter* real bound, not a conservative one),
+now replaced with a genuine Cortex-M4 DWT cycle-counter deadline; the
+idempotent trial-boot confirmation resume path checked the durable
+floor's counter and hash against the current transaction but not its
+`active_image_extent`, letting an internally inconsistent floor record
+finish `CONFIRMED`; and the bank-0 settings read/write path is now a
+single hardware-independent codec shared by the real hardware adapter
+and native tests, expressed through the same internal-flash callbacks
+every other durability check already uses, replacing a hand-modelled
+settings-fault mirror. See
+`bootloader/xiao_nrf52840_ota/README.md`'s "Fixed: QSPI WP#/HOLD#
+assertion on custom instructions, torn timeout calibration, and a
+floor-extent identity gap" section for full detail, exact source
+citations, and what remains genuinely unverified without hardware
+access.
 
 ## Hardware acceptance gates
 

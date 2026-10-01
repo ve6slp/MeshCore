@@ -1,6 +1,21 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+// Pure templates, no Arduino/OTA-feature dependency: the trial-safe mount
+// call sites below apply unconditionally (even when MESHCORE_LORA_OTA is
+// compiled out, ota_allow_destructive_boot_writes is simply always true).
+#include "helpers/ota/OtaTrialSafeFilesystemMount.h"
+
+#if MESHCORE_LORA_OTA
+// Genuine earliest-boot-phase preflight (see the weak default's doc
+// comment in MyMesh.cpp and the real implementations in
+// variants/*/Ota*Backend.cpp): declared here (not exposed via MyMesh.h)
+// because it must be queried strictly BEFORE store.begin()/the_mesh.begin()
+// -- i.e. before either object exists in a usable state -- to gate their
+// own identity/prefs/migration writes below.
+bool otaBoardEarlyBootTrialOrUnknown();
+#endif
+
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -47,8 +62,22 @@ MultiSerialInterface interface_manager;
 
 // include usb interface
 #if defined(ENABLE_USB_INTERFACE)
-  #include <helpers/ArduinoSerialInterface.h>
-  ArduinoSerialInterface usb_serial_interface;
+  #if MESHCORE_LORA_OTA
+    // Source-bound USB port/framer+router adapter (NOT a second/
+    // duplicate parser) -- demuxes legacy companion CLI frames from OTA
+    // commissioning control frames on the same physical USB byte
+    // stream; see its own doc comment for the full rationale. Only the
+    // header is included here: the actual instance is declared further
+    // below (after `the_mesh`), since it must wrap the SAME real
+    // OtaControlSessionRouter that MyMesh owns -- `usb_serial_interface`
+    // below has the identical begin(Stream&)/BaseSerialInterface shape
+    // as the non-OTA ArduinoSerialInterface case, so the registration
+    // call site in setup() is unchanged either way.
+    #include "helpers/ota/OtaUsbCommissioningSerialInterface.h"
+  #else
+    #include <helpers/ArduinoSerialInterface.h>
+    ArduinoSerialInterface usb_serial_interface;
+  #endif
 #endif
 
 // include ethernet interface
@@ -101,6 +130,21 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
    #endif
 );
 
+#if defined(ENABLE_USB_INTERFACE) && MESHCORE_LORA_OTA
+  // Wraps the SAME real OtaControlSessionRouter `the_mesh` owns/binds its
+  // job backend into (see MyMesh::getOtaControlRouter()) -- never a
+  // second/duplicate router or session instance. Declared only after
+  // `the_mesh` so this reference is valid at construction time.
+  meshcore::ota::helpers::OtaUsbControlService ota_usb_control_service(the_mesh.getOtaControlRouter());
+  // Real connection probe: on the TinyUSB/Adafruit nRF52 cores this is
+  // wired for (XIAO nRF52840 / SenseCAP Solar), the concrete `Serial`
+  // object's operator bool() reflects whether the host actually has the
+  // CDC port open -- never a stub literal true/false.
+  static bool otaUsbIsPhysicallyConnected() { return static_cast<bool>(Serial); }
+  meshcore::ota::helpers::OtaUsbCommissioningSerialInterface usb_serial_interface(
+      ota_usb_control_service, otaUsbIsPhysicallyConnected);
+#endif
+
 /* END GLOBAL OBJECTS */
 
 void halt() {
@@ -138,48 +182,159 @@ void setup() {
 
   fast_rng.begin(radio_driver.getRngSeed());
 
+#if MESHCORE_LORA_OTA
+  // Genuine earliest-boot-phase preflight, called strictly BEFORE
+  // store.begin()/the_mesh.begin() below ever touch identity/prefs/
+  // migration storage -- see otaBoardEarlyBootTrialOrUnknown()'s doc
+  // comment. Only a genuinely qualified board whose persisted OTA state
+  // record carries POSITIVE, already-bootloader-verified CONFIRMED
+  // evidence AND a real fresh baseline proof (not currently wired --
+  // see resolveOtaBoardStartupDecision()) reports false (allow); every
+  // other case -- unqualified device, no install history,
+  // active/ambiguous/failed trial, CONFIRMED-without-fresh-proof, or an
+  // OTA=1 build with no board-specific backend linked at all -- reports
+  // true (block) -- "not currently mid-trial" is NOT the same as
+  // "positively proven safe".
+  const bool ota_allow_destructive_boot_writes = !otaBoardEarlyBootTrialOrUnknown();
+  // Format permission and identity-generation permission are TWO FURTHER
+  // SEPARATE, INDEPENDENTLY-VERIFIED permits -- not aliases of
+  // ota_allow_destructive_boot_writes (ordinary userdata-write
+  // authority) or of each other, and not merely differently-named
+  // copies of the same value. Each requires its own explicit,
+  // independently verified factory/repair authority (see
+  // OtaBaselineCertificationEvidence.h -- a future certified-baseline/
+  // host-certificate provider, separate owner) that does not exist
+  // anywhere in this tree yet; until that authority is wired, BOTH stay
+  // honestly false for EVERY MESHCORE_LORA_OTA=1 boot -- including a
+  // genuinely Normal (userdata-write-permitted) boot. Normal userdata-
+  // write evidence alone does not grant filesystem-format authority or
+  // identity-generation authority.
+  const bool ota_allow_format = false;
+  const bool ota_allow_identity_generation = false;
+#else
+  const bool ota_allow_destructive_boot_writes = true;
+  const bool ota_allow_format = true;
+  const bool ota_allow_identity_generation = true;
+#endif
+
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  InternalFS.begin();
+  // InternalFileSystem::begin() (and this repo's CustomLFS::begin()) both
+  // override Adafruit_LittleFS's own begin() to erase/format the whole
+  // flash region on a failed mount. Adafruit_LittleFS::begin() is public
+  // and non-virtual, so an explicit base-class-qualified call statically
+  // bypasses that override entirely (mount-only, zero format risk) without
+  // touching either third-party/vendored file. During a trial/unknown boot
+  // we must use that mount-only path so a corrupt/blank filesystem can
+  // never be destructively reformatted before a failed OTA trial has a
+  // chance to roll back with userdata intact; a normal boot keeps the
+  // original legacy format-on-fail behaviour unchanged. Gated on
+  // ota_allow_format (a SEPARATE permit from ordinary userdata-write
+  // authority -- see its doc comment above): filesystem FORMAT authority
+  // is never granted merely because userdata writes are Normal.
+  bool internalfs_ok = ota_fs_mount::mountTrialSafe(
+    ota_allow_format,
+    [](){ return InternalFS.Adafruit_LittleFS::begin(); },
+    [](){ return InternalFS.begin(); });
   #if defined(QSPIFLASH)
-    if (!QSPIFlash.begin()) {
+    // NOTE: the currently-approved MESHCORE_LORA_OTA=1 build target
+    // (Xiao_nrf52_companion_radio_usb / SenseCap_Solar_companion_radio_usb)
+    // does NOT define QSPIFLASH -- it uses EXTRAFS (this repo's CustomLFS,
+    // fixed above via the same base-class-qualified mount-only call), so
+    // this branch is not on that board's actual boot path today. It only
+    // matters if/when QSPIFLASH is ever combined with MESHCORE_LORA_OTA=1
+    // (e.g. a future BLE+OTA env). CustomLFS_QSPIFlash::begin() performs
+    // QSPI peripheral init, chip detection, mount AND format-on-fail
+    // atomically inside one call with no public non-destructive mount path
+    // and no separable init step (pinned third-party library, not vendored
+    // in-repo, outside our granted edit scope to patch). There is nothing
+    // safe to call during a trial/unknown boot -- even the very first
+    // mount attempt may format on failure -- so we must not call begin()
+    // at all; the QSPI-backed filesystem is simply unavailable/degraded
+    // for this boot instead. Gated on ota_allow_format for the same
+    // reason as internalfs_ok above.
+    bool qspiflash_ok = ota_fs_mount::mountOrDegradeIfDestructiveWritesDisallowed(
+      ota_allow_format,
+      [](){ return QSPIFlash.begin(); });
+    if (!qspiflash_ok) {
       // debug output might not be available at this point, might be too early. maybe should fall back to InternalFS here?
-      MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize");
+      MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize (or skipped: trial/unknown boot cannot risk its format-on-fail mount)");
     } else {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: initialized successfully");
     }
+    bool filesystem_ok = internalfs_ok && qspiflash_ok;
   #else
   #if defined(EXTRAFS)
-      ExtraFS.begin();
+      // Same explicit-base-class-qualification mount-only fix as InternalFS
+      // above: this repo's CustomLFS::begin() also overrides
+      // Adafruit_LittleFS::begin() with an erase-and-format-on-fail retry.
+      // Gated on ota_allow_format (separate permit, see above).
+      bool extrafs_ok = ota_fs_mount::mountTrialSafe(
+        ota_allow_format,
+        [](){ return ExtraFS.Adafruit_LittleFS::begin(); },
+        [](){ return ExtraFS.begin(); });
+  #else
+      bool extrafs_ok = true;
   #endif
+    bool filesystem_ok = internalfs_ok && extrafs_ok;
   #endif
-  store.begin();
+  store.begin(ota_allow_destructive_boot_writes, ota_allow_format);
   the_mesh.begin(
     #ifdef DISPLAY_CLASS
         disp != NULL
     #else
         false
     #endif
+    , ota_allow_destructive_boot_writes
+    , ota_allow_identity_generation
   );
+  #if MESHCORE_LORA_OTA
+    // radio_init() already succeeded above (or we halt()ed before reaching
+    // here), so radio_ready is genuinely true at this point -- not an
+    // assumed placeholder; filesystem_ok is the real begin() result(s)
+    // captured just above, not an unconditional true.
+    the_mesh.setOtaTrialBootHealthSignals(true, filesystem_ok);
+  #endif
 #elif defined(RP2040_PLATFORM)
-  LittleFS.begin();
-  store.begin();
+  // arduino-pico's LittleFS.begin(bool formatOnFail = false) already
+  // defaults to a non-destructive mount-only attempt (no call-site change
+  // needed here): this call was never auto-formatting on a failed mount,
+  // trial/unknown or not, so it's already trial-safe as written.
+  bool filesystem_ok = LittleFS.begin();
+  store.begin(ota_allow_destructive_boot_writes, ota_allow_format);
   the_mesh.begin(
     #ifdef DISPLAY_CLASS
         disp != NULL
     #else
         false
     #endif
+    , ota_allow_destructive_boot_writes
+    , ota_allow_identity_generation
   );
+  #if MESHCORE_LORA_OTA
+    the_mesh.setOtaTrialBootHealthSignals(true, filesystem_ok);
+  #endif
 #elif defined(ESP32)
-  SPIFFS.begin(true);
-  store.begin();
+  // SPIFFS.begin(bool formatOnFail=false, ...) exposes the format-on-fail
+  // switch directly as its own public parameter (unlike the InternalFS/
+  // CustomLFS backends above), so the fix here is simply to stop always
+  // passing the literal `true` and instead gate it on ota_allow_format
+  // (a SEPARATE permit from ordinary userdata-write authority -- see its
+  // doc comment above): filesystem FORMAT authority is never granted
+  // merely because userdata writes are Normal.
+  bool filesystem_ok = SPIFFS.begin(ota_allow_format);
+  store.begin(ota_allow_destructive_boot_writes, ota_allow_format);
   the_mesh.begin(
     #ifdef DISPLAY_CLASS
         disp != NULL
     #else
         false
     #endif
+    , ota_allow_destructive_boot_writes
+    , ota_allow_identity_generation
   );
+  #if MESHCORE_LORA_OTA
+    the_mesh.setOtaTrialBootHealthSignals(true, filesystem_ok);
+  #endif
 #else
   #error "need to define filesystem"
 #endif
@@ -256,12 +411,6 @@ void loop() {
   external_watchdog.loop();
 #endif
 
-  if (!the_mesh.hasPendingWork()) {
-#if defined(NRF52_PLATFORM)
-    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
-#endif
-  }
-
 #if defined(ESP32) && defined(WIFI_SSID)
   // Safely attempt to reconnect every 10 seconds if flagged
   if (wifi_needs_reconnect && (millis() - last_wifi_reconnect_attempt > 10000)) {
@@ -271,4 +420,22 @@ void loop() {
     last_wifi_reconnect_attempt = millis();
   }
 #endif
+
+#if MESHCORE_LORA_OTA
+  // Trial-boot health tick runs LAST, only after every other real outer-
+  // loop service for this pass has actually executed (mesh dispatch,
+  // every interface, sensors/UI, RTC, the external watchdog, and WiFi
+  // reconnect) -- confirming health before those services ran this same
+  // pass could latch a false-healthy outcome even if one of them
+  // silently failed or stalled earlier in the tick. Must also run BEFORE
+  // the deep-sleep decision below, since MyMesh::hasPendingWork() must
+  // see an up-to-date isTrialActive() this same pass.
+  the_mesh.tickOtaTrialHealth();
+#endif
+
+  if (!the_mesh.hasPendingWork()) {
+#if defined(NRF52_PLATFORM)
+    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+#endif
+  }
 }

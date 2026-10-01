@@ -2,6 +2,25 @@
 #include <Mesh.h>
 
 #include "MyMesh.h"
+// Pure templates, no Arduino/OTA-feature dependency: the trial-safe mount
+// and identity-boot call sites below apply unconditionally (even when
+// MESHCORE_LORA_OTA is compiled out, ota_allow_destructive_boot_writes is
+// simply always true, matching legacy behaviour byte-for-byte) -- see
+// examples/companion_radio/main.cpp's identical usage.
+#include "helpers/ota/OtaTrialSafeFilesystemMount.h"
+#include "helpers/ota/OtaTrialSafeIdentityBoot.h"
+#if MESHCORE_LORA_OTA
+#include "helpers/ota/OtaUsbControlService.h"
+#include "helpers/ota/OtaUsbTextCliBinaryDemux.h"
+#endif
+
+#if MESHCORE_LORA_OTA
+// Declared here (not exposed via MyMesh.h), same reasoning as
+// examples/companion_radio/main.cpp: must be queried strictly BEFORE
+// store.load()/the_mesh.begin() ever touch identity/filesystem state.
+bool otaBoardEarlyBootTrialOrUnknown();
+#endif
+
 
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
@@ -17,6 +36,26 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
+
+#if MESHCORE_LORA_OTA
+// Wraps the SAME real OtaControlSessionRouter `the_mesh` owns/binds its
+// job backend into (see MyMesh::getOtaControlRouter()) -- never a
+// second/duplicate router or session instance. Declared only after
+// `the_mesh` so this reference is valid at construction time.
+meshcore::ota::helpers::OtaUsbControlService ota_usb_control_service(the_mesh.getOtaControlRouter());
+// Idle-byte text/binary demultiplexer in front of this board's existing
+// plain text-line Serial CLI reader -- see its own doc comment.
+meshcore::ota::helpers::OtaUsbTextCliBinaryDemux ota_usb_cli_demux(ota_usb_control_service);
+
+// Writes any reply the OTA control service produced directly back to the
+// physical Serial object -- NEVER broadcast, since simple_repeater has
+// only ever had the one physical USB source to begin with.
+static void otaFlushPendingUsbReply() {
+  if (!ota_usb_control_service.hasPendingReply()) return;
+  Serial.write(ota_usb_control_service.pendingReplyData(), ota_usb_control_service.pendingReplyLen());
+  ota_usb_control_service.consumeReply();
+}
+#endif
 
 void halt() {
   while (1) ;
@@ -60,38 +99,150 @@ void setup() {
   }
 #endif
 
-  if (!radio_init()) {
-    MESH_DEBUG_PRINTLN("Radio init failed!");
-    halt();
+  // A failed radio_init() previously halt()ed here, stranding the serial/
+  // CLI/maintenance/OTA-trial-health path along with RF dispatch -- per
+  // the same degraded-lifecycle contract already proven on this board's
+  // identity-load failure below, keep setup()/loop() reachable instead:
+  // notifyRadioUnavailableForDispatch() suppresses MyMesh::begin()'s/
+  // loop()'s RF-touching operations (see MyMesh.h's _radio_available_
+  // doc comment), and fast_rng falls back to a millis()-based seed
+  // rather than calling getRngSeed() against a known-failed radio.
+  const bool radio_ok = radio_init();
+  if (!radio_ok) {
+    MESH_DEBUG_PRINTLN("Radio init failed! Continuing in degraded (maintenance-only) mode.");
+    the_mesh.notifyRadioUnavailableForDispatch();
   }
 
-  fast_rng.begin(radio_driver.getRngSeed());
+  fast_rng.begin(radio_ok ? radio_driver.getRngSeed() : (uint32_t)millis());
+
+#if MESHCORE_LORA_OTA
+  // Same contract as examples/companion_radio/main.cpp: "not currently
+  // mid-trial" is NOT the same as "positively proven safe" -- every case
+  // except a genuinely qualified, bootloader-CONFIRMED board reports
+  // true (block destructive identity/filesystem writes for this boot).
+  const bool ota_allow_destructive_boot_writes = !otaBoardEarlyBootTrialOrUnknown();
+  if (!ota_allow_destructive_boot_writes) {
+    // Same policy MyMesh's own identity-generation path below already
+    // honours -- also propagate it to loop()'s acl.save(_fs) (contacts
+    // ACL persistence is a destructive write too, see
+    // _ota_destructive_writes_disallowed_'s doc comment in MyMesh.h).
+    the_mesh.notifyDestructiveWritesDisallowed();
+  }
+#else
+  const bool ota_allow_destructive_boot_writes = true;
+#endif
+  // Format permission is a separate, independently-verified permit, not
+  // an alias of ota_allow_destructive_boot_writes -- see
+  // examples/companion_radio/main.cpp's identical doc comment. No such
+  // authority is wired anywhere in this tree yet, so it stays false for
+  // every MESHCORE_LORA_OTA=1 boot.
+#if MESHCORE_LORA_OTA
+  const bool ota_allow_format = false;
+#else
+  const bool ota_allow_format = true;
+#endif
 
   FILESYSTEM* fs;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  InternalFS.begin();
+  // Mount-only during a trial/unknown boot (see OtaTrialSafeFilesystemMount.h)
+  // so a corrupt/blank filesystem is never destructively reformatted
+  // before a failed OTA trial has a chance to roll back with userdata
+  // intact; a normal boot keeps the original legacy format-on-fail
+  // behaviour unchanged.
+  bool filesystem_ok = ota_fs_mount::mountTrialSafe(
+    ota_allow_format,
+    [](){ return InternalFS.Adafruit_LittleFS::begin(); },
+    [](){ return InternalFS.begin(); });
   fs = &InternalFS;
   IdentityStore store(InternalFS, "");
 #elif defined(ESP32)
-  SPIFFS.begin(true);
+  bool filesystem_ok = SPIFFS.begin(ota_allow_format);
   fs = &SPIFFS;
   IdentityStore store(SPIFFS, "/identity");
 #elif defined(RP2040_PLATFORM)
-  LittleFS.begin();
+  // arduino-pico's LittleFS.begin(bool formatOnFail = false) already
+  // defaults to a non-destructive mount-only attempt.
+  bool filesystem_ok = LittleFS.begin();
   fs = &LittleFS;
   IdentityStore store(LittleFS, "/identity");
   store.begin();
 #else
   #error "need to define filesystem"
 #endif
-  if (!store.load("_main", the_mesh.self_id)) {
-    MESH_DEBUG_PRINTLN("Generating new keypair");
-    the_mesh.self_id = radio_new_identity();   // create new random identity
-    int count = 0;
-    while (count < 10 && (the_mesh.self_id.pub_key[0] == 0x00 || the_mesh.self_id.pub_key[0] == 0xFF)) {  // reserved id hashes
-      the_mesh.self_id = radio_new_identity(); count++;
+#if MESHCORE_LORA_OTA
+  // Astra's correction: unlike companion_radio (whose main.cpp halt()s
+  // on a failed radio_init(), making `true` always genuinely true by
+  // the time this is reached), this board continues in degraded
+  // (maintenance-only) mode on radio failure -- so the boot-health
+  // signal fed into the shared trial evaluator must reflect the REAL
+  // radio_ok result, never a literal `true`.
+  the_mesh.setOtaTrialBootHealthSignals(radio_ok, filesystem_ok);
+#endif
+  bool identity_loaded = store.load("_main", the_mesh.self_id);
+  if (!identity_loaded) {
+#if MESHCORE_LORA_OTA
+    // Same unconditional latch as examples/companion_radio/MyMesh.cpp's
+    // begin(): a genuine load failure is recorded even on an ordinary
+    // never-configured device, because a successful fresh generate+save
+    // immediately below would otherwise make this boot indistinguishable
+    // from a healthy one.
+    the_mesh.notifyOtaTrialIdentityLoadFault();
+#endif
+    bool save_ok = false;
+    // Astra's correction: generation itself must never run against a
+    // known-failed radio -- target.cpp's radio_new_identity() draws its
+    // entropy from RadioNoiseListener(radio), a REAL noise-floor read
+    // over the same (possibly uninitialized) SPI radio object, never
+    // fast_rng/millis. Folding `radio_ok` into the generation-permit
+    // reuses the EXACT existing IdentityUnavailable contract (zero
+    // generation, zero writes, self_id left unset, degraded-dispatch-
+    // only) instead of inventing a second decision path or promoting
+    // millis-seeded entropy into an identity.
+    const bool identity_generation_safe = ota_allow_destructive_boot_writes && radio_ok;
+    const ota_identity_boot::Outcome identity_outcome = ota_identity_boot::resolveIdentityTrialSafe(
+        identity_generation_safe,
+        [](){ return false; },  // load_fn: already known-failed above, never re-invoked.
+        [&](){
+          the_mesh.self_id = radio_new_identity();   // create new random identity
+          int count = 0;
+          while (count < 10 && (the_mesh.self_id.pub_key[0] == 0x00 || the_mesh.self_id.pub_key[0] == 0xFF)) {  // reserved id hashes
+            the_mesh.self_id = radio_new_identity(); count++;
+          }
+        },
+        [&](){ save_ok = store.save("_main", the_mesh.self_id); return save_ok; });
+    if (identity_outcome == ota_identity_boot::Outcome::IdentityUnavailable) {
+      // A failed load during a trial/unknown boot might merely be
+      // transiently unreadable, not genuinely corrupt/absent -- the
+      // ORIGINAL persisted secret must never be overwritten or
+      // RAM-synthesized around. Perform ZERO generation and ZERO writes:
+      // self_id is left at its default/unset value. Previously this
+      // halted unconditionally (repeater had no equivalent of
+      // companion_radio's `_identity_available_` degraded-dispatch
+      // mode); now mirrors companion's exact pattern instead --
+      // notifyIdentityUnavailableForDispatch() suppresses MyMesh::loop()'s
+      // ordinary mesh dispatch (identity-dependent TX/signing/advert) and
+      // begin()'s acl.load() for the rest of this boot, while leaving the
+      // bounded serial/CLI/maintenance/trial-health path (and the
+      // bootloader's own trial-rollback path on the next boot) reachable.
+      MESH_DEBUG_PRINTLN("OTA trial/unknown boot: identity unavailable, running degraded (no mesh dispatch)");
+#if MESHCORE_LORA_OTA
+      the_mesh.notifyIdentityUnavailableForDispatch();
+#endif
     }
-    store.save("_main", the_mesh.self_id);
+#if MESHCORE_LORA_OTA
+    // Only a genuinely PERSISTED fresh identity counts as "confirmed
+    // loaded" -- a RAM-only one (not reachable here: the IdentityUnavailable
+    // branch above handles the no-identity case, and generation
+    // failure-to-save isn't possible without allow_destructive_boot_writes
+    // being true, which is exactly when a save is actually attempted) is
+    // never silently treated as durably bound. See
+    // notifyOtaIdentityConfirmedLoaded()'s doc comment in MyMesh.h.
+    the_mesh.notifyOtaIdentityConfirmedLoaded(identity_outcome == ota_identity_boot::Outcome::GeneratedAndSaved);
+#endif
+  } else {
+#if MESHCORE_LORA_OTA
+    the_mesh.notifyOtaIdentityConfirmedLoaded(true);
+#endif
   }
 
   Serial.print("Repeater ID: ");
@@ -127,6 +278,17 @@ void loop() {
   int len = strlen(command);
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
+#if MESHCORE_LORA_OTA
+    // A '<' arriving while no partial command line is pending (len==0)
+    // may be the start of a binary OTA commissioning frame -- see
+    // OtaUsbTextCliBinaryDemux's doc comment. Once committed to binary
+    // framing, every subsequent byte (even one that looks like CR/LF)
+    // is consumed here and never reaches the text CLI below.
+    if (ota_usb_cli_demux.consumeByte((uint8_t)c, millis(), len == 0)) {
+      otaFlushPendingUsbReply();
+      continue;
+    }
+#endif
     if (c != '\n') {
       command[len++] = c;
       command[len] = 0;
@@ -134,6 +296,12 @@ void loop() {
     }
     if (c == '\r') break;
   }
+#if MESHCORE_LORA_OTA
+  // Independent of whether any bytes arrived this pass, so a stalled
+  // partial binary frame can never wedge text CLI input forever.
+  ota_usb_cli_demux.tick(millis());
+  otaFlushPendingUsbReply();
+#endif
   if (len == sizeof(command)-1) {  // command buffer full
     command[sizeof(command)-1] = '\r';
   }
@@ -195,6 +363,15 @@ void loop() {
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
+
+#if MESHCORE_LORA_OTA
+  // Runs LAST, only after every other real outer-loop service for this
+  // pass has actually executed, and BEFORE the deep-sleep decision below
+  // -- see examples/companion_radio/main.cpp's identical placement/
+  // rationale for tickOtaTrialHealth().
+  the_mesh.tickOtaTrialHealth();
+#endif
+
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible

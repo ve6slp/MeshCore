@@ -5,6 +5,7 @@
 
 #include "ota/platform/FlashDevice.h"
 #include "ota/platform/FlashTypes.h"
+#include "ota/platform/Nrf52QspiPhysicalIdentity.h"
 
 #if defined(NRF52840_XXAA)
 #include <Arduino.h>
@@ -252,6 +253,28 @@ public:
   }
 
   static constexpr bool hasCustomBootloader() { return false; }
+
+  // RAM-only physical-resource identity for THIS adapter's actual QSPI
+  // peripheral + chip-select GPIO pairing -- see
+  // Nrf52QspiPhysicalIdentity.h for the full rationale. Uses the exact
+  // same `g_ADigitalPinMap[PIN_QSPI_CS]` value already passed to
+  // `nrfx_qspi_config_t::pins.csn_pin` in begin() above, so this
+  // genuinely reflects the real driver configuration rather than an ad
+  // hoc board literal. `g_ADigitalPinMap` is a plain, constant-
+  // initialized array of pin-number literals (no dynamic initializer),
+  // so it is fully populated before any dynamic initialization runs in
+  // ANY translation unit (a standard C++ guarantee, independent of
+  // translation-unit init order) -- safe to read even from another
+  // global's own static-initialization-time constructor arguments.
+  // Returns 0 (Unavailable) on natively-compiled/non-nRF52840 builds,
+  // matching this class's existing FlashStatus::Unsupported convention.
+  uint64_t physicalResourceToken() const {
+#if defined(NRF52840_XXAA)
+    return tokenForChipSelectPin(g_ADigitalPinMap[PIN_QSPI_CS]);
+#else
+    return 0u;
+#endif
+  }
 
 private:
   bool rangeFits(uint32_t offset, uint32_t len) const {
