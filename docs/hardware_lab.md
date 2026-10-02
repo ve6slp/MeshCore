@@ -429,7 +429,13 @@ boards. Read-only inspection at `09:15:35Z` confirmed their existing identities,
 names, radio/path preferences and complete target ACL without reconfiguration.
 Both still reported healthy stock boot, ordinary writes allowed and cache-only.
 The target-only loader installer then passed artifact validation but refused
-the vendor's actual stable boot-port product name before writing.
+the vendor's actual stable boot-port product name before writing. Its
+identity check now reuses the shared lab device resolver rather than a
+product-name template, retaining the approved serial, Seeed vendor,
+bootloader mode and stable by-id requirements. Read-only inspection found
+that the stock target exposes CDC but no mass-storage interface or mounted
+UF2 volume. This still blocks the UF2 installer; the volume and Board-ID
+guards have not been bypassed.
 No qualified target-loader installation, replacement-protocol radio OTA
 transfer, READY, COMMIT, installation or rollback has been performed.
 
@@ -477,6 +483,12 @@ role, complete flash load and boot-info marker have been checked. Follow the
 [nRF52840 QSPI and bootloader guide](lora_ota_nrf52840_qspi.md) for geometry
 and physical acceptance requirements. Artifact verification alone is not
 installed recovery qualification.
+
+The guarded UF2 path requires a real mass-storage interface and exactly
+one mounted UF2 volume belonging to the approved target's USB serial.
+Its `INFO_UF2.TXT` Board-ID must match the supported board. A CDC-only
+serial DFU port does not provide that volume, regardless of its product
+name. Do not fabricate a mount or bypass the Board-ID check.
 
 The reviewed factory-initialization loader can create the initial durable
 floor only with verified flash, healthy vendor boot evidence and all eight

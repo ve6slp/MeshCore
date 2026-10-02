@@ -88,6 +88,19 @@ class GuardedInstallerTest(unittest.TestCase):
         (self.work / "sys/devices/usb/1-1/serial").write_text(
             TEST_SERIAL, encoding="utf-8"
         )
+        (self.work / "sys/devices/usb/1-1/idVendor").write_text("2886")
+        (self.work / "sys/devices/usb/1-1/idProduct").write_text("0044")
+        (self.work / "sys/devices/usb/1-1/product").write_text("XIAO-BOOT")
+        (self.work / "sys/devices/usb/1-1/1-1:1.0/tty/boot-device").mkdir(
+            parents=True
+        )
+        for attribute, value in (
+            ("BY_ID_DIR", self.work / "dev/serial/by-id"),
+            ("USB_DEVICES", self.work / "sys/devices/usb"),
+        ):
+            patcher = mock.patch.object(INSTALLER.lab_device, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self.device = self.work / "dev/boot-device"
         self.device.touch()
@@ -192,6 +205,72 @@ class GuardedInstallerTest(unittest.TestCase):
     def test_rejects_unstable_port_name(self):
         with self.assertRaisesRegex(ValueError, "stable authorized identity"):
             INSTALLER.install(self.args(boot_port=str(self.device)))
+
+    def _use_sense_identity(self):
+        self.boot_port.unlink()
+        self.boot_port = (
+            self.work / "dev/serial/by-id"
+            / f"usb-Seeed_XIAO_nRF52840_Sense_{TEST_SERIAL}-if00"
+        )
+        self.boot_port.symlink_to(self.device)
+        (self.work / "sys/devices/usb/1-1/idProduct").write_text("0045")
+        (self.work / "sys/devices/usb/1-1/product").write_text("XIAO nRF52840 Sense")
+
+    def test_sense_vendor_identity_uses_shared_discovery(self):
+        self._use_sense_identity()
+        INSTALLER.install(self.args())
+        self.assertFalse((self.volume / self.artifact.name).exists())
+        with mock.patch.object(INSTALLER.os, "sync"):
+            INSTALLER.install(self.args(dry_run=False))
+        self.assertEqual(
+            (self.volume / self.artifact.name).read_bytes(), self.artifact.read_bytes()
+        )
+
+    def test_sense_product_does_not_bypass_board_id_guard(self):
+        self._use_sense_identity()
+        (self.volume / "INFO_UF2.TXT").write_text(
+            "Board-ID: nRF52840-SeeedXiaoSense-v1\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "wrong UF2 board ID"):
+            INSTALLER.install(self.args(dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
+
+    def test_rejects_non_seeed_usb_vendor(self):
+        (self.work / "sys/devices/usb/1-1/idVendor").write_text("1234")
+        with self.assertRaisesRegex(ValueError, "discovered Seeed"):
+            INSTALLER.install(self.args(dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
+
+    def test_rejects_application_usb_mode(self):
+        (self.work / "sys/devices/usb/1-1/idProduct").write_text("8045")
+        with self.assertRaisesRegex(ValueError, "not bootloader mode"):
+            INSTALLER.install(self.args(dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
+
+    def test_rejects_alias_not_selected_by_shared_discovery(self):
+        alias = self.work / "dev/serial/by-id" / f"usb-Zalias_{TEST_SERIAL}-if00"
+        alias.symlink_to(self.device)
+        with self.assertRaisesRegex(ValueError, "discovered Seeed"):
+            INSTALLER.install(self.args(boot_port=str(alias), dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
+
+    def test_rejects_regular_file_in_by_id_directory(self):
+        port = self.work / "dev/serial/by-id" / f"usb-Fake_{TEST_SERIAL}-if00"
+        port.touch()
+        with self.assertRaisesRegex(ValueError, "identity symlink"):
+            INSTALLER.install(self.args(boot_port=str(port), dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
+
+    def test_rejects_volume_from_different_usb_serial(self):
+        other = self.work / "sys/devices/usb/other/block/sdz/sdz1"
+        other.mkdir(parents=True)
+        (self.work / "sys/devices/usb/other/serial").write_text("OTHER")
+        link = self.work / "sys/dev/block/8:99"
+        link.unlink()
+        link.symlink_to(other)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            INSTALLER.install(self.args(dry_run=False))
+        self.assertFalse((self.volume / self.artifact.name).exists())
 
     def test_rejects_wrong_usb_ancestry_serial(self):
         (self.work / "sys/devices/usb/1-1/serial").write_text(

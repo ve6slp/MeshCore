@@ -266,10 +266,9 @@ def install(args):
         )
 
     boot_port = Path(args.boot_port)
-    expected_name = f"usb-Seeed_Studio_XIAO-BOOT_{args.serial}-if00"
-    if boot_port.parent != Path(args.by_id_dir) or boot_port.name != expected_name:
+    if boot_port.parent != Path(args.by_id_dir) or not boot_port.is_symlink():
         raise ValueError(
-            f"boot port must be the stable authorized identity {Path(args.by_id_dir) / expected_name}"
+            f"boot port must be a stable authorized identity symlink in {args.by_id_dir}"
         )
     if not boot_port.exists():
         raise ValueError(f"stable bootloader identity is missing: {boot_port}")
@@ -281,6 +280,18 @@ def install(args):
     if tty_serial != args.serial:
         raise ValueError(
             f"bootloader USB ancestry serial is {tty_serial!r}, expected {args.serial!r}"
+        )
+    devices = [
+        device for device in lab_device.discover()
+        if device.serial == args.serial and device.by_id == boot_port
+    ]
+    if len(devices) != 1:
+        raise ValueError(
+            f"boot port is not a unique discovered Seeed stable authorized identity: {boot_port}"
+        )
+    if devices[0].mode != lab_device.MODE_BOOT:
+        raise ValueError(
+            f"authorized USB identity is in {devices[0].mode} mode, not bootloader mode"
         )
 
     artifact = Path(args.artifact)

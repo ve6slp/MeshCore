@@ -661,6 +661,12 @@ and the complete target ACL without setters or replacement grants.
 Both reported healthy stock boot, ordinary writes allowed and cache-only
 OTA. The subsequent target-only loader installer passed artifact validation
 but refused the vendor's actual stable boot-port product name before writing.
+The host guard was corrected to use the existing lab identity resolver,
+without relaxing serial, vendor, bootloader mode, stable by-id, volume
+ancestry, Board-ID or artifact checks. Read-only inspection then identified
+the remaining constraint: the stock target exposes CDC only, without a
+mass-storage interface or mounted UF2 volume. The UF2 commissioning path
+therefore remains unavailable on this loader.
 The target's qualified custom loader is not installed, and no
 replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and
