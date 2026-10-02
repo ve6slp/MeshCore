@@ -643,33 +643,104 @@ inline OtaBoardBootQualification resolveOtaBoardBootQualificationFromRecordStatu
 // Ordinary stock-app writes are not installation, formatting or identity-generation authority.
 class OtaBoardStockBootPreflight {
 public:
-  enum class Result { Healthy, NotStock, InvalidRunning, InstallJournalPresent, InvalidCache, IoError, Changed };
+  enum class Result {
+    Healthy, NotStock, InvalidRunning, InstallJournalPresent, InvalidCache, IoError, Changed, CacheNeedsReset
+  };
+  struct Diagnostic {
+    OtaBoardQualificationReason marker = OtaBoardQualificationReason::BlankUncertifiedStock;
+    const char* proof = "not-run";
+    bool sdkRead = false, tailErased = false, crcKnown = false;
+    uint16_t bank0 = 0, bank1 = 0, storedCrc = 0, computedCrc = 0;
+    uint32_t size = 0, journalOffset = UINT32_MAX;
+  };
 
   static Result check(const OtaBoardBootQualification& qualification, const IOtaNrf52RunningContext& running,
-                      ::ota::platform::FlashRegion& journal, ::ota::platform::FlashRegion& cache_records,
-                      const ::ota::trust::SignatureVerifier& signatures) {
+                      ::ota::platform::FlashRegion& journal, Diagnostic* diagnostic = nullptr) {
+    if (diagnostic) { *diagnostic = Diagnostic(); diagnostic->marker = qualification.reason; }
+    const auto finish = [&](Result result, const char* proof) {
+      if (diagnostic) diagnostic->proof = proof;
+      return result;
+    };
     if (qualification.status != OtaBoardQualificationStatus::Unknown || qualification.qualified ||
-        qualification.reason != OtaBoardQualificationReason::BlankUncertifiedStock) return Result::NotStock;
+        qualification.reason != OtaBoardQualificationReason::BlankUncertifiedStock)
+      return finish(Result::NotStock, "marker");
     OtaNrf52RunningContext before, after;
-    if (!running.read(before)) return Result::IoError;
+    if (!running.read(before)) return finish(Result::IoError, "sdk-read");
     const auto bank = ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(before.settings);
     const uint16_t bank1 = uint16_t(before.settings[4]) | (uint16_t(before.settings[5]) << 8);
-    if (!before.settingsTailErased || (bank1 != 0xfe && bank1 != 0xff)) return Result::InvalidRunning;
+    if (diagnostic) {
+      diagnostic->sdkRead = true;
+      diagnostic->bank0 = bank.bank_0;
+      diagnostic->bank1 = bank1;
+      diagnostic->storedCrc = bank.bank_0_crc;
+      diagnostic->size = bank.bank_0_size;
+      diagnostic->tailErased = before.settingsTailErased;
+    }
+    if (!before.settingsTailErased) return finish(Result::InvalidRunning, "sdk-tail");
+    if (bank1 != 0xfe && bank1 != 0xff) return finish(Result::InvalidRunning, "sdk-pending-bank");
     const auto current = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(bank, before.image, before.capacity);
-    if (!current.active_image_extent) return Result::InvalidRunning;
+    if (!current.active_image_extent) {
+      if (bank.bank_0 != ::ota::storage::kBankValidApp) return finish(Result::InvalidRunning, "sdk-bank0");
+      if (!before.image || !bank.bank_0_size || bank.bank_0_size > before.capacity ||
+          bank.bank_0_size > meshcore::ota::runtime::kOtaMaxImageBytes)
+        return finish(Result::InvalidRunning, "sdk-size");
+      if (diagnostic) {
+        diagnostic->computedCrc = ::ota::storage::XiaoOtaActiveExtentBridge::crc16Compute(
+            before.image, bank.bank_0_size);
+        diagnostic->crcKnown = true;
+      }
+      return finish(Result::InvalidRunning, "sdk-crc");
+    }
+    if (diagnostic) { diagnostic->computedCrc = bank.bank_0_crc; diagnostic->crcKnown = true; }
     uint8_t digest[32], rechecked[32];
-    auto result = inspect(journal, cache_records, signatures, digest);
-    if (result != Result::Healthy) return result;
-    if (!running.read(after)) return Result::IoError;
+    auto result = inspectJournal(journal, digest, diagnostic);
+    if (result != Result::Healthy)
+      return finish(result, result == Result::InstallJournalPresent ? "install-journal" : "journal-read");
+    if (!running.read(after)) return finish(Result::IoError, "sdk-recheck-read");
     const auto current_after = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(
         ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(after.settings), after.image, after.capacity);
     if (memcmp(before.settings, after.settings, sizeof(before.settings)) || before.image != after.image ||
         before.capacity != after.capacity || before.settingsTailErased != after.settingsTailErased ||
         current_after.active_image_extent != current.active_image_extent ||
-        memcmp(current_after.active_image_hash_sha256, current.active_image_hash_sha256, 32)) return Result::Changed;
-    result = inspect(journal, cache_records, signatures, rechecked);
-    if (result != Result::Healthy) return result;
-    return memcmp(digest, rechecked, sizeof(digest)) ? Result::Changed : Result::Healthy;
+        memcmp(current_after.active_image_hash_sha256, current.active_image_hash_sha256, 32))
+      return finish(Result::Changed, "sdk-changed");
+    result = inspectJournal(journal, rechecked, diagnostic);
+    if (result != Result::Healthy)
+      return finish(result, result == Result::InstallJournalPresent ? "install-journal" : "journal-recheck-read");
+    return memcmp(digest, rechecked, sizeof(digest)) ? finish(Result::Changed, "journal-changed") :
+                                                    finish(Result::Healthy, "healthy");
+  }
+
+  static void formatDiagnostic(char* out, size_t size, const Diagnostic& diagnostic) {
+    const char* marker = diagnostic.marker == OtaBoardQualificationReason::BlankUncertifiedStock ? "blank" :
+                         diagnostic.marker == OtaBoardQualificationReason::CorruptMarker ? "corrupt" :
+                         diagnostic.marker == OtaBoardQualificationReason::QualifiedMatch ? "qualified" : "mismatch";
+    if (!diagnostic.sdkRead) {
+      snprintf(out, size, "marker=%s proof=%s sdk=unread", marker, diagnostic.proof);
+      return;
+    }
+    char crc[5] = "?", offset[9] = "?";
+    if (diagnostic.crcKnown) snprintf(crc, sizeof(crc), "%04X", unsigned(diagnostic.computedCrc));
+    if (diagnostic.journalOffset != UINT32_MAX)
+      snprintf(offset, sizeof(offset), "%08lX", static_cast<unsigned long>(diagnostic.journalOffset));
+    snprintf(out, size, "marker=%s proof=%s off=%s bank0=%X bank1=%X size=%lu crc=%04X/%s tail=%u",
+             marker, diagnostic.proof, offset, unsigned(diagnostic.bank0), unsigned(diagnostic.bank1),
+             static_cast<unsigned long>(diagnostic.size), unsigned(diagnostic.storedCrc), crc,
+             unsigned(diagnostic.tailErased));
+  }
+
+  // Stock boot never consumes cache records; their integrity cannot revoke ordinary-write proof.
+  static Result checkCache(::ota::platform::FlashRegion& records, const ::ota::trust::SignatureVerifier& signatures) {
+    uint8_t digest[32], rechecked[32];
+    const auto result = inspectCache(records, signatures, digest);
+    if (!cacheAttachAllowed(result)) return result;
+    const auto after = inspectCache(records, signatures, rechecked);
+    if (!cacheAttachAllowed(after)) return after;
+    return result != after || memcmp(digest, rechecked, sizeof(digest)) ? Result::Changed : result;
+  }
+
+  static bool cacheAttachAllowed(Result result) {
+    return result == Result::Healthy || result == Result::CacheNeedsReset;
   }
 
   static const char* reason(Result result) {
@@ -681,6 +752,7 @@ public:
       case Result::InvalidCache: return "cache metadata unproven";
       case Result::IoError: return "stock preflight read error";
       case Result::Changed: return "stock proof changed";
+      case Result::CacheNeedsReset: return "cache needs explicit retry/reupload";
     }
     return "stock proof unavailable";
   }
@@ -694,20 +766,34 @@ private:
     for (size_t i = 0; i < count; ++i) if (bytes[i] != 0xff) return false;
     return true;
   }
-  static Result inspect(::ota::platform::FlashRegion& journal, ::ota::platform::FlashRegion& records,
-                        const ::ota::trust::SignatureVerifier& signatures, uint8_t digest[32]) {
+  static Result inspectJournal(::ota::platform::FlashRegion& journal, uint8_t digest[32], Diagnostic* diagnostic) {
     if (!journal.isValid() || journal.sizeBytes() != 4 * Store::kExpectedRegionBytes ||
-        journal.eraseUnitBytes() != Store::kSectorBytes || !records.isValid() ||
-        records.sizeBytes() != Store::kExpectedRegionBytes || records.eraseUnitBytes() != Store::kSectorBytes)
-      return Result::IoError;
+        journal.eraseUnitBytes() != Store::kSectorBytes) return Result::IoError;
     ::ota::trust::Sha256 hash;
     uint8_t bytes[Store::kRecordBytes];
     for (uint32_t offset = 0; offset < journal.sizeBytes(); offset += sizeof(bytes)) {
-      if (!::ota::platform::isOk(journal.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
-      if (!blank(bytes, sizeof(bytes))) return Result::InstallJournalPresent;
+      if (!::ota::platform::isOk(journal.read(offset, bytes, sizeof(bytes)))) {
+        if (diagnostic) diagnostic->journalOffset = offset;
+        return Result::IoError;
+      }
+      if (!blank(bytes, sizeof(bytes))) {
+        if (diagnostic) for (size_t i = 0; i < sizeof(bytes); ++i) {
+          if (bytes[i] != 0xff) { diagnostic->journalOffset = offset + i; break; }
+        }
+        return Result::InstallJournalPresent;
+      }
       hash.update(bytes, sizeof(bytes));
     }
-    bool found_cache = false, found_blank = false;
+    hash.finish(digest);
+    return Result::Healthy;
+  }
+  static Result inspectCache(::ota::platform::FlashRegion& records,
+                             const ::ota::trust::SignatureVerifier& signatures, uint8_t digest[32]) {
+    if (!records.isValid() || records.sizeBytes() != Store::kExpectedRegionBytes ||
+        records.eraseUnitBytes() != Store::kSectorBytes) return Result::IoError;
+    ::ota::trust::Sha256 hash;
+    uint8_t bytes[Store::kRecordBytes], latest_binding[171];
+    bool found_cache = false, found_blank = false, needs_reset = false;
     uint32_t sequence = 0, total_blocks = 0, received = 0;
     uint8_t latest_phase = 0;
     for (uint32_t offset = 0; offset < Store::kSectorBytes; offset += sizeof(bytes)) {
@@ -718,7 +804,7 @@ private:
       if (found_blank || le32(bytes) != Store::kMagic || bytes[4] != Store::kVersion || bytes[5] ||
           bytes[6] != (Store::kRecordBytes & 0xff) || bytes[7] != (Store::kRecordBytes >> 8) ||
           !(bytes[12] & 0x80) || phase > uint8_t(Store::Phase::Failed) || phase == uint8_t(Store::Phase::Committed) ||
-          le32(bytes + 8) <= sequence || le32(bytes + 188) != Store::kCommitMarker ||
+          le32(bytes + 8) <= sequence || (le32(bytes + 188) & Store::kCommitMarker) != Store::kCommitMarker ||
           le32(bytes + 184) != ::ota::storage::Crc32::computeFinalized(bytes, 184) ||
           !blank(bytes + 192, sizeof(bytes) - 192)) return Result::InvalidCache;
       meshcore::ota::protocol::OtaDescriptor descriptor;
@@ -730,9 +816,17 @@ private:
           (uint16_t(bytes[13]) | (uint16_t(bytes[14]) << 8)) !=
               (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes ||
           !signatures.verify(bytes + 120, 64, bytes + 29, 59, bytes + 88, 32)) return Result::InvalidCache;
+      // Only a complete authenticated body can explain an unfinished marker.
+      // The store ignores this slot; never project its phase or ownership.
+      if (le32(bytes + 188) != Store::kCommitMarker) {
+        if (found_cache && memcmp(latest_binding, bytes + 13, sizeof(latest_binding))) return Result::InvalidCache;
+        needs_reset = true;
+        continue;
+      }
       sequence = le32(bytes + 8);
       total_blocks = uint16_t(bytes[13]) | (uint16_t(bytes[14]) << 8);
       latest_phase = phase;
+      memcpy(latest_binding, bytes + 13, sizeof(latest_binding));
       found_cache = true;
     }
     for (uint32_t offset = Store::kBitmapSectorOffset; offset < records.sizeBytes(); offset += sizeof(bytes)) {
@@ -740,6 +834,7 @@ private:
       hash.update(bytes, sizeof(bytes));
       for (uint32_t i = 0; i < sizeof(bytes); ++i) for (uint8_t bit = 0; bit < 8; ++bit) {
         if (bytes[i] & (1u << bit)) continue;
+        if (!found_cache) { needs_reset = true; continue; }
         if ((offset - Store::kBitmapSectorOffset + i) * 8 + bit >= total_blocks) return Result::InvalidCache;
         ++received;
       }
@@ -747,9 +842,22 @@ private:
     if (found_cache && (latest_phase == uint8_t(Store::Phase::Verifying) || latest_phase == uint8_t(Store::Phase::Ready)) &&
         received != total_blocks) return Result::InvalidCache;
     hash.finish(digest);
-    return Result::Healthy;
+    return needs_reset ? Result::CacheNeedsReset : Result::Healthy;
   }
 };
+
+inline void formatOtaOrdinaryWriteDiagnostic(char* out, size_t size, bool writes_blocked, const char* detail) {
+  snprintf(out, size, "writes=%s %s", writes_blocked ? "blocked" : "allowed",
+           detail ? detail : "proof=backend-unavailable");
+}
+
+inline size_t encodeOtaOrdinaryWriteDiagnostic(uint8_t* out, size_t size, uint8_t response_code,
+                                             bool writes_blocked, const char* detail) {
+  if (!out || size < 2) return 0;
+  out[0] = response_code;
+  formatOtaOrdinaryWriteDiagnostic(reinterpret_cast<char*>(out + 1), size - 1, writes_blocked, detail);
+  return 1 + strlen(reinterpret_cast<char*>(out + 1));
+}
 
 // Fail-closed boot-marker qualification check, shared by both backends.
 // Only a struct that passes XiaoOtaBootInfoReader's magic/format/CRC

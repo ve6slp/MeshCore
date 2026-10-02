@@ -97,13 +97,30 @@ or qualify custom-loader installation.
 A healthy stock-loader nRF uploader can retain ordinary MeshCore settings,
 contacts and filesystem writes while caching an image for another device.
 Before filesystem mounting, this requires a blank custom-loader marker,
-fresh stable SDK bank, CRC and image-hash evidence, no pending bank, a fully
-erased install journal, and empty or authenticated local-cache metadata.
-Backend attachment rechecks the proof. This permits ordinary writes, not
+fresh stable SDK bank, CRC and image-hash evidence, no pending bank and a fully
+erased install journal. Cache integrity is checked separately and cannot
+revoke that positive ordinary-write proof. Backend attachment rechecks the
+stock proof. This permits ordinary writes, not
 filesystem formatting or identity replacement; the device remains cache-only
-and cannot install an image. Trial, unknown, corrupt and unreadable contexts
-retain the write guard. A failed stock-cache attachment reports
+and cannot install an image. Trial, unknown, corrupt marker or SDK, present
+install journal and unreadable boot-proof contexts retain the write guard.
+A failed stock-cache attachment reports
 `CACHE_UNAVAILABLE` with its reason instead of silently enabling installation.
+
+Authenticated torn cache appends and erased-metadata/orphan-bitmap cuts can
+attach cache-only for an explicit owner retry or reupload. Neither boot proof
+nor attachment erases storage. Valid ownership and progress remain protected;
+unsigned, nonlocal, committed, inconsistent or unreadable cache state does not
+gain attachment or installer authority.
+
+Read-only stock diagnostics expose the actual latched write permission and
+the captured early refusal separately from later backend capability. The
+companion accepts payload `420001` for preflight and `420002` for capability,
+returning response code 29 followed by ASCII; the repeater accepts
+`ota preflight` and `ota capability`. These diagnostics do not alter the
+existing `4200` reply, canonical 86-byte OTA replies, storage or boot state.
+Older applications ignore the selector, so a lifecycle-only reply is not
+preflight evidence.
 
 `build-ota-esp32-targets` builds `Xiao_S3_WIO_companion_radio_usb` and
 `Xiao_S3_WIO_repeater_ota_usb`. The new repeater profile inherits the

@@ -168,10 +168,14 @@ bool g_backend_qualified_and_bank0_valid = false;
 bool g_qualified = false;
 mesh::ota::OtaBoardStockBootPreflight::Result g_stock_boot_result =
     mesh::ota::OtaBoardStockBootPreflight::Result::NotStock;
-bool stockBootOrdinaryWritesAllowed(const mesh::ota::OtaBoardBootQualification& qualification) {
+char g_early_write_diagnostic[128] = "proof=not-run";
+bool stockBootOrdinaryWritesAllowed(const mesh::ota::OtaBoardBootQualification& qualification, bool early = false) {
   mesh::ota::OtaBoardNrf52RunningContext running;
+  mesh::ota::OtaBoardStockBootPreflight::Diagnostic diagnostic;
   g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::check(
-      qualification, running, xiao_journal_full_region, candidate_record_scratch_region, signature_verifier);
+      qualification, running, xiao_journal_full_region, early ? &diagnostic : nullptr);
+  if (early) mesh::ota::OtaBoardStockBootPreflight::formatDiagnostic(
+      g_early_write_diagnostic, sizeof(g_early_write_diagnostic), diagnostic);
   return g_stock_boot_result == mesh::ota::OtaBoardStockBootPreflight::Result::Healthy;
 }
 mesh::ota::OtaBoardBootLifecycleObserver& bootLifecycleObserver() {
@@ -196,6 +200,7 @@ const char* otaLabInstallCapabilityReason() { return g_install_capability_reason
 // embedding directly in the existing OTA status serial frame (<=176 byte
 // budget) alongside other fields -- not just an unwired getter.
 const char* otaBoardInstallCapabilityStatus() { return g_install_capability_status; }
+const char* otaBoardEarlyWriteDiagnostic() { return g_early_write_diagnostic; }
 bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
   return bootLifecycleObserver().read(g_qualified, out);
 }
@@ -334,17 +339,25 @@ bool otaBoardTrialHealthWindowActive() {
 // confirmer and independently rechecks the stock proof before cache attachment.
 bool otaBoardEarlyBootTrialOrUnknown() {
   g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::Result::IoError;
-  if (!ota::platform::SenseCapQspiLayout::isValid() || !ota::platform::isOk(flash.begin())) {
+  snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic), "proof=qspi-layout");
+  if (!ota::platform::SenseCapQspiLayout::isValid()) return true;
+  snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic), "proof=qspi-read");
+  if (!ota::platform::isOk(flash.begin())) {
     // Cannot even read the OTA state region -- genuinely UNKNOWN (a real
     // flash/IO failure, not a positive "no trial concept" observation).
     // Fail closed: block destructive writes rather than allow them.
     return true;
   }
   const uint8_t* jedec = flash.jedecId();
-  if (jedec[0] != 0x85 || jedec[1] != 0x60 || jedec[2] != 0x15) return true;
+  if (jedec[0] != 0x85 || jedec[1] != 0x60 || jedec[2] != 0x15) {
+    snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic), "proof=jedec observed=%02X%02X%02X",
+             unsigned(jedec[0]), unsigned(jedec[1]), unsigned(jedec[2]));
+    return true;
+  }
   const mesh::ota::OtaBoardBootQualification qualification = mesh::ota::resolveOtaBoardBootQualification(
       kExpectedBoardTargetId, kExpectedRoleId, kExpectedCapabilityFlags);
-  if (!qualification.qualified) return !stockBootOrdinaryWritesAllowed(qualification);
+  if (!qualification.qualified) return !stockBootOrdinaryWritesAllowed(qualification, true);
+  snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic), "marker=qualified proof=qualified-state");
   g_qualified = true;
   if (trial_boot_confirmer_ptr == nullptr) {
     // boot_epoch_ms=0 -- see the identical rationale in
@@ -367,6 +380,10 @@ bool otaBoardEarlyBootTrialOrUnknown() {
   // record, never a fabricated Normal.
   const mesh::ota::OtaBoardStartupDecision decision = mesh::ota::resolveOtaBoardStartupDecision(
       /*qualified=*/true, trial_boot_confirmer_ptr->stateReadStatus(), trial_boot_confirmer_ptr->statePhase());
+  snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic),
+           "marker=qualified proof=qualified-state state=%u phase=%u decision=%u",
+           unsigned(trial_boot_confirmer_ptr->stateReadStatus()), unsigned(trial_boot_confirmer_ptr->statePhase()),
+           unsigned(decision.status));
   return decision.status != mesh::ota::OtaBoardStartupDecisionStatus::Normal;
 }
 
@@ -401,13 +418,17 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
 
   if (!qualification.qualified) {
     const bool stock_healthy = stockBootOrdinaryWritesAllowed(qualification);
+    const auto cache_result = stock_healthy ?
+        mesh::ota::OtaBoardStockBootPreflight::checkCache(candidate_record_scratch_region, signature_verifier) :
+        g_stock_boot_result;
+    const bool cache_allowed = stock_healthy && mesh::ota::OtaBoardStockBootPreflight::cacheAttachAllowed(cache_result);
     static mesh::ota::OtaBoardCacheOnlyBackend cache_backend(
         candidate, candidate_record_scratch_region, &otaBoardTrialHealthWindowActive);
     snprintf(g_install_capability_status, sizeof(g_install_capability_status), "%s: %s",
-             stock_healthy ? "CACHE_ONLY" : "CACHE_UNAVAILABLE",
-             mesh::ota::OtaBoardStockBootPreflight::reason(g_stock_boot_result));
+             cache_allowed ? "CACHE_ONLY" : "CACHE_UNAVAILABLE",
+             mesh::ota::OtaBoardStockBootPreflight::reason(cache_result));
     g_install_capability_reason = g_install_capability_status;
-    return stock_healthy && cache_backend.attach(integration, signature_verifier);
+    return cache_allowed && cache_backend.attach(integration, signature_verifier);
   }
   std::memcpy(active_wire_public_key, qualification.info.trustedPublicKey, sizeof(active_wire_public_key));
   active_wire_key_id = qualification.info.keyId;

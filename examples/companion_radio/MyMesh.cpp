@@ -47,6 +47,9 @@ __attribute__((weak)) bool otaLabEraseFloorASector(uint32_t) {
 __attribute__((weak)) const char* otaBoardInstallCapabilityStatus() {
   return "backend not configured";
 }
+__attribute__((weak)) const char* otaBoardEarlyWriteDiagnostic() {
+  return "proof=backend-unavailable";
+}
 // Genuine trial-boot health confirmation entry point (see
 // src/ota/storage/XiaoOtaTrialHealthMonitor.h for the full continuous-
 // window/deadline/incremental-hash gate); weak default covers any build
@@ -3102,11 +3105,19 @@ void MyMesh::handleCmdFrame(size_t len) {
 #if MESHCORE_LORA_OTA
     uint8_t op = cmd_frame[1];
     if (op == OTA_CTRL_GET_STATUS) {
-      int i = 0;
-      out_frame[i++] = RESP_CODE_OTA_STATUS;
-      formatFirmwareOtaStatus((char*)&out_frame[i], sizeof(out_frame) - i);
-      i += strlen((char*)&out_frame[i]);
-      _serial->writeFrame(out_frame, i);
+      // Optional read-only selectors; the original two-byte status request is unchanged.
+      if (len == 3 && (cmd_frame[2] == 1 || cmd_frame[2] == 2)) {
+        const char* detail = cmd_frame[2] == 1 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus();
+        const size_t count = mesh::ota::encodeOtaOrdinaryWriteDiagnostic(
+            out_frame, sizeof(out_frame), RESP_CODE_OTA_STATUS, _store->destructiveWritesDisallowed(), detail);
+        _serial->writeFrame(out_frame, count);
+      } else {
+        int i = 0;
+        out_frame[i++] = RESP_CODE_OTA_STATUS;
+        formatFirmwareOtaStatus((char*)&out_frame[i], sizeof(out_frame) - i);
+        i += strlen((char*)&out_frame[i]);
+        _serial->writeFrame(out_frame, i);
+      }
     } else if (op == OTA_CTRL_SET_MODE && len >= 3) {
       if (refusePersistIfDisallowed()) {
         // already replied ERR_CODE_BAD_STATE; do not mutate _prefs.ota_mode.

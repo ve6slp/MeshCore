@@ -56,6 +56,9 @@ __attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFi
 __attribute__((weak)) const char* otaBoardInstallCapabilityStatus() {
   return "backend not configured";
 }
+__attribute__((weak)) const char* otaBoardEarlyWriteDiagnostic() {
+  return "proof=backend-unavailable";
+}
 #endif
 
 /* ------------------------------ Config -------------------------------- */
@@ -1456,6 +1459,9 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     while (*sub == ' ') sub++;
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
+    } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
+      mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
+          strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
     } else if (strcmp(sub, "abort") == 0) {
       abortFirmwareOta();
       strcpy(reply, "OK");
@@ -1467,7 +1473,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else if (memcmp(sub, "duty ", 5) == 0) {
       if (setFirmwareOtaDutyCycle((float)atof(sub + 5))) strcpy(reply, "OK"); else strcpy(reply, "Err - bad duty");
     } else {
-      strcpy(reply, "Err - usage: ota status|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
+      strcpy(reply, "Err - usage: ota status|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
     }
 #endif
   } else{
