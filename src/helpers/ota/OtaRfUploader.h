@@ -97,6 +97,8 @@ public:
     target_ = 0; index_ = 0; first_ = 0; last_poll_ = 0; waiting_poll_ = false; last_direct_request_ = 0;
     reupload_spent_ = 0; reupload_pending_ = 0;
     normal_stage_ = 0; normal_poll_ms_ = 0;
+    last_admission_ms_ = 0; last_admission_index_ = 0;
+    admission_failed_data_ = 0;
     for (uint8_t i = 0; i < count; ++i) {
       integration.trackOtaTarget(targets + 32u * i);
       integration.clearTargetObservation(targets + 32u * i);
@@ -123,7 +125,10 @@ public:
       if (!lean.exportCandidateForUpload(canonical, signature)) return;
       const auto len = encodeOtaTargetAuthorization(selected(), st.ownerPublicKey, canonical, signature, frame, sizeof(frame));
       if (send(ctx, route(), selected(), frame, len, Category::Control)) {
-        if (++target_ == count_) { target_ = 0; stage_ = Stage::Initial; }
+        if (++target_ == count_) {
+          target_ = 0; stage_ = Stage::Initial;
+          last_admission_ms_ = now; last_admission_index_ = 0;
+        }
       }
       return;
     }
@@ -195,8 +200,34 @@ public:
 
     if (stage_ == Stage::Initial) {
       if (index_ < st.totalBlocks) {
+        bool admission_refused = false;
+        // Lost BEGIN must not waste a whole image sweep. DATA progress also
+        // paces retries, so scarce duty credit cannot become an AUTH-only loop.
+        if (mode_ != usb::kStartModeDirect && now - last_admission_ms_ >= 15000u &&
+            static_cast<uint16_t>(index_ - last_admission_index_) >= 32u) {
+          uint8_t canonical[59], signature[64];
+          if (!lean.exportCandidateForUpload(canonical, signature)) return;
+          const auto len = encodeOtaTargetAuthorization(selected(), st.ownerPublicKey, canonical, signature,
+                                                        frame, sizeof(frame));
+          const bool sent = send(ctx, OtaRfRoute::Directed, selected(), frame, len, Category::Control);
+          if (sent) {
+            if (++target_ == count_) target_ = 0;
+            admission_failed_data_ = 0;
+            last_admission_ms_ = now; last_admission_index_ = index_;
+            return;
+          }
+          admission_refused = true;
+        }
         if (sendBlock(lean, st, index_, ctx, sign, send,
-                      mode_ == usb::kStartModeBackground ? OtaRfRoute::Multicast : route(), targets_, Category::Relay)) ++index_;
+                      mode_ == usb::kStartModeBackground ? OtaRfRoute::Multicast : route(), targets_, Category::Relay)) {
+          ++index_;
+          // Empty credit must not churn the target cursor. An unavailable
+          // peer gets a bounded DATA-progress turn without holding the fleet.
+          if (admission_refused && ++admission_failed_data_ == 32u) {
+            admission_failed_data_ = 0;
+            if (++target_ == count_) target_ = 0;
+          }
+        }
         return;
       }
       stage_ = Stage::Census; target_ = 0; first_ = 0; waiting_poll_ = false;
@@ -294,11 +325,14 @@ private:
   }
   const uint8_t* targets_ = nullptr;
   uint8_t mode_ = 0, count_ = 0, target_ = 0;
+  uint8_t admission_failed_data_ = 0;
   uint16_t index_ = 0, first_ = 0, lease_ = 0;
   uint32_t frequency_ = 0, token_ = 0, last_poll_ = 0, last_direct_request_ = 0;
   uint32_t reupload_spent_ = 0;
   uint32_t reupload_pending_ = 0, reupload_generation_[usb::kMaxSelectedTargets] = {};
   uint32_t normal_poll_ms_ = 0;
+  uint32_t last_admission_ms_ = 0;
+  uint16_t last_admission_index_ = 0;
   uint8_t normal_stage_ = 0;
   Stage stage_ = Stage::Admission;
   bool active_ = false, waiting_poll_ = false, repair_unknown_ = false, reupload_ = false;

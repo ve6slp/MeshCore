@@ -1064,8 +1064,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   next_ack_idx = 0;
   sign_data = NULL;
   dirty_contacts_expiry = 0;
-  set_radio_at = 0;
-  revert_radio_at = 0;
+  _temporary_radio_lease.reset();
   pending_freq = 0.0f;
   pending_bw = 0.0f;
   pending_sf = 0;
@@ -1322,26 +1321,12 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
 #if MESHCORE_LORA_OTA
   _ota_rf_uploader.stop(getOtaIntegration());
 #endif
-  set_radio_at = futureMillis(2000);
   pending_freq = freq;
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
 
-  // Checked, overflow-safe arithmetic: timeout_mins can arrive unclamped
-  // from either the binary CMD_OTA_CONTROL path (uint16, up to 65535) or a
-  // text CLI path, and the naive `2000 + timeout_mins * 60 * 1000` here was
-  // computed entirely in (signed 32-bit) int, silently overflowing for
-  // timeout_mins >= 35792 (INT32_MAX ms is ~35791.4 minutes). Dispatcher::
-  // futureMillis()/millisHasNowPassed() also require the resulting offset
-  // to stay within INT32_MAX ms for their wrap-safe comparison to hold, so
-  // the multiplication is done in int64_t and the final offset is clamped
-  // to that bound before narrowing back to the int futureMillis() expects.
-  constexpr int64_t kSetDelayMs = 2000;
-  constexpr int64_t kMaxRevertOffsetMs = 2147483647LL - kSetDelayMs; // INT32_MAX - kSetDelayMs
-  int64_t requested_ms = timeout_mins > 0 ? static_cast<int64_t>(timeout_mins) * 60LL * 1000LL : 0LL;
-  if (requested_ms > kMaxRevertOffsetMs) requested_ms = kMaxRevertOffsetMs;
-  revert_radio_at = futureMillis(static_cast<int>(kSetDelayMs + requested_ms));
+  _temporary_radio_lease.schedule(_ms->getMillis(), timeout_mins);
 }
 
 bool MyMesh::setFirmwareOtaMode(const char* mode) {
@@ -1403,10 +1388,9 @@ void MyMesh::abortFirmwareOta() {
   _ota_upload_active = false;
   getOtaIntegration().abortSession();
 #endif
-  if (revert_radio_at || set_radio_at) {
-    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    set_radio_at = 0;
-    revert_radio_at = 0;
+  if (_temporary_radio_lease.pending()) {
+    _temporary_radio_lease.cancel(_ms->getMillis());
+    revertTempRadioLeaseIfDue();
   }
 }
 
@@ -1944,7 +1928,7 @@ void MyMesh::handleCmdFrame(size_t len) {
                      (_prefs.telemetry_mode_base); // v5+
     out_frame[i++] = _prefs.manual_add_contacts;
 
-    const bool temp_radio_active = revert_radio_at && !set_radio_at;
+    const bool temp_radio_active = _temporary_radio_lease.applied();
     const float active_freq = temp_radio_active ? pending_freq : _prefs.freq;
     const float active_bw = temp_radio_active ? pending_bw : _prefs.bw;
     const uint8_t active_sf = temp_radio_active ? pending_sf : _prefs.sf;
@@ -3778,27 +3762,30 @@ void MyMesh::tickOtaTrialHealth() {
 #endif
 
 void MyMesh::checkTempRadioLease() {
-  if (set_radio_at && millisHasNowPassed(set_radio_at)) {
+  _temporary_radio_lease.applyIfDue(_ms->getMillis(), [this]() {
     applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
-    set_radio_at = 0;
-  }
+  });
 }
 
-// Astra's correction: restoring an ALREADY-APPLIED temporary lease back
-// to the node's normal configured radio params needs no identity/
-// authorization -- only granting a NEW lease (checkTempRadioLease()'s
-// set_radio_at, above, which loop() still gates under
-// _identity_available_) does. Keeping this outside that gate means an
-// active off-frequency/high-speed lease is never left stuck applied
-// forever merely because identity became unavailable mid-lease. main.cpp
-// halt()s on a failed radio_init() before MyMesh is ever reached, so (
-// unlike simple_repeater's _radio_available_) no further radio-liveness
-// gate is needed here.
+// Restoring normal parameters must remain independent of identity availability.
 void MyMesh::revertTempRadioLeaseIfDue() {
-  if (revert_radio_at && millisHasNowPassed(revert_radio_at)) {
+  const uint32_t now = _ms->getMillis();
+#if MESHCORE_LORA_OTA && defined(NRF52_PLATFORM)
+  _temporary_radio_lease.restoreIfDue(now, [this]() {
+#if MESHCORE_OTA_USB_MEASUREMENTS
+    return applyMeasuredRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr, false);
+#else
+    const bool restored = otaBoardApplyRfProfile(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    if (!restored) MESH_DEBUG_PRINTLN("Temporary radio lease: normal profile restore failed");
+    return restored;
+#endif
+  }, !isSendInProgress() && !_radio->isReceiving());
+#else
+  // Preserve the existing unchecked radio API on other platforms/builds.
+  _temporary_radio_lease.restoreUncheckedIfDue(now, [this]() {
     applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    revert_radio_at = 0;
-  }
+  });
+#endif
 }
 
 bool MyMesh::advert() {

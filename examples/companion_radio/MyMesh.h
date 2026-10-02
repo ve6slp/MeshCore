@@ -32,6 +32,7 @@
 #include <helpers/IdentityStore.h>
 #include <helpers/SimpleMeshTables.h>
 #include <helpers/StaticPoolPacketManager.h>
+#include <helpers/TemporaryRadioLease.h>
 #include <target.h>
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
@@ -411,8 +412,7 @@ private:
   uint8_t *sign_data;
   uint32_t sign_data_len;
   unsigned long dirty_contacts_expiry;
-  unsigned long set_radio_at;
-  unsigned long revert_radio_at;
+  mesh::TemporaryRadioLease _temporary_radio_lease;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;

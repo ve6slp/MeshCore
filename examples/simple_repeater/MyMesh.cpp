@@ -942,7 +942,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   uptime_millis = 0;
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
-  set_radio_at = revert_radio_at = 0;
+  _temporary_radio_lease.reset();
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1107,13 +1107,12 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
 #if MESHCORE_LORA_OTA
   getOtaIntegration().stopDirect();
 #endif
-  set_radio_at = futureMillis(2000); // give CLI reply some time to be sent back, before applying temp radio params
   pending_freq = freq;
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
 
-  revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
+  _temporary_radio_lease.schedule(_ms->getMillis(), timeout_mins);
 }
 
 #if MESHCORE_LORA_OTA
@@ -1132,10 +1131,9 @@ bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
 
 void MyMesh::abortFirmwareOta() {
   getOtaIntegration().abortSession();
-  if (revert_radio_at || set_radio_at) {
-    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    set_radio_at = 0;
-    revert_radio_at = 0;
+  if (_temporary_radio_lease.pending()) {
+    _temporary_radio_lease.cancel(_ms->getMillis());
+    revertTempRadioLeaseIfDue();
   }
 }
 
@@ -1159,6 +1157,27 @@ void MyMesh::applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr) {
 #else
   radio_driver.setParams(freq, bw, sf, cr);
 #endif
+}
+
+void MyMesh::revertTempRadioLeaseIfDue() {
+  if (!_radio_available_) return;
+  const uint32_t now = _ms->getMillis();
+#if MESHCORE_LORA_OTA && defined(NRF52_PLATFORM)
+  const bool restored = _temporary_radio_lease.restoreIfDue(now, [this]() {
+#if MESHCORE_OTA_USB_MEASUREMENTS
+    return applyMeasuredRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr, false);
+#else
+    const bool applied = otaBoardApplyRfProfile(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    if (!applied) MESH_DEBUG_PRINTLN("Temporary radio lease: normal profile restore failed");
+    return applied;
+#endif
+  }, !isSendInProgress() && !_radio->isReceiving());
+#else
+  const bool restored = _temporary_radio_lease.restoreUncheckedIfDue(now, [this]() {
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  });
+#endif
+  if (restored) MESH_DEBUG_PRINTLN("Radio params restored");
 }
 
 #if MESHCORE_OTA_USB_MEASUREMENTS
@@ -1635,28 +1654,13 @@ void MyMesh::loop() {
       updateAdvertTimer(); // schedule next local advert
     }
 
-    if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
-      set_radio_at = 0;                                     // clear timer
+    if (_temporary_radio_lease.applyIfDue(_ms->getMillis(), [this]() {
       applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
-      MESH_DEBUG_PRINTLN("Temp radio params");
-    }
+    })) MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
-  // Astra's correction: restoring an ALREADY-APPLIED temporary lease back
-  // to the node's normal configured radio params needs no identity/
-  // authorization -- only granting a NEW lease (set_radio_at, above,
-  // genuinely identity-gated) does. Gating this on _identity_available_
-  // too would leave an active off-frequency/high-speed lease applied
-  // forever (no safe revert) whenever identity became unavailable mid-
-  // lease. Only _radio_available_ (a live radio to apply params to) is
-  // required; if the radio is unavailable, revert_radio_at is left
-  // non-zero (an explicit pending-restoration obligation) rather than
-  // being cleared without ever actually restoring.
-  if (_radio_available_ && revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
-    revert_radio_at = 0;                                                            // clear timer
-    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    MESH_DEBUG_PRINTLN("Radio params restored");
-  }
+  // Restoring normal parameters requires a live radio, not an identity.
+  revertTempRadioLeaseIfDue();
 
   // is pending dirty contacts write needed? A denied/failed write must
   // never be silently labeled "saved" -- ClientACL::save() is void, so

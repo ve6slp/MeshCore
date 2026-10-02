@@ -3662,6 +3662,14 @@ struct RfProductHarness {
   bool loseAck = false, lostAck = false, loseSparseBlocks = false;
   bool loseAuthorization = false, lostAuthorization = false;
   bool loseReupload = false, lostReupload = false;
+  bool normalTrafficActive = false;
+  bool missingAdmissionRouteA = false;
+  int authorizations = 0, initialData = 0, commits = 0;
+  int firstReadmissionData = -1;
+  uint32_t estimateMs = 20, completedMs = 20;
+  uint32_t authorizationEstimateMs = 0, authorizationCompletedMs = 0;
+  uint64_t controlTxMs = 0, dataTxMs = 0;
+  bool advanceCompletionClock = false;
   int multicastBlocks = 0, directedBlocks = 0, zeroHopBlocks = 0, census = 0;
   std::vector<uint16_t> repairs;
 
@@ -3692,8 +3700,30 @@ struct RfProductHarness {
   static bool send(void* ctx, OtaRfRoute route, const uint8_t target[32], const uint8_t* frame, size_t len,
                     meshcore::ota::protocol::OtaAirtimeCategory category) {
     auto& h = *static_cast<RfProductHarness*>(ctx);
-    if (!h.sender.fx.integration.canTransmit(h.now, category, 20, true, false)) return false;
-    h.sender.fx.integration.recordTransmit(h.now, category, 20);
+    if (h.missingAdmissionRouteA && h.lostAuthorization && frame[0] == kOtaTargetAuthorizationKind &&
+        !std::memcmp(target, h.targets[0], 32)) return false;
+    const bool authorization = frame[0] == kOtaTargetAuthorizationKind;
+    const uint32_t estimate = authorization && h.authorizationEstimateMs ? h.authorizationEstimateMs : h.estimateMs;
+    const uint32_t completed = authorization && h.authorizationCompletedMs ? h.authorizationCompletedMs : h.completedMs;
+    if (!h.sender.fx.integration.canTransmit(h.now, category, estimate, true, h.normalTrafficActive)) return false;
+    if (h.advanceCompletionClock) h.now += completed;
+    EXPECT_TRUE(h.sender.fx.integration.recordTransmit(h.now, category, completed));
+    if (category == meshcore::ota::protocol::OtaAirtimeCategory::Control) h.controlTxMs += completed;
+    else h.dataTxMs += completed;
+    if (frame[0] == kOtaCommitKind) ++h.commits;
+    if (frame[0] == kOtaTargetAuthorizationKind) {
+      EXPECT_EQ(164u, len);
+      uint8_t tag[8];
+      otaTargetTag(target, tag);
+      EXPECT_EQ(0, std::memcmp(tag, frame + 1, sizeof(tag)));
+      meshcore::ota::protocol::OtaDescriptor parsed;
+      EXPECT_EQ(meshcore::ota::protocol::OtaDescriptorCodecResult::Ok,
+                meshcore::ota::protocol::decodeOtaDescriptorCanonical(frame + 41, 59, parsed));
+      EXPECT_EQ(h.image.size(), parsed.exactSizeBytes);
+      ++h.authorizations;
+      if (h.lostAuthorization && h.firstReadmissionData < 0 && !std::memcmp(target, h.targets[0], 32))
+        h.firstReadmissionData = h.initialData;
+    }
     if (h.loseReupload && !h.lostReupload && frame[0] == kOtaReuploadKind) {
       h.lostReupload = true; return true;
     }
@@ -3702,6 +3732,7 @@ struct RfProductHarness {
     }
     if (frame[0] == kOtaCensusPollKind) ++h.census;
     if (frame[0] == kOtaOwnerSignedBlockKind) {
+      if (category == meshcore::ota::protocol::OtaAirtimeCategory::Relay) ++h.initialData;
       if (route == OtaRfRoute::Multicast) ++h.multicastBlocks;
       else if (route == OtaRfRoute::Directed) ++h.directedBlocks;
       else ++h.zeroHopBlocks;
@@ -3736,6 +3767,14 @@ struct RfProductHarness {
   bool ready(RfNode& node) const {
     return node.fx.integration.leanReceiver().status().phase == ::ota::storage::OtaCandidateStore::Phase::Ready;
   }
+  void expectByteExact(RfNode& node) {
+    std::vector<uint8_t> received(image.size());
+    for (size_t offset = 0; offset < received.size(); offset += 84) {
+      ASSERT_EQ(IOtaStagingSink::Result::Ok, node.fx.staging.readChunk(
+          offset, received.data() + offset, std::min<size_t>(84, received.size() - offset)));
+    }
+    EXPECT_EQ(image, received);
+  }
 };
 }  // namespace
 
@@ -3768,6 +3807,147 @@ TEST(LoraOtaRfProduct, BackgroundMulticastsThenCensusesAllTargetsAndRepairsAcros
   EXPECT_EQ(4, h.directedBlocks);
   EXPECT_GE(h.census, 4);
   EXPECT_EQ((std::vector<uint16_t>{0, 0, 129, 129}), h.repairs);
+}
+
+TEST(LoraOtaRfProduct, DirectedLostBeginReadmitsBeforeInitialSweepAtTwoPercent) {
+  RfProductHarness h;
+  h.loseAuthorization = true;
+  h.prepare(84 * 512 + 7, usb::kStartModeDirected);
+  ASSERT_FLOAT_EQ(2.0f, h.sender.fx.integration.dutyCyclePercent());
+  h.normalTrafficActive = true;
+  for (int i = 0; i < 30; ++i) h.step();
+  EXPECT_EQ(0, h.authorizations);
+  EXPECT_EQ(0, h.initialData);
+  h.normalTrafficActive = false;
+  for (int i = 0; i < 160 && h.a.fx.integration.leanReceiver().status().receivedBlocks == 0; ++i) h.step();
+  ASSERT_TRUE(h.lostAuthorization);
+  ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
+  ASSERT_GE(h.firstReadmissionData, 32);
+  EXPECT_LT(h.firstReadmissionData, 513);
+  EXPECT_LT(h.initialData, 513);
+  EXPECT_LE(h.authorizations, 1 + h.initialData / 32);
+  EXPECT_LE(h.sender.fx.integration.status(h.now).dutyUsedMs, 72000u);
+  for (int i = 0; i < 2000 && !h.ready(h.a); ++i) h.step();
+  EXPECT_TRUE(h.ready(h.a));
+  h.expectByteExact(h.a);
+  EXPECT_EQ(0, h.commits);
+}
+
+TEST(LoraOtaRfProduct, BackgroundLostBeginReadmitsWithoutBlockingHealthyFleetAtTwoPercent) {
+  RfProductHarness h;
+  h.loseAuthorization = true;
+  h.prepare(84 * 512 + 7, usb::kStartModeBackground);
+  for (int i = 0; i < 160 && h.a.fx.integration.leanReceiver().status().receivedBlocks == 0; ++i) {
+    const int before = h.initialData + h.authorizations + h.census;
+    h.normalTrafficActive = i % 7 == 0;
+    h.step();
+    if (h.normalTrafficActive) EXPECT_EQ(before, h.initialData + h.authorizations + h.census);
+  }
+  ASSERT_TRUE(h.lostAuthorization);
+  ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
+  ASSERT_GT(h.b.fx.integration.leanReceiver().status().receivedBlocks, 0);
+  EXPECT_LT(h.firstReadmissionData, 513);
+  EXPECT_LT(h.initialData, 513);
+  EXPECT_LE(h.authorizations, 2 + h.initialData / 32);
+  h.normalTrafficActive = false;
+  for (int i = 0; i < 3000 && !(h.ready(h.a) && h.ready(h.b)); ++i) h.step();
+  EXPECT_TRUE(h.ready(h.a));
+  EXPECT_TRUE(h.ready(h.b));
+  h.expectByteExact(h.a);
+  h.expectByteExact(h.b);
+  EXPECT_LE(h.sender.fx.integration.status(h.now).dutyUsedMs, 72000u);
+  EXPECT_EQ(0, h.commits);
+}
+
+class LoraOtaRfPacedAdmission : public testing::TestWithParam<uint8_t> {};
+
+TEST_P(LoraOtaRfPacedAdmission, ScarceDutyCreditAcrossClockWrapAdmitsDataAndLostBeginBeforeFullSweep) {
+  RfProductHarness h;
+  h.loseAuthorization = true;
+  h.prepare(537816, GetParam());
+  ASSERT_EQ(6403u, h.sender.fx.integration.leanReceiver().status().totalBlocks);
+  h.estimateMs = 200; h.completedMs = 300;
+  h.authorizationEstimateMs = 300; h.authorizationCompletedMs = 400;
+  h.advanceCompletionClock = true;
+  const uint32_t start = UINT32_MAX - 120000u;
+  auto& integration = h.sender.fx.integration;
+  using Category = meshcore::ota::protocol::OtaAirtimeCategory;
+  for (uint32_t i = 0; i < 180; ++i) {
+    const uint32_t time = start - 3590000u + i * 20000u;
+    ASSERT_TRUE(integration.canTransmit(time, Category::Repair, 254, true, false));
+    ASSERT_TRUE(integration.recordTransmit(time, Category::Repair, 399));
+  }
+  h.now = start;
+  ASSERT_FLOAT_EQ(2.0f, integration.dutyCyclePercent());
+  ASSERT_EQ(3600000u, integration.status(h.now).dutyWindowMs);
+  ASSERT_EQ(72000u, integration.status(h.now).dutyBudgetMs);
+  ASSERT_EQ(71820u, integration.status(h.now).dutyUsedMs);
+  for (int i = 0; i < 2500 && h.a.fx.integration.leanReceiver().status().receivedBlocks == 0; ++i) {
+    h.normalTrafficActive = i % 9 == 0;
+    const int before = h.initialData + h.authorizations + h.census;
+    h.step();
+    if (h.normalTrafficActive) EXPECT_EQ(before, h.initialData + h.authorizations + h.census);
+    ASSERT_LE(integration.status(h.now).dutyUsedMs, 72000u);
+  }
+  SCOPED_TRACE(testing::Message() << "initial DATA=" << h.initialData
+      << " AUTH=" << h.authorizations << " first readmission DATA=" << h.firstReadmissionData
+      << " clock=" << h.now << " used=" << integration.status(h.now).dutyUsedMs);
+  ASSERT_TRUE(h.lostAuthorization);
+  ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
+  if (GetParam() == usb::kStartModeBackground)
+    EXPECT_GT(h.b.fx.integration.leanReceiver().status().receivedBlocks, 0);
+  EXPECT_LT(h.now, start);
+  EXPECT_LT(h.firstReadmissionData, 6403);
+  EXPECT_LT(h.initialData, 6403);
+  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 2 : 1) + h.initialData / 32);
+  for (int i = 0; i < 180000 && !(h.ready(h.a) &&
+      (GetParam() != usb::kStartModeBackground || h.ready(h.b))); ++i) {
+    h.normalTrafficActive = i % 9 == 0;
+    const int before = h.initialData + h.authorizations + h.census + h.repairs.size();
+    h.step();
+    if (h.normalTrafficActive)
+      EXPECT_EQ(before, h.initialData + h.authorizations + h.census + h.repairs.size());
+    ASSERT_LE(integration.status(h.now).dutyUsedMs, 72000u);
+  }
+  ASSERT_TRUE(h.ready(h.a));
+  h.expectByteExact(h.a);
+  if (GetParam() == usb::kStartModeBackground) {
+    ASSERT_TRUE(h.ready(h.b));
+    h.expectByteExact(h.b);
+  }
+  EXPECT_EQ(6403, h.initialData);
+  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 2 : 1) + h.initialData / 32);
+  EXPECT_LE(h.controlTxMs * 10u, h.dataTxMs);
+  EXPECT_GE(h.now - start, 24u * 3600000u);
+  EXPECT_LE(h.now - start, 72u * 3600000u);
+  RecordProperty("campaign_ms", h.now - start);
+  RecordProperty("control_tx_ms", std::to_string(h.controlTxMs));
+  RecordProperty("data_tx_ms", std::to_string(h.dataTxMs));
+  RecordProperty("authorization_packets", h.authorizations);
+  RecordProperty("initial_data_packets", h.initialData);
+  RecordProperty("first_readmission_after_data", h.firstReadmissionData);
+  EXPECT_EQ(0, h.commits);
+}
+
+INSTANTIATE_TEST_SUITE_P(BothOnMeshModes, LoraOtaRfPacedAdmission,
+                        testing::Values(usb::kStartModeDirected, usb::kStartModeBackground),
+                        [](const testing::TestParamInfo<uint8_t>& info) {
+                          return info.param == usb::kStartModeDirected ? "Directed" : "Background";
+                        });
+
+TEST(LoraOtaRfProduct, FailedAdmissionRouteCannotBlockHealthyMulticastOrConsumeDuty) {
+  RfProductHarness h;
+  h.loseAuthorization = true;
+  h.missingAdmissionRouteA = true;
+  h.prepare(84 * 512 + 7, usb::kStartModeBackground);
+  for (int i = 0; i < 800 && !h.ready(h.b); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.b));
+  EXPECT_FALSE(h.a.fx.integration.leanReceiver().status().valid);
+  h.expectByteExact(h.b);
+  EXPECT_EQ(513, h.initialData);
+  EXPECT_LE(h.authorizations, 2 + h.initialData / 32);
+  EXPECT_LE(h.sender.fx.integration.status(h.now).dutyUsedMs, 72000u);
+  EXPECT_EQ(0, h.commits);
 }
 
 TEST(LoraOtaRfProduct, DirectNegotiatesOffFrequencySurvivesLostAckAndMoreThanSixtySecondsThenRestores) {

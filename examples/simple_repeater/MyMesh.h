@@ -31,6 +31,7 @@
 #include <helpers/IdentityStore.h>
 #include <helpers/SimpleMeshTables.h>
 #include <helpers/StaticPoolPacketManager.h>
+#include <helpers/TemporaryRadioLease.h>
 #include <helpers/StatsFormatHelper.h>
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
@@ -132,7 +133,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
   CayenneLPP telemetry;
-  unsigned long set_radio_at, revert_radio_at;
+  mesh::TemporaryRadioLease _temporary_radio_lease;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -359,6 +360,7 @@ public:
 #endif
 
   void applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr);
+  void revertTempRadioLeaseIfDue();
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {
