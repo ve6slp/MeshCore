@@ -160,6 +160,18 @@ ACL afterwards. Configure-only stays non-provisioning, monitoring stays
 read-only, and the signed runner never grants permissions. This setup command
 and its mocked tests make no hardware-success claim.
 
+After the separately authorized normal restart, capture settings and the
+complete ACL without repeating setters or an administrator grant:
+
+```sh
+make inspect-xiao-nrf52-ota-configuration \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/configuration-after-reboot-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+This read-only inspection records both identities, names, radio preferences,
+path settings and the full target ACL. Compare them with the commissioning
+capture. A settings readback is still not proof of on-air peer reception.
+
 Repeater radio readbacks describe configured preferences, not the live radio
 profile; applying them requires a separate reboot. Neither role's
 configuration readback proves reboot persistence or peer reception.
@@ -325,13 +337,11 @@ That comparison issued no flash, reset, power cycle or install command, and
 the protected board was not opened. This establishes preservation of the
 captured media, not a mesh connection or a working OTA installation.
 
-The eight-profile firmware gate passed for `bda99d13`, and immutable,
-role-specific applications have now been flashed to both approved boards.
-The first companion NAME setter (`0x08`, `OTA-LAB-CLIENT`) still returns
-`0104 BAD_STATE` before mutation. Normal settings and paired radio
-configuration are therefore incomplete. No administrator change, qualified
-target custom-loader installation, radio OTA transfer, READY, COMMIT,
-installation or rollback has been performed with these applications.
+The eight-profile firmware gate passed for `bda99d13`, and its immutable,
+role-specific applications were flashed to both approved boards.
+The first companion NAME setter (`0x08`, `OTA-LAB-CLIENT`) returned
+`0104 BAD_STATE` before mutation, blocking normal commissioning at that
+revision.
 
 The reviewed `7e3066b9` diagnostic applications subsequently passed the
 six affected OTA profile builds and were flashed to the same pair.
@@ -339,8 +349,22 @@ Read-only inspection identified the refusal on both boards: valid bank 0,
 blank custom-loader marker and stored SDK CRC `0000`, with nonzero calculated
 image CRCs. The stock Adafruit bootloader intentionally uses zero to mean
 that its optional CRC check is disabled; normal serial DFU writes that
-sentinel. The stock-only compatibility correction is pending. This finding
-does not authorize changing the qualified loader's integrity checks.
+sentinel. This finding did not authorize changing the qualified loader's
+integrity checks.
+
+On 2026-10-02, reviewed and gated `6e0b63be` applications corrected that
+stock-only compatibility issue on both boards. Actual preflight readbacks
+reported healthy stock boot, ordinary writes allowed and cache-only OTA.
+Both accepted `OTA-LAB-CLIENT`/`OTA-LAB-TARGET`, 907.525 MHz, 250 kHz,
+SF7, CR5 and three-byte path preferences without changing their public keys.
+The separate normal administrator grant added only client permission 3.
+After the six-second save opportunity and normal protocol reboots of both
+boards, read-only inspection at `06:25:47Z` confirmed the same identities,
+names, radio preferences, client path mode and complete target ACL.
+It issued no setters or replacement grant. This establishes persistence
+across those reboots, not fresh on-air peer reception or OTA installation.
+No qualified target-loader installation, radio OTA transfer, READY,
+COMMIT, installation or rollback has been performed with these applications.
 
 The uploader must remain on the stock bootloader, with only cache staging
 available after its preflight succeeds. The ordinary settings-write

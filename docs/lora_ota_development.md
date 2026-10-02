@@ -591,24 +591,39 @@ on it, since hardware qualification is ongoing.
 On 2026-10-01, both approved boards passed the existing Make targets for
 live, read-only comparison with their authenticated encrypted archives.
 Each comparison covered all 1 MiB of internal flash and 2 MiB of QSPI,
-with an exact byte-for-byte match. Neither result establishes production
-mesh service. Immutable `bda99d13` companion and repeater applications
+with an exact byte-for-byte match. Those comparisons issued no flash, reset,
+power cycle or installation command, and the protected board was not opened.
+Neither result establishes production mesh service.
+Immutable `bda99d13` companion and repeater applications
 were subsequently flashed to the approved pair, but the first companion
 NAME setter returned `0104 BAD_STATE` before mutation. Radio settings
-and administrator commissioning remain incomplete; the target's qualified
-custom bootloader has not been installed, and no radio OTA installation
-has been demonstrated. Reviewed and gated `7e3066b9` diagnostic applications
+and administrator commissioning were blocked at that revision.
+Reviewed and gated `7e3066b9` diagnostic applications
 were then flashed. Both captured early readbacks identify the stored SDK
 CRC `0000` sentinel as the refusal: calculated image CRCs are `19D3`
 (companion) and `F59D` (repeater). The stock vendor loader deliberately
 disables its optional CRC check at zero, and its normal serial DFU writer
-sets that sentinel. Stock-only compatibility is being corrected; qualified
-loader, installation and rollback integrity must not gain a blanket zero
-bypass.
+sets that sentinel. Qualified loader, installation and rollback integrity
+must not gain a blanket zero bypass.
+
+On 2026-10-02, reviewed and gated `6e0b63be` applications restored ordinary
+stock-loader writes on both boards. Their actual preflight readbacks were
+healthy, writes allowed and cache-only. Normal commissioning set
+`OTA-LAB-CLIENT`/`OTA-LAB-TARGET`, 907.525 MHz, 250 kHz, SF7, CR5 and
+three-byte path preferences, preserving both public keys. A separate
+normal administrator grant added only client permission 3.
+After the six-second save opportunity and normal protocol reboots,
+read-only inspection at `06:25:47Z` confirmed both identities, names and
+radio preferences, client path mode 2 and the complete target ACL.
+The inspection used no setters or fallback grant. Its evidence retains
+`reboot_persistence_verified: false` because the inspection does not itself
+reboot a device; persistence follows from comparison with the separately
+recorded commissioning and reboot operations.
+Fresh peer reception on this profile remains unverified. The target's
+qualified custom loader is not installed, and no replacement-protocol
+radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and
 destructive shared-domain power-cut qualification remains deferred.
-No flash, reset, power cycle or installation was performed, and the
-protected board was not opened.
 
 Destructive power cuts are deferred while the target shares the protected
 power domain. Simulated recovery and offline artifact qualification do
@@ -763,8 +778,10 @@ release notes:
     native tests**. Packaged HEX and UF2 build artifacts with marker
     verification now build separately for both the XIAO and SenseCAP
     profiles, in their own board/role-specific output directories. All
-    four current no-SWD packages use 37,812 of 38,912 bytes, leaving
-    1,100 bytes free. Historical footprints do not describe this build.
+    four reviewed `7861fdc0` no-SWD packages use 38,004 of 38,912 bytes,
+    leaving 908 bytes free. These packages do not yet include factory
+    floor initialization and must not commission a blank target.
+    Historical footprints do not describe this build.
   - The candidate and backup regions each hold at most 708,608 bytes,
     preserving the extra-filesystem range `0xD4000`–`0xED000`.
     The 811,008-byte staging stride includes receiver metadata; it is

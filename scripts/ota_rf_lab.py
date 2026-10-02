@@ -661,6 +661,27 @@ def run_inspect_ota_preflight(client, target, evidence):
     return record
 
 
+def run_inspect_configuration(client, target, evidence):
+    record = {"read_only": True, "inspection_complete": False, "acl_complete": False,
+              "nodes": {}, "raw_serial_events": "serial-events.jsonl",
+              "reboot_requested": False, "reboot_persistence_verified": False}
+    evidence.summary["measurements"]["configuration_inspection"] = record
+    for role, node, reader in (("client", client, companion_info), ("target", target, repeater_info)):
+        observed = serializable_app_info(reader(node))
+        record["nodes"][role] = observed
+        evidence.log("configuration_inspection_node", node=role, observed=observed, read_only=True)
+    nodes = record["nodes"]
+    evidence.check("node-identities-are-distinct",
+                   nodes["client"]["pubkey"] != nodes["target"]["pubkey"],
+                   client=nodes["client"]["pubkey"], target=nodes["target"]["pubkey"])
+    record["acl"] = target.get_acl()
+    record["acl_complete"] = True
+    record["client_permission"] = record["acl"].get(nodes["client"]["pubkey"])
+    record["inspection_complete"] = True
+    evidence.log("configuration_inspection_complete", **record)
+    return record
+
+
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
     roles = [CLIENT_ROLE] if client_only else [CLIENT_ROLE, TARGET_ROLE]
@@ -698,6 +719,17 @@ def resolve_preflight_roles(evidence, client_only=False):
     return devices
 
 
+def resolve_configuration_inspection_roles(evidence):
+    evidence.check("approved-configuration-inspection-roles",
+                   (CLIENT_ROLE, TARGET_ROLE) == ("client", "target"),
+                   client_role=CLIENT_ROLE, target_role=TARGET_ROLE)
+    devices = resolve_roles(evidence)
+    for role, serial in APPROVED_ADMIN_PAIR.items():
+        evidence.check(f"approved-configuration-inspection-{role}", devices[role].serial == serial,
+                       expected_serial=serial, observed_serial=devices[role].serial)
+    return devices
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
@@ -714,18 +746,23 @@ def main():
                             "live ACL verification only, no reboot or OTA")
     scope.add_argument("--inspect-ota-preflight", action="store_true",
                        help="read-only early preflight, write-latch and capability diagnostics")
+    scope.add_argument("--inspect-configuration", action="store_true",
+                       help="read-only approved pair settings and complete repeater ACL; "
+                            "no setters, grants or reboot")
     args = parser.parse_args()
     if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
         parser.error("--monitor-seconds must be finite and non-negative")
     if args.grant_client_admin and args.client_only:
         parser.error("--grant-client-admin requires both approved roles; not --client-only")
+    if args.inspect_configuration and args.client_only:
+        parser.error("--inspect-configuration requires both approved roles; not --client-only")
     if args.bandwidth_hz is not None and not args.configure_only:
         parser.error("--bandwidth-hz requires --configure-only")
     if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin
-            or args.inspect_ota_preflight):
+            or args.inspect_ota_preflight or args.inspect_configuration):
         parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
-                     "select --configure-only, --grant-client-admin, --inspect-ota-preflight "
-                     "or a positive --monitor-seconds. "
+                     "select --configure-only, --grant-client-admin, --inspect-ota-preflight, "
+                     "--inspect-configuration or a positive --monitor-seconds. "
                      "Signed transfers use ota_uploader.py with a separate explicit commit")
 
     radio = (NORMAL_RADIO if args.bandwidth_hz is None
@@ -738,6 +775,8 @@ def main():
             devices = resolve_admin_grant_roles(evidence)
         elif args.inspect_ota_preflight:
             devices = resolve_preflight_roles(evidence, client_only=args.client_only)
+        elif args.inspect_configuration:
+            devices = resolve_configuration_inspection_roles(evidence)
         else:
             devices = resolve_roles(evidence, client_only=args.client_only)
         client_device = devices[CLIENT_ROLE]
@@ -764,6 +803,8 @@ def main():
             run_grant_client_admin(client, target, evidence)
         elif args.inspect_ota_preflight:
             run_inspect_ota_preflight(client, target, evidence)
+        elif args.inspect_configuration:
+            run_inspect_configuration(client, target, evidence)
         else:
             if args.client_only:
                 run_configure_client(client, evidence, radio=radio)

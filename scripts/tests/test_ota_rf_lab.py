@@ -336,6 +336,14 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--inspect-ota-preflight", "--monitor-seconds=1"], "not allowed"),
             (["--inspect-ota-preflight", "--bandwidth-hz=62500"], "requires --configure-only"),
             (["--inspect-ota-preflight", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--inspect-configuration", "--configure-only"], "not allowed"),
+            (["--inspect-configuration", "--grant-client-admin"], "not allowed"),
+            (["--inspect-configuration", "--inspect-ota-preflight"], "not allowed"),
+            (["--inspect-configuration", "--monitor-seconds=0"], "not allowed"),
+            (["--inspect-configuration", "--monitor-seconds=1"], "not allowed"),
+            (["--inspect-configuration", "--bandwidth-hz=62500"], "requires --configure-only"),
+            (["--inspect-configuration", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--inspect-configuration", "--client-only"], "requires both approved roles"),
             (["--monitor-seconds=1", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--grant-client-admin", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--bandwidth-hz=250000"], "requires --configure-only"),
@@ -1634,6 +1642,223 @@ class OtaPreflightInspectionTests(unittest.TestCase):
                 self.assertEqual(self.client.command.call_count, 1)
                 self.assertFalse(any(call.args[0].startswith("ota ")
                                      for call in self.target.command.call_args_list))
+
+
+class ConfigurationInspectionTests(unittest.TestCase):
+    def setUp(self):
+        self.evidence = evidence_fixture()
+        self.evidence.finish = mock.Mock()
+        self.client = mock.Mock()
+        self.client.name = "client"
+        self.client.command.side_effect = [
+            self_info("observed-client", radio=(869525, 125000, 8, 6)), device_info(1),
+        ]
+        self.target = ota_rf_lab.RepeaterSerial.__new__(ota_rf_lab.RepeaterSerial)
+        self.target.name = "target"
+        self.target.evidence = self.evidence
+        self.target.buffer = bytearray()
+        self.target.pending = []
+        self.target.command = mock.Mock(side_effect=[
+            "> repeater", "> " + TARGET_KEY.hex(), "> observed-target",
+            "> 907.5250244,250,7,5", "> 2",
+        ])
+        self.target._write_bytes = mock.Mock()
+        self.target.close = mock.Mock()
+        self.target.get_acl = mock.Mock(wraps=self.target.get_acl)
+        self.acl = {CLIENT_KEY.hex(): 3, "ab" * 32: 0x83, "cd" * 32: 2}
+        self.now = 0.0
+        self.acl_batches(self.acl)
+
+        def poll(duration=0):
+            self.now += max(duration, 0.01)
+            self.target.pending.extend(next(self.batches, []))
+
+        self.target.poll = mock.Mock(side_effect=poll)
+        self.devices = {
+            role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{role}")
+            for role, serial in ota_rf_lab.APPROVED_ADMIN_PAIR.items()
+        }
+
+    def acl_batches(self, acl):
+        self.batches = iter([
+            [], ["get acl", "ACL:", *(f"{permission:02X} {key}" for key, permission in acl.items())],
+            ["get role", "  -> > repeater"],
+        ])
+
+    def run_main(self):
+        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--inspect-configuration"]
+        with mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
+                mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
+                mock.patch.object(ota_rf_lab, "FramedSerial", return_value=self.client) as client_open, \
+                mock.patch.object(ota_rf_lab, "RepeaterSerial", return_value=self.target) as target_open, \
+                mock.patch.object(ota_rf_lab, "run_configure") as configure, \
+                mock.patch.object(ota_rf_lab, "run_grant_client_admin") as grant, \
+                mock.patch.object(ota_rf_lab.time, "sleep") as sleep, \
+                mock.patch.object(ota_rf_lab.time, "monotonic", side_effect=lambda: self.now):
+            self.resolve, self.client_open, self.target_open = resolve, client_open, target_open
+            self.configure, self.grant, self.sleep = configure, grant, sleep
+            resolve.side_effect = lambda role, mode: self.devices[role]
+            ota_rf_lab.main()
+
+    def assert_read_only_commands(self):
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(b"\x16\x0d", expected=(13,)),
+        ])
+        self.assertEqual(self.target.command.call_args_list, [
+            mock.call("get role"), mock.call("get public.key"), mock.call("get name"),
+            mock.call("get radio"), mock.call("get path.hash.mode"),
+        ])
+        self.target.get_acl.assert_called_once_with()
+        self.assertEqual(self.target._write_bytes.call_args_list,
+                         [mock.call(b"get acl\r"), mock.call(b"get role\r")])
+        self.configure.assert_not_called()
+        self.grant.assert_not_called()
+        self.sleep.assert_called_once_with(2.0)
+
+    def test_inspection_records_arbitrary_valid_settings_full_acl_and_only_normal_reads(self):
+        self.run_main()
+        self.assert_read_only_commands()
+        self.assertEqual(self.resolve.call_args_list, [
+            mock.call("client", mode=ota_rf_lab.lab_device.MODE_APP),
+            mock.call("target", mode=ota_rf_lab.lab_device.MODE_APP),
+        ])
+        record = self.evidence.summary["measurements"]["configuration_inspection"]
+        self.assertTrue(record["read_only"])
+        self.assertTrue(record["inspection_complete"])
+        self.assertTrue(record["acl_complete"])
+        self.assertFalse(record["reboot_requested"])
+        self.assertFalse(record["reboot_persistence_verified"])
+        self.assertEqual(record["raw_serial_events"], "serial-events.jsonl")
+        self.assertEqual(record["acl"], self.acl)
+        self.assertEqual(record["client_permission"], 3)
+        client, target = record["nodes"]["client"], record["nodes"]["target"]
+        self.assertEqual(client["role"], "companion")
+        self.assertEqual(target["role"], "repeater")
+        self.assertEqual(client["pubkey"], CLIENT_KEY.hex())
+        self.assertEqual(target["pubkey"], TARGET_KEY.hex())
+        self.assertNotIn("pubkey_bytes", client)
+        self.assertEqual(client["name"], "observed-client")
+        self.assertEqual(target["name"], "observed-target")
+        self.assertEqual(tuple(client[key] for key in ("freq_khz", "bw_hz", "sf", "cr")),
+                         (869525, 125000, 8, 6))
+        self.assertEqual(tuple(target[key] for key in ("freq_khz", "bw_hz", "sf", "cr")),
+                         (907525, 250000, 7, 5))
+        self.assertEqual(client["path_hash_mode"], 1)
+        self.assertEqual(target["path_hash_mode"], 2)
+        self.assertEqual(target["settings_readback_scope"], "preferences")
+        self.assertNotIn("configuration_expected_radio", self.evidence.summary["measurements"])
+        self.assertNotIn("default-radio-client", self.evidence.summary["checks"])
+        self.client.close.assert_called_once()
+        self.target.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+        self.evidence.log.assert_called_with("configuration_inspection_complete", **record)
+
+    def test_missing_or_nonadmin_permission_is_observed_without_auto_grant_or_repair(self):
+        for acl, permission in (({}, None), ({"ab" * 32: 0x83}, None), ({CLIENT_KEY.hex(): 1}, 1)):
+            with self.subTest(acl=acl):
+                self.setUp()
+                self.acl_batches(acl)
+                self.run_main()
+                self.assert_read_only_commands()
+                record = self.evidence.summary["measurements"]["configuration_inspection"]
+                self.assertEqual(record["acl"], acl)
+                self.assertEqual(record["client_permission"], permission)
+                self.assertTrue(record["acl_complete"])
+                self.assertTrue(record["inspection_complete"])
+                self.assertFalse(record["reboot_persistence_verified"])
+
+    def test_incomplete_or_malformed_acl_is_fatal_with_nodes_retained_and_no_success_flag(self):
+        for batches, error in (
+            ([[], ["get acl", "ACL:", f"03 {CLIENT_KEY.hex()}"]], TimeoutError),
+            ([[], ["get acl", "ACL:", "03 bad-key"]], ValueError),
+            ([[], ["get acl", "ACL:", f"03 {CLIENT_KEY.hex()}", f"01 {CLIENT_KEY.hex()}"]], ValueError),
+        ):
+            with self.subTest(batches=batches):
+                self.setUp()
+                self.batches = iter(batches)
+                with self.assertRaises(error):
+                    self.run_main()
+                record = self.evidence.summary["measurements"]["configuration_inspection"]
+                self.assertEqual(set(record["nodes"]), {"client", "target"})
+                self.assertFalse(record["acl_complete"])
+                self.assertFalse(record["inspection_complete"])
+                self.assertNotIn("acl", record)
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+                self.client.close.assert_called_once()
+                self.target.close.assert_called_once()
+                self.grant.assert_not_called()
+                self.configure.assert_not_called()
+
+    def test_malformed_settings_stop_inspection_without_acl_reads_or_configuration_fallback(self):
+        for role in ("client", "target"):
+            with self.subTest(role=role):
+                self.setUp()
+                if role == "client":
+                    self.client.command.side_effect = [self_info(), device_info()[:81]]
+                else:
+                    self.target.command.side_effect = [
+                        "> repeater", "> " + TARGET_KEY.hex(), "> observed-target",
+                        "> 907.5250243,250,7,5",
+                    ]
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.run_main()
+                record = self.evidence.summary["measurements"]["configuration_inspection"]
+                self.assertFalse(record["inspection_complete"])
+                self.assertFalse(record["acl_complete"])
+                self.assertEqual(set(record["nodes"]), set() if role == "client" else {"client"})
+                self.target.get_acl.assert_not_called()
+                self.target._write_bytes.assert_not_called()
+                self.grant.assert_not_called()
+                self.configure.assert_not_called()
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_wrong_actual_roles_invalid_or_duplicate_identity_refuse_before_acl(self):
+        for client_frame, target_role, key in (
+            (self_info(advert_type=2), "> repeater", TARGET_KEY.hex()),
+            (self_info(public_key=bytes(32)), "> repeater", TARGET_KEY.hex()),
+            (self_info(), "> room", TARGET_KEY.hex()),
+            (self_info(), "> repeater", "00" * 32),
+            (self_info(), "> repeater", CLIENT_KEY.hex()),
+        ):
+            with self.subTest(target_role=target_role, key=key):
+                self.setUp()
+                self.client.command.side_effect = [client_frame, device_info()]
+                self.target.command.side_effect = [
+                    target_role, "> " + key, "> observed-target", "> 907.5250244,250,7,5", "> 2",
+                ]
+                with self.assertRaises((RuntimeError, AssertionError)):
+                    self.run_main()
+                self.target.get_acl.assert_not_called()
+                self.target._write_bytes.assert_not_called()
+                self.assertFalse(self.evidence.summary["measurements"]["configuration_inspection"]["inspection_complete"])
+                self.grant.assert_not_called()
+                self.configure.assert_not_called()
+
+    def test_unapproved_swapped_or_pine_usb_serial_refuses_before_either_port_opens(self):
+        for role, serial in (("client", "unapproved"), ("target", "unapproved"),
+                             ("client", "3BE94917B92DC5E9"), ("target", "4186AE911D94CDB1"),
+                             ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
+            with self.subTest(role=role, serial=serial):
+                self.setUp()
+                self.devices[role].serial = serial
+                with self.assertRaises(AssertionError):
+                    self.run_main()
+                self.client_open.assert_not_called()
+                self.target_open.assert_not_called()
+                self.client.command.assert_not_called()
+                self.target.command.assert_not_called()
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_role_override_cannot_redirect_configuration_inspection(self):
+        with mock.patch.object(ota_rf_lab, "TARGET_ROLE", "pine"):
+            with self.assertRaisesRegex(AssertionError, "approved-configuration-inspection-roles"):
+                self.run_main()
+        self.resolve.assert_not_called()
+        self.client_open.assert_not_called()
+        self.target_open.assert_not_called()
 
 
 class CompanionSigningTests(unittest.TestCase):
