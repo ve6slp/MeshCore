@@ -666,7 +666,8 @@ public:
       return finish(Result::NotStock, "marker");
     OtaNrf52RunningContext before, after;
     if (!running.read(before)) return finish(Result::IoError, "sdk-read");
-    const auto bank = ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(before.settings);
+    using Bridge = ::ota::storage::XiaoOtaActiveExtentBridge;
+    const auto bank = Bridge::decodeBank0FromRaw28Bytes(before.settings);
     const uint16_t bank1 = uint16_t(before.settings[4]) | (uint16_t(before.settings[5]) << 8);
     if (diagnostic) {
       diagnostic->sdkRead = true;
@@ -678,31 +679,30 @@ public:
     }
     if (!before.settingsTailErased) return finish(Result::InvalidRunning, "sdk-tail");
     if (bank1 != 0xfe && bank1 != 0xff) return finish(Result::InvalidRunning, "sdk-pending-bank");
-    const auto current = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(bank, before.image, before.capacity);
-    if (!current.active_image_extent) {
-      if (bank.bank_0 != ::ota::storage::kBankValidApp) return finish(Result::InvalidRunning, "sdk-bank0");
-      if (!before.image || !bank.bank_0_size || bank.bank_0_size > before.capacity ||
-          bank.bank_0_size > meshcore::ota::runtime::kOtaMaxImageBytes)
-        return finish(Result::InvalidRunning, "sdk-size");
-      if (diagnostic) {
-        diagnostic->computedCrc = ::ota::storage::XiaoOtaActiveExtentBridge::crc16Compute(
-            before.image, bank.bank_0_size);
-        diagnostic->crcKnown = true;
-      }
+    if (bank.bank_0 != ::ota::storage::kBankValidApp) return finish(Result::InvalidRunning, "sdk-bank0");
+    if (!before.image || bank.bank_0_size < 8 || bank.bank_0_size > before.capacity ||
+        bank.bank_0_size > ::ota::storage::kXiaoOtaAppInstallMaxSize ||
+        bank.bank_0_size > meshcore::ota::runtime::kOtaMaxImageBytes)
+      return finish(Result::InvalidRunning, "sdk-size");
+    if (blank(before.image, 8)) return finish(Result::InvalidRunning, "sdk-vector");
+    const uint16_t computed_crc = Bridge::crc16Compute(before.image, bank.bank_0_size);
+    if (diagnostic) { diagnostic->computedCrc = computed_crc; diagnostic->crcKnown = true; }
+    // Vendor stock DFU stores zero to disable its optional CRC; qualified paths retain the strict bridge.
+    if (bank.bank_0_crc != 0 && computed_crc != bank.bank_0_crc)
       return finish(Result::InvalidRunning, "sdk-crc");
-    }
-    if (diagnostic) { diagnostic->computedCrc = bank.bank_0_crc; diagnostic->crcKnown = true; }
+    uint8_t image_hash[32], rechecked_image_hash[32];
+    Bridge::computeFreshHash(before.image, bank.bank_0_size, image_hash);
     uint8_t digest[32], rechecked[32];
     auto result = inspectJournal(journal, digest, diagnostic);
     if (result != Result::Healthy)
       return finish(result, result == Result::InstallJournalPresent ? "install-journal" : "journal-read");
     if (!running.read(after)) return finish(Result::IoError, "sdk-recheck-read");
-    const auto current_after = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(
-        ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(after.settings), after.image, after.capacity);
     if (memcmp(before.settings, after.settings, sizeof(before.settings)) || before.image != after.image ||
-        before.capacity != after.capacity || before.settingsTailErased != after.settingsTailErased ||
-        current_after.active_image_extent != current.active_image_extent ||
-        memcmp(current_after.active_image_hash_sha256, current.active_image_hash_sha256, 32))
+        before.capacity != after.capacity || before.settingsTailErased != after.settingsTailErased)
+      return finish(Result::Changed, "sdk-changed");
+    const uint16_t rechecked_crc = Bridge::crc16Compute(after.image, bank.bank_0_size);
+    Bridge::computeFreshHash(after.image, bank.bank_0_size, rechecked_image_hash);
+    if (computed_crc != rechecked_crc || memcmp(image_hash, rechecked_image_hash, sizeof(image_hash)))
       return finish(Result::Changed, "sdk-changed");
     result = inspectJournal(journal, rechecked, diagnostic);
     if (result != Result::Healthy)
@@ -800,12 +800,17 @@ private:
       if (!::ota::platform::isOk(records.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
       hash.update(bytes, sizeof(bytes));
       if (blank(bytes, sizeof(bytes))) { found_blank = true; continue; }
+      // Match readSlot(): ignored torn bodies cannot supply ownership or phase.
+      if (le32(bytes) != Store::kMagic ||
+          le32(bytes + 184) != ::ota::storage::Crc32::computeFinalized(bytes, 184)) {
+        needs_reset = true;
+        continue;
+      }
       const uint8_t phase = bytes[12] & 0x7f;
-      if (found_blank || le32(bytes) != Store::kMagic || bytes[4] != Store::kVersion || bytes[5] ||
+      if (bytes[4] != Store::kVersion || bytes[5] ||
           bytes[6] != (Store::kRecordBytes & 0xff) || bytes[7] != (Store::kRecordBytes >> 8) ||
           !(bytes[12] & 0x80) || phase > uint8_t(Store::Phase::Failed) || phase == uint8_t(Store::Phase::Committed) ||
           le32(bytes + 8) <= sequence || (le32(bytes + 188) & Store::kCommitMarker) != Store::kCommitMarker ||
-          le32(bytes + 184) != ::ota::storage::Crc32::computeFinalized(bytes, 184) ||
           !blank(bytes + 192, sizeof(bytes) - 192)) return Result::InvalidCache;
       meshcore::ota::protocol::OtaDescriptor descriptor;
       if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(bytes + 29, 59, descriptor) !=
@@ -823,6 +828,8 @@ private:
         needs_reset = true;
         continue;
       }
+      // A partial erase can remove early slots while leaving a valid owned suffix.
+      if (found_blank) needs_reset = true;
       sequence = le32(bytes + 8);
       total_blocks = uint16_t(bytes[13]) | (uint16_t(bytes[14]) << 8);
       latest_phase = phase;

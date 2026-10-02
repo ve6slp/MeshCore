@@ -107,11 +107,18 @@ install journal and unreadable boot-proof contexts retain the write guard.
 A failed stock-cache attachment reports
 `CACHE_UNAVAILABLE` with its reason instead of silently enabling installation.
 
-Authenticated torn cache appends and erased-metadata/orphan-bitmap cuts can
-attach cache-only for an explicit owner retry or reupload. Neither boot proof
+The stock vendor loader uses stored SDK CRC zero to disable its optional
+CRC check. Stock-only preflight honours that documented convention while
+still computing the full CRC and stable SHA; nonzero stored CRC must match.
+This does not change qualified installation or trial CRC checks.
+
+Cache slots with bad magic or CRC are ignored exactly as in the candidate
+store, without importing their owner or phase. Interrupted record-body
+writes, torn commit markers and partial metadata erases can therefore
+attach cache-only for an explicit retry or reupload. Neither boot proof
 nor attachment erases storage. Valid ownership and progress remain protected;
-unsigned, nonlocal, committed, inconsistent or unreadable cache state does not
-gain attachment or installer authority.
+CRC-valid unsigned, nonlocal, committed, inconsistent or unreadable cache
+state does not gain attachment or installer authority.
 
 Read-only stock diagnostics expose the actual latched write permission and
 the captured early refusal separately from later backend capability. The
@@ -574,8 +581,22 @@ on it, since hardware qualification is ongoing.
 On 2026-10-01, both approved boards passed the existing Make targets for
 live, read-only comparison with their authenticated encrypted archives.
 Each comparison covered all 1 MiB of internal flash and 2 MiB of QSPI,
-with an exact byte-for-byte match. The boards still run the diagnostic
-applications; neither result establishes production mesh service.
+with an exact byte-for-byte match. Neither result establishes production
+mesh service. Immutable `bda99d13` companion and repeater applications
+were subsequently flashed to the approved pair, but the first companion
+NAME setter returned `0104 BAD_STATE` before mutation. Radio settings
+and administrator commissioning remain incomplete; the target's qualified
+custom bootloader has not been installed, and no radio OTA installation
+has been demonstrated. Reviewed and gated `7e3066b9` diagnostic applications
+were then flashed. Both captured early readbacks identify the stored SDK
+CRC `0000` sentinel as the refusal: calculated image CRCs are `19D3`
+(companion) and `F59D` (repeater). The stock vendor loader deliberately
+disables its optional CRC check at zero, and its normal serial DFU writer
+sets that sentinel. Stock-only compatibility is being corrected; qualified
+loader, installation and rollback integrity must not gain a blanket zero
+bypass.
+The uploader remains on the stock bootloader. Pine is untouched, and
+destructive shared-domain power-cut qualification remains deferred.
 No flash, reset, power cycle or installation was performed, and the
 protected board was not opened.
 

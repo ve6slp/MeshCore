@@ -15,8 +15,9 @@ The approved bench pair now has immutable applications, but normal settings
 and radio setup remain incomplete. No administrator change or qualified
 target custom-loader installation has been performed. Keep the uploader on
 the stock bootloader; only cache staging is available after its preflight
-succeeds. Its ordinary settings-write refusal is under diagnosis;
-installing a custom loader is not a workaround.
+succeeds. The bench refusal comes from the stock vendor's documented
+zero-CRC SDK convention; a stock-only compatibility correction is pending.
+Installing a custom uploader loader is not a workaround.
 
 ## Update policy
 

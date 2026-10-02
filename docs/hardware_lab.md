@@ -332,9 +332,19 @@ The first companion NAME setter (`0x08`, `OTA-LAB-CLIENT`) still returns
 configuration are therefore incomplete. No administrator change, qualified
 target custom-loader installation, radio OTA transfer, READY, COMMIT,
 installation or rollback has been performed with these applications.
+
+The reviewed `7e3066b9` diagnostic applications subsequently passed the
+six affected OTA profile builds and were flashed to the same pair.
+Read-only inspection identified the refusal on both boards: valid bank 0,
+blank custom-loader marker and stored SDK CRC `0000`, with nonzero calculated
+image CRCs. The stock Adafruit bootloader intentionally uses zero to mean
+that its optional CRC check is disabled; normal serial DFU writes that
+sentinel. The stock-only compatibility correction is pending. This finding
+does not authorize changing the qualified loader's integrity checks.
+
 The uploader must remain on the stock bootloader, with only cache staging
-available after its preflight succeeds. Its ordinary settings-write
-refusal is under diagnosis, not permission to install a custom loader.
+available after its preflight succeeds. The ordinary settings-write
+refusal is not permission to install a custom uploader loader.
 Local power-failure recovery for torn or orphaned cache
 metadata remains an open risk. This is not production qualification.
 
