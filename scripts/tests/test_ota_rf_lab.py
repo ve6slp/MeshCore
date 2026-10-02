@@ -330,6 +330,10 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--grant-client-admin", "--monitor-seconds=1"], "not allowed"),
             (["--grant-client-admin", "--monitor-seconds=0"], "not allowed"),
             (["--grant-client-admin", "--client-only"], "requires both approved roles"),
+            (["--monitor-seconds=1", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--grant-client-admin", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--client-only", "--bandwidth-hz=62500"], "requires --configure-only"),
             (["--grant-client"], "unrecognized arguments"),
             (["--configure"], "unrecognized arguments"),
         ):
@@ -365,6 +369,30 @@ class LabRoleTransportTests(unittest.TestCase):
                     self.assertEqual(raised.exception.code, 2)
                     self.assertIn("finite and non-negative", errors.getvalue())
                     resolve.assert_not_called()
+
+    def test_invalid_or_unsupported_bandwidth_is_refused_before_any_physical_access(self):
+        for bandwidth in ("nan", "inf", "-inf", "250000.0", "250000.5", "2.5e5",
+                          "0x3d090", "-250000", "0", "7799", "7812", "15625", "100000",
+                          "249999", "250001", "500001", ""):
+            with self.subTest(bandwidth=bandwidth):
+                arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--configure-only",
+                             f"--bandwidth-hz={bandwidth}"]
+                with mock.patch.object(sys, "argv", arguments), \
+                        mock.patch.object(ota_rf_lab, "Evidence") as evidence, \
+                        mock.patch.object(ota_rf_lab, "resolve_roles") as resolve, \
+                        mock.patch.object(ota_rf_lab, "FramedSerial") as client, \
+                        mock.patch.object(ota_rf_lab, "RepeaterSerial") as target, \
+                        mock.patch.object(ota_rf_lab.os, "open") as open_port, \
+                        contextlib.redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(SystemExit) as raised:
+                        ota_rf_lab.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("--bandwidth-hz", errors.getvalue())
+                    evidence.assert_not_called()
+                    resolve.assert_not_called()
+                    client.assert_not_called()
+                    target.assert_not_called()
+                    open_port.assert_not_called()
 
     def run_main_fixture(self, options, client_frame=None, target_role="> repeater"):
         self.devices = {
@@ -435,7 +463,8 @@ class LabRoleTransportTests(unittest.TestCase):
     def test_paired_configuration_dispatches_to_role_correct_helper(self):
         client, target = self.run_main_fixture(["--configure-only"])
         self.configure.assert_called_once_with(client.return_value, target.return_value,
-                                                self.evidence.return_value)
+                                                self.evidence.return_value,
+                                                radio=ota_rf_lab.NORMAL_RADIO)
         self.configure_client.assert_not_called()
         target.assert_called_once()
         self.evidence.return_value.finish.assert_called_once_with(None)
@@ -454,7 +483,30 @@ class LabRoleTransportTests(unittest.TestCase):
         client, target = self.run_main_fixture(["--client-only", "--configure-only"])
         target.assert_not_called()
         self.configure.assert_not_called()
-        self.configure_client.assert_called_once_with(client.return_value, self.evidence.return_value)
+        self.configure_client.assert_called_once_with(client.return_value, self.evidence.return_value,
+                                                     radio=ota_rf_lab.NORMAL_RADIO)
+
+    def test_supported_bandwidths_dispatch_only_the_selected_radio_profile(self):
+        self.assertEqual(ota_rf_lab.SUPPORTED_LORA_BANDWIDTHS_HZ,
+                         (7800, 10400, 15600, 20800, 31250, 41700,
+                          62500, 125000, 250000, 500000))
+        for bandwidth in ota_rf_lab.SUPPORTED_LORA_BANDWIDTHS_HZ:
+            with self.subTest(bandwidth=bandwidth):
+                client, target = self.run_main_fixture(
+                    ["--configure-only", f"--bandwidth-hz={bandwidth}"])
+                self.configure.assert_called_once_with(
+                    client.return_value, target.return_value, self.evidence.return_value,
+                    radio=(907525, bandwidth, 7, 5))
+                self.configure_client.assert_not_called()
+                self.assertEqual(ota_rf_lab.NORMAL_RADIO, (907525, 62500, 7, 5))
+
+    def test_client_only_bandwidth_override_does_not_open_target(self):
+        client, target = self.run_main_fixture(
+            ["--configure-only", "--client-only", "--bandwidth-hz=250000"])
+        target.assert_not_called()
+        self.configure.assert_not_called()
+        self.configure_client.assert_called_once_with(
+            client.return_value, self.evidence.return_value, radio=(907525, 250000, 7, 5))
 
 
 class CompanionConfigurationTests(unittest.TestCase):
@@ -735,6 +787,116 @@ class PairedConfigurationTests(unittest.TestCase):
         ]
         self.target = repeater_fixture()
         self.evidence = evidence_fixture()
+
+    def bandwidth_fixture(self, bandwidth, client_readback=None, target_readback=None):
+        client_radio = (907525, bandwidth if client_readback is None else client_readback, 7, 5)
+        target_bandwidth = bandwidth if target_readback is None else target_readback
+        self.client.command.side_effect = [
+            self_info("existing-client"), device_info(0), b"\x00", b"\x00", b"\x00",
+            self_info(radio=client_radio), device_info(),
+        ]
+        self.target = repeater_fixture({
+            "get radio": ["> 907.5250244,62.5,7,5",
+                          f"> 907.5250244,{target_bandwidth / 1000:g},7,5"],
+            f"set radio 907.525,{bandwidth / 1000:g},7,5": ["OK - reboot to apply"],
+        })
+
+    def test_default_and_250khz_override_use_actual_readbacks_exact_setters_and_selected_evidence(self):
+        for override in (None, 62500, 250000):
+            with self.subTest(override=override):
+                self.setUp()
+                bandwidth = 62500 if override is None else override
+                self.bandwidth_fixture(bandwidth)
+                self.evidence.finish = mock.Mock()
+                arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--configure-only"]
+                if override is not None:
+                    arguments.append(f"--bandwidth-hz={override}")
+                devices = {
+                    role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{role}")
+                    for role, serial in ota_rf_lab.APPROVED_ADMIN_PAIR.items()
+                }
+                with mock.patch.object(sys, "argv", arguments), \
+                        mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
+                        mock.patch.object(ota_rf_lab, "resolve_roles", return_value=devices), \
+                        mock.patch.object(ota_rf_lab, "FramedSerial", return_value=self.client), \
+                        mock.patch.object(ota_rf_lab, "RepeaterSerial", return_value=self.target), \
+                        mock.patch.object(ota_rf_lab.time, "sleep"):
+                    ota_rf_lab.main()
+                radio = [907525, bandwidth, 7, 5]
+                self.assertEqual(self.client.command.call_args_list, [
+                    mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+                    mock.call(b"\x16\x0d", expected=(13,)),
+                    mock.call(b"\x08OTA-LAB-CLIENT"),
+                    mock.call(b"\x0b" + struct.pack("<II", 907525, bandwidth) + bytes([7, 5, 0])),
+                    mock.call(b"\x3d\x00\x02"),
+                    mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+                    mock.call(b"\x16\x0d", expected=(13,)),
+                ])
+                self.assertEqual(self.target.command.call_args_list, [
+                    mock.call("get role"), mock.call("get public.key"), mock.call("get name"),
+                    mock.call("get radio"), mock.call("get path.hash.mode"),
+                    mock.call("set name OTA-LAB-TARGET"),
+                    mock.call(f"set radio 907.525,{bandwidth / 1000:g},7,5"),
+                    mock.call("set path.hash.mode 2"),
+                    mock.call("get role"), mock.call("get public.key"), mock.call("get name"),
+                    mock.call("get radio"), mock.call("get path.hash.mode"),
+                ])
+                measurements = self.evidence.summary["measurements"]
+                self.assertEqual(measurements["configuration_expected_radio"], radio)
+                self.assertEqual(measurements["acl_before"], measurements["acl_after"])
+                self.assertEqual(self.target.get_acl.call_count, 2)
+                for role, key in (("client", CLIENT_KEY.hex()), ("target", TARGET_KEY.hex())):
+                    self.assertEqual(measurements["configured"][role]["bw_hz"], bandwidth)
+                    self.assertEqual(measurements["configured"][role]["pubkey"], key)
+                    self.assertEqual(measurements["configured"][role]["path_hash_mode"], 2)
+                    check = self.evidence.summary["checks"][f"default-radio-{role}"]
+                    self.assertTrue(check["passed"])
+                    self.assertEqual(check["expected_radio"], radio)
+                    self.assertFalse(check["active_rf_verified"])
+                readbacks = [call.kwargs for call in self.evidence.log.call_args_list
+                             if call.args == ("configuration_readback",)]
+                self.assertEqual(len(readbacks), 2)
+                self.assertTrue(all(row["expected_radio"] == radio for row in readbacks))
+                self.assertTrue(all(not row["reboot_persistence_verified"] for row in readbacks))
+                self.assertEqual(ota_rf_lab.NORMAL_RADIO, (907525, 62500, 7, 5))
+                self.evidence.finish.assert_called_once_with(None)
+
+    def test_selected_bandwidth_requires_both_role_readbacks_without_falling_back_to_default(self):
+        for role in ("client", "target"):
+            with self.subTest(role=role):
+                self.setUp()
+                readbacks = {f"{role}_readback": 62500}
+                self.bandwidth_fixture(250000, **readbacks)
+                with self.assertRaisesRegex(AssertionError, f"default-radio-{role}"):
+                    ota_rf_lab.run_configure(self.client, self.target, self.evidence,
+                                            radio=(907525, 250000, 7, 5))
+                check = self.evidence.summary["checks"][f"default-radio-{role}"]
+                self.assertFalse(check["passed"])
+                self.assertEqual(check["expected_radio"], [907525, 250000, 7, 5])
+                self.assertEqual(self.evidence.summary["measurements"]["configuration_expected_radio"],
+                                 [907525, 250000, 7, 5])
+                self.assertNotIn(role, self.evidence.summary["measurements"].get("configured", {}))
+                self.assertIn(
+                    mock.call(b"\x0b" + struct.pack("<II", 907525, 250000) + bytes([7, 5, 0])),
+                    self.client.command.call_args_list)
+                self.assertFalse(any(call.args[0] == "set radio 907.525,62.5,7,5"
+                                     for call in self.target.command.call_args_list))
+
+    def test_override_radio_setter_still_requires_exact_reboot_pending_ok(self):
+        for reply in ("OK", "OK - reboot to apply extra", "Err - bad param"):
+            with self.subTest(reply=reply):
+                self.setUp()
+                self.bandwidth_fixture(250000)
+                original = self.target.command.side_effect
+                setter = "set radio 907.525,250,7,5"
+                self.target.command.side_effect = (
+                    lambda command: reply if command == setter else original(command))
+                with self.assertRaisesRegex(RuntimeError, "repeater command failed"):
+                    ota_rf_lab.run_configure(self.client, self.target, self.evidence,
+                                            radio=(907525, 250000, 7, 5))
+                self.assertEqual(self.target.command.call_args_list[-1], mock.call(setter))
+                self.assertEqual(self.target.get_acl.call_count, 1)
+                self.assertNotIn("target", self.evidence.summary["measurements"]["configured"])
 
     def test_paired_configuration_preserves_identities_and_every_existing_acl_entry(self):
         client_info, target_info = ota_rf_lab.run_configure(self.client, self.target, self.evidence)

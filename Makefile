@@ -76,6 +76,7 @@ VERIFY_OTA_INSTALL_ARTIFACT = python3 bootloader/xiao_nrf52840_ota/tools/install
 	--validate-only --board "$(XIAO_OTA_BOARD)" --role-id "$(XIAO_OTA_ROLE_ID)"
 OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_MONITOR_SECONDS ?= 60
+OTA_LAB_BANDWIDTH_HZ ?= 62500
 OTA_LAB_CLIENT_PROTOCOL ?= companion
 OTA_LAB_TARGET_PROTOCOL ?= repeater
 OTA_UPLOAD_IMAGE ?=
@@ -339,10 +340,12 @@ enter-xiao-nrf52-target-bootloader: tmpdir
 	@$(LAB_DEVICE) bootloader target
 
 configure-xiao-nrf52-ota-lab: tmpdir
-	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --configure-only
+	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --configure-only \
+	  --bandwidth-hz "$(OTA_LAB_BANDWIDTH_HZ)"
 
 configure-xiao-nrf52-ota-client: tmpdir
-	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --client-only --configure-only
+	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --client-only --configure-only \
+	  --bandwidth-hz "$(OTA_LAB_BANDWIDTH_HZ)"
 
 grant-xiao-nrf52-ota-client-admin: tmpdir
 	@mkdir -p -- "$$(dirname -- "$(OTA_LAB_ARTIFACT_DIR)")"

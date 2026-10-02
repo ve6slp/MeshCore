@@ -54,6 +54,9 @@ MAX_SERIAL_FRAME_SIZE = 176
 ADV_TYPE_CHAT = 1  # src/helpers/AdvertDataHelpers.h
 
 NORMAL_RADIO = (907525, 62500, 7, 5)
+SUPPORTED_LORA_BANDWIDTHS_HZ = (
+    7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000,
+)
 PATH_HASH_MODE = 2
 CLIENT_NAME = "OTA-LAB-CLIENT"
 TARGET_NAME = "OTA-LAB-TARGET"
@@ -445,11 +448,11 @@ def require_repeater_ok(node, command, expected="OK"):
         raise RuntimeError(f"{node.name}: repeater command failed for {command!r}: {reply!r}")
 
 
-def configure_repeater(node, before=None):
+def configure_repeater(node, before=None, radio=NORMAL_RADIO):
     if before is None:
         before = repeater_info(node)
     require_repeater_ok(node, f"set name {TARGET_NAME}")
-    freq, bw, sf, cr = NORMAL_RADIO
+    freq, bw, sf, cr = radio
     require_repeater_ok(node, f"set radio {freq / 1000:g},{bw / 1000:g},{sf},{cr}",
                         expected="OK - reboot to apply")
     require_repeater_ok(node, f"set path.hash.mode {PATH_HASH_MODE}")
@@ -459,13 +462,13 @@ def configure_repeater(node, before=None):
     return info
 
 
-def configure_node(node, name, before=None):
+def configure_node(node, name, before=None, radio=NORMAL_RADIO):
     if not re.fullmatch(r"[\x20-\x7e]{1,31}", name):
         raise ValueError("companion name must be 1..31 printable ASCII bytes")
     if before is None:
         before = companion_info(node)
     require_ok(node, bytes([CMD_SET_ADVERT_NAME]) + name.encode("ascii"))
-    freq, bw, sf, cr = NORMAL_RADIO
+    freq, bw, sf, cr = radio
     require_ok(node, bytes([CMD_SET_RADIO_PARAMS]) + struct.pack("<II", freq, bw) + bytes([sf, cr, 0]))
     require_ok(node, bytes([CMD_SET_PATH_HASH_MODE, 0, PATH_HASH_MODE]))
     info = companion_info(node)
@@ -474,33 +477,35 @@ def configure_node(node, name, before=None):
     return info
 
 
-def record_configuration(evidence, role, before, info, name):
+def record_configuration(evidence, role, before, info, name, radio=NORMAL_RADIO):
     observed = serializable_app_info(info)
     evidence.check(f"identity-{role}-preserved", info["pubkey"] == before["pubkey"],
                    before=before["pubkey"], after=info["pubkey"])
     evidence.check(f"default-radio-{role}",
-                   (info["freq_khz"], info["bw_hz"], info["sf"], info["cr"]) == NORMAL_RADIO,
-                   observed=observed, active_rf_verified=False)
+                   (info["freq_khz"], info["bw_hz"], info["sf"], info["cr"]) == radio,
+                   observed=observed, expected_radio=list(radio), active_rf_verified=False)
     evidence.check(f"configured-name-{role}", info["name"] == name, observed=observed)
     evidence.check(f"path-hash-mode-{role}", info["path_hash_mode"] == PATH_HASH_MODE,
                    observed=observed, bytes_per_hash=3, physical_path_verified=False)
     evidence.summary["measurements"].setdefault("configured", {})[role] = observed
-    evidence.log("configuration_readback", node=role, observed=observed,
+    evidence.log("configuration_readback", node=role, observed=observed, expected_radio=list(radio),
                  settings_readback_scope=info["settings_readback_scope"],
                  reboot_persistence_verified=False, active_rf_verified=False)
 
 
-def run_configure_client(client, evidence, before=None):
+def run_configure_client(client, evidence, before=None, radio=NORMAL_RADIO):
+    evidence.summary["measurements"]["configuration_expected_radio"] = list(radio)
     if before is None:
         before = companion_info(client)
     evidence.summary["measurements"].setdefault("configuration_before", {})["client"] = (
         serializable_app_info(before))
-    client_info = configure_node(client, CLIENT_NAME, before=before)
-    record_configuration(evidence, "client", before, client_info, CLIENT_NAME)
+    client_info = configure_node(client, CLIENT_NAME, before=before, radio=radio)
+    record_configuration(evidence, "client", before, client_info, CLIENT_NAME, radio=radio)
     return client_info
 
 
-def run_configure(client, target, evidence):
+def run_configure(client, target, evidence, radio=NORMAL_RADIO):
+    evidence.summary["measurements"]["configuration_expected_radio"] = list(radio)
     client_before = companion_info(client)
     target_before = repeater_info(target)
     evidence.check("node-identities-are-distinct",
@@ -510,14 +515,14 @@ def run_configure(client, target, evidence):
     evidence.summary["measurements"]["acl_before"] = acl_before
     evidence.summary["measurements"].setdefault("configuration_before", {})["target"] = (
         serializable_app_info(target_before))
-    client_info = run_configure_client(client, evidence, before=client_before)
-    target_info = configure_repeater(target, before=target_before)
+    client_info = run_configure_client(client, evidence, before=client_before, radio=radio)
+    target_info = configure_repeater(target, before=target_before, radio=radio)
     acl_after = target.get_acl()
     evidence.summary["measurements"]["acl_after"] = acl_after
     evidence.check("repeater-acl-preserved", acl_after == acl_before,
                    before=acl_before, after=acl_after, admin_provisioned=False,
                    reboot_persistence_verified=False)
-    record_configuration(evidence, "target", target_before, target_info, TARGET_NAME)
+    record_configuration(evidence, "target", target_before, target_info, TARGET_NAME, radio=radio)
     evidence.log("repeater_radio_application_pending", reboot_required=True,
                  reboot_requested=False, active_rf_verified=False)
     return client_info, target_info
@@ -606,6 +611,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--client-only", action="store_true")
+    parser.add_argument("--bandwidth-hz", type=int, choices=SUPPORTED_LORA_BANDWIDTHS_HZ,
+                       help="configure-only LoRa bandwidth in integer Hz (default: 62500)")
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--configure-only", action="store_true",
                        help="configure ordinary radio/name/path settings; never provision ADMIN or run OTA")
@@ -619,11 +626,15 @@ def main():
         parser.error("--monitor-seconds must be finite and non-negative")
     if args.grant_client_admin and args.client_only:
         parser.error("--grant-client-admin requires both approved roles; not --client-only")
+    if args.bandwidth_hz is not None and not args.configure_only:
+        parser.error("--bandwidth-hz requires --configure-only")
     if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin):
         parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
                      "select --configure-only, --grant-client-admin or a positive --monitor-seconds. "
                      "Signed transfers use ota_uploader.py with a separate explicit commit")
 
+    radio = (NORMAL_RADIO if args.bandwidth_hz is None
+             else (NORMAL_RADIO[0], args.bandwidth_hz, *NORMAL_RADIO[2:]))
     evidence = Evidence(args.artifact_dir)
     client = target = None
     error = None
@@ -656,9 +667,9 @@ def main():
             run_grant_client_admin(client, target, evidence)
         else:
             if args.client_only:
-                run_configure_client(client, evidence)
+                run_configure_client(client, evidence, radio=radio)
             else:
-                run_configure(client, target, evidence)
+                run_configure(client, target, evidence, radio=radio)
     except (Exception, SystemExit) as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)

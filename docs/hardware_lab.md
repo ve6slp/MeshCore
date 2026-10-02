@@ -102,8 +102,15 @@ qualification. The RF harness now monitors the binary companion client
 and the repeater's text CLI separately.
 
 `make configure-xiao-nrf52-ota-lab` uses each role's actual protocol to
-configure the pair for 907.525 MHz, 62.5 kHz bandwidth, SF7, CR5 and
-three-byte path hashes. It checks both roles and full public keys before
+configure the pair for 907.525 MHz, **62.5 kHz bandwidth by default**, SF7,
+CR5 and three-byte path hashes. For the separately authorized higher-bandwidth
+bench configuration, use `OTA_LAB_BANDWIDTH_HZ=250000` with that Make target
+(the helper accepts `--configure-only --bandwidth-hz 250000`). Only bandwidth
+changes: both setters, readback checks and evidence use the selected profile.
+Supported integer-Hz overrides are 7800, 10400, 15600, 20800, 31250, 41700,
+62500, 125000, 250000 and 500000; unsupported values are refused before
+opening ports. The option is configure-only, not monitor or grant, and does
+not set duty cycle. It checks both roles and full public keys before
 making changes, then requires unchanged identities and complete
 administrator ACL readbacks. It does not grant administrator permissions,
 transfer an image, commit an update or reboot either board. Client-only
@@ -214,10 +221,12 @@ Select `OTA_SIGNED_LAB_MODE=direct` for 908525 kHz and 60-second leases;
 firmware owns restoration and renewal. Background requires an existing
 configured channel through `OTA_SIGNED_LAB_CHANNEL`. The default share
 is 2%, with a 72-hour host timeout, not a completion guarantee. A
-supervised full-image smoke run requires both
-`OTA_SIGNED_LAB_DUTY=100000` and
+supervised full-image smoke run requires
+`OTA_SIGNED_LAB_DUTY=95000` (95%) or `100000` (100%), together with
 `OTA_SIGNED_LAB_EXTRA=--supervised-full-image-smoke`; it is not 2%
-acceptance. To resume the same candidate, pass
+acceptance. Both peers may use the separately verified 250 kHz bench
+profile; the default remains 62.5 kHz. Use the same mode, duty share and
+supervision settings for stage and commit. To resume the same candidate, pass
 `OTA_SIGNED_LAB_EXTRA='--baseline-record /path/to/prior/baseline.json'`.
 Different local-cache content still requires an independent, explicit
 abort, not force-overwrite.

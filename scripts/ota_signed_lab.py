@@ -76,12 +76,16 @@ requests 908525 kHz/60000 ms; production uploader firmware renews bounded leases
 and resumes the bitmap, and the app owns SF5, not this host. Active SF5 and lease
 renewal are NOT measured here. After READY wait a full lease before testing
 ordinary peer advert reception. Default 2000 milli-percent is 2%; explicitly
-passing 100000 AND --supervised-full-image-smoke is 100% supervised smoke,
-NEVER 2% acceptance. No measured-duty/budget-saturation counters are exposed by
+passing 95000 or 100000 AND --supervised-full-image-smoke is 95% or 100%
+supervised smoke, NEVER 2% acceptance. The approved normal pair may use
+62.5 kHz or 250 kHz bandwidth at 907.525 MHz/SF7/CR5/path3; both peers must
+agree and retain their actual captured configuration. This runner does not
+configure radio settings. No measured-duty/budget-saturation counters are exposed by
 these status APIs; requested share and peer reception do not prove fairness.
 No multihop, fleet, power-cut, rollback or full-configuration-media qualification.
-Both approved boards currently run diagnostic firmware: MAIN must first close
-the software review, approve commissioning and install qualified role packages.
+MAIN must close the current commissioning/recovery gate and use qualified role
+packages before hardware execution; bench application readbacks are not OTA
+qualification.
 The earlier frozen uploader snapshot had CacheBegin owner32 and remote COMMIT
 no-snapshot echo ABI mismatches; MAIN must use the owner's corrected production
 helper before running hardware. The receiver's missing automatic remote-COMMIT
@@ -107,6 +111,7 @@ import ota_uploader as ota
 
 
 APPROVED = {"client": "4186AE911D94CDB1", "target": "3BE94917B92DC5E9"}
+APPROVED_RADIOS = ((907525, 62500, 7, 5), (907525, 250000, 7, 5))
 RECORD_VERSION = 1
 ACTIVE_PHASES = {"erasing", "receiving", "verifying", "ready"}
 BOOT_PATTERN = re.compile(
@@ -222,15 +227,16 @@ def check_floor(status, candidate):
 
 
 def profile(args):
-    require(args.duty_milli_percent in (2000, 100000), "use 2000 (2%) or explicit 100000 smoke")
-    require(args.duty_milli_percent != 100000 or args.supervised_full_image_smoke,
-            "100000 is 100% smoke and requires --supervised-full-image-smoke")
+    require(args.duty_milli_percent in (2000, 95000, 100000),
+            "use 2000 (2%) or explicit 95000/100000 supervised smoke")
+    require(args.duty_milli_percent == 2000 or args.supervised_full_image_smoke,
+            "95%/100% smoke requires --supervised-full-image-smoke")
     frequency, lease = (908525, 60000) if args.mode == "direct" else (0, 0)
     body = ota.start_body(args.mode, args.channel, frequency, lease, args.duty_milli_percent)
     return body, {"mode": args.mode, "channel": args.channel, "frequency_khz": frequency,
                   "lease_ms": lease, "duty_milli_percent": args.duty_milli_percent,
                   "budget_class": "2_percent_requested_not_measured" if args.duty_milli_percent == 2000
-                  else "100_percent_supervised_smoke_not_2_percent_acceptance"}
+                  else f"{args.duty_milli_percent // 1000}_percent_supervised_smoke_not_2_percent_acceptance"}
 
 
 def approved_device(role):
@@ -323,9 +329,12 @@ def capture(pair, candidate, evidence, deadline, uploader=None):
     target = lab.repeater_info(pair.target)
     require(client["pubkey"] != target["pubkey"], "client and target public keys collide")
     for role, info in (("client", client), ("target", target)):
-        require(tuple(info[k] for k in ("freq_khz", "bw_hz", "sf", "cr")) == lab.NORMAL_RADIO
+        require(tuple(info[k] for k in ("freq_khz", "bw_hz", "sf", "cr")) in APPROVED_RADIOS
                 and info["path_hash_mode"] == lab.PATH_HASH_MODE,
-                f"{role} is not configured for 907.525/BW62.5/SF7/CR5/path3")
+                f"{role} is not configured for approved 907.525/BW62.5 or BW250/SF7/CR5/path3")
+    require(tuple(client[k] for k in ("freq_khz", "bw_hz", "sf", "cr"))
+            == tuple(target[k] for k in ("freq_khz", "bw_hz", "sf", "cr")),
+            "approved client and target normal radio configurations disagree")
     acl = pair.target.get_acl()
     require(acl.get(client["pubkey"], 0) & 3 == 3,
             "actual companion public key lacks existing target ADMIN ACL; no grant attempted")

@@ -61,6 +61,7 @@ class Companion:
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.commands = []
         self.pending = []
+        self.radio = lab.NORMAL_RADIO
         self.boot = b"boot=unknown phase=unknown floor=unknown counter=0 verified=0 image=unknown"
         self.signed_data = None
 
@@ -70,8 +71,8 @@ class Companion:
             frame = bytearray(58)
             frame[0], frame[1] = lab.RESP_SELF_INFO, lab.ADV_TYPE_CHAT
             frame[4:36] = self.public_key
-            struct.pack_into("<II", frame, 48, *lab.NORMAL_RADIO[:2])
-            frame[56:58] = bytes(lab.NORMAL_RADIO[2:])
+            struct.pack_into("<II", frame, 48, *self.radio[:2])
+            frame[56:58] = bytes(self.radio[2:])
             return bytes(frame) + b"captured-client"
         if payload[0] == lab.CMD_DEVICE_QUERY:
             frame = bytearray(82)
@@ -112,11 +113,13 @@ class Target:
         self.commands = []
         self.peer = companion
         self.key = TARGET_KEY
+        self.radio = lab.NORMAL_RADIO
 
     def command(self, command, **kwargs):
         self.commands.append(command)
         values = {"get role": "repeater", "get public.key": self.key.hex(),
-                  "get name": "captured-target", "get radio": "907.525,62.5,7,5",
+                  "get name": "captured-target",
+                  "get radio": f"{self.radio[0] / 1000:g},{self.radio[1] / 1000:g},{self.radio[2]},{self.radio[3]}",
                   "get path.hash.mode": "2"}
         if command in values:
             return "> " + values[command]
@@ -557,6 +560,94 @@ class SignedLabTests(unittest.TestCase):
         self.assertEqual(record["profile"]["budget_class"],
                          "100_percent_supervised_smoke_not_2_percent_acceptance")
         self.assertIn('"measured_duty_evidence_available": false', self.output.getvalue())
+
+    def test_95000_requires_supervision_and_real_uploader_records_250khz_pair(self):
+        self.args.duty_milli_percent = 95000
+        with self.assertRaisesRegex(signed.QualificationError, "requires --supervised"):
+            signed.profile(self.args)
+        self.args.supervised_full_image_smoke = True
+        for mode in ("direct", "directed", "background"):
+            with self.subTest(mode=mode):
+                node = ProductCompanion()
+                node.radio = node.target.radio = (907525, 250000, 7, 5)
+                pair = SimpleNamespace(client=node, target=node.target)
+                uploader = ota.Uploader(node, self.evidence)
+                self.args.mode, self.args.channel = mode, 2 if mode == "background" else 255
+                record = self.product_stage(node, pair, uploader, self.candidate, "95-percent-" + mode)
+                start = next(packet for packet in node.packets if packet[1] == ota.Op.START)
+                self.assertEqual(struct.unpack_from(">I", start, 10)[0], 95000)
+                self.assertEqual(record["profile"]["budget_class"],
+                                 "95_percent_supervised_smoke_not_2_percent_acceptance")
+                self.assertEqual(record["client"]["bw_hz"], 250000)
+                self.assertEqual(record["target"]["bw_hz"], 250000)
+                self.assertEqual(record["ready"]["counter"], self.candidate.counter)
+                self.assertEqual(record["candidate"]["image_sha256"], self.args.image_sha256)
+                self.assertNotIn(ota.Op.COMMIT, [packet[1] for packet in node.packets])
+                self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in node.packets])
+                self.assertNotIn(lab.CMD_SET_RADIO_PARAMS, [packet[0] for packet in node.commands])
+                self.assertFalse(any(command.startswith("set") or command == "reboot"
+                                     for command in node.target.commands))
+
+    def test_invalid_duties_fail_before_hardware_even_with_supervision(self):
+        for value in (-1, 0, 100001):
+            for supervised in (False, True):
+                flags = ["--supervised-full-image-smoke"] if supervised else []
+                with self.subTest(value=value, supervised=supervised), mock.patch.object(signed, "Pair") as opened:
+                    with self.assertRaises(signed.QualificationError):
+                        signed.main(["--artifact-dir", str(self.directory / "unused"), "stage"]
+                                    + self.arguments + ["--duty-milli-percent", str(value)] + flags)
+                    opened.assert_not_called()
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch.object(signed, "Pair") as opened:
+            with self.assertRaises(SystemExit):
+                signed.main(["--artifact-dir", str(self.directory / "unused"), "stage"]
+                            + self.arguments + ["--duty-milli-percent", "95000.5",
+                                                "--supervised-full-image-smoke"])
+            opened.assert_not_called()
+
+    def test_radio_bandwidth_mismatch_or_unapproved_profile_is_not_admitted(self):
+        for client_radio, target_radio in (
+                ((907525, 250000, 7, 5), (907525, 62500, 7, 5)),
+                ((907525, 500000, 7, 5), (907525, 500000, 7, 5)),
+                ((908525, 250000, 7, 5), (908525, 250000, 7, 5)),
+                ((907525, 250000, 5, 5), (907525, 250000, 5, 5))):
+            with self.subTest(client=client_radio, target=target_radio):
+                self.client.radio, self.target.radio = client_radio, target_radio
+                with self.assertRaises(signed.QualificationError):
+                    self.run_stage()
+                self.assertEqual(self.uploader.ops, [])
+
+    def test_observed_250khz_configuration_must_remain_preserved_after_ready(self):
+        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+        original = self.uploader.start
+
+        def changed(*values):
+            original(*values)
+            self.client.radio = self.target.radio = (907525, 62500, 7, 5)
+
+        self.uploader.start = changed
+        with self.assertRaisesRegex(signed.QualificationError, "differs from saved baseline"):
+            self.run_stage()
+        baseline = json.loads((self.evidence.directory / "baseline.json").read_text())
+        self.assertEqual(baseline["client"]["bw_hz"], 250000)
+        self.assertEqual(baseline["target"]["bw_hz"], 250000)
+        self.assertFalse((self.evidence.directory / "ready.json").exists())
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+
+    def test_95000_250khz_explicit_commit_keeps_existing_install_proof_contract(self):
+        self.args.duty_milli_percent = 95000
+        self.args.supervised_full_image_smoke = True
+        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+        args, evidence = self.prepare_commit()
+        outcome = signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        self.assertEqual(outcome["profile"]["duty_milli_percent"], 95000)
+        self.assertEqual(outcome["profile"]["budget_class"],
+                         "95_percent_supervised_smoke_not_2_percent_acceptance")
+        self.assertTrue(outcome["identity_config_acl_preserved"])
+        self.assertEqual(outcome["lifecycle"]["floor"], self.candidate.counter)
+        self.assertEqual(outcome["lifecycle"]["image"], self.args.image_sha256)
+        self.assertEqual(self.uploader.ops.count(ota.Op.COMMIT), 1)
+        self.assertFalse(outcome["usb_reset_sent"])
+        self.assertFalse(outcome["measured_duty_evidence_available"])
 
     def test_candidate_role_counter_hash_vectors_and_provenance_admission(self):
         for field, value in (("counter", 8), ("image_sha256", "00" * 32),
