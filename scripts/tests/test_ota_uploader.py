@@ -233,6 +233,25 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(puts[0], puts[1])
         self.assertEqual(puts[2][1][:2], b"\x00\x01")
 
+    def test_pending_begin_still_waits_for_receiving_before_put_and_seal(self):
+        begin = ota.decode_reply(frame(
+            op=ota.Op.CACHE_BEGIN, result=ota.Result.PENDING, phase=ota.Phase.RECEIVING,
+            target=ota.LOCAL_TARGET, flags=1, manifest_hash=self.manifest_hash, received=1))
+        sealed = ota.decode_reply(frame(
+            phase=ota.Phase.CACHE_SEALED, target=ota.LOCAL_TARGET,
+            flags=1, manifest_hash=self.manifest_hash))
+        self.uploader.exchange.side_effect = [begin, self.good, self.good, self.good]
+        self.uploader.wait_phase = mock.Mock(side_effect=[begin, sealed])
+        with mock.patch.object(ota.lab, "sign_manifest", return_value=bytes(64)):
+            reply = self.uploader.cache(self.canonical, self.image, TARGET, time.monotonic() + 10)
+        self.assertEqual(reply, sealed)
+        self.assertEqual([call.args[0] for call in self.uploader.exchange.call_args_list],
+                         [ota.Op.CACHE_BEGIN, ota.Op.CACHE_PUT, ota.Op.CACHE_PUT, ota.Op.CACHE_SEAL])
+        self.assertEqual([call.args[:4] for call in self.uploader.wait_phase.call_args_list], [
+            (ota.LOCAL_TARGET, ota.Phase.RECEIVING, self.manifest_hash, 7),
+            (ota.LOCAL_TARGET, ota.Phase.CACHE_SEALED, self.manifest_hash, 7),
+        ])
+
     def test_target_selection_precedes_start_and_does_not_commit(self):
         body = ota.start_body("background", 0, 0, 0, 2000)
         self.uploader.start([TARGET, OTHER_TARGET], body, "background", time.monotonic() + 10)
@@ -411,6 +430,7 @@ class CliLifecycleTests(unittest.TestCase):
         self.remote_phase = ota.Phase.READY
         self.signature_override = None
         self.local_status = {}
+        self.cache_already_sealed = False
 
         def check(name, passed, **details):
             if not passed:
@@ -445,18 +465,24 @@ class CliLifecycleTests(unittest.TestCase):
         target = payload[2:34] if remote or op == ota.Op.STATUS else ota.LOCAL_TARGET
         flags = ota.SNAPSHOT_VALID | (ota.REMOTE if target != ota.LOCAL_TARGET else 0)
         phase = self.remote_phase if target != ota.LOCAL_TARGET else ota.Phase.CACHE_SEALED
-        received = 2
-        if op == ota.Op.CACHE_BEGIN:
+        blocks = (len(self.image) + 83) // 84
+        received = blocks
+        result = self.results.get(op, ota.Result.OK)
+        if op == ota.Op.CACHE_BEGIN and not self.cache_already_sealed:
             phase, received = ota.Phase.RECEIVING, 0
         elif op == ota.Op.CACHE_PUT:
-            self.received += 1
-            phase, received = ota.Phase.RECEIVING, self.received
+            if self.cache_already_sealed:
+                result = ota.Result.BAD_REQUEST
+            else:
+                self.received += 1
+                phase, received = ota.Phase.RECEIVING, self.received
         elif op == ota.Op.COMMIT:
             phase = ota.Phase.COMMIT_PENDING
         elif op == ota.Op.ABORT:
             phase = ota.Phase.ABORTED
-        fields = dict(op=op, result=self.results.get(op, ota.Result.OK), phase=phase,
-                      target=target, flags=flags, manifest_hash=self.manifest_hash, received=received)
+        fields = dict(op=op, result=result, phase=phase, target=target, flags=flags,
+                      manifest_hash=self.manifest_hash, received=received, total=blocks,
+                      counter=struct.unpack_from(">I", self.canonical, 45)[0])
         if op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
             fields.update(self.local_status)
         response = frame(**fields)
@@ -513,6 +539,92 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual((result["counter"], result["received"], result["total"]), (7, 2, 2))
         self.node.close.assert_called_once()
         self.evidence.finish.assert_called_once_with(None)
+
+    def test_duplicate_sealed_full_image_signs_and_begins_then_proves_local_status_without_writes(self):
+        self.image = b"\xa5" * 537816
+        canonical = bytearray(manifest(self.image))
+        struct.pack_into(">I", canonical, 45, 1)
+        self.canonical = bytes(canonical)
+        self.manifest_hash = hashlib.sha256(self.canonical).digest()
+        self.image_path.write_bytes(self.image)
+        self.manifest_path.write_bytes(self.canonical)
+        self.cache_already_sealed = True
+        self.run_cli(self.cache_arguments())
+        self.assertEqual(self.sent_payloads(), [
+            bytes.fromhex("421000") + self.public_key + self.canonical
+            + self.private_key.sign(self.canonical),
+            bytes.fromhex("4217") + bytes(32),
+        ])
+        self.assertEqual([call.args[0][0] for call in self.node.command.call_args_list], [1, 33, 34, 35])
+        result = self.evidence.log.call_args.kwargs
+        self.assertEqual((result["op"], result["phase"]), ("STATUS", "CACHE_SEALED"))
+        self.assertFalse(result["remote"])
+        self.assertTrue(result["snapshot_valid"])
+        self.assertEqual(result["target"], "0" * 64)
+        self.assertEqual(result["hash"], self.manifest_hash.hex())
+        self.assertEqual((result["counter"], result["received"], result["total"]), (1, 6403, 6403))
+        self.node.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_explicit_upload_can_start_after_fresh_sealed_reuse_but_never_commits(self):
+        self.cache_already_sealed = True
+        self.run_cli([*self.upload_arguments(), "--wait-ready"])
+        payloads = self.sent_payloads()
+        self.assertEqual([payload[1] for payload in payloads], [0x10, 0x17, 0x13, 0x14, 0x17])
+        self.assertEqual(payloads[0][2], 0)
+        self.assertEqual(payloads[1], bytes.fromhex("4217") + bytes(32))
+        self.assertEqual(payloads[-1], bytes.fromhex("4217") + TARGET)
+        self.assertEqual([call.args[0][0] for call in self.node.command.call_args_list], [1, 33, 34, 35])
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_sealed_begin_is_not_proof_when_fresh_status_binding_scope_or_blocks_fail(self):
+        cases = (
+            ({"manifest_hash": HASH}, ota.UploaderError),
+            ({"counter": 8}, ota.UploaderError),
+            ({"flags": 3}, ota.UploaderError),
+            ({"received": 1}, ota.UploaderError),
+            ({"received": 0, "total": 0}, ota.UploaderError),
+            ({"received": 1, "total": 1}, ota.UploaderError),
+            ({"phase": ota.Phase.RECEIVING}, TimeoutError),
+            ({"phase": ota.Phase.FAILED}, ota.UploaderError),
+            ({"phase": ota.Phase.ABORTED}, ota.UploaderError),
+            ({"age": 20000}, TimeoutError),
+            ({"target": OTHER_TARGET}, TimeoutError),
+            ({"result": ota.Result.BUSY}, ota.UploaderError),
+            ({"flags": 0, "phase": ota.Phase.UNKNOWN, "manifest_hash": bytes(32),
+              "received": 0, "total": 0, "counter": 0, "age": ota.AGE_UNKNOWN}, TimeoutError),
+        )
+        for fields, error in cases:
+            with self.subTest(fields=fields):
+                self.setUp()
+                self.cache_already_sealed = True
+                self.local_status = fields
+                with self.assertRaises(error):
+                    self.run_cli(self.cache_arguments())
+                payloads = self.sent_payloads()
+                self.assertEqual(payloads[0][1:3], bytes.fromhex("1000"))
+                self.assertGreaterEqual(len(payloads), 2)
+                self.assertTrue(all(payload == bytes.fromhex("4217") + bytes(32)
+                                    for payload in payloads[1:]))
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+                self.node.close.assert_called_once()
+
+    def test_sealed_begin_busy_or_conflict_still_requires_signing_and_fails_without_status_or_takeover(self):
+        for result in (ota.Result.BUSY, ota.Result.MISMATCH, ota.Result.DENIED, ota.Result.UNAVAILABLE):
+            with self.subTest(result=result):
+                self.setUp()
+                self.cache_already_sealed = True
+                self.results[ota.Op.CACHE_BEGIN] = result
+                with self.assertRaisesRegex(ota.UploaderError, result.name):
+                    self.run_cli(self.cache_arguments())
+                self.assertEqual(self.sent_payloads(), [
+                    bytes.fromhex("421000") + self.public_key + self.canonical
+                    + self.private_key.sign(self.canonical),
+                ])
+                self.assertEqual([call.args[0][0] for call in self.node.command.call_args_list], [1, 33, 34, 35])
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.node.close.assert_called_once()
 
     def test_cache_reupload_is_explicit_and_never_sends_abort_or_replaces_refused_cache(self):
         self.run_cli([*self.cache_arguments(), "--reupload"])

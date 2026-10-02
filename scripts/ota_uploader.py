@@ -246,6 +246,8 @@ class Uploader:
         reply = self.require_accepted(self.exchange(
             Op.CACHE_BEGIN, bytes([int(reupload)]) + owner_public_key + canonical + signature,
             timeout=self.remaining(deadline)))
+        if reply.phase == Phase.CACHE_SEALED:
+            return self.wait_phase(LOCAL_TARGET, Phase.CACHE_SEALED, manifest_hash, counter, since, deadline)
         if reply.result == Result.PENDING:
             self.wait_phase(LOCAL_TARGET, Phase.RECEIVING, manifest_hash, counter, since, deadline)
         for index, offset in enumerate(range(0, len(image), BLOCK_BYTES)):
