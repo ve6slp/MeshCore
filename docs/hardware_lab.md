@@ -109,6 +109,34 @@ administrator ACL readbacks. It does not grant administrator permissions,
 transfer an image, commit an update or reboot either board. Client-only
 configuration remains available.
 
+Administrator setup is a separate, explicit **normal MeshCore** operation:
+
+```sh
+make grant-xiao-nrf52-ota-client-admin \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/client-admin-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Use a new evidence path for each invocation; the Make wrapper refuses any
+already-existing artifact directory. It invokes
+`scripts/ota_rf_lab.py --artifact-dir "$OTA_LAB_ARTIFACT_DIR" --grant-client-admin`
+and only opens approved client
+`4186AE911D94CDB1` and target `3BE94917B92DC5E9`, never Pine
+`49C5BAF21EEF44A1`. After checking actual companion/repeater roles, distinct
+normal full public keys and the complete ACL, it sends exactly
+`setperm <64-hex-normal-companion-pk> 3` through the existing repeater text CLI
+and requires exact `OK`. A complete ACL readback must show permission `03`
+and preserve every unrelated entry; an already-admin client needs no write.
+It does not change identities, name/radio/path settings, OTA authority,
+candidates, journals or floors, and never reboots. After an acknowledged
+mutation it waits six seconds for the ordinary lazy-save opportunity:
+dirty contacts save 5000 ms after the latest contact update, and the
+destructive-write gate can defer saving. Neither timing nor live ACL readback
+proves durable persistence; a normal reboot does **not** flush the ACL.
+MAIN must separately authorize a later normal restart and check the complete
+ACL afterwards. Configure-only stays non-provisioning, monitoring stays
+read-only, and the signed runner never grants permissions. This setup command
+and its mocked tests make no hardware-success claim.
+
 Repeater radio readbacks describe configured preferences, not the live radio
 profile; applying them requires a separate reboot. Neither role's
 configuration readback proves reboot persistence or peer reception.
@@ -205,7 +233,8 @@ The repeater transport also reads `get acl`, whose output has no closing
 marker. It waits for the echoed reply to a following `get role` command
 instead of treating a quiet serial port as a complete ACL. An in-memory
 ACL entry does not prove that `setperm` has saved it: qualification must
-allow the lazy write to finish and verify the permission after a restart.
+allow the lazy-save opportunity and verify the complete ACL after a separately
+authorized restart; restarting does not itself flush dirty contacts.
 
 ## Why these mechanisms
 

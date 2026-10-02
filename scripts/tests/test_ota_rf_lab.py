@@ -326,6 +326,11 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--duty-timeout=1"], "unrecognized arguments"),
             (["--configure-only", "--airtime-only"], "unrecognized arguments"),
             (["--configure-only", "--monitor-seconds=1"], "not allowed"),
+            (["--grant-client-admin", "--configure-only"], "not allowed"),
+            (["--grant-client-admin", "--monitor-seconds=1"], "not allowed"),
+            (["--grant-client-admin", "--monitor-seconds=0"], "not allowed"),
+            (["--grant-client-admin", "--client-only"], "requires both approved roles"),
+            (["--grant-client"], "unrecognized arguments"),
             (["--configure"], "unrecognized arguments"),
         ):
             with self.subTest(options=options):
@@ -811,6 +816,395 @@ class PairedConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "incomplete ACL"):
             ota_rf_lab.run_configure(self.client, self.target, self.evidence)
         self.assertNotIn("target", self.evidence.summary["measurements"]["configured"])
+
+
+class GrantClientAdminTests(unittest.TestCase):
+    def setUp(self):
+        self.client = mock.Mock()
+        self.client.name = "client"
+        self.client.command.side_effect = [
+            self_info("existing-client"), device_info(0),
+            self_info("existing-client"), device_info(0),
+        ]
+        self.command = f"setperm {CLIENT_KEY.hex()} 3"
+        self.target = repeater_fixture({
+            "get name": ["> existing-target", "> existing-target"],
+            "get radio": ["> 869.525,250,11,5", "> 869.525,250,11,5"],
+            "get path.hash.mode": ["> 0", "> 0"],
+            self.command: ["OK"],
+        })
+        self.before = {CLIENT_KEY.hex(): 1, "ab" * 32: 0x83, "cd" * 32: 2}
+        self.after = {**self.before, CLIENT_KEY.hex(): 3}
+        self.target.get_acl.side_effect = [self.before.copy(), self.after.copy()]
+        self.evidence = evidence_fixture()
+        patcher = mock.patch.object(ota_rf_lab.time, "sleep")
+        self.sleep = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def grant(self):
+        return ota_rf_lab.run_grant_client_admin(self.client, self.target, self.evidence)
+
+    def mutations(self):
+        return [call.args[0] for call in self.target.command.call_args_list
+                if not call.args[0].startswith("get ")]
+
+    def wire_acl_reader(self, batches):
+        def read():
+            node = ota_rf_lab.RepeaterSerial.__new__(ota_rf_lab.RepeaterSerial)
+            node.name = "target"
+            node.pending = []
+            node.evidence = mock.Mock()
+            node._start_command = mock.Mock()
+            node._write_bytes = mock.Mock()
+            remaining = iter(batches)
+            now = 0.0
+
+            def poll(duration=0):
+                nonlocal now
+                now += max(duration, 0.01)
+                node.pending.extend(next(remaining, []))
+
+            node.poll = poll
+            with mock.patch.object(ota_rf_lab.time, "monotonic", side_effect=lambda: now):
+                return node.get_acl(timeout=0.5)
+        return read
+
+    def test_exact_normal_permission_command_and_full_live_readback_without_other_writes(self):
+        record = self.grant()
+        self.assertEqual(self.mutations(), [self.command])
+        self.assertEqual(self.target.command.call_args_list, [
+            mock.call("get role"), mock.call("get public.key"), mock.call("get name"),
+            mock.call("get radio"), mock.call("get path.hash.mode"), mock.call(self.command),
+            mock.call("get role"), mock.call("get public.key"), mock.call("get name"),
+            mock.call("get radio"), mock.call("get path.hash.mode"),
+        ])
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(b"\x16\x0d", expected=(13,)),
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(b"\x16\x0d", expected=(13,)),
+        ])
+        self.assertEqual(record["acl_before"], self.before)
+        self.assertEqual(record["acl_after"], self.after)
+        self.assertEqual(record["normal_identities_before"]["client"]["pubkey"], CLIENT_KEY.hex())
+        self.assertEqual(record["normal_identities_before"]["target"]["pubkey"], TARGET_KEY.hex())
+        self.assertNotIn("pubkey_bytes", record["normal_identities_before"]["client"])
+        self.assertEqual(record["normal_identities_before"], record["normal_identities_after"])
+        self.assertTrue(record["mutation_acknowledged"])
+        self.assertTrue(record["live_acl_verified"])
+        self.assertFalse(record["reboot_requested"])
+        self.assertFalse(record["reboot_persistence_verified"])
+        self.assertEqual(record["lazy_save_wait_seconds"], 6.0)
+        self.sleep.assert_called_once_with(6.0)
+
+    def test_both_actual_identities_and_complete_acl_are_captured_before_mutation(self):
+        timeline = mock.Mock()
+        timeline.attach_mock(self.client.command, "client")
+        timeline.attach_mock(self.target.command, "target")
+        timeline.attach_mock(self.target.get_acl, "acl")
+        timeline.attach_mock(self.evidence.log, "log")
+        timeline.attach_mock(self.sleep, "sleep")
+        self.grant()
+        calls = timeline.mock_calls
+        write_index = calls.index(mock.call.target(self.command))
+        baseline = next(index for index, call in enumerate(calls)
+                        if call[0] == "log" and call.args[0] == "normal_admin_grant_baseline")
+        self.assertLess(baseline, write_index)
+        record = calls[baseline].kwargs
+        self.assertEqual(record["acl_before"], self.before)
+        self.assertEqual(record["normal_identities_before"]["client"]["pubkey"], CLIENT_KEY.hex())
+        self.assertEqual(record["normal_identities_before"]["target"]["pubkey"], TARGET_KEY.hex())
+        self.assertEqual([call for call in calls[:write_index] if call[0] in ("client", "target", "acl")], [
+            mock.call.client(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call.client(b"\x16\x0d", expected=(13,)),
+            mock.call.target("get role"), mock.call.target("get public.key"),
+            mock.call.target("get name"), mock.call.target("get radio"),
+            mock.call.target("get path.hash.mode"), mock.call.acl(),
+        ])
+        wait_index = calls.index(mock.call.sleep(6.0))
+        acl_indices = [index for index, call in enumerate(calls) if call == mock.call.acl()]
+        self.assertLess(write_index, wait_index)
+        self.assertLess(wait_index, acl_indices[1])
+
+    def test_existing_exact_admin_is_idempotent_but_still_verifies_the_complete_acl(self):
+        self.target.get_acl.side_effect = [self.after.copy(), self.after.copy()]
+        record = self.grant()
+        self.assertEqual(self.mutations(), [])
+        self.sleep.assert_not_called()
+        self.assertEqual(self.target.get_acl.call_count, 2)
+        self.assertFalse(record["command_attempted"])
+        self.assertFalse(record["mutation_acknowledged"])
+        self.assertEqual(record["lazy_save_wait_seconds"], 0)
+        self.assertTrue(record["live_acl_verified"])
+        self.assertFalse(record["reboot_persistence_verified"])
+
+    def test_absent_guest_readwrite_and_flagged_permissions_are_not_exact_admin(self):
+        for permission in (None, 0, 1, 2, 0x83):
+            with self.subTest(permission=permission):
+                self.setUp()
+                before = {**self.before, CLIENT_KEY.hex(): permission}
+                if permission is None:
+                    del before[CLIENT_KEY.hex()]
+                self.target.get_acl.side_effect = [before, self.after]
+                self.grant()
+                self.assertEqual(self.mutations(), [self.command])
+
+    def test_only_exact_ok_acknowledges_a_grant(self):
+        for reply in ("Err - bad pubkey", "Err - table full", "", "OK extra", "> OK",
+                      "OK - reboot to apply", "OK ", "ok"):
+            with self.subTest(reply=reply):
+                self.setUp()
+                original = self.target.command.side_effect
+                self.target.command.side_effect = (
+                    lambda command: reply if command == self.command else original(command))
+                with self.assertRaisesRegex(RuntimeError, "repeater command failed"):
+                    self.grant()
+                record = self.evidence.summary["measurements"]["admin_grant"]
+                self.assertTrue(record["command_attempted"])
+                self.assertFalse(record["mutation_acknowledged"])
+                self.assertFalse(record["live_acl_verified"])
+                self.assertEqual(self.target.get_acl.call_count, 1)
+                self.sleep.assert_not_called()
+
+    def test_transport_refusal_is_propagated_without_success_or_followup_mutation(self):
+        original = self.target.command.side_effect
+
+        def command(text):
+            if text == self.command:
+                raise TimeoutError("no repeater CLI reply")
+            return original(text)
+
+        self.target.command.side_effect = command
+        with self.assertRaisesRegex(TimeoutError, "no repeater CLI reply"):
+            self.grant()
+        self.assertEqual(self.mutations(), [self.command])
+        self.assertFalse(self.evidence.summary["measurements"]["admin_grant"]["live_acl_verified"])
+        self.sleep.assert_not_called()
+
+    def test_malformed_duplicate_zero_or_incomplete_initial_acl_prevents_any_grant(self):
+        for batches, error in (
+            ([["get acl", "ACL:", "03 bad-key"]], ValueError),
+            ([["get acl", "ACL:", f"03 {'00' * 32}"]], ValueError),
+            ([["get acl", "ACL:", f"03 {'ab' * 32}", f"01 {'AB' * 32}"]], ValueError),
+            ([["get acl", "ACL:", f"03 {CLIENT_KEY.hex()}"]], TimeoutError),
+            ([["get acl", "ACL:", "get role", "  -> > companion"]], RuntimeError),
+        ):
+            with self.subTest(batches=batches):
+                self.setUp()
+                self.target.get_acl.side_effect = self.wire_acl_reader(batches)
+                with self.assertRaises(error):
+                    self.grant()
+                self.assertEqual(self.mutations(), [])
+                self.sleep.assert_not_called()
+                self.assertFalse(self.evidence.summary["measurements"]["admin_grant"]["command_attempted"])
+
+    def test_malformed_or_incomplete_post_grant_acl_remains_a_failure_after_save_opportunity(self):
+        for batches, error in (
+            ([["get acl", "ACL:", "garbage"]], ValueError),
+            ([["get acl", "ACL:", f"03 {CLIENT_KEY.hex()}", "get role"]], TimeoutError),
+        ):
+            with self.subTest(batches=batches):
+                self.setUp()
+                read = self.wire_acl_reader(batches)
+                self.target.get_acl.side_effect = (
+                    lambda: self.before.copy() if self.target.get_acl.call_count == 1 else read())
+                with self.assertRaises(error):
+                    self.grant()
+                self.sleep.assert_called_once_with(6.0)
+                record = self.evidence.summary["measurements"]["admin_grant"]
+                self.assertTrue(record["mutation_acknowledged"])
+                self.assertFalse(record["live_acl_verified"])
+                self.assertFalse(record["reboot_persistence_verified"])
+
+    def test_ok_does_not_replace_exact_permission03_readback(self):
+        for permission in (None, 0, 1, 2, 0x83):
+            with self.subTest(permission=permission):
+                self.setUp()
+                after = {**self.after, CLIENT_KEY.hex(): permission}
+                if permission is None:
+                    del after[CLIENT_KEY.hex()]
+                self.target.get_acl.side_effect = [self.before, after]
+                with self.assertRaisesRegex(AssertionError, "normal-client-admin-live"):
+                    self.grant()
+                self.assertFalse(self.evidence.summary["measurements"]["admin_grant"]["live_acl_verified"])
+
+    def test_unrelated_acl_changes_additions_or_removals_are_fatal_without_repair(self):
+        for after in ({CLIENT_KEY.hex(): 3}, {**self.after, "ab" * 32: 0x82},
+                      {**self.after, "ef" * 32: 1}):
+            with self.subTest(after=after):
+                self.setUp()
+                self.target.get_acl.side_effect = [self.before, after]
+                with self.assertRaisesRegex(AssertionError, "unrelated-repeater-acl-preserved"):
+                    self.grant()
+                self.assertEqual(self.mutations(), [self.command])
+                self.assertFalse(self.evidence.summary["measurements"]["admin_grant"]["live_acl_verified"])
+
+    def test_idempotent_readback_does_not_hide_changed_unrelated_entries(self):
+        self.target.get_acl.side_effect = [self.after.copy(), {**self.after, "ab" * 32: 1}]
+        with self.assertRaisesRegex(AssertionError, "unrelated-repeater-acl-preserved"):
+            self.grant()
+        self.assertEqual(self.mutations(), [])
+        self.sleep.assert_not_called()
+
+    def test_wrong_companion_role_zero_or_short_identity_prevents_target_queries(self):
+        for frame in (self_info(advert_type=2), self_info(public_key=bytes(32)), self_info()[:57]):
+            with self.subTest(frame=frame[:2]):
+                self.setUp()
+                self.client.command.side_effect = [frame]
+                with self.assertRaises(RuntimeError):
+                    self.grant()
+                self.target.command.assert_not_called()
+                self.target.get_acl.assert_not_called()
+                self.sleep.assert_not_called()
+
+    def test_wrong_repeater_role_malformed_or_duplicate_identity_prevents_grant(self):
+        for command, reply, error in (
+            ("get role", "> companion", RuntimeError),
+            ("get role", "> room", RuntimeError),
+            ("get public.key", "> " + "00" * 32, RuntimeError),
+            ("get public.key", "> " + TARGET_KEY.hex()[:16], RuntimeError),
+            ("get public.key", "> " + "gg" * 32, RuntimeError),
+            ("get public.key", "> " + CLIENT_KEY.hex().upper(), AssertionError),
+        ):
+            with self.subTest(command=command, reply=reply):
+                self.setUp()
+                original = self.target.command.side_effect
+                self.target.command.side_effect = (
+                    lambda text: reply if text == command else original(text))
+                with self.assertRaises(error):
+                    self.grant()
+                self.target.get_acl.assert_not_called()
+                self.assertEqual(self.mutations(), [])
+                self.sleep.assert_not_called()
+
+    def test_post_grant_identity_or_setting_change_is_not_success_or_repaired(self):
+        for role in ("client", "target"):
+            with self.subTest(role=role):
+                self.setUp()
+                if role == "client":
+                    self.client.command.side_effect = [
+                        self_info("existing-client"), device_info(0),
+                        self_info("changed-client"), device_info(0),
+                    ]
+                else:
+                    original = self.target.command.side_effect
+
+                    def command(text):
+                        if text == "get public.key":
+                            return "> " + (TARGET_KEY if not self.mutations() else CLIENT_KEY).hex()
+                        return original(text)
+
+                    self.target.command.side_effect = command
+                with self.assertRaisesRegex(AssertionError, f"normal-admin-grant-{role}-unchanged"):
+                    self.grant()
+                self.assertEqual(self.mutations(), [self.command])
+                self.assertFalse(self.evidence.summary["measurements"]["admin_grant"]["live_acl_verified"])
+
+
+class AdminGrantModeTests(unittest.TestCase):
+    def setUp(self):
+        self.evidence = evidence_fixture()
+        self.evidence.finish = mock.Mock()
+        self.devices = {
+            role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{role}")
+            for role, serial in ota_rf_lab.APPROVED_ADMIN_PAIR.items()
+        }
+
+    def run_main(self):
+        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--grant-client-admin"]
+        with mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
+                mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
+                mock.patch.object(ota_rf_lab, "FramedSerial") as client, \
+                mock.patch.object(ota_rf_lab, "RepeaterSerial") as target, \
+                mock.patch.object(ota_rf_lab, "run_grant_client_admin") as grant, \
+                mock.patch.object(ota_rf_lab, "run_configure") as configure, \
+                mock.patch.object(ota_rf_lab, "run_configure_client") as configure_client, \
+                mock.patch.object(ota_rf_lab.time, "sleep"):
+            self.resolve, self.client, self.target = resolve, client, target
+            self.grant, self.configure, self.configure_client = grant, configure, configure_client
+            resolve.side_effect = lambda role, mode: self.devices[role]
+            if hasattr(self, "failure"):
+                grant.side_effect = self.failure
+            ota_rf_lab.main()
+
+    def test_explicit_grant_resolves_only_approved_app_roles_and_dispatches_separately(self):
+        self.run_main()
+        self.assertEqual(self.resolve.call_args_list, [
+            mock.call("client", mode=ota_rf_lab.lab_device.MODE_APP),
+            mock.call("target", mode=ota_rf_lab.lab_device.MODE_APP),
+        ])
+        self.client.assert_called_once_with("client-4186AE911D94CDB1",
+                                           "/dev/serial/by-id/client", self.evidence)
+        self.target.assert_called_once_with("target-3BE94917B92DC5E9",
+                                           "/dev/serial/by-id/target", self.evidence)
+        self.grant.assert_called_once_with(self.client.return_value, self.target.return_value,
+                                          self.evidence)
+        self.configure.assert_not_called()
+        self.configure_client.assert_not_called()
+        self.client.return_value.close.assert_called_once()
+        self.target.return_value.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_unapproved_swapped_duplicate_or_pine_serials_fail_before_either_port_opens(self):
+        for role, serial in (("client", "unapproved"), ("target", "unapproved"),
+                             ("client", "3BE94917B92DC5E9"), ("target", "4186AE911D94CDB1"),
+                             ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
+            with self.subTest(role=role, serial=serial):
+                self.setUp()
+                self.devices[role].serial = serial
+                with self.assertRaises(AssertionError):
+                    self.run_main()
+                self.client.assert_not_called()
+                self.target.assert_not_called()
+                self.grant.assert_not_called()
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIn("AssertionError", self.evidence.finish.call_args.args[0])
+
+    def test_role_name_overrides_cannot_redirect_grant_to_other_roles(self):
+        for client_role, target_role in (("other", "target"), ("client", "pine"), ("target", "client")):
+            with self.subTest(client_role=client_role, target_role=target_role):
+                self.setUp()
+                with mock.patch.object(ota_rf_lab, "CLIENT_ROLE", client_role), \
+                        mock.patch.object(ota_rf_lab, "TARGET_ROLE", target_role):
+                    with self.assertRaisesRegex(AssertionError, "approved-admin-grant-roles"):
+                        self.run_main()
+                self.resolve.assert_not_called()
+                self.client.assert_not_called()
+                self.target.assert_not_called()
+
+    def test_existing_role_guard_system_exit_is_logged_as_fatal_not_success(self):
+        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--grant-client-admin"]
+        with mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
+                mock.patch.object(ota_rf_lab.lab_device, "load_roles",
+                                  side_effect=SystemExit("refusing protected lab device assignment")), \
+                mock.patch.object(ota_rf_lab.lab_device, "discover") as discover, \
+                mock.patch.object(ota_rf_lab, "FramedSerial") as client, \
+                mock.patch.object(ota_rf_lab, "RepeaterSerial") as target:
+            with self.assertRaisesRegex(SystemExit, "refusing protected"):
+                ota_rf_lab.main()
+        discover.assert_not_called()
+        client.assert_not_called()
+        target.assert_not_called()
+        self.evidence.log.assert_called_with(
+            "fatal", error="SystemExit: refusing protected lab device assignment")
+        self.evidence.finish.assert_called_once_with(
+            "SystemExit: refusing protected lab device assignment")
+
+    def test_grant_failures_are_fatal_logged_rethrown_and_close_both_ports(self):
+        for error in (RuntimeError("repeater command failed"), ValueError("malformed ACL row"),
+                      TimeoutError("incomplete ACL"), AssertionError("unrelated ACL changed")):
+            with self.subTest(error=error):
+                self.setUp()
+                self.failure = error
+                with self.assertRaises(type(error)):
+                    self.run_main()
+                self.client.return_value.close.assert_called_once()
+                self.target.return_value.close.assert_called_once()
+                message = f"{type(error).__name__}: {error}"
+                self.evidence.log.assert_called_with("fatal", error=message)
+                self.evidence.finish.assert_called_once_with(message)
 
 
 class CompanionSigningTests(unittest.TestCase):

@@ -132,7 +132,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         flash-xiao-nrf52-client flash-xiao-nrf52-target flash-xiao-nrf52-lab \
         enter-xiao-nrf52-target-bootloader \
         install-xiao-nrf52-target-ota-bootloader flash-xiao-nrf52-target-ota-bootloader \
-        configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client \
+        configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client grant-xiao-nrf52-ota-client-admin \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
         ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-abort-cache ota-lab-admin \
         qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
@@ -343,6 +343,12 @@ configure-xiao-nrf52-ota-lab: tmpdir
 
 configure-xiao-nrf52-ota-client: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --client-only --configure-only
+
+grant-xiao-nrf52-ota-client-admin: tmpdir
+	@mkdir -p -- "$$(dirname -- "$(OTA_LAB_ARTIFACT_DIR)")"
+	@mkdir -- "$(OTA_LAB_ARTIFACT_DIR)" || \
+	  { echo "Set OTA_LAB_ARTIFACT_DIR to a new directory for the administrator grant" >&2; exit 1; }
+	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --grant-client-admin
 
 monitor-xiao-nrf52-ota-lab: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --monitor-seconds $(OTA_LAB_MONITOR_SECONDS)

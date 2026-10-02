@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Configure or monitor a lab companion and TEXT repeater without OTA transfers.
+"""Configure, monitor, or explicitly grant normal MeshCore administrator access.
 
 Configuration preserves existing identities and ACLs. Readbacks describe current
 settings, not active RF, reboot persistence, transfer, install, or trial evidence.
 Repeater settings are preference readbacks; radio application requires a separate
 reboot. This helper never reboots.
+Only --grant-client-admin changes an ACL, using the existing normal text CLI.
 Use ota_uploader.py for the signed USB uploader and its explicit commit operation.
 """
 
@@ -29,6 +30,9 @@ import lab_device  # noqa: E402
 # serial or ttyACMn, so the lab survives re-cabling and board swaps.
 CLIENT_ROLE = os.environ.get("MESHCORE_LAB_CLIENT_ROLE", "client")
 TARGET_ROLE = os.environ.get("MESHCORE_LAB_TARGET_ROLE", "target")
+APPROVED_ADMIN_PAIR = {"client": "4186AE911D94CDB1", "target": "3BE94917B92DC5E9"}
+CLIENT_ACL_ADMIN = 3
+ACL_LAZY_SAVE_WAIT_SECONDS = 6.0
 
 CMD_APP_START = 1
 CMD_SET_ADVERT_NAME = 8
@@ -502,6 +506,59 @@ def run_configure(client, target, evidence):
     return client_info, target_info
 
 
+def run_grant_client_admin(client, target, evidence):
+    client_before = serializable_app_info(companion_info(client))
+    target_before = repeater_info(target)
+    record = {
+        "normal_identities_before": {"client": client_before, "target": target_before},
+        "permission": CLIENT_ACL_ADMIN,
+        "command_attempted": False,
+        "mutation_acknowledged": False,
+        "lazy_save_wait_seconds": 0,
+        "live_acl_verified": False,
+        "reboot_requested": False,
+        "reboot_persistence_verified": False,
+    }
+    evidence.summary["measurements"]["admin_grant"] = record
+    evidence.check("node-identities-are-distinct",
+                   client_before["pubkey"] != target_before["pubkey"],
+                   client=client_before["pubkey"], target=target_before["pubkey"])
+    key = client_before["pubkey"]
+    acl_before = target.get_acl()
+    record["acl_before"] = acl_before
+    evidence.log("normal_admin_grant_baseline", **record)
+    if acl_before.get(key) != CLIENT_ACL_ADMIN:
+        command = f"setperm {key} {CLIENT_ACL_ADMIN}"
+        record["command_attempted"] = True
+        require_repeater_ok(target, command)
+        record["mutation_acknowledged"] = True
+        evidence.log("normal_admin_grant_acknowledged", command=command,
+                     reboot_persistence_verified=False)
+        # Dirty contacts save after 5000 ms since the latest update, subject to
+        # the destructive-write gate. This wait is an opportunity, not proof.
+        time.sleep(ACL_LAZY_SAVE_WAIT_SECONDS)
+        record["lazy_save_wait_seconds"] = ACL_LAZY_SAVE_WAIT_SECONDS
+    acl_after = target.get_acl()
+    record["acl_after"] = acl_after
+    evidence.check("normal-client-admin-live", acl_after.get(key) == CLIENT_ACL_ADMIN,
+                   public_key=key, permission=acl_after.get(key),
+                   reboot_persistence_verified=False)
+    unrelated_before = {pk: permission for pk, permission in acl_before.items() if pk != key}
+    unrelated_after = {pk: permission for pk, permission in acl_after.items() if pk != key}
+    evidence.check("unrelated-repeater-acl-preserved", unrelated_after == unrelated_before,
+                   before=unrelated_before, after=unrelated_after)
+    identities_after = {"client": serializable_app_info(companion_info(client)),
+                        "target": repeater_info(target)}
+    record["normal_identities_after"] = identities_after
+    for role, before in record["normal_identities_before"].items():
+        evidence.check(f"normal-admin-grant-{role}-unchanged",
+                       identities_after[role] == before,
+                       before=before, after=identities_after[role])
+    record["live_acl_verified"] = True
+    evidence.log("normal_admin_grant_live_readback", **record)
+    return record
+
+
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
     roles = [CLIENT_ROLE] if client_only else [CLIENT_ROLE, TARGET_ROLE]
@@ -517,6 +574,17 @@ def resolve_roles(evidence, client_only=False):
     return resolved
 
 
+def resolve_admin_grant_roles(evidence):
+    evidence.check("approved-admin-grant-roles",
+                   (CLIENT_ROLE, TARGET_ROLE) == ("client", "target"),
+                   client_role=CLIENT_ROLE, target_role=TARGET_ROLE)
+    devices = resolve_roles(evidence)
+    for role, serial in APPROVED_ADMIN_PAIR.items():
+        evidence.check(f"approved-admin-grant-{role}", devices[role].serial == serial,
+                       expected_serial=serial, observed_serial=devices[role].serial)
+    return devices
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
@@ -526,19 +594,27 @@ def main():
                        help="configure ordinary radio/name/path settings; never provision ADMIN or run OTA")
     scope.add_argument("--monitor-seconds", type=float, default=0,
                        help="read-only role-checked serial monitoring for a positive duration")
+    scope.add_argument("--grant-client-admin", action="store_true",
+                       help="explicit normal CLI grant of permission 03 to the approved companion; "
+                            "live ACL verification only, no reboot or OTA")
     args = parser.parse_args()
     if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
         parser.error("--monitor-seconds must be finite and non-negative")
-    if not (args.configure_only or args.monitor_seconds > 0):
+    if args.grant_client_admin and args.client_only:
+        parser.error("--grant-client-admin requires both approved roles; not --client-only")
+    if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin):
         parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
-                     "select --configure-only or a positive --monitor-seconds. "
+                     "select --configure-only, --grant-client-admin or a positive --monitor-seconds. "
                      "Signed transfers use ota_uploader.py with a separate explicit commit")
 
     evidence = Evidence(args.artifact_dir)
     client = target = None
     error = None
     try:
-        devices = resolve_roles(evidence, client_only=args.client_only)
+        if args.grant_client_admin:
+            devices = resolve_admin_grant_roles(evidence)
+        else:
+            devices = resolve_roles(evidence, client_only=args.client_only)
         client_device = devices[CLIENT_ROLE]
         client = FramedSerial(f"{CLIENT_ROLE}-{client_device.serial}",
                               str(client_device.by_id), evidence)
@@ -559,12 +635,14 @@ def main():
                 if target:
                     target.poll(0.05)
                     target.pending.clear()
+        elif args.grant_client_admin:
+            run_grant_client_admin(client, target, evidence)
         else:
             if args.client_only:
                 run_configure_client(client, evidence)
             else:
                 run_configure(client, target, evidence)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)
         raise
