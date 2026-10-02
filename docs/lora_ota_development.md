@@ -663,10 +663,19 @@ OTA. The subsequent target-only loader installer passed artifact validation
 but refused the vendor's actual stable boot-port product name before writing.
 The host guard was corrected to use the existing lab identity resolver,
 without relaxing serial, vendor, bootloader mode, stable by-id, volume
-ancestry, Board-ID or artifact checks. Read-only inspection then identified
-the remaining constraint: the stock target exposes CDC only, without a
-mass-storage interface or mounted UF2 volume. The UF2 commissioning path
-therefore remains unavailable on this loader.
+ancestry, Board-ID or artifact checks. Read-only inspection showed CDC
+without mass storage in the mode selected by the 1200-baud helper.
+Vendor and Arduino source inspection established that the helper requests
+serial-only DFU; the loader deliberately hides MSC in that mode. The
+separate vendor UF2 API and physical double-reset entry must not be
+confused with that application-flash path. Current MBR/UICR addresses,
+UF2 Board-ID and CF2 compatibility remain unproven; historical archive
+metadata cannot substitute for fresh observations.
+The bench-only USB adapter and `make lab-bootloader-uf2-target` use the
+existing vendor API rather than a parallel updater. The paired read-only
+address gate and host application-to-bootloader mass-storage check remain
+software safeguards until exercised on the approved target; they do not
+close the physical compatibility or commissioning gates.
 The target's qualified custom loader is not installed, and no
 replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and

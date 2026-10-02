@@ -10,6 +10,7 @@ escalation order instead of ad-hoc commands.
   ./scripts/lab_device.py path target
   ./scripts/lab_device.py reset target --protocol repeater
   ./scripts/lab_device.py bootloader target
+  ./scripts/lab_device.py bootloader-uf2 target
   ./scripts/lab_device.py power-cycle target
   ./scripts/lab_device.py wait target --mode app
 
@@ -23,6 +24,7 @@ import configparser
 import glob
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -330,6 +332,111 @@ def cmd_bootloader(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_uf2_identity(device: Device, serial: str) -> None:
+    if device.serial != serial:
+        raise SystemExit(f"UF2 commissioning requires approved target serial {serial}, "
+                         f"not {device.serial}")
+    if (device.by_id.parent != BY_ID_DIR or not device.by_id.is_symlink()
+            or not device.by_id.exists() or device.by_id.resolve().name != device.tty):
+        raise SystemExit(f"UF2 commissioning requires a real stable by-id symlink "
+                         f"for {device.tty}: {device.by_id}")
+    if _read(device.sysfs / "serial") != serial:
+        raise SystemExit(f"UF2 commissioning USB ancestry does not match target {serial}: "
+                         f"{device.sysfs}")
+
+
+def _uf2_target(args: argparse.Namespace) -> Device:
+    if args.role != "target":
+        raise SystemExit("UF2 commissioning is authorized for the target role only")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise SystemExit("UF2 commissioning timeout must be finite and positive")
+    from ota_rf_lab import APPROVED_ADMIN_PAIR
+
+    device = resolve(args.role, MODE_APP)
+    _validate_uf2_identity(device, APPROVED_ADMIN_PAIR["target"])
+    return device
+
+
+def _uf2_repeater_request(device: Device, command: str, timeout: float) -> str:
+    from ota_rf_lab import RepeaterSerial
+
+    evidence = argparse.Namespace(log=lambda event, **fields: print(
+        json.dumps({"event": event, **fields}, sort_keys=True), file=sys.stderr))
+    node = None
+    try:
+        node = RepeaterSerial("target", str(device.by_id), evidence)
+        return node.command(command, timeout=timeout)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(f"target UF2 command {command!r} failed: {exc}") from exc
+    finally:
+        if node is not None:
+            node.close()
+
+
+def _has_msc_interface(device: Device) -> bool:
+    for interface in sorted(device.sysfs.glob(f"{device.sysfs.name}:*")):
+        try:
+            interface_class = (interface / "bInterfaceClass").read_text().strip()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SystemExit(f"cannot inspect target USB interface {interface}: {exc}") from exc
+        if interface_class.lower() == "08":
+            return True
+    return False
+
+
+def _wait_for_uf2(source: Device, timeout: float) -> Device:
+    deadline = time.monotonic() + timeout
+    serial = source.serial
+    disconnected = False
+    last = "target did not disconnect after the UF2 reboot request"
+    while time.monotonic() < deadline:
+        if not disconnected:
+            try:
+                source.sysfs.stat()
+            except FileNotFoundError:
+                disconnected = True
+            except OSError as exc:
+                raise SystemExit(f"cannot observe target USB disconnection: {exc}") from exc
+        if disconnected:
+            usb = sysfs_for_serial(serial)
+            if usb is None:
+                last = "target disconnected but has not re-enumerated"
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                continue
+            matches = [device for device in discover() if device.serial == serial]
+            if len(matches) > 1:
+                raise SystemExit(f"ambiguous target USB identity for {serial}")
+            if not matches:
+                last = "target USB is present but its stable by-id identity is not ready"
+            else:
+                device = matches[0]
+                if device.sysfs.resolve() != usb.resolve():
+                    raise SystemExit(f"target USB ancestry changed unexpectedly for {serial}")
+                _validate_uf2_identity(device, serial)
+                if device.mode != MODE_BOOT:
+                    last = f"target returned in {device.mode} mode, not UF2 bootloader mode"
+                elif _has_msc_interface(device):
+                    return device
+                else:
+                    last = "target bootloader has no MSC interface (USB class 08); CDC-only is not UF2"
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    raise SystemExit(f"timed out waiting for target UF2 bootloader: {last}")
+
+
+def cmd_bootloader_uf2(args: argparse.Namespace) -> int:
+    """Request vendor UF2 entry and verify a new target bootloader with MSC."""
+    device = _uf2_target(args)
+    deadline = time.monotonic() + args.timeout
+    reply = _uf2_repeater_request(device, "reboot uf2", min(5.0, args.timeout))
+    if reply != "OK - rebooting UF2":
+        raise SystemExit(f"target UF2 reboot request failed: {reply!r}")
+    ready = _wait_for_uf2(device, max(0.0, deadline - time.monotonic()))
+    print(ready.by_id)
+    return 0
+
+
 def validate_application_package(package: Path) -> bytes:
     tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
     sys.path.insert(0, str(tools))
@@ -544,6 +651,11 @@ def main() -> int:
                        help="serial protocol of the installed application")
     add_role_command("bootloader", cmd_bootloader, mode_default=MODE_BOOT,
                      help_text="enter the serial DFU bootloader (1200-baud touch)")
+    uf2 = sub.add_parser("bootloader-uf2",
+                         help="reboot the approved target application into UF2 and require MSC")
+    uf2.add_argument("role", choices=["target"])
+    uf2.add_argument("--timeout", type=float, default=30.0)
+    uf2.set_defaults(func=cmd_bootloader_uf2)
     flash = add_role_command("flash", cmd_flash, mode_default=MODE_APP,
                              help_text="flash a DFU package and return to the application")
     flash.add_argument("--package", required=True, help="path to firmware.zip")

@@ -647,10 +647,32 @@ def parse_ota_preflight_diagnostic(text, kind):
     return result
 
 
-def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_floor=False):
+def parse_ota_boot_addresses(text):
+    if text.startswith("Err - "):
+        raise RuntimeError(f"target bootloader address readback refused: {text}")
+    fields = ("mbr8", "mbrc", "uicrb", "uicrp", "boot", "params")
+    pattern = " ".join(rf"{field}=([0-9A-F]{{8}})" for field in fields)
+    match = re.fullmatch(pattern, text)
+    if not match:
+        raise ValueError("malformed, truncated or duplicate bootloader address tuple")
+    hex_words = dict(zip(fields, match.groups()))
+    values = {field: int(value, 16) for field, value in hex_words.items()}
+    boot = values["uicrb"] if values["mbr8"] == 0xFFFFFFFF else values["mbr8"]
+    params = values["uicrp"] if values["mbrc"] == 0xFFFFFFFF else values["mbrc"]
+    if (values["boot"], values["params"]) != (boot, params):
+        raise ValueError("reported bootloader addresses disagree with current MBR/UICR words")
+    return {"text": text, "hex": hex_words, **values}
+
+
+def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_floor=False,
+                             require_target_boot_addresses=False):
+    if require_target_boot_addresses and target is None:
+        raise ValueError("bootloader address inspection requires the approved target")
     record = {"read_only": True, "inspection_complete": False, "nodes": {},
               "target_genesis_floor_required": require_target_genesis_floor,
-              "target_genesis_floor_verified": False}
+              "target_genesis_floor_verified": False,
+              "target_boot_addresses_required": require_target_boot_addresses,
+              "target_boot_addresses_verified": False}
     evidence.summary["measurements"]["ota_preflight"] = record
     identities = {"client": serializable_app_info(app_info(client))}
     if target is not None:
@@ -675,6 +697,10 @@ def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_f
                 row["command"] = f"ota {kind}"
                 row["text"] = node.command(row["command"])
             evidence.log("ota_preflight_raw_readback", node=role, kind=kind, **row)
+        if role == "target" and require_target_boot_addresses:
+            row = diagnostics["bootloader"] = {"command": "ota bootloader"}
+            row["text"] = node.command(row["command"])
+            evidence.log("ota_preflight_raw_readback", node=role, kind="bootloader", **row)
     for role, diagnostics in record["nodes"].items():
         for kind, row in diagnostics.items():
             try:
@@ -683,12 +709,28 @@ def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_f
                     if not frame or frame[0] != RESP_OTA_STATUS:
                         raise RuntimeError(f"companion OTA diagnostic refused: {frame.hex()}")
                     row["text"] = frame[1:].decode("ascii")
-                row.update(parse_ota_preflight_diagnostic(row["text"], kind))
+                row.update(parse_ota_boot_addresses(row["text"]) if kind == "bootloader"
+                           else parse_ota_preflight_diagnostic(row["text"], kind))
             except (ValueError, RuntimeError) as exc:
                 row["error"] = f"{type(exc).__name__}: {exc}"
                 raise
             evidence.log("ota_preflight_diagnostic", node=role, kind=kind, **row)
     record["inspection_complete"] = True
+    if require_target_boot_addresses:
+        diagnostics = record["nodes"]["target"]
+        observed = diagnostics["bootloader"]
+        early_writes_allowed = diagnostics["preflight"]["writes_allowed"]
+        writes_allowed = diagnostics["capability"]["writes_allowed"]
+        expected = {"boot": 0xF4000, "params": 0xFE000}
+        evidence.check("target-boot-addresses",
+                       observed["boot"] == expected["boot"]
+                       and observed["params"] == expected["params"]
+                       and early_writes_allowed and writes_allowed,
+                       observed=observed, expected=expected,
+                       early_writes_allowed=early_writes_allowed,
+                       writes_allowed=writes_allowed, read_only=True,
+                       board_id_verified=False, cf2_verified=False, loader_installed_verified=False)
+        record["target_boot_addresses_verified"] = True
     if require_target_genesis_floor:
         capability = record["nodes"]["target"]["capability"]
         early_writes_allowed = record["nodes"]["target"]["preflight"]["writes_allowed"]
@@ -782,6 +824,9 @@ def main():
     parser.add_argument("--require-target-genesis-floor", action="store_true",
                        help="paired preflight only: require target INSTALL_CAPABLE, allowed writes "
                             "and freshly observed present genesis floor")
+    parser.add_argument("--require-target-boot-addresses", action="store_true",
+                       help="paired preflight only: require fresh matching MBR/UICR boot addresses "
+                            "and allowed ordinary writes; never reset or install")
     parser.add_argument("--bandwidth-hz", type=int, choices=SUPPORTED_LORA_BANDWIDTHS_HZ,
                        help="configure-only LoRa bandwidth in integer Hz (default: 62500)")
     scope = parser.add_mutually_exclusive_group()
@@ -800,6 +845,9 @@ def main():
     args = parser.parse_args()
     if args.require_target_genesis_floor and (not args.inspect_ota_preflight or args.client_only):
         parser.error("--require-target-genesis-floor requires --inspect-ota-preflight "
+                     "with both approved roles; not --client-only or another mode")
+    if args.require_target_boot_addresses and (not args.inspect_ota_preflight or args.client_only):
+        parser.error("--require-target-boot-addresses requires --inspect-ota-preflight "
                      "with both approved roles; not --client-only or another mode")
     if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
         parser.error("--monitor-seconds must be finite and non-negative")
@@ -854,7 +902,8 @@ def main():
             run_grant_client_admin(client, target, evidence)
         elif args.inspect_ota_preflight:
             run_inspect_ota_preflight(client, target, evidence,
-                                     require_target_genesis_floor=args.require_target_genesis_floor)
+                                     require_target_genesis_floor=args.require_target_genesis_floor,
+                                     require_target_boot_addresses=args.require_target_boot_addresses)
         elif args.inspect_configuration:
             run_inspect_configuration(client, target, evidence)
         else:

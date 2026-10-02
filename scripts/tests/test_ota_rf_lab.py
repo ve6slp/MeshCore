@@ -353,6 +353,17 @@ class LabRoleTransportTests(unittest.TestCase):
              "requires --inspect-ota-preflight"),
             (["--require-target-genesis-floor", "--inspect-ota-preflight", "--bandwidth-hz=250000"],
              "requires --configure-only"),
+            (["--require-target-boot-addresses"], "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--configure-only"], "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--grant-client-admin"], "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--monitor-seconds=0"], "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--monitor-seconds=1"], "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--inspect-configuration"],
+             "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--inspect-ota-preflight", "--client-only"],
+             "requires --inspect-ota-preflight"),
+            (["--require-target-boot-addresses", "--inspect-ota-preflight", "--bandwidth-hz=250000"],
+             "requires --configure-only"),
             (["--monitor-seconds=1", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--grant-client-admin", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--bandwidth-hz=250000"], "requires --configure-only"),
@@ -1463,6 +1474,8 @@ class OtaPreflightInspectionTests(unittest.TestCase):
     GENESIS_REASON = ("floor=present seq=00000001 ctr=00000000 ext=00000000 sha="
                       + "0" * 64 + " io=ok")
     GENESIS_CAPABILITY = "writes=allowed INSTALL_CAPABLE: " + GENESIS_REASON
+    BOOT_ADDRESSES = ("mbr8=FFFFFFFF mbrc=FFFFFFFF uicrb=000F4000 uicrp=000FE000 "
+                      "boot=000F4000 params=000FE000")
 
     def setUp(self):
         self.evidence = evidence_fixture()
@@ -1520,6 +1533,217 @@ class OtaPreflightInspectionTests(unittest.TestCase):
         ])
         self.client.get_acl.assert_not_called()
         self.target.get_acl.assert_not_called()
+
+    def boot_addresses_fixture(self, text=None, early_blocked=False, capability_blocked=False):
+        self.genesis_fixture(early_blocked=early_blocked)
+        capability = self.GENESIS_CAPABILITY.replace("allowed", "blocked") if capability_blocked \
+            else self.GENESIS_CAPABILITY
+        writes = "blocked" if early_blocked else "allowed"
+        self.target.command.side_effect = [
+            "> repeater", "> " + TARGET_KEY.hex(),
+            f"writes={writes} marker=qualified proof=qualified-state state=0 phase=0 decision=0",
+            capability, self.BOOT_ADDRESSES if text is None else text,
+        ]
+
+    def test_boot_addresses_inspection_captures_actual_words_without_reset_or_install(self):
+        self.boot_addresses_fixture()
+        self.run_main(["--require-target-boot-addresses"])
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertTrue(record["read_only"])
+        self.assertTrue(record["target_boot_addresses_required"])
+        self.assertTrue(record["target_boot_addresses_verified"])
+        self.assertFalse(record["target_genesis_floor_verified"])
+        self.assertEqual(record["nodes"]["target"]["bootloader"], {
+            "command": "ota bootloader", "text": self.BOOT_ADDRESSES,
+            "hex": {"mbr8": "FFFFFFFF", "mbrc": "FFFFFFFF",
+                    "uicrb": "000F4000", "uicrp": "000FE000",
+                    "boot": "000F4000", "params": "000FE000"},
+            "mbr8": 0xFFFFFFFF, "mbrc": 0xFFFFFFFF,
+            "uicrb": 0xF4000, "uicrp": 0xFE000, "boot": 0xF4000, "params": 0xFE000,
+        })
+        self.assertEqual(self.target.command.call_args_list, [
+            mock.call("get role"), mock.call("get public.key"),
+            mock.call("ota preflight"), mock.call("ota capability"), mock.call("ota bootloader"),
+        ])
+        self.assertEqual(self.client.command.call_count, 3)
+        self.target.get_acl.assert_not_called()
+        check = self.evidence.summary["checks"]["target-boot-addresses"]
+        self.assertFalse(check["board_id_verified"])
+        self.assertFalse(check["cf2_verified"])
+        self.assertFalse(check["loader_installed_verified"])
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_current_mbr_words_override_uicr_without_assuming_erased_words_are_zero(self):
+        text = ("mbr8=000F4000 mbrc=000FE000 uicrb=000F0000 uicrp=FFFFFFFF "
+                "boot=000F4000 params=000FE000")
+        self.boot_addresses_fixture(text)
+        self.run_main(["--require-target-boot-addresses"])
+        self.assertTrue(self.evidence.summary["measurements"]["ota_preflight"]
+                        ["target_boot_addresses_verified"])
+
+    def test_independent_word_selection_uses_only_ffffffff_as_the_uicr_sentinel(self):
+        for text in (
+            "mbr8=000F4000 mbrc=FFFFFFFF uicrb=00000000 uicrp=000FE000 "
+            "boot=000F4000 params=000FE000",
+            "mbr8=FFFFFFFF mbrc=000FE000 uicrb=000F4000 uicrp=00000000 "
+            "boot=000F4000 params=000FE000",
+        ):
+            with self.subTest(text=text):
+                self.setUp()
+                self.boot_addresses_fixture(text)
+                self.run_main(["--require-target-boot-addresses"])
+                self.assertTrue(self.evidence.summary["measurements"]["ota_preflight"]
+                                ["target_boot_addresses_verified"])
+        for mbr_boot in ("00000000", "FFFFFFFE"):
+            with self.subTest(mbr_boot=mbr_boot):
+                self.setUp()
+                text = (f"mbr8={mbr_boot} mbrc=FFFFFFFF uicrb=000F4000 "
+                        f"uicrp=000FE000 boot={mbr_boot} params=000FE000")
+                self.boot_addresses_fixture(text)
+                with self.assertRaisesRegex(AssertionError, "target-boot-addresses"):
+                    self.run_main(["--require-target-boot-addresses"])
+                observed = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertEqual(observed["nodes"]["target"]["bootloader"]["boot"], int(mbr_boot, 16))
+                self.assertFalse(observed["target_boot_addresses_verified"])
+
+    def test_boot_address_serial_transport_strips_the_existing_wrapper_not_a_payload_prefix(self):
+        node = ota_rf_lab.RepeaterSerial.__new__(ota_rf_lab.RepeaterSerial)
+        node.name = "target"
+        node.pending = []
+        node.buffer = bytearray()
+        node.evidence = mock.Mock()
+        node._write_bytes = mock.Mock()
+        batches = iter([[], ["ota bootloader", "  -> " + self.BOOT_ADDRESSES]])
+        node.poll = mock.Mock(side_effect=lambda timeout=0: node.pending.extend(next(batches, [])))
+        text = node.command("ota bootloader")
+        self.assertEqual(text, self.BOOT_ADDRESSES)
+        self.assertEqual(len(text), 87)
+        self.assertEqual(ota_rf_lab.parse_ota_boot_addresses(text)["hex"]["uicrb"], "000F4000")
+        node._write_bytes.assert_called_once_with(b"ota bootloader\r")
+
+    def test_backend_boot_address_refusals_keep_actual_raw_errors_and_fail_explicitly(self):
+        for text in ("Err - USB only", "Err - bootloader metadata changed",
+                     "Err - bootloader reply overflow"):
+            with self.subTest(text=text):
+                self.setUp()
+                self.boot_addresses_fixture(text)
+                with self.assertRaisesRegex(RuntimeError, text):
+                    self.run_main(["--require-target-boot-addresses"])
+                record = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertFalse(record["inspection_complete"])
+                self.assertFalse(record["target_boot_addresses_verified"])
+                self.assertEqual(record["nodes"]["target"]["bootloader"]["text"], text)
+                self.assertIn(text, record["nodes"]["target"]["bootloader"]["error"])
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.client.close.assert_called_once()
+                self.target.close.assert_called_once()
+
+    def test_boot_address_requirement_cannot_bypass_approved_pair_or_role_name_guards(self):
+        for role, serial in (("client", "unapproved"), ("target", "unapproved"),
+                             ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
+            with self.subTest(role=role, serial=serial):
+                self.setUp()
+                self.boot_addresses_fixture()
+                self.devices[role].serial = serial
+                with self.assertRaises(AssertionError):
+                    self.run_main(["--require-target-boot-addresses"])
+                self.client_open.assert_not_called()
+                self.target_open.assert_not_called()
+                self.client.command.assert_not_called()
+                self.target.command.assert_not_called()
+        self.setUp()
+        with mock.patch.object(ota_rf_lab, "TARGET_ROLE", "pine"):
+            with self.assertRaisesRegex(AssertionError, "approved-ota-preflight-roles"):
+                self.run_main(["--require-target-boot-addresses"])
+        self.resolve.assert_not_called()
+        self.client_open.assert_not_called()
+        self.target_open.assert_not_called()
+
+    def test_boot_address_requirement_checks_actual_roles_and_distinct_normal_keys_before_queries(self):
+        for frame, role, key in ((self_info(advert_type=2), "> repeater", TARGET_KEY),
+                                 (self_info(), "> room", TARGET_KEY),
+                                 (self_info(), "> repeater", CLIENT_KEY)):
+            with self.subTest(role=role, key=key):
+                self.setUp()
+                self.client.command.side_effect = [frame]
+                self.target.command.side_effect = [role, "> " + key.hex()]
+                with self.assertRaises((RuntimeError, AssertionError)):
+                    self.run_main(["--require-target-boot-addresses"])
+                self.assertEqual(self.client.command.call_count, 1)
+                self.assertFalse(any(call.args[0].startswith("ota ")
+                                     for call in self.target.command.call_args_list))
+
+    def test_boot_addresses_and_actual_genesis_floor_are_independent_required_proofs(self):
+        self.boot_addresses_fixture()
+        self.run_main(["--require-target-boot-addresses", "--require-target-genesis-floor"])
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertTrue(record["target_boot_addresses_verified"])
+        self.assertTrue(record["target_genesis_floor_verified"])
+        self.assertTrue(self.evidence.summary["checks"]["target-boot-addresses"]["passed"])
+        self.assertTrue(self.evidence.summary["checks"]["target-genesis-floor"]["passed"])
+
+    def test_boot_address_requirement_refuses_wrong_erased_zero_or_blocked_values(self):
+        cases = [
+            (self.BOOT_ADDRESSES.replace("000F4000", "000F0000"), False, False),
+            (self.BOOT_ADDRESSES.replace("000FE000", "000FF000"), False, False),
+            (self.BOOT_ADDRESSES.replace("000F4000", "FFFFFFFF").replace("000FE000", "FFFFFFFF"),
+             False, False),
+            (self.BOOT_ADDRESSES.replace("FFFFFFFF", "00000000")
+             .replace("000F4000", "00000000").replace("000FE000", "00000000"), False, False),
+            (self.BOOT_ADDRESSES, True, False),
+            (self.BOOT_ADDRESSES, False, True),
+        ]
+        for text, early_blocked, capability_blocked in cases:
+            with self.subTest(text=text, early_blocked=early_blocked,
+                              capability_blocked=capability_blocked):
+                self.setUp()
+                self.boot_addresses_fixture(text, early_blocked, capability_blocked)
+                with self.assertRaisesRegex(AssertionError, "target-boot-addresses"):
+                    self.run_main(["--require-target-boot-addresses"])
+                record = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertTrue(record["inspection_complete"])
+                self.assertFalse(record["target_boot_addresses_verified"])
+                self.assertEqual(record["nodes"]["target"]["bootloader"]["text"], text)
+                self.assertIn("target-boot-addresses", self.evidence.finish.call_args.args[0])
+
+    def test_malformed_or_inconsistent_boot_words_retain_evidence_and_fail_explicitly(self):
+        for text in (
+            self.BOOT_ADDRESSES[:-1],
+            self.BOOT_ADDRESSES + " boot=000F4000",
+            self.BOOT_ADDRESSES.replace("mbr8=FFFFFFFF ", ""),
+            self.BOOT_ADDRESSES.replace(" boot=000F4000", " boot=000F0000"),
+            self.BOOT_ADDRESSES.replace(" params=000FE000", " params=000FF000"),
+            self.BOOT_ADDRESSES.replace("mbr8=FFFFFFFF", "mbr8=000F0000"),
+            self.BOOT_ADDRESSES.replace("mbrc=FFFFFFFF", "mbrc=?"),
+            self.BOOT_ADDRESSES.replace("uicrb=000F4000", "uicrb=000f4000"),
+            self.BOOT_ADDRESSES.replace("mbrc=FFFFFFFF", "mbrc=FFFFFFF"),
+            self.BOOT_ADDRESSES.replace(" ", "  ", 1),
+            self.BOOT_ADDRESSES.replace("mbr8=", "mbr_boot="),
+            "bootloader " + self.BOOT_ADDRESSES,
+            "> " + self.BOOT_ADDRESSES,
+            self.BOOT_ADDRESSES + "\r\n",
+            self.BOOT_ADDRESSES + "\x00",
+            "ERR: boot metadata unavailable",
+        ):
+            with self.subTest(text=text):
+                self.setUp()
+                self.boot_addresses_fixture(text)
+                with self.assertRaises(ValueError):
+                    self.run_main(["--require-target-boot-addresses"])
+                record = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertFalse(record["inspection_complete"])
+                self.assertFalse(record["target_boot_addresses_verified"])
+                self.assertEqual(record["nodes"]["target"]["bootloader"]["text"], text)
+                self.assertIn("error", record["nodes"]["target"]["bootloader"])
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_ordinary_preflight_does_not_query_or_assume_boot_addresses(self):
+        self.run_main()
+        self.assert_probe_commands()
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertFalse(record["target_boot_addresses_required"])
+        self.assertFalse(record["target_boot_addresses_verified"])
+        self.assertNotIn("bootloader", record["nodes"]["target"])
 
     def test_floor_suffix_parses_full_hex_values_without_losing_the_opaque_reason(self):
         reason = ("floor=present seq=A0000001 ctr=00000002 ext=00010000 sha="

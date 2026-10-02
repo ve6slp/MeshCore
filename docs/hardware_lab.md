@@ -58,6 +58,7 @@ of use makes that a non-event.
 | `make lab-doctor` | Check sudo, uhubctl, pyserial, and per-role power control |
 | `make lab-reset-<role>` | Restart the application firmware |
 | `make lab-bootloader-<role>` | Enter the serial DFU bootloader |
+| `make lab-bootloader-uf2-target` | Request vendor UF2 mode from the target's bench USB application |
 | `make lab-power-cycle-<role>` | Cut and restore USB port power |
 | `make lab-wait-<role>` | Block until the board enumerates |
 | `make upload-xiao-nrf52-<role>` | Build and flash the role's application |
@@ -441,10 +442,14 @@ The target-only loader installer then passed artifact validation but refused
 the vendor's actual stable boot-port product name before writing. Its
 identity check now reuses the shared lab device resolver rather than a
 product-name template, retaining the approved serial, Seeed vendor,
-bootloader mode and stable by-id requirements. Read-only inspection found
-that the stock target exposes CDC but no mass-storage interface or mounted
-UF2 volume. This still blocks the UF2 installer; the volume and Board-ID
-guards have not been bypassed.
+bootloader mode and stable by-id requirements. Read-only inspection in the
+mode requested by the 1200-baud helper found CDC but no mass-storage
+interface or mounted UF2 volume. Vendor and Arduino source inspection
+then established why: that helper deliberately selects serial-only DFU,
+which hides mass storage. The vendor has a separate UF2-entry API and a
+physical double-reset path. Their existence does not establish today's
+boot configuration or board compatibility. The volume and Board-ID guards
+have not been bypassed.
 No qualified target-loader installation, replacement-protocol radio OTA
 transfer, READY, COMMIT, installation or rollback has been performed.
 
@@ -497,7 +502,46 @@ The guarded UF2 path requires a real mass-storage interface and exactly
 one mounted UF2 volume belonging to the approved target's USB serial.
 Its `INFO_UF2.TXT` Board-ID must match the supported board. A CDC-only
 serial DFU port does not provide that volume, regardless of its product
-name. Do not fabricate a mount or bypass the Board-ID check.
+name. The 1200-baud application-flash helper selects serial-only DFU, not
+UF2 mode. Do not fabricate a mount or bypass the Board-ID check.
+
+With the matching bench application, first capture the target's current
+MBR and UICR address words through the read-only preflight:
+
+```sh
+make inspect-xiao-nrf52-ota-preflight OTA_LAB_REQUIRE_BOOT_ADDRESSES=1 \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/boot-addresses-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The inspection requests only public boot metadata, never a memory dump,
+reset or repair. It derives the effective boot and parameter addresses
+from the flash words, falling back to UICR only when a flash word is
+`FFFFFFFF`. It requires `000F4000` and `000FE000`, matching reported
+derived values and allowed early and later ordinary-write diagnostics.
+Missing or malformed tuples, and zero, erased or incompatible effective
+addresses, fail explicitly.
+This establishes address compatibility only: current UF2 Board-ID, CF2,
+artifact and installed-loader checks remain separate requirements.
+
+Then request the vendor's separate UF2 mode through that application's
+local USB CLI:
+
+```sh
+make lab-bootloader-uf2-target
+```
+
+This target-only helper requires the approved application-mode serial and
+stable by-id identity, an acknowledgement for the current command,
+observed USB disappearance and bootloader re-enumeration with a real
+mass-storage interface under the target's USB ancestry. It has no
+1200-baud fallback and refuses an already-running serial DFU bootloader.
+The firmware refuses non-USB requests and active OTA transactions or
+unresolved boot verification, and rechecks those guards before entry.
+The helper neither mounts a volume nor writes firmware. Mount the
+serial-matched volume separately, then read its current `INFO_UF2.TXT`
+and complete the board and artifact checks before using the guarded
+installer. Successful UF2 entry alone proves neither package compatibility
+nor an installed recovery loader.
 
 The reviewed factory-initialization loader can create the initial durable
 floor only with verified flash, healthy vendor boot evidence and all eight

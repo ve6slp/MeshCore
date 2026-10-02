@@ -2,6 +2,11 @@
 #include <algorithm>
 #include <cmath>
 
+#if XIAO_OTA_USB_LAB_CLI
+#include <nrf_mbr.h>
+#include <wiring.h>
+#endif
+
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaBoardBackendCommon.h>
 #include <helpers/ota/OtaWriteGate.h>
@@ -1362,7 +1367,19 @@ bool MyMesh::otaBootCandidateThunk(void*, const mesh::ota::OtaBootLifecycleEvide
 }
 #endif
 
-void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
+#if XIAO_OTA_USB_LAB_CLI
+bool MyMesh::uf2RebootAllowed() {
+  const auto phase = getOtaIntegration().readback().phase;
+  using Phase = mesh::ota::usb::UsbOtaPhase;
+  return !_ota_destructive_writes_disallowed_ && !otaBoardTrialHealthWindowActive() &&
+      !otaBoardBootLifecycleVerificationPending() && !getOtaIntegration().hasPendingRfWork() &&
+      phase != Phase::Erasing && phase != Phase::Receiving && phase != Phase::Verifying && phase != Phase::Ready &&
+      phase != Phase::CacheSealed && phase != Phase::CommitPending && phase != Phase::Trial;
+}
+#endif
+
+void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply, bool local_usb) {
+  (void)local_usb;
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1399,11 +1416,39 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
   while (*command == ' ') command++; // skip leading spaces
 
+#if XIAO_OTA_USB_LAB_CLI
+  size_t reply_capacity = 160;
+#endif
   if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
     memcpy(reply, command, 3);                    // reflect the prefix back
     reply += 3;
     command += 3;
+#if XIAO_OTA_USB_LAB_CLI
+    reply_capacity -= 3;
+#endif
   }
+
+#if XIAO_OTA_USB_LAB_CLI
+  if (strncmp(command, "reboot uf2", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    // Transport provenance, never the remote client's timestamp, grants this lab operation.
+    if (!local_usb) {
+      strcpy(reply, "Err - USB only");
+    } else if (command[10] != 0) {
+      strcpy(reply, "Err - usage: reboot uf2");
+    } else if (!uf2RebootAllowed()) {
+      strcpy(reply, "Err - OTA busy");
+    } else {
+      if (!_uf2_reboot_pending) {
+        const uint32_t now = _ms->getMillis();
+        _uf2_reboot_pending = true;
+        _uf2_reboot_due_ms = now + mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs;
+        _uf2_reboot_queue_deadline_ms = now + mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs;
+      }
+      strcpy(reply, "OK - rebooting UF2");
+    }
+    return;
+  }
+#endif
 
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
@@ -1459,6 +1504,35 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     while (*sub == ' ') sub++;
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
+#if XIAO_OTA_USB_LAB_CLI
+    } else if (strcmp(sub, "bootloader") == 0) {
+      if (!local_usb) {
+        strcpy(reply, "Err - USB only");
+      } else {
+        auto read_words = [](uint32_t words[4]) {
+          words[0] = *reinterpret_cast<volatile const uint32_t*>(MBR_BOOTLOADER_ADDR);
+          words[1] = *reinterpret_cast<volatile const uint32_t*>(MBR_PARAM_PAGE_ADDR);
+          words[2] = *MBR_UICR_BOOTLOADER_ADDR;
+          words[3] = *MBR_UICR_PARAM_PAGE_ADDR;
+        };
+        uint32_t words[4], rechecked[4];
+        read_words(words);
+        read_words(rechecked);
+        if (memcmp(words, rechecked, sizeof(words))) {
+          strcpy(reply, "Err - bootloader metadata changed");
+        } else {
+          const uint32_t boot = words[0] == UINT32_MAX ? words[2] : words[0];
+          const uint32_t params = words[1] == UINT32_MAX ? words[3] : words[1];
+          const int written = snprintf(reply, reply_capacity,
+              "mbr8=%08lX mbrc=%08lX uicrb=%08lX uicrp=%08lX boot=%08lX params=%08lX",
+              static_cast<unsigned long>(words[0]), static_cast<unsigned long>(words[1]),
+              static_cast<unsigned long>(words[2]), static_cast<unsigned long>(words[3]),
+              static_cast<unsigned long>(boot), static_cast<unsigned long>(params));
+          if (written < 0 || static_cast<size_t>(written) >= reply_capacity)
+            strcpy(reply, "Err - bootloader reply overflow");
+        }
+      }
+#endif
     } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
       mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
           strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
@@ -1567,6 +1641,23 @@ void MyMesh::loop() {
   last_millis = now;
 #if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
   getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(), _mgr->getOutboundTotal() != 0);
+#endif
+#if XIAO_OTA_USB_LAB_CLI
+  if (_uf2_reboot_pending) {
+    if (!uf2RebootAllowed()) {
+      _uf2_reboot_pending = false;
+      Serial.println("  -> Err - OTA busy");
+    } else {
+      const uint32_t now_ms = _ms->getMillis();
+      if (static_cast<int32_t>(now_ms - _uf2_reboot_due_ms) >= 0 &&
+          ((!isSendInProgress() && _mgr->getOutboundTotal() == 0) ||
+           static_cast<int32_t>(now_ms - _uf2_reboot_queue_deadline_ms) >= 0)) {
+        _uf2_reboot_pending = false;
+        Serial.flush();
+        enterUf2Dfu();
+      }
+    }
+  }
 #endif
 }
 
@@ -1688,6 +1779,9 @@ void MyMesh::tickOtaTrialHealth() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+#if XIAO_OTA_USB_LAB_CLI
+  if (_uf2_reboot_pending) return true;
+#endif
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif

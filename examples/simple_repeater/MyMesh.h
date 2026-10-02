@@ -42,6 +42,11 @@
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
 #endif
 
+#if MESHCORE_LORA_OTA && MESHCORE_OTA_LAB_BACKEND && defined(NRF52_PLATFORM) && \
+    defined(NRF52840_XXAA) && defined(_SEEED_XIAO_NRF52840_H_) && defined(ENABLE_USB_INTERFACE)
+#define XIAO_OTA_USB_LAB_CLI 1
+#endif
+
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
 #endif
@@ -194,6 +199,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   mesh::ota::OtaFirmwareService _ota_service_;
   uint32_t _ota_trial_last_radio_fault_count_ = 0;
 
+#if XIAO_OTA_USB_LAB_CLI
+  bool _uf2_reboot_pending = false;
+  uint32_t _uf2_reboot_due_ms = 0, _uf2_reboot_queue_deadline_ms = 0;
+  bool uf2RebootAllowed();
+#endif
+
   bool isRadioStuckOutOfRecv(uint32_t now_ms);
   // Astra's correction: boot-mount success + the board-level storage-
   // fault latch alone is stale evidence beyond the exact tick a user
@@ -317,7 +328,7 @@ public:
   void saveIdentity(const mesh::LocalIdentity& new_id) override;
   void clearStats() override;
 
-  void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
+  void handleCommand(uint32_t sender_timestamp, char* command, char* reply, bool local_usb = false);
   void loop();
 
 #if MESHCORE_LORA_OTA

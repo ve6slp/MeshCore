@@ -80,6 +80,7 @@ OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_MONITOR_SECONDS ?= 60
 OTA_LAB_BANDWIDTH_HZ ?= 62500
 OTA_LAB_REQUIRE_GENESIS_FLOOR ?= 0
+OTA_LAB_REQUIRE_BOOT_ADDRESSES ?= 0
 OTA_LAB_CLIENT_PROTOCOL ?= companion
 OTA_LAB_TARGET_PROTOCOL ?= repeater
 OTA_UPLOAD_IMAGE ?=
@@ -127,7 +128,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         test-ota-image-layout-index test-ota-storage \
         test-ota-trust test-ota-boot test-ota-integration test-ota-rf-to-boot test-ota-lab-host test-ota-lab-archive clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
-        lab-bootloader-client lab-bootloader-target \
+        lab-bootloader-client lab-bootloader-target lab-bootloader-uf2-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
         lab-wait-client lab-wait-target \
         build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets build-ota-baseline-targets build-non-ota-targets \
@@ -274,6 +275,10 @@ lab-bootloader-client:
 lab-bootloader-target:
 	@$(LAB_DEVICE) bootloader target
 
+## Enter vendor UF2 mode through the approved target's bench USB application.
+lab-bootloader-uf2-target:
+	@$(LAB_DEVICE) bootloader-uf2 target --timeout 30
+
 ## Cut and restore USB port power. Use this to recover an unresponsive board.
 lab-power-cycle-client:
 	@$(LAB_DEVICE) power-cycle client
@@ -367,7 +372,8 @@ inspect-xiao-nrf52-ota-preflight: tmpdir
 	@mkdir -- "$(OTA_LAB_ARTIFACT_DIR)" || \
 	  { echo "Set OTA_LAB_ARTIFACT_DIR to a new directory for the preflight inspection" >&2; exit 1; }
 	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --inspect-ota-preflight \
-	  $(if $(filter 1,$(OTA_LAB_REQUIRE_GENESIS_FLOOR)),--require-target-genesis-floor)
+	  $(if $(filter 1,$(OTA_LAB_REQUIRE_GENESIS_FLOOR)),--require-target-genesis-floor) \
+	  $(if $(filter 1,$(OTA_LAB_REQUIRE_BOOT_ADDRESSES)),--require-target-boot-addresses)
 
 inspect-xiao-nrf52-ota-configuration: tmpdir
 	@mkdir -p -- "$$(dirname -- "$(OTA_LAB_ARTIFACT_DIR)")"
