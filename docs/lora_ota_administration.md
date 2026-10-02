@@ -11,13 +11,18 @@ results do not qualify the replacement. No physical node has completed a
 LoRa-delivered firmware install, confirmation or rollback. Do not use these
 controls to manage a deployed network.
 
-The approved bench pair now has immutable applications, but normal settings
-and radio setup remain incomplete. No administrator change or qualified
-target custom-loader installation has been performed. Keep the uploader on
-the stock bootloader; only cache staging is available after its preflight
-succeeds. The bench refusal comes from the stock vendor's documented
-zero-CRC SDK convention; a stock-only compatibility correction is pending.
-Installing a custom uploader loader is not a workaround.
+On 2026-10-02, the approved bench pair preserved normal settings, identities
+and the separately granted administrator ACL across reboot. Ordinary
+target-to-client radio reception then passed with native MeshCore identity
+acceptance and independently verified advert signing; configuration and the
+full ACL were unchanged afterward. These results do not qualify an update.
+The target's qualified custom loader is not installed, and application
+recovery integration remains open.
+
+Keep the uploader on the stock bootloader; only cache staging is available
+after its preflight succeeds. Stock-only compatibility now honours the
+vendor's documented unused-CRC-zero convention without relaxing candidate
+or trial integrity. Installing a custom uploader loader is not a workaround.
 
 ## Update policy
 

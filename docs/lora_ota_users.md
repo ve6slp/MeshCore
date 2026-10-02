@@ -34,11 +34,14 @@ competing candidates. These results are not physical acceptance.
 Hardware qualification remains incomplete: no node has completed a
 LoRa-delivered install, trial confirmation or rollback with this
 implementation. The approved bench pair has received immutable applications,
-but normal settings and radio configuration are not complete, and the target
-has not received a qualified custom OTA bootloader. Its 2% airtime policy and
-ordinary mesh service must still be verified together on the radio.
-Routed delivery through intermediate
-nodes and fleet contention also need hardware beyond the two-node bench.
+and its normal settings and administrator permission survived reboot.
+On 2026-10-02, ordinary target-to-client radio reception also passed with
+MeshCore identity verification and unchanged configuration. The target has
+not received its qualified custom OTA bootloader, and application recovery
+integration remains a gate. The 2% airtime policy and ordinary mesh service
+must still be verified together during an update. Routed delivery through
+intermediate nodes and fleet contention also need hardware beyond the
+two-node bench.
 
 Earlier lab firmware demonstrated radio transfers and external-flash
 staging, but that transport has been retired. Those captures do not qualify
@@ -57,7 +60,7 @@ or `start ota` over USB/BLE — until this changes.
 
 | Board | LoRa OTA status |
 | --- | --- |
-| Seeed Studio XIAO nRF52840 + SX1262 | Historical radio and raw-flash evidence only; current OTA qualification incomplete |
+| Seeed Studio XIAO nRF52840 + SX1262 | Ordinary radio and configuration verified; firmware OTA qualification incomplete |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
 | Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
 | Heltec v3/v4 | Not started |
