@@ -185,6 +185,85 @@ static void test_retired_intent_cannot_install_ready_without_new_commit_after_ba
          (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID);
 }
 
+static void test_consumed_failed_command_does_not_install_replacement_after_precommit_abort(const char *prefix) {
+  fake_io_state_t s;
+  xiao_ota_command_v2_t command;
+  xiao_ota_wire_descriptor_t previous, next;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t settings[28], canonical[59], digest[32], running_hash[32];
+  uint8_t next_hash[32];
+  size_t running_size, candidate_size;
+  unsigned attempt;
+  fake_io_reset(&s);
+  assert(read_remote_fixture(prefix, "rollback-command", (uint8_t *)&command, sizeof(command)) == sizeof(command));
+  assert(xiao_ota_command_v2_valid(&command));
+  assert(xiao_ota_wire_descriptor_decode(command.wire_descriptor, &previous));
+  assert(previous.security_counter == 5);
+  assert((((uint32_t)previous.board_family << 16) | previous.board_variant) == XIAO_OTA_BOARD_TARGET);
+  assert(previous.role == XIAO_OTA_COMPILED_ROLE_ID);
+  memcpy(s.qspi + XIAO_OTA_COMMAND_A, &command, sizeof(command));
+  candidate_size = read_remote_fixture(prefix, "rollback-candidate", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                                       XIAO_OTA_CANDIDATE_SIZE);
+  running_size = read_remote_fixture(prefix, "rollback-running", s.internal_flash + XIAO_OTA_APP_START,
+                                     XIAO_OTA_APP_MAX_SIZE);
+  assert(candidate_size == previous.exact_size_bytes && running_size == command.active_image_extent);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, running_size, running_hash);
+  assert(read_remote_fixture(prefix, "rollback-sdk", settings, sizeof(settings)) == sizeof(settings));
+  fake_io_write_settings_raw(&s, settings);
+  assert(read_remote_fixture(prefix, "rollback-floor", s.qspi + XIAO_OTA_FLOOR_A,
+                             2 * XIAO_OTA_QSPI_SECTOR_SIZE) == 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  for (attempt = 0; attempt < XIAO_OTA_MAX_TRIAL_BOOTS; ++attempt)
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+  assert(state.transaction_nonce == command.transaction_nonce && state.candidate_counter == 5);
+  assert(memcmp(state.candidate_hash_sha256, previous.sha256, 32) == 0);
+  assert(state.active_image_extent == running_size && memcmp(state.backup_hash_sha256, running_hash, 32) == 0);
+  assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 4);
+  assert(memcmp(s.qspi + XIAO_OTA_COMMAND_A, &command, sizeof(command)) == 0);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, running_size, digest);
+  assert(memcmp(digest, running_hash, 32) == 0);
+
+  /* Native production recovery signed-aborted B and admitted different C,
+   * READY without COMMIT, without erasing this consumed above-floor command. */
+  assert(read_remote_fixture(prefix, "rollback-retained-command-region", s.qspi + XIAO_OTA_COMMAND_A,
+                             2 * XIAO_OTA_QSPI_SECTOR_SIZE) == 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  assert(memcmp(s.qspi + XIAO_OTA_COMMAND_A, &command, sizeof(command)) == 0);
+  assert(read_remote_fixture(prefix, "rollback-next-canonical", canonical, sizeof(canonical)) == sizeof(canonical));
+  assert(xiao_ota_wire_descriptor_decode(canonical, &next) && next.security_counter == 7);
+  assert(memcmp(next.sha256, previous.sha256, 32) != 0);
+  assert((((uint32_t)next.board_family << 16) | next.board_variant) == XIAO_OTA_BOARD_TARGET);
+  assert(next.role == XIAO_OTA_COMPILED_ROLE_ID);
+  candidate_size = read_remote_fixture(prefix, "rollback-next-candidate", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                                       XIAO_OTA_CANDIDATE_SIZE);
+  assert(candidate_size == next.exact_size_bytes);
+  sha256_of(s.qspi + XIAO_OTA_CANDIDATE_BASE, candidate_size, next_hash);
+  assert(memcmp(next_hash, next.sha256, 32) == 0);
+  for (attempt = 0; attempt < 3; ++attempt) {
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED && state.candidate_counter == 5);
+    assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 4);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, running_size, digest);
+    assert(memcmp(digest, running_hash, 32) == 0);
+    sha256_of(s.qspi + XIAO_OTA_CANDIDATE_BASE, candidate_size, digest);
+    assert(memcmp(digest, next_hash, 32) == 0);
+  }
+  assert(read_remote_fixture(prefix, "rollback-candidate", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                             XIAO_OTA_CANDIDATE_SIZE) == previous.exact_size_bytes);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+  /* The exact terminal state, not temporary QSPI hash refusal, consumes A. */
+  memset(s.qspi + XIAO_OTA_STATE_A, 0xff, 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(state.transaction_nonce == command.transaction_nonce && state.candidate_counter == 5);
+  printf("real Trial->FailedMax/floor4 board=%08x role=%u retains consumed counter5 command; "
+         "native signed ABORT(B)->different C READY/no COMMIT cannot install passed\n",
+         (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID);
+}
+
 int main(int argc, char **argv) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
   test_valid_usb_reflash_refuses_original_command_without_admission();
@@ -192,6 +271,7 @@ int main(int argc, char **argv) {
   if (argc == 2) {
     test_exact_rf_commit_deferred_reset_handoff_installs_and_confirms(argv[1]);
     test_retired_intent_cannot_install_ready_without_new_commit_after_bank_restore(argv[1]);
+    test_consumed_failed_command_does_not_install_replacement_after_precommit_abort(argv[1]);
   }
   return frozen_boot_process_tests_main();
 }

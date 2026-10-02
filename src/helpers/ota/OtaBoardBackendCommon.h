@@ -342,6 +342,7 @@ public:
 
     uint8_t records[2][Command::kRecordBytes];
     bool valid[2] = {}, matches[2] = {};
+    bool consumed_unbound = false;
     int newest = -1;
     for (uint32_t slot = 0; slot < 2; ++slot) {
       const uint32_t offset = slot * command_.eraseUnitBytes();
@@ -364,9 +365,20 @@ public:
           !memcmp(Command::admittedSignerKeyOf(records[slot]), candidate.ownerPublicKey, 32);
       if (newest < 0 || Command::sequenceOf(records[slot]) >= Command::sequenceOf(records[newest]))
         newest = slot;
-      // A future bank restore can revive an unbound sibling unless the protected floor excludes it.
+      // An above-floor unbound command needs proven consumption, never temporary admission refusal.
       const bool floor_refusal = d.securityCounter <= floor;
-      if (!matches[slot] && !floor_refusal) return Result::TooLate;
+      if (!matches[slot] && !floor_refusal) {
+        const bool completed_rollback = state_status == State::ReadStatus::Found &&
+            State::phase(state) == State::kPhaseFailedMax && before.settingsTailErased &&
+            State::transactionNonce(state) == Command::transactionNonceOf(records[slot]) &&
+            State::candidateCounter(state) == d.securityCounter &&
+            !memcmp(State::candidateHashSha256(state), d.sha256, 32) &&
+            State::activeImageExtent(state) == current.active_image_extent &&
+            !memcmp(state + 76, current.active_image_hash_sha256, 32);
+        if (!completed_rollback) return Result::TooLate;
+        consumed_unbound = true;
+        continue;
+      }
       const bool refused_now = floor_refusal || !before.settingsTailErased ||
           Command::activeImageExtentOf(records[slot]) != current.active_image_extent ||
           memcmp(Command::activeImageHashOf(records[slot]), current.active_image_hash_sha256, 32);
@@ -380,6 +392,9 @@ public:
     }
     const bool have_match = matches[0] || matches[1];
     if (candidate.phase == Store::Phase::Committed && !have_match) return Result::TooLate;
+    // No current intent: a proven consumed rollback must not block ordinary precommit ABORT.
+    // Actual cancellation still cannot leave any unbound sibling above the protected floor.
+    if (have_match && consumed_unbound) return Result::TooLate;
     if (have_match && (newest < 0 || !matches[newest] || candidate.receivedBlocks != candidate.totalBlocks))
       return Result::TooLate;
 

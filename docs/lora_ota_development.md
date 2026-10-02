@@ -300,6 +300,12 @@ the protected floor. Restoring the previous running bank cannot revive a
 cancelled command. Candidate bytes, the original owner and the floor
 remain intact until authorized replacement. Missing or corrupt command
 evidence does not become a generic unlock.
+An unrelated consumed command from a completed rollback does not block
+aborting a newer, uncommitted candidate when its authenticated nonce,
+counter and image hash match the terminal rollback and the running bank
+matches the restored backup. A command bound to the current candidate,
+including READY after an uncertain commit journal write, still requires
+the full cancellation proof.
 
 A newly durable remote nRF COMMIT arms the existing application reboot
 helper. It allows two seconds for the reply, requires direct-profile

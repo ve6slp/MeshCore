@@ -532,7 +532,9 @@ test-ota-rf-to-boot: tmpdir
 	    for role in 0 1; do \
 	      for suffix in command candidate running sdk floor \
 	        retired-candidate retired-canonical retired-command-region retired-floor \
-	        retired-previous-command retired-running retired-sdk retired-state-region; do \
+	        retired-previous-command retired-running retired-sdk retired-state-region \
+	        rollback-command rollback-candidate rollback-running rollback-sdk rollback-floor \
+	        rollback-next-candidate rollback-next-canonical rollback-retained-command-region; do \
 	        rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role-$$suffix.bin"; \
 	      done; \
 	    done; \
