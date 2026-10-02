@@ -1078,6 +1078,9 @@ void MyMesh::begin(FILESYSTEM *fs) {
   getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
   getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
+#if defined(NRF52840_XXAA)
+  getOtaIntegration().attachCommitReboot(nullptr, [](void*) { board.reboot(); });
+#endif
 #endif
 }
 
@@ -1556,6 +1559,9 @@ void MyMesh::loop() {
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+#if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
+  getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(), _mgr->getOutboundTotal() != 0);
+#endif
 }
 
 #if MESHCORE_LORA_OTA

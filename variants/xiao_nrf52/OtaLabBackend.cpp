@@ -577,6 +577,11 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   mesh::ota::formatOtaBoardCapabilityStatus(g_install_capability_status, sizeof(g_install_capability_status),
                                             g_install_capability_reason);
 
+  static mesh::ota::OtaBoardNrf52RunningContext running_context;
+  static mesh::ota::OtaBoardUnadmittedCommandRecovery recovery(
+      xiao_command_region, xiao_state_region, xiao_floor_region, candidate, signature_verifier,
+      running_context, g_qualified, kExpectedBoardTargetId, kExpectedRoleId);
+  integration.attachUnadmittedAbort(&recovery, &mesh::ota::OtaBoardUnadmittedCommandRecovery::invoke);
   static ::ota::storage::OtaCandidateStore candidate_store(candidate_record_scratch_region);
   integration.attachCandidateStore(&candidate_store);
   integration.attachLeanSignatureVerifier(&signature_verifier);

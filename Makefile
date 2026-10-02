@@ -49,6 +49,25 @@ XIAO_OTA_BOARD ?= xiao_nrf52840
 XIAO_OTA_ROLE_ID ?= 0
 XIAO_OTA_ROLE_SUFFIX = $(if $(filter 0,$(XIAO_OTA_ROLE_ID)),,_role$(XIAO_OTA_ROLE_ID))
 XIAO_OTA_TEST_BOARD_TARGET ?= XIAO_OTA_TARGET_XIAO_NRF52840
+OTA_NRF_REMOTE_BOOT_PROOF_PREFIX ?=
+XIAO_OTA_BOOT_PROCESS_SOURCES = \
+	bootloader/xiao_nrf52840_ota/src/xiao_ota_boot_io.c \
+	bootloader/xiao_nrf52840_ota/src/xiao_ota_record.c \
+	bootloader/xiao_nrf52840_ota/src/xiao_ota_sha256.c \
+	bootloader/xiao_nrf52840_ota/src/xiao_ota_ed25519_tweetnacl.c \
+	bootloader/xiao_nrf52840_ota/third_party/tweetnacl/tweetnacl.c \
+	bootloader/xiao_nrf52840_ota/tests/crc16_host.c \
+	bootloader/xiao_nrf52840_ota/tests/fake_io.c
+XIAO_OTA_BOOT_PROCESS_CFLAGS = -std=c11 -O2 -Wall -Wextra -Werror \
+	-Ibootloader/xiao_nrf52840_ota/include \
+	-Ibootloader/xiao_nrf52840_ota/src \
+	-Ibootloader/xiao_nrf52840_ota/third_party/tweetnacl \
+	-Ibootloader/xiao_nrf52840_ota/tests \
+	-Isrc/ota/trust/third_party/ed25519 \
+	-DXIAO_OTA_BOARD_TARGET="$(XIAO_OTA_TEST_BOARD_TARGET)" \
+	-DXIAO_OTA_COMPILED_ROLE_ID="$(XIAO_OTA_ROLE_ID)" \
+	-Wno-unused-function -Wno-sign-compare -Wno-shadow \
+	-Wno-unterminated-string-initialization
 XIAO_OTA_STEM = $(XIAO_OTA_BOARD)_ota$(XIAO_OTA_ROLE_SUFFIX)
 XIAO_NRF52_TARGET_OTA_BOOTLOADER_PACKAGE ?= $(XIAO_OTA_ARTIFACTS)/custom-noswd/$(XIAO_OTA_STEM)_noswd_update.uf2
 VERIFY_OTA_BOOT_INFO = python3 bootloader/xiao_nrf52840_ota/tools/verify_boot_info_artifact.py \
@@ -102,7 +121,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
 
 .PHONY: tmpdir test test-ota test-ota-native test-ota-index test-ota-protocol test-ota-runtime \
         test-ota-image-layout-index test-ota-storage \
-        test-ota-trust test-ota-boot test-ota-integration test-ota-lab-host test-ota-lab-archive clean-ota-targets \
+        test-ota-trust test-ota-boot test-ota-integration test-ota-rf-to-boot test-ota-lab-host test-ota-lab-archive clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
@@ -124,7 +143,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         validate-xiao-nrf52-archive validate-xiao-nrf52-client-archive validate-xiao-nrf52-target-archive \
         verify-xiao-nrf52-archive verify-xiao-nrf52-client-archive verify-xiao-nrf52-target-archive \
         fetch-xiao-ota-bootloader generate-xiao-ota-fixture-key \
-        test-xiao-ota-bootloader test-xiao-ota-bootloader-tools test-xiao-ota-boot-process qualify-xiao-ota-bootloader validate-xiao-stock-source build-xiao-stock-bootloader \
+        test-xiao-ota-bootloader test-xiao-ota-bootloader-tools test-xiao-ota-boot-process test-nrf-unadmitted-boot-process qualify-xiao-ota-bootloader validate-xiao-stock-source build-xiao-stock-bootloader \
         build-xiao-ota-bootloader package-xiao-ota-bootloader \
         build-xiao-ota-bootloader-noswd package-xiao-ota-bootloader-noswd \
         sign-xiao-ota-image verify-xiao-ota-bootloader verify-xiao-ota-boot-info-artifacts \
@@ -485,26 +504,48 @@ qualify-xiao-ota-bootloader: tmpdir
 
 test-xiao-ota-boot-process: tmpdir
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
-	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
-	  -Ibootloader/xiao_nrf52840_ota/include \
-	  -Ibootloader/xiao_nrf52840_ota/src \
-	  -Ibootloader/xiao_nrf52840_ota/third_party/tweetnacl \
-	  -Ibootloader/xiao_nrf52840_ota/tests \
-	  -Isrc/ota/trust/third_party/ed25519 \
-	  -DXIAO_OTA_BOARD_TARGET="$(XIAO_OTA_TEST_BOARD_TARGET)" \
-	  -DXIAO_OTA_COMPILED_ROLE_ID="$(XIAO_OTA_ROLE_ID)" \
-	  bootloader/xiao_nrf52840_ota/src/xiao_ota_boot_io.c \
-	  bootloader/xiao_nrf52840_ota/src/xiao_ota_record.c \
-	  bootloader/xiao_nrf52840_ota/src/xiao_ota_sha256.c \
-	  bootloader/xiao_nrf52840_ota/src/xiao_ota_ed25519_tweetnacl.c \
-	  bootloader/xiao_nrf52840_ota/third_party/tweetnacl/tweetnacl.c \
-	  bootloader/xiao_nrf52840_ota/tests/crc16_host.c \
-	  bootloader/xiao_nrf52840_ota/tests/fake_io.c \
+	$(CC) $(XIAO_OTA_BOOT_PROCESS_CFLAGS) \
+	  $(XIAO_OTA_BOOT_PROCESS_SOURCES) \
 	  bootloader/xiao_nrf52840_ota/tests/test_boot_process.c \
-	  -Wno-unused-function -Wno-sign-compare -Wno-shadow \
-	  -Wno-unterminated-string-initialization \
 	  -o "$(TMPDIR)/xiao-ota-host/test_boot_process"
 	"$(TMPDIR)/xiao-ota-host/test_boot_process"
+
+test-nrf-unadmitted-boot-process: tmpdir
+	@mkdir -p "$(TMPDIR)/rf-n1-boot-host"
+	$(CC) $(XIAO_OTA_BOOT_PROCESS_CFLAGS) \
+	  -DOTA_NRF_UNADMITTED_BOOT_PROCESS_TEST \
+	  $(XIAO_OTA_BOOT_PROCESS_SOURCES) \
+	  test/test_lora_ota_integration/test_nrf_unadmitted_boot_process.c \
+	  -o "$(TMPDIR)/rf-n1-boot-host/test_nrf_unadmitted_boot_process"
+	"$(TMPDIR)/rf-n1-boot-host/test_nrf_unadmitted_boot_process" $(if $(OTA_NRF_REMOTE_BOOT_PROOF_PREFIX),"$(OTA_NRF_REMOTE_BOOT_PROOF_PREFIX)")
+
+test-ota-rf-to-boot: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-rf-to-boot"
+	@set -eu; \
+	  for family in 584e3430 53435031; do \
+	    for role in 0 1; do \
+	      for suffix in command candidate running sdk floor \
+	        retired-candidate retired-canonical retired-command-region retired-floor \
+	        retired-previous-command retired-running retired-sdk retired-state-region; do \
+	        rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role-$$suffix.bin"; \
+	      done; \
+	    done; \
+	  done
+	env -u GTEST_FILTER \
+	  OTA_NRF_REMOTE_BOOT_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
+	  $(MAKE) --no-print-directory test-ota-integration
+	@set -eu; \
+	  for board in xiao_nrf52840 sensecap_solar_p1; do \
+	    case "$$board" in \
+	      xiao_nrf52840) target=XIAO_OTA_TARGET_XIAO_NRF52840; family=584e3430 ;; \
+	      sensecap_solar_p1) target=XIAO_OTA_TARGET_SENSECAP_SOLAR_P1; family=53435031 ;; \
+	    esac; \
+	    for role in 0 1; do \
+	      $(MAKE) --no-print-directory test-nrf-unadmitted-boot-process \
+	        XIAO_OTA_TEST_BOARD_TARGET="$$target" XIAO_OTA_ROLE_ID="$$role" \
+	        OTA_NRF_REMOTE_BOOT_PROOF_PREFIX="$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role"; \
+	    done; \
+	  done
 
 test-xiao-ota-bootloader: tmpdir test-xiao-ota-bootloader-tools test-xiao-ota-boot-process
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
@@ -675,7 +716,7 @@ verify-xiao-ota-bootloader: test-xiao-ota-bootloader package-xiao-ota-bootloader
 ## on-device radio behaviour, real flash writes, the custom nRF52840
 ## QSPI-aware bootloader, trusted boot, the anti-rollback counter backend and
 ## power-loss rollback all remain hardware acceptance gates.
-verify-ota-software: test build-ota-nrf52-targets build-ota-esp32-targets build-non-ota-targets
+verify-ota-software: test test-ota-rf-to-boot build-ota-nrf52-targets build-ota-esp32-targets build-non-ota-targets
 	@echo
 	@echo "OTA software checks passed: native tests green, firmware targets link."
 	@echo "NOT qualified here: on-device radio, flash, bootloader, anti-rollback, rollback."

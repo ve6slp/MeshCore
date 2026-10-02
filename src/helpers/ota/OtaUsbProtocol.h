@@ -184,6 +184,7 @@ struct UsbOtaReply {
   // ABORT echoes imageHash32 (descriptor.sha256, content hash) -- see
   // the HASH SEMANTICS note above buildCommitSignedMessage(). Never
   // both at once; callers must interpret per their own request op.
+  // NoSnapshot always clears this slot; request echoes are not snapshots.
   uint8_t manifestHash[kHashBytes] = {0};
   uint16_t durableReceivedBlocks = 0;
   uint16_t totalBlocks = 0;
@@ -207,7 +208,10 @@ struct UsbOtaReply {
 
 // Encodes `reply` into the fixed kReplyBytes-byte wire layout at `out`
 // (caller-owned buffer, must be >= kReplyBytes). Returns kReplyBytes.
-inline size_t encodeUsbOtaReply(const UsbOtaReply& reply, uint8_t* out) {
+// NoSnapshot canonicalization preserves the operation, scope, target, result and retry.
+inline size_t encodeUsbOtaReply(const UsbOtaReply& input, uint8_t* out) {
+  UsbOtaReply reply = input;
+  if ((reply.flags & kReplyFlagSnapshotValid) == 0) reply.setNoSnapshot();
   out[0] = kReplyCode;
   out[1] = kAbiVersion;
   out[2] = reply.requestOp;

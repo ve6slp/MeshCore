@@ -20,6 +20,7 @@ public:
   using Result = usb::UsbOtaResult;
   using AdminCheckFn = bool (*)(void*, const uint8_t[32]);
   using TerminalCheckFn = bool (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&);
+  using UnadmittedAbortFn = Result (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&, bool);
 
   struct Status {
     bool valid = false;
@@ -39,6 +40,7 @@ public:
   void attachStagingSink(meshcore::ota::runtime::IOtaStagingSink* sink) { staging_sink_ = sink; tryResumeSink(); }
   void attachOwnerSignatureVerifier(const ::ota::trust::SignatureVerifier* verifier) { owner_signature_verifier_ = verifier; }
   void attachTerminalCheck(void* ctx, TerminalCheckFn fn) { terminal_ctx_ = ctx; terminal_check_ = fn; }
+  void attachUnadmittedAbort(void* ctx, UnadmittedAbortFn fn) { unadmitted_ctx_ = ctx; unadmitted_abort_ = fn; }
 
   void attachCandidateStore(::ota::storage::OtaCandidateStore* store) {
     store_ = store;
@@ -227,6 +229,12 @@ public:
         if (!reupload) return Result::Denied;
       }
     }
+    if (candidate_.valid && candidate_.phase == Phase::Aborted && !candidate_.localCache && unadmitted_abort_) {
+      const auto recovered = unadmitted_abort_(unadmitted_ctx_, candidate_, true);
+      if (recovered != Result::Ok) return recovered;
+      commit_started_ = false;
+      commit_sink_done_ = false;
+    }
     if (!terminal && (commit_started_ || (candidate_.valid && candidate_.phase == Phase::Committed)))
       return Result::TooLate;
 
@@ -378,7 +386,8 @@ public:
   Result commit(uint32_t counter, const uint8_t signature[64]) {
     if (!candidate_.valid) return Result::NotFound;
     if (candidate_.localCache) return Result::Denied;
-    if (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready) return Result::TooLate;
+    const bool already_committed = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
+    if (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready && !already_committed) return Result::TooLate;
     if (!have_target_public_key_ || signature == nullptr) return Result::BadRequest;
     if (!isCurrentAdmin(candidate_.ownerPublicKey)) return Result::Denied;
     uint8_t manifest_hash[32] = {};
@@ -387,6 +396,7 @@ public:
     const size_t message_len = usb::buildCommitSignedMessage(target_public_key_, manifest_hash, counter, message);
     if (!verifyOwnerSignature(candidate_.ownerPublicKey, message, message_len, signature)) return Result::Denied;
     if (counter != usb::getBE32(candidate_.canonical + 45)) return Result::Mismatch;
+    if (already_committed) return Result::Ok;
     if (!commit_sink_done_) {
       staging_sink_->onAdmittedOwnerIdentity(candidate_.ownerPublicKey);
       const bool already_started = commit_started_;
@@ -411,7 +421,8 @@ public:
   Result abort(const uint8_t signer_public_key[32], const uint8_t signature[64], const uint8_t image_hash[32],
                 bool local_owner_trusted = false) {
     if (!candidate_.valid) return Result::NotFound;
-    if (commit_started_ || candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed) return Result::TooLate;
+    const bool committed = commit_started_ || candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
+    if (committed && !unadmitted_abort_) return Result::TooLate;
     if (signer_public_key == nullptr || signature == nullptr || image_hash == nullptr || !have_target_public_key_) {
       return Result::BadRequest;
     }
@@ -428,7 +439,18 @@ public:
     uint8_t message[usb::kAbortSignedBytes] = {};
     const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, message);
     if (!verifyOwnerSignature(signer_public_key, message, message_len, signature)) return Result::Denied;
-    if (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted) return Result::Ok;
+    if (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted) {
+      const auto recovered = !candidate_.localCache && unadmitted_abort_ ?
+          unadmitted_abort_(unadmitted_ctx_, candidate_, true) : Result::Ok;
+      if (recovered == Result::Ok) { commit_started_ = false; commit_sink_done_ = false; }
+      return recovered;
+    }
+    if (!candidate_.localCache && unadmitted_abort_) {
+      auto proof = candidate_;
+      if (committed) proof.phase = ::ota::storage::OtaCandidateStore::Phase::Committed;
+      const auto checked = unadmitted_abort_(unadmitted_ctx_, proof, false);
+      if (checked != Result::Ok) return checked;
+    }
     auto next = candidate_;
     next.phase = ::ota::storage::OtaCandidateStore::Phase::Aborted;
     ++next.sessionId;
@@ -436,6 +458,14 @@ public:
     candidate_ = next;
     seal_pending_ = false;
     staging_sink_->abort();
+    if (!candidate_.localCache && unadmitted_abort_) {
+      // Durable ABORT precedes cancellation so a reset can finish the same authorized cleanup.
+      commit_started_ = true;
+      const auto recovered = unadmitted_abort_(unadmitted_ctx_, candidate_, true);
+      if (recovered != Result::Ok) return recovered;
+      commit_started_ = false;
+      commit_sink_done_ = false;
+    }
     return Result::Ok;
   }
 
@@ -520,6 +550,8 @@ private:
   AdminCheckFn admin_check_ = nullptr;
   void* terminal_ctx_ = nullptr;
   TerminalCheckFn terminal_check_ = nullptr;
+  void* unadmitted_ctx_ = nullptr;
+  UnadmittedAbortFn unadmitted_abort_ = nullptr;
   uint8_t target_public_key_[32] = {0};
   bool have_target_public_key_ = false;
   bool seal_pending_ = false;

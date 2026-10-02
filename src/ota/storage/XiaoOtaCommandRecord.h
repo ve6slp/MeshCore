@@ -520,6 +520,11 @@ public:
   static uint64_t transactionNonceOf(const uint8_t* record) { return getU64(record + 12); }
   static const uint8_t* wireDescriptorOf(const uint8_t* record) { return record + kWireDescriptorOffset; }
   static const uint8_t* admittedSignerKeyOf(const uint8_t* record) { return record + kAdmittedSignerKeyOffset; }
+  static constexpr uint32_t kSignatureOffset = kAdmittedSignerKeyOffset + kSignerKeyBytes;
+  static constexpr uint32_t kActiveExtentOffset = kSignatureOffset + kSignatureBytes;
+  static const uint8_t* signatureOf(const uint8_t* record) { return record + kSignatureOffset; }
+  static uint32_t activeImageExtentOf(const uint8_t* record) { return getU32(record + kActiveExtentOffset); }
+  static const uint8_t* activeImageHashOf(const uint8_t* record) { return record + kActiveExtentOffset + 4; }
 
 private:
   static bool readSlot(const platform::FlashRegion& region, uint32_t slot, uint8_t out[kRecordBytes]) {

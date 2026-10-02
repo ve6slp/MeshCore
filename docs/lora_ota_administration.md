@@ -109,6 +109,11 @@ The commit command waits for fresh READY before sending COMMIT. An
 accepted command is not proof of installation, reboot or trial
 confirmation. Confirm that node's health and normal mesh service before
 committing the next one.
+After a newly durable remote COMMIT, nRF firmware schedules its own
+reboot; no USB reset is required. It gives replies a short grace period
+and restores an off-frequency session first. READY, denied commands and
+uncertain writes do not arm a reboot. Retrying the same accepted COMMIT
+does not rewrite the intent or postpone its deadline.
 
 To abort before commit, use `make ota-lab-abort` with the target key and
 original `OTA_UPLOAD_IMAGE`. Abort identifies the firmware content hash,
@@ -134,6 +139,14 @@ locally; it sends no radio abort and does not cancel any remote candidate.
 Abort the remote target separately when that is intended. A denied,
 mismatched or unavailable local abort is an error, not permission to
 overwrite the cache.
+
+An nRF command refused before installation is not an active copy or
+trial. If the device can prove that refusal against the original signed
+command and its current valid running bank, a currently trusted
+administrator may explicitly abort it. Firmware durably records the
+abort and cancels the old intent before allowing replacement. Missing,
+corrupt or unbound commands, inconsistent boot evidence and I/O faults
+remain protected; an unknown status alone is not permission to erase.
 
 ## Build-time requirement
 

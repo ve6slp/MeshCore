@@ -70,6 +70,7 @@ make test-ota-storage
 make test-ota-trust
 make test-ota-boot
 make test-ota-integration
+make test-ota-rf-to-boot      # signed RF handoff into the real nRF boot processor
 make test-ota-lab-host        # host-side unittest suite for lab scripts (below)
 make test-ota-lab-host OTA_LAB_HOST_TEST_PATTERN=test_lab_device.py
 
@@ -79,7 +80,7 @@ make build-ota-esp32-targets  # XIAO S3/Wio, companion and repeater roles
 make build-ota-baseline-targets  # same targets, OTA disabled, for size diffing
 make build-non-ota-targets    # regression guard: platforms that never enable OTA
 
-make verify-ota-software      # full tests + six OTA and ordinary profile builds
+make verify-ota-software      # full tests, RF-to-boot proofs and profile builds
 ```
 
 `verify-ota-software` is explicitly a **software-only** qualification gate.
@@ -136,6 +137,18 @@ exact original SDK settings restoration, and trial confirmation or rollback.
 Reception and staging tests must exercise the production integration path,
 including reboot resume, harmless duplicates, bad-frame refusal, busy
 ownership, abort suppression and `READY` without an install command.
+
+`make test-ota-rf-to-boot` regenerates signed command and flash fixtures
+through the current native RF integration, then passes them to the actual
+boot processor for both nRF boards and both roles. It proves trial entry
+and confirmation, pre-admission refusal after a valid application reflash,
+and persistent cancellation before candidate replacement. The cancellation
+case restores the previous running bank while the replacement is only
+`READY`; a surviving-command negative control demonstrates that the old
+intent would otherwise install. This target is part of
+`verify-ota-software` and remains a software proof, not a physical test.
+`make test-nrf-unadmitted-boot-process` runs the processor directly;
+`OTA_NRF_REMOTE_BOOT_PROOF_PREFIX` selects exported fixtures.
 
 ### ESP32-S3 vendor recovery inspection
 
@@ -275,6 +288,26 @@ only after matching terminal boot evidence proves a confirmed install or
 completed rollback. An active trial, unknown outcome, mismatched provenance
 or failed reception does not release the slot. The new image must still
 pass admission, including the version floor, before an erase begins.
+For an install command refused before admission, nRF recovery instead
+requires an explicit, signed administrator ABORT. The board must match
+the original signed command, validate the running SDK bank, CRC and full
+image hash, and obtain consistent state, sidecar and floor reads proving
+that no installation transaction is active. Durable Aborted intent precedes
+command cancellation: every bound command sector is erased and independently
+verified blank before replacement is allowed. An unbound surviving command
+blocks recovery unless its authenticated counter is permanently excluded by
+the protected floor. Restoring the previous running bank cannot revive a
+cancelled command. Candidate bytes, the original owner and the floor
+remain intact until authorized replacement. Missing or corrupt command
+evidence does not become a generic unlock.
+
+A newly durable remote nRF COMMIT arms the existing application reboot
+helper. It allows two seconds for the reply, requires direct-profile
+restoration, and gives queued traffic up to 15 seconds before controlled
+reset may interrupt normal transmission. Authenticated duplicate COMMIT
+does not rewrite the intent or extend the deadline. READY, denied,
+failed or uncertain COMMIT does not arm it, and a proven refusal ABORT
+cancels the old timer. A reboot is still not confirmation or Installed.
 
 On ESP32, startup retires only authenticated, obsolete inactive-slot
 selection metadata covered by the durable floor. It preserves the original

@@ -82,6 +82,50 @@ TEST(OtaUsbProtocolTest, BigEndianRoundTrip) {
   EXPECT_EQ(0xDEADBEEFu, getBE32(buf));
 }
 
+TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreservesRealViews) {
+  for (uint8_t op = 0x10; op <= 0x18; ++op) {
+    for (uint8_t result = 0; result <= static_cast<uint8_t>(UsbOtaResult::Unsupported); ++result) {
+      for (const uint8_t scope : {uint8_t(0), kReplyFlagRemote}) {
+        UsbOtaReply reply;
+        reply.requestOp = op;
+        reply.result = static_cast<UsbOtaResult>(result);
+        reply.flags = scope;
+        reply.phase = UsbOtaPhase::Ready;
+        std::memset(reply.target, 0xA7, sizeof(reply.target));
+        std::memset(reply.manifestHash, 0x5A, sizeof(reply.manifestHash));
+        reply.durableReceivedBlocks = 5;
+        reply.totalBlocks = 9;
+        reply.counter = 33;
+        reply.statusAgeMs = 4;
+        reply.retryAfterMs = 442;
+        uint8_t encoded[kReplyBytes];
+        ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, encoded));
+        EXPECT_EQ(op, encoded[2]);
+        EXPECT_EQ(result, encoded[3]);
+        EXPECT_EQ(static_cast<uint8_t>(UsbOtaPhase::Unknown), encoded[4]);
+        EXPECT_EQ(scope, encoded[5]);
+        EXPECT_EQ(0, std::memcmp(reply.target, encoded + 6, sizeof(reply.target)));
+        const uint8_t empty[40] = {};
+        EXPECT_EQ(0, std::memcmp(empty, encoded + 38, sizeof(empty)));
+        EXPECT_EQ(kStatusAgeUnknown, getBE32(encoded + 78));
+        EXPECT_EQ(442u, getBE32(encoded + 82));
+        EXPECT_EQ(UsbOtaPhase::Ready, reply.phase);
+        EXPECT_EQ(0x5A, reply.manifestHash[0]);  // Encoding does not mutate the working reply.
+        reply.flags |= kReplyFlagSnapshotValid;
+        ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, encoded));
+        EXPECT_EQ(static_cast<uint8_t>(UsbOtaPhase::Ready), encoded[4]);
+        EXPECT_EQ(scope | kReplyFlagSnapshotValid, encoded[5]);
+        EXPECT_EQ(0, std::memcmp(reply.manifestHash, encoded + 38, sizeof(reply.manifestHash)));
+        EXPECT_EQ(5u, getBE16(encoded + 70));
+        EXPECT_EQ(9u, getBE16(encoded + 72));
+        EXPECT_EQ(33u, getBE32(encoded + 74));
+        EXPECT_EQ(4u, getBE32(encoded + 78));
+        EXPECT_EQ(442u, getBE32(encoded + 82));
+      }
+    }
+  }
+}
+
 TEST(OtaUsbProtocolTest, CommitSignedMessageBindsDomainTargetHashAndCounter) {
   uint8_t target[kPubKeyBytes];
   uint8_t hash[kHashBytes];

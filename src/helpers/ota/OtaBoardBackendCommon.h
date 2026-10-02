@@ -248,6 +248,278 @@ private:
   TrialActivePredicate trial_active_predicate_ = nullptr;
 };
 
+struct OtaNrf52RunningContext {
+  uint8_t settings[::ota::storage::XiaoOtaActiveExtentBridge::kBootloaderSettingsRawBytes] = {};
+  const uint8_t* image = nullptr;
+  uint32_t capacity = 0;
+  bool settingsTailErased = false;
+};
+
+class IOtaNrf52RunningContext {
+public:
+  virtual ~IOtaNrf52RunningContext() = default;
+  virtual bool read(OtaNrf52RunningContext& out) const = 0;
+};
+
+class OtaBoardNrf52RunningContext final : public IOtaNrf52RunningContext {
+public:
+  bool read(OtaNrf52RunningContext& out) const override {
+    out = OtaNrf52RunningContext();
+#if defined(NRF52840_XXAA)
+    const auto* settings = reinterpret_cast<const uint8_t*>(0x000FF000u);
+    memcpy(out.settings, settings, sizeof(out.settings));
+    out.image = reinterpret_cast<const uint8_t*>(::ota::storage::kXiaoOtaAppStart);
+    out.capacity = ::ota::storage::kXiaoOtaAppInstallMaxSize;
+    out.settingsTailErased = true;
+    for (uint32_t i = sizeof(out.settings); i < 4096; ++i) {
+      if (settings[i] != 0xff) { out.settingsTailErased = false; break; }
+    }
+    return true;
+#else
+    return false;
+#endif
+  }
+};
+
+// Explicit signed ABORT is the only cancellation authority. BootUnknown alone is never evidence.
+class OtaBoardUnadmittedCommandRecovery {
+public:
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  using Command = ::ota::storage::XiaoOtaCommandRecordV3;
+  using State = ::ota::storage::XiaoOtaStateReader;
+  OtaBoardUnadmittedCommandRecovery(::ota::platform::FlashRegion& command, ::ota::platform::FlashRegion& state,
+      ::ota::platform::FlashRegion& floor, ::ota::platform::FlashRegion& image,
+      const ::ota::trust::SignatureVerifier& signatures, const IOtaNrf52RunningContext& running,
+      const bool& qualified, uint32_t target, uint32_t role)
+      : command_(command), state_(state), floor_(floor), image_(image), signatures_(signatures),
+        running_(running), qualified_(qualified), target_(target), role_(role) {}
+  static Result invoke(void* ctx, const Store::Snapshot& candidate, bool cancel) {
+    return static_cast<OtaBoardUnadmittedCommandRecovery*>(ctx)->recover(candidate, cancel);
+  }
+
+  Result recover(const Store::Snapshot& candidate, bool cancel) {
+    if (!qualified_ || !candidate.valid || candidate.localCache || !Command::regionIsValid(command_))
+      return Result::TooLate;
+    meshcore::ota::protocol::OtaDescriptor descriptor;
+    if (!authentic(candidate.canonical, candidate.signature, candidate.ownerPublicKey, descriptor) ||
+        candidate.exactSizeBytes != descriptor.exactSizeBytes ||
+        candidate.totalBlocks != (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes)
+      return Result::TooLate;
+    auto bound = candidate;
+    if (candidate.phase == Store::Phase::Aborted) {
+      if (!bound.sessionId) return Result::TooLate;
+      --bound.sessionId;
+    }
+    const auto expected = OtaLeanReceiver::snapshotStatus(bound);
+    if (!expected.transactionNonce || !expected.counter) return Result::TooLate;
+    uint8_t state[State::kRecordBytes] = {};
+    const auto state_status = State::readNewestWithStatus(state_, state);
+    if (state_status == State::ReadStatus::Unknown) return Result::IoError;
+    if (state_status != State::ReadStatus::Blank && state_status != State::ReadStatus::Found)
+      return Result::TooLate;
+    if (state_status == State::ReadStatus::Found &&
+        ((State::phase(state) != 0 && State::phase(state) != State::kPhaseConfirmed &&
+          State::phase(state) != State::kPhaseFailedMax) ||
+         State::transactionNonce(state) == expected.transactionNonce)) return Result::TooLate;
+    uint8_t state_digest[32];
+    const auto checked_state = inspectStateWindows(state, state_status, expected.transactionNonce, state_digest);
+    if (checked_state != Result::Ok) return checked_state;
+    bool ignored = false;
+    uint32_t floor = 0;
+    if (!::ota::storage::XiaoOtaFloorReader::readNewestConfirmedCounterFailClosed(floor_, floor))
+      return Result::IoError;
+    if (state_status == State::ReadStatus::Found && State::phase(state) == State::kPhaseConfirmed &&
+        State::candidateCounter(state) > floor) return Result::TooLate;
+    OtaNrf52RunningContext before, after;
+    if (!running_.read(before)) return Result::IoError;
+    // Pinned SDK11 BANK_ERASED/BANK_INVALID_APP; every copy/pending/unknown bank-1 code is refused.
+    const uint16_t bank1 = before.settings[4] | (uint16_t(before.settings[5]) << 8);
+    if (bank1 != 0xfe && bank1 != 0xff) return Result::TooLate;
+    const auto bank0 = ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(before.settings);
+    const auto current = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(bank0, before.image, before.capacity);
+    if (!current.active_image_extent) return Result::TooLate;
+
+    uint8_t records[2][Command::kRecordBytes];
+    bool valid[2] = {}, matches[2] = {};
+    int newest = -1;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      const uint32_t offset = slot * command_.eraseUnitBytes();
+      if (!::ota::platform::isOk(command_.read(offset, records[slot], Command::kRecordBytes)))
+        return Result::IoError;
+      valid[slot] = Command::isValidRecord(records[slot], Command::kRecordBytes);
+      if (!valid[slot]) {
+        bool blank = false;
+        if (!scan(command_, offset, command_.eraseUnitBytes(), blank)) return Result::IoError;
+        if (!blank) return Result::TooLate;
+        continue;
+      }
+      if (!scan(command_, offset, command_.eraseUnitBytes(), ignored)) return Result::IoError;
+      meshcore::ota::protocol::OtaDescriptor d;
+      if (!authentic(Command::wireDescriptorOf(records[slot]), Command::signatureOf(records[slot]),
+                     Command::admittedSignerKeyOf(records[slot]), d)) return Result::TooLate;
+      matches[slot] = Command::transactionNonceOf(records[slot]) == expected.transactionNonce &&
+          !memcmp(Command::wireDescriptorOf(records[slot]), candidate.canonical, 59) &&
+          !memcmp(Command::signatureOf(records[slot]), candidate.signature, 64) &&
+          !memcmp(Command::admittedSignerKeyOf(records[slot]), candidate.ownerPublicKey, 32);
+      if (newest < 0 || Command::sequenceOf(records[slot]) >= Command::sequenceOf(records[newest]))
+        newest = slot;
+      // A future bank restore can revive an unbound sibling unless the protected floor excludes it.
+      const bool floor_refusal = d.securityCounter <= floor;
+      if (!matches[slot] && !floor_refusal) return Result::TooLate;
+      const bool refused_now = floor_refusal || !before.settingsTailErased ||
+          Command::activeImageExtentOf(records[slot]) != current.active_image_extent ||
+          memcmp(Command::activeImageHashOf(records[slot]), current.active_image_hash_sha256, 32);
+      if (!refused_now) {
+        // Only this exactly bound candidate may use a fresh QSPI hash refusal.
+        if (!matches[slot]) return Result::TooLate;
+        uint8_t digest[32];
+        if (!hashCandidate(d.exactSizeBytes, digest)) return Result::IoError;
+        if (!memcmp(digest, d.sha256, 32)) return Result::TooLate;
+      }
+    }
+    const bool have_match = matches[0] || matches[1];
+    if (candidate.phase == Store::Phase::Committed && !have_match) return Result::TooLate;
+    if (have_match && (newest < 0 || !matches[newest] || candidate.receivedBlocks != candidate.totalBlocks))
+      return Result::TooLate;
+
+    uint8_t latest_state[State::kRecordBytes] = {};
+    uint32_t latest_floor = 0;
+    if (State::readNewestWithStatus(state_, latest_state) != state_status ||
+        memcmp(state, latest_state, sizeof(state)) ||
+        !::ota::storage::XiaoOtaFloorReader::readNewestConfirmedCounterFailClosed(floor_, latest_floor) ||
+        latest_floor != floor || !running_.read(after)) return Result::IoError;
+    const auto current_after = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(bank0, after.image, after.capacity);
+    if (memcmp(before.settings, after.settings, sizeof(before.settings)) ||
+        before.image != after.image || before.capacity != after.capacity ||
+        before.settingsTailErased != after.settingsTailErased ||
+        current_after.active_image_extent != current.active_image_extent ||
+        memcmp(current_after.active_image_hash_sha256, current.active_image_hash_sha256, 32)) return Result::TooLate;
+    uint8_t latest_state_digest[32];
+    const auto rechecked_state = inspectStateWindows(latest_state, state_status, expected.transactionNonce,
+                                                     latest_state_digest);
+    if (rechecked_state != Result::Ok) return rechecked_state;
+    if (memcmp(state_digest, latest_state_digest, sizeof(state_digest))) return Result::TooLate;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      uint8_t reread[Command::kRecordBytes];
+      if (!::ota::platform::isOk(command_.read(slot * command_.eraseUnitBytes(), reread, sizeof(reread))))
+        return Result::IoError;
+      if (memcmp(reread, records[slot], sizeof(reread))) return Result::TooLate;
+    }
+    if (!cancel || !have_match) return Result::Ok;
+    if (candidate.phase != Store::Phase::Aborted) return Result::TooLate;
+    // Remove an older duplicate first: no reset may resurrect an admissible sibling command.
+    for (int pass = 0; pass < 2; ++pass) {
+      const uint32_t slot = pass == 0 ? 1u - uint32_t(newest) : uint32_t(newest);
+      if (!matches[slot]) continue;
+      if (!::ota::platform::isOk(command_.eraseSector(slot * command_.eraseUnitBytes()))) return Result::IoError;
+      bool blank = false;
+      if (!scan(command_, slot * command_.eraseUnitBytes(), command_.eraseUnitBytes(), blank) || !blank)
+        return Result::IoError;
+    }
+    return Result::Ok;
+  }
+
+private:
+  Result inspectStateWindows(const uint8_t newest[State::kRecordBytes], State::ReadStatus status,
+                             uint64_t nonce, uint8_t digest[32]) const {
+    // Frozen boot-private XSID/88 sidecars share each state sector at offset 0x100.
+    constexpr uint32_t sidecar_offset = 0x100, sidecar_bytes = 88;
+    if (state_.eraseUnitBytes() < sidecar_offset + sidecar_bytes) return Result::TooLate;
+    ::ota::trust::Sha256 hash;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      const uint32_t offset = slot * state_.eraseUnitBytes();
+      uint8_t prefix[sidecar_offset], sidecar[sidecar_bytes];
+      if (!::ota::platform::isOk(state_.read(offset, prefix, sizeof(prefix))) ||
+          !::ota::platform::isOk(state_.read(offset + sidecar_offset, sidecar, sizeof(sidecar))))
+        return Result::IoError;
+      hash.update(prefix, sizeof(prefix)); hash.update(sidecar, sizeof(sidecar));
+      bool valid = State::isValidRecord(prefix, State::kRecordBytes);
+      if (valid) {
+        const uint32_t sequence = le32(prefix + 8), latest_sequence = le32(newest + 8);
+        const auto phase = State::phase(prefix);
+        const bool terminal = phase == 0 || phase == State::kPhaseConfirmed || phase == State::kPhaseFailedMax;
+        if (status != State::ReadStatus::Found || State::transactionNonce(prefix) == nonce ||
+            sequence > latest_sequence ||
+            (!terminal && (sequence >= latest_sequence ||
+                           State::transactionNonce(prefix) != State::transactionNonce(newest))))
+          return Result::TooLate;
+      } else {
+        for (uint32_t i = 0; i < State::kRecordBytes; ++i)
+          if (prefix[i] != 0xff) return Result::TooLate;
+      }
+      for (uint32_t i = State::kRecordBytes; i < sizeof(prefix); ++i)
+        if (prefix[i] != 0xff) return Result::TooLate;
+      bool sidecar_blank = true;
+      for (const auto byte : sidecar) if (byte != 0xff) sidecar_blank = false;
+      if (!sidecar_blank &&
+          (!valid || le32(sidecar) != 0x58534944 || sidecar[4] != 1 || sidecar[5] ||
+           sidecar[6] != sidecar_bytes || sidecar[7] ||
+           le32(sidecar + 80) != ::ota::storage::Crc32::computeFinalized(sidecar, 80) ||
+           le32(sidecar + 84) != State::kCommitMarker ||
+           memcmp(sidecar + 8, prefix + 8, 12) ||
+           memcmp(sidecar + 52, prefix + 36, 4) || memcmp(sidecar + 60, prefix + 40, 4)))
+        return Result::TooLate;
+      uint8_t bytes[256];
+      for (uint32_t done = sidecar_offset + sidecar_bytes; done < state_.eraseUnitBytes();) {
+        const uint32_t n = state_.eraseUnitBytes() - done < sizeof(bytes) ?
+            state_.eraseUnitBytes() - done : sizeof(bytes);
+        if (!::ota::platform::isOk(state_.read(offset + done, bytes, n))) return Result::IoError;
+        hash.update(bytes, n);
+        for (uint32_t i = 0; i < n; ++i) if (bytes[i] != 0xff) return Result::TooLate;
+        done += n;
+      }
+    }
+    hash.finish(digest);
+    return Result::Ok;
+  }
+  static uint32_t le32(const uint8_t* p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+  }
+  bool authentic(const uint8_t canonical[59], const uint8_t signature[64], const uint8_t owner[32],
+                 meshcore::ota::protocol::OtaDescriptor& d) const {
+    return meshcore::ota::protocol::decodeOtaDescriptorCanonical(canonical, 59, d) ==
+               meshcore::ota::protocol::OtaDescriptorCodecResult::Ok &&
+        d.boardFamily == (target_ >> 16) && d.boardVariant == (target_ & 0xffff) && d.role == role_ &&
+        d.formatId == 1 && d.algorithmId == 1 && d.keyId && !(d.minBootloaderCapabilities & ~1u) &&
+        d.appAddress == ::ota::storage::kXiaoOtaAppStart && d.exactSizeBytes &&
+        d.exactSizeBytes <= OtaNrf52FirmwareTrustProvider::kMaximumImageBytes &&
+        d.exactSizeBytes <= image_.sizeBytes() &&
+        signatures_.verify(signature, 64, canonical, 59, owner, 32);
+  }
+  static bool scan(const ::ota::platform::FlashRegion& region, uint32_t offset, uint32_t size, bool& blank) {
+    uint8_t bytes[256];
+    blank = true;
+    for (uint32_t done = 0; done < size;) {
+      const uint32_t n = size - done < sizeof(bytes) ? size - done : sizeof(bytes);
+      if (!::ota::platform::isOk(region.read(offset + done, bytes, n))) return false;
+      for (uint32_t i = 0; i < n; ++i) if (bytes[i] != 0xff) blank = false;
+      done += n;
+    }
+    return true;
+  }
+  bool hashCandidate(uint32_t size, uint8_t out[32]) const {
+    uint8_t bytes[256];
+    ::ota::trust::Sha256 hash;
+    for (uint32_t done = 0; done < size;) {
+      const uint32_t n = size - done < sizeof(bytes) ? size - done : sizeof(bytes);
+      if (!::ota::platform::isOk(image_.read(done, bytes, n))) return false;
+      hash.update(bytes, n);
+      done += n;
+    }
+    hash.finish(out);
+    return true;
+  }
+  ::ota::platform::FlashRegion& command_;
+  ::ota::platform::FlashRegion& state_;
+  ::ota::platform::FlashRegion& floor_;
+  ::ota::platform::FlashRegion& image_;
+  const ::ota::trust::SignatureVerifier& signatures_;
+  const IOtaNrf52RunningContext& running_;
+  const bool& qualified_;
+  uint32_t target_, role_;
+};
+
 // Three-way classification of the boot-info marker check: `Normal` is
 // reserved for a FUTURE, separately signed "CertifyExistingBaseline"
 // evidence chain -- NOT merely

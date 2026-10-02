@@ -1225,6 +1225,9 @@ void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool al
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
   getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
   configureCompanionFirmwareOtaBackend(getOtaIntegration());
+#if defined(NRF52840_XXAA)
+  getOtaIntegration().attachCommitReboot(nullptr, [](void*) { board.reboot(); });
+#endif
 #endif
 
 #ifdef BLE_PIN_CODE // 123456 by default
@@ -1567,6 +1570,10 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
   auto fillLocalSnapshot = [&]() {
     getOtaIntegration().fillUsbReadback(reply);
   };
+  const auto sendRemoteControl = [](void* ctx, const uint8_t target[32], const uint8_t* frame, size_t frame_len) {
+    return static_cast<MyMesh*>(ctx)->sendOtaControlFrameToTarget(
+        target, frame, frame_len, meshcore::ota::protocol::OtaAirtimeCategory::Control);
+  };
 
   switch (static_cast<UsbOtaOp>(op)) {
     case UsbOtaOp::SetContactAdmin: {
@@ -1595,36 +1602,19 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       break;
     }
     case UsbOtaOp::CacheBegin: {
-      if ((size_t)len != kCacheBeginTotalBytes || (cmd_frame[2] & ~kCacheBeginFlagReupload)) {
-        reply.result = UsbOtaResult::BadRequest;
-        break;
-      }
-      const uint8_t flags = cmd_frame[2];
-      const uint8_t* canonical = &cmd_frame[3 + kPubKeyBytes];
-      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
+      reply = getOtaIntegration().handleUsbLocalControl(cmd_frame, static_cast<size_t>(len),
+                                                       _identity_available_ ? self_id.pub_key : nullptr);
       if (reply.result == UsbOtaResult::Ok) {
         _ota_rf_uploader.stop(getOtaIntegration());
-        _ota_cache_reupload = (flags & kCacheBeginFlagReupload) != 0;
+        _ota_cache_reupload = (cmd_frame[2] & kCacheBeginFlagReupload) != 0;
         _ota_selected_target_count = 0;
       }
-      // Per the ABI contract, CacheBegin is a LOCAL-CACHE operation and
-      // must echo targetPK32 as all-zero (reply.target already defaults
-      // to zero) -- never the manifest owner's key, which is a distinct
-      // concept from the remote install target.
-      mesh::ota::computeOtaManifestHash(canonical, reply.manifestHash);
-      fillLocalSnapshot();
       break;
     }
-    case UsbOtaOp::CachePut: {
-      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
-      if (reply.result == UsbOtaResult::BadRequest) break;
-      fillLocalSnapshot();
-      break;
-    }
+    case UsbOtaOp::CachePut:
     case UsbOtaOp::CacheSeal: {
-      reply.result = lean.handleUsbCacheFrame(cmd_frame, len, _identity_available_ ? self_id.pub_key : nullptr);
-      if (reply.result == UsbOtaResult::BadRequest) break;
-      fillLocalSnapshot();
+      reply = getOtaIntegration().handleUsbLocalControl(cmd_frame, static_cast<size_t>(len),
+                                                       _identity_available_ ? self_id.pub_key : nullptr);
       break;
     }
     case UsbOtaOp::AddTarget: {
@@ -1741,13 +1731,12 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       const uint8_t* manifest_hash = &cmd_frame[2 + kPubKeyBytes];
       const uint32_t counter = getBE32(&cmd_frame[2 + kPubKeyBytes + kHashBytes]);
       std::memcpy(reply.target, target, kPubKeyBytes);
-      std::memcpy(reply.manifestHash, manifest_hash, kHashBytes);
-      reply.counter = counter;
+      const bool local_target = _identity_available_ && std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0;
+      if (!local_target) reply.flags |= kReplyFlagRemote;
       if (!_identity_available_) {
         reply.result = UsbOtaResult::Unavailable;
         break;
       }
-      const bool local_target = std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0;
       const auto snap = lean.status();
       if (local_target) {
         if (!snap.valid) { reply.result = UsbOtaResult::NotFound; break; }
@@ -1756,34 +1745,13 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         const size_t message_len = buildCommitSignedMessage(target, manifest_hash, counter, message);
         uint8_t signature[64] = {};
         self_id.sign(signature, message, static_cast<int>(message_len));
-        reply.result = lean.commit(counter, signature);
+        reply.result = getOtaIntegration().commitAndDeferReboot(counter, signature, _ms->getMillis());
         fillLocalSnapshot();
         break;
       }
-      // Remote target: a real signed COMMIT frame, destined for exactly
-      // the real device whose identity the ABI caller supplied. The
-      // snapshot bits of the reply are deliberately left at setNoSnapshot()
-      // defaults (never this node's OWN local candidate state, which
-      // would be a different device entirely) -- only target/manifestHash/
-      // counter/kReplyFlagRemote are meaningful here.
-      if (!snap.valid || std::memcmp(snap.manifestHash, manifest_hash, kHashBytes) != 0) {
-        reply.result = UsbOtaResult::Mismatch;
-        reply.flags |= kReplyFlagRemote;
-        break;
-      }
-      uint8_t message[kCommitSignedBytes] = {};
-      const size_t message_len = buildCommitSignedMessage(target, manifest_hash, counter, message);
-      uint8_t signature[64] = {};
-      self_id.sign(signature, message, static_cast<int>(message_len));
-      uint8_t frame[mesh::ota::kOtaCommitFrameBytes] = {};
-      const size_t frame_len = mesh::ota::encodeOtaCommitFrame(target, manifest_hash, counter, signature, frame, sizeof(frame));
-      reply.flags |= kReplyFlagRemote;
-      if (frame_len != 0 &&
-          sendOtaControlFrameToTarget(target, frame, frame_len, meshcore::ota::protocol::OtaAirtimeCategory::Control)) {
-        reply.result = UsbOtaResult::Ok;
+      reply = getOtaIntegration().handleUsbRemoteControl(cmd_frame, static_cast<size_t>(len), this, sendRemoteControl);
+      if (reply.result == UsbOtaResult::Ok) {
         _ota_stop_upload_when_idle = _ota_rf_uploader.mode() == kStartModeDirect || _ota_selected_target_count == 1;
-      } else {
-        reply.result = UsbOtaResult::Busy; // airtime-denied/unroutable this instant; caller may retry.
       }
       break;
     }
@@ -1793,49 +1761,27 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         break;
       }
       const uint8_t* target = &cmd_frame[2];
-      const uint8_t* image_hash = &cmd_frame[2 + kPubKeyBytes];
       std::memcpy(reply.target, target, kPubKeyBytes);
-      std::memcpy(reply.manifestHash, image_hash, kHashBytes);
       const bool zero_target = std::all_of(target, target + kPubKeyBytes, [](uint8_t b) { return b == 0; });
       const bool local_target = zero_target || (_identity_available_ && std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0);
+      if (!local_target) reply.flags |= kReplyFlagRemote;
+      if (local_target) {
+        reply = getOtaIntegration().handleUsbLocalControl(cmd_frame, static_cast<size_t>(len),
+                                                         _identity_available_ ? self_id.pub_key : nullptr);
+        if (reply.result == UsbOtaResult::Ok) {
+          _ota_rf_uploader.stop(getOtaIntegration()); _ota_upload_active = false;
+        }
+        break;
+      }
       if (!_identity_available_) {
         reply.result = UsbOtaResult::Unavailable;
         break;
       }
-      if (local_target) {
-        uint8_t message[kAbortSignedBytes] = {};
-        const size_t message_len = buildAbortSignedMessage(self_id.pub_key, image_hash, message);
-        uint8_t signature[64] = {};
-        self_id.sign(signature, message, static_cast<int>(message_len));
-        reply.result = lean.abort(self_id.pub_key, signature, image_hash, true);
-        if (reply.result == UsbOtaResult::Ok) {
-          _ota_rf_uploader.stop(getOtaIntegration()); _ota_upload_active = false;
-        }
-        fillLocalSnapshot();
-        break;
-      }
-      // Remote target: any CURRENT admin may abort (not only the
-      // original manifest owner, per the agreed asymmetric authority
-      // rule) -- sign with THIS node's own identity (never a copied
-      // target private key) over a message built against the REAL
-      // destination's public key, exactly what the remote's own
-      // OtaLeanReceiver::abort() reconstructs using its own identity.
-      uint8_t message[kAbortSignedBytes] = {};
-      const size_t message_len = buildAbortSignedMessage(target, image_hash, message);
-      uint8_t signature[64] = {};
-      self_id.sign(signature, message, static_cast<int>(message_len));
-      uint8_t frame[mesh::ota::kOtaAbortFrameBytes] = {};
-      const size_t frame_len =
-          mesh::ota::encodeOtaAbortFrame(self_id.pub_key, target, image_hash, signature, frame, sizeof(frame));
-      reply.flags |= kReplyFlagRemote;
-      if (frame_len != 0 &&
-          sendOtaControlFrameToTarget(target, frame, frame_len, meshcore::ota::protocol::OtaAirtimeCategory::Control)) {
-        reply.result = UsbOtaResult::Ok;
+      reply = getOtaIntegration().handleUsbRemoteControl(cmd_frame, static_cast<size_t>(len), this, sendRemoteControl);
+      if (reply.result == UsbOtaResult::Ok) {
         // Keep the direct profile until the signed ABORT actually leaves
         // the TX queue; restoring at enqueue would strand the receiver.
         _ota_stop_upload_when_idle = _ota_rf_uploader.mode() == kStartModeDirect || _ota_selected_target_count == 1;
-      } else {
-        reply.result = UsbOtaResult::Busy;
       }
       break;
     }
@@ -3626,6 +3572,10 @@ void MyMesh::loop() {
 
 #ifdef DISPLAY_CLASS
   if (_ui) _ui->setHasConnection(_serial->isConnected());
+#endif
+#if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
+  getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(),
+                                      _mgr->getOutboundTotal() != 0, _serial->isWriteBusy());
 #endif
 }
 

@@ -307,6 +307,11 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   };
   const mesh::ota::OtaBoardBootQualification qualification = mesh::ota::resolveOtaBoardBootQualification(
       kExpectedBoardTargetId, kExpectedRoleId, kExpectedCapabilityFlags);
+  static mesh::ota::OtaBoardNrf52RunningContext running_context;
+  static mesh::ota::OtaBoardUnadmittedCommandRecovery recovery(
+      xiao_command_region, xiao_state_region, xiao_floor_region, candidate, signature_verifier,
+      running_context, g_qualified, kExpectedBoardTargetId, kExpectedRoleId);
+  integration.attachUnadmittedAbort(&recovery, &mesh::ota::OtaBoardUnadmittedCommandRecovery::invoke);
   if (!qualification.qualified) {
     return attach_cache_only("CACHE_ONLY: no qualified custom boot detected (production)");
   }

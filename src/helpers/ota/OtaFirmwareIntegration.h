@@ -149,10 +149,134 @@ public:
   OtaLeanReceiver& leanReceiver() { return lean_; }
   const OtaLeanReceiver& leanReceiver() const { return lean_; }
   void loop() { lean_.loop(); }
+  static constexpr uint32_t kCommitRebootGraceMs = 2000;
+  static constexpr uint32_t kCommitRebootQueueWaitMs = 15000;
+  using CommitRebootFn = void (*)(void*);
+  void attachCommitReboot(void* ctx, CommitRebootFn fn) { commit_reboot_ctx_ = ctx; commit_reboot_ = fn; }
+  usb::UsbOtaResult commitAndDeferReboot(uint32_t counter, const uint8_t signature[64], uint32_t now_ms) {
+    const auto before = lean_.status();
+    const auto result = lean_.commit(counter, signature);
+    if (result != usb::UsbOtaResult::Ok) return result;
+    stopDirect();
+    // A retry after boot must not reboot an already-running trial or installed image.
+    if (commit_reboot_ && before.phase == ::ota::storage::OtaCandidateStore::Phase::Ready &&
+        (!commit_reboot_pending_ || commit_reboot_nonce_ != before.transactionNonce)) {
+      commit_reboot_pending_ = true;
+      commit_reboot_nonce_ = lean_.status().transactionNonce;
+      commit_reboot_due_ms_ = now_ms + kCommitRebootGraceMs;
+      commit_reboot_queue_deadline_ms_ = now_ms + kCommitRebootQueueWaitMs;
+    }
+    return result;
+  }
+  bool takeCommitReboot(uint32_t now_ms, bool tx_active, bool outbound_queued, bool interface_busy = false) {
+    if (!commit_reboot_pending_) return false;
+    const auto st = lean_.status();
+    if (!st.valid || st.phase != ::ota::storage::OtaCandidateStore::Phase::Committed ||
+        st.transactionNonce != commit_reboot_nonce_) {
+      commit_reboot_pending_ = false;
+      return false;
+    }
+    if (static_cast<int32_t>(now_ms - commit_reboot_due_ms_) < 0) return false;
+    const bool queue_deadline = static_cast<int32_t>(now_ms - commit_reboot_queue_deadline_ms_) >= 0;
+    if (tx_active && (!queue_deadline || direct_active_ || direct_pending_)) return false;
+    stopDirect();
+    if (direct_active_ || direct_pending_) return false;
+    // At the deadline a controlled reset may interrupt normal TX, never an unrestored direct profile.
+    if (!queue_deadline &&
+        (pending_control_frame_valid_ || outbound_queued || interface_busy)) return false;
+    commit_reboot_pending_ = false;
+    return true;
+  }
+  bool tickCommitReboot(uint32_t now_ms, bool tx_active, bool outbound_queued, bool interface_busy = false) {
+    if (!commit_reboot_ || !takeCommitReboot(now_ms, tx_active, outbound_queued, interface_busy)) return false;
+    commit_reboot_(commit_reboot_ctx_);
+    return true;
+  }
   using SignFn = void (*)(void*, const uint8_t*, size_t, uint8_t[64]);
   using RadioChangeFn = bool (*)(void*, uint32_t, bool);
   void attachRfIdentity(void* ctx, SignFn sign, RadioChangeFn change, uint32_t normal_freq_khz) {
     rf_ctx_ = ctx; rf_sign_ = sign; rf_radio_change_ = change; normal_freq_khz_ = normal_freq_khz;
+  }
+  usb::UsbOtaReply handleUsbLocalControl(const uint8_t* command, size_t len, const uint8_t local_owner[32]) {
+    usb::UsbOtaReply reply;
+    reply.setNoSnapshot();
+    reply.result = usb::UsbOtaResult::BadRequest;
+    if (!command || len < 2 || command[0] != usb::kCommand) return reply;
+    reply.requestOp = command[1];
+    switch (static_cast<usb::UsbOtaOp>(command[1])) {
+      case usb::UsbOtaOp::CacheBegin:
+        if (len != usb::kCacheBeginTotalBytes || (command[2] & ~usb::kCacheBeginFlagReupload)) return reply;
+        reply.result = lean_.handleUsbCacheFrame(command, len, local_owner);
+        fillUsbReadback(reply);
+        break;
+      case usb::UsbOtaOp::CachePut:
+      case usb::UsbOtaOp::CacheSeal:
+        reply.result = lean_.handleUsbCacheFrame(command, len, local_owner);
+        if (reply.result != usb::UsbOtaResult::BadRequest) fillUsbReadback(reply);
+        break;
+      case usb::UsbOtaOp::Abort: {
+        if (len != usb::kAbortTotalBytes) return reply;
+        std::memcpy(reply.target, command + 2, sizeof(reply.target));
+        if (!local_owner || !rf_sign_) {
+          reply.result = usb::UsbOtaResult::Unavailable;
+          return reply;
+        }
+        bool zero_target = true;
+        for (const auto byte : reply.target) if (byte) zero_target = false;
+        if (!zero_target && std::memcmp(reply.target, local_owner, sizeof(reply.target))) return reply;
+        uint8_t message[usb::kAbortSignedBytes], signature[64];
+        const auto message_len = usb::buildAbortSignedMessage(local_owner, command + 34, message);
+        rf_sign_(rf_ctx_, message, message_len, signature);
+        reply.result = lean_.abort(local_owner, signature, command + 34, true);
+        fillUsbReadback(reply);
+        break;
+      }
+      default:
+        reply.result = usb::UsbOtaResult::Unsupported;
+        break;
+    }
+    return reply;
+  }
+  using UsbRemoteControlSendFn = bool (*)(void*, const uint8_t[32], const uint8_t*, size_t);
+  // A queued remote command is not evidence of the target's durable state.
+  usb::UsbOtaReply handleUsbRemoteControl(const uint8_t* command, size_t len,
+                                        void* send_ctx, UsbRemoteControlSendFn send) {
+    usb::UsbOtaReply reply;
+    reply.setNoSnapshot();
+    reply.flags |= usb::kReplyFlagRemote;
+    reply.result = usb::UsbOtaResult::BadRequest;
+    if (!command || len < 2 || command[0] != usb::kCommand) return reply;
+    reply.requestOp = command[1];
+    const auto op = static_cast<usb::UsbOtaOp>(command[1]);
+    if ((op != usb::UsbOtaOp::Commit && op != usb::UsbOtaOp::Abort) ||
+        len != (op == usb::UsbOtaOp::Commit ? usb::kCommitTotalBytes : usb::kAbortTotalBytes)) return reply;
+    const auto* target = command + 2;
+    const auto* hash = target + usb::kPubKeyBytes;
+    std::memcpy(reply.target, target, sizeof(reply.target));
+    if (!rf_sign_ || !lean_.haveTargetPublicKey() || !send) {
+      reply.result = usb::UsbOtaResult::Unavailable;
+      return reply;
+    }
+    uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaAbortFrameBytes];
+    size_t message_len, frame_len;
+    if (op == usb::UsbOtaOp::Commit) {
+      const auto st = lean_.status();
+      if (!st.valid || std::memcmp(st.manifestHash, hash, usb::kHashBytes)) {
+        reply.result = usb::UsbOtaResult::Mismatch;
+        return reply;
+      }
+      const auto counter = usb::getBE32(hash + usb::kHashBytes);
+      message_len = usb::buildCommitSignedMessage(target, hash, counter, message);
+      rf_sign_(rf_ctx_, message, message_len, signature);
+      frame_len = encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame));
+    } else {
+      message_len = usb::buildAbortSignedMessage(target, hash, message);
+      rf_sign_(rf_ctx_, message, message_len, signature);
+      frame_len = encodeOtaAbortFrame(lean_.targetPublicKey(), target, hash, signature, frame, sizeof(frame));
+    }
+    reply.result = frame_len && send(send_ctx, target, frame, frame_len) ?
+        usb::UsbOtaResult::Ok : usb::UsbOtaResult::Busy;
+    return reply;
   }
   using BootLifecycleFn = bool (*)(void*, OtaBootLifecycleEvidence&);
   // The board verifies signed provenance and live boot/slot identity before returning a read-only snapshot.
@@ -161,6 +285,9 @@ public:
   void attachBootLifecycle(void* ctx, BootLifecycleFn fn, BootCandidateFn candidate_fn = nullptr) {
     boot_ctx_ = ctx; boot_lifecycle_ = fn; boot_candidate_ = candidate_fn;
     lean_.attachTerminalCheck(this, &terminalCandidateThunk);
+  }
+  void attachUnadmittedAbort(void* ctx, OtaLeanReceiver::UnadmittedAbortFn fn) {
+    lean_.attachUnadmittedAbort(ctx, fn);
   }
   OtaBootLifecycleEvidence bootLifecycle() const {
     OtaBootLifecycleEvidence out;
@@ -238,7 +365,7 @@ public:
   bool directActive() const { return direct_active_; }
   bool directPending() const { return direct_pending_; }
   bool hasPendingRfWork() const {
-    return direct_active_ || direct_pending_ || pending_control_frame_valid_ ||
+    return commit_reboot_pending_ || direct_active_ || direct_pending_ || pending_control_frame_valid_ ||
            lean_.status().phase == ::ota::storage::OtaCandidateStore::Phase::Verifying;
   }
   void stopDirect() {
@@ -567,14 +694,7 @@ private:
                                candidate.signature)) return false;
     const auto boot = bootLifecycle();
     if (boot.phase != usb::UsbOtaPhase::Installed && boot.phase != usb::UsbOtaPhase::Failed) return false;
-    if (validBootCandidate(boot, candidate, true)) return true;
-    // A verified newer running install can supersede an old inactive COMMITTED record.
-    if (candidate.phase != Phase::Committed || !boot_candidate_ ||
-        boot.phase != usb::UsbOtaPhase::Installed || !boot.imageVerified || !boot.floorKnown ||
-        boot.confirmedFloor != boot.counter ||
-        OtaLeanReceiver::snapshotStatus(candidate).counter >= boot.counter) return false;
-    ::ota::storage::OtaCandidateStore::Snapshot running;
-    return boot_candidate_(boot_ctx_, boot, running) && validBootCandidate(boot, running);
+    return validBootCandidate(boot, candidate, true);
   }
   static bool validBootCandidate(const OtaBootLifecycleEvidence& boot,
                                  const ::ota::storage::OtaCandidateStore::Snapshot& candidate,
@@ -680,8 +800,14 @@ private:
         const auto st = lean_.status();
         if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32) ||
             !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32)) return LeanControlResult::Rejected;
-        const auto r = lean_.commit(parsed.counter, parsed.signature);
-        if (r == usb::UsbOtaResult::Ok) stopDirect();
+        const auto r = commitAndDeferReboot(parsed.counter, parsed.signature, now_ms);
+        if (r == usb::UsbOtaResult::Ok) {
+          uint8_t tag[kOtaManifestTagBytes];
+          manifestTagFromHash(st.manifestHash, tag);
+          pending_control_frame_valid_ = false;
+          queueStatusReportReply(tag);
+          pending_control_due_ms_ = now_ms;
+        }
         return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
       }
       case kOtaAbortKind: {
@@ -1322,6 +1448,11 @@ private:
   OtaLeanReceiver lean_;
   TrackedTarget targets_[kMaxTrackedOtaTargets];
   bool pending_control_frame_valid_ = false;
+  bool commit_reboot_pending_ = false;
+  void* commit_reboot_ctx_ = nullptr;
+  CommitRebootFn commit_reboot_ = nullptr;
+  uint64_t commit_reboot_nonce_ = 0;
+  uint32_t commit_reboot_due_ms_ = 0, commit_reboot_queue_deadline_ms_ = 0;
   uint8_t pending_control_frame_[kOtaDirectFrameBytes] = {0};
   size_t pending_control_frame_len_ = 0;
   uint32_t pending_control_due_ms_ = 0;
