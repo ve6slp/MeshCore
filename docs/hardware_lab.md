@@ -597,8 +597,25 @@ volume reports Board-ID `Seeed_XIAO_nRF52840_Sense` and USB identity
 The virtual `CURRENT.UF2` does not expose the bootloader region, so it
 cannot establish the current CF2 contents. Keep that distinction:
 current public identity can qualify a matching vendor board profile,
-but an old archive cannot serve as a fresh CF2 readback. No qualified
-loader has been written; the volume remains mounted read-only.
+but an old archive cannot serve as a fresh CF2 readback.
+
+**Latest physical commissioning result, Oct. 2, 2026:** the immutable
+`47b40e59` application was restored through stock serial DFU. Fresh
+address and configuration readbacks at `13:24:51Z` preserved the identities,
+radio/path preferences and complete target ACL. Read-only, address-selected
+application bytes from `CURRENT.UF2` independently matched its full
+536,152-byte SHA-256 at `13:32:40Z`. Only application bytes were retained;
+this did not read or qualify the bootloader or CF2.
+
+The reviewed `0.11.0` Sense bootloader-only serial package subsequently
+passed the actual stock identity, package and fresh-address guards.
+Vendor transport reported completion, but the target disconnected at
+`13:46:21Z` and did not return on USB, including after one target-only
+physical reset. The cause remains unproven. No application restoration,
+bootloader retry or filesystem erase followed. Installed-loader,
+genesis-floor and radio-installation acceptance therefore remain
+**blocked**, not passed. Do not repeat commissioning or bypass its guards
+to recover an inaccessible board.
 
 **UF2 self-update is blocked for this layout.** The retained upstream
 0.6.1 and pinned vendor sources stage the bootloader update at
