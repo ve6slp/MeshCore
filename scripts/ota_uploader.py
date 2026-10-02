@@ -246,7 +246,7 @@ class Uploader:
         reply = self.require_accepted(self.exchange(
             Op.CACHE_BEGIN, bytes([int(reupload)]) + owner_public_key + canonical + signature,
             timeout=self.remaining(deadline)))
-        if reply.phase == Phase.CACHE_SEALED:
+        if reply.phase in (Phase.VERIFYING, Phase.CACHE_SEALED):
             return self.wait_phase(LOCAL_TARGET, Phase.CACHE_SEALED, manifest_hash, counter, since, deadline)
         if reply.result == Result.PENDING:
             self.wait_phase(LOCAL_TARGET, Phase.RECEIVING, manifest_hash, counter, since, deadline)
@@ -396,7 +396,7 @@ def main():
         else:
             reply = uploader.status(args.target)
         evidence.log("ota_command_result", command=args.command, **reply.summary())
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)
         raise

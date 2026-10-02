@@ -227,6 +227,13 @@ The empty `OTA_UPLOAD_TARGET=` override keeps status local even if a previous
 campaign exported a remote target. The result's `hash` is the canonical
 manifest hash; that manifest binds the validated raw image SHA256.
 
+An interrupted upload can resume the same receiving candidate without
+`--reupload`; durable duplicate blocks are accepted without rewriting them.
+If BEGIN reports **VERIFYING**, the host waits for a fresh matching local
+CACHE_SEALED instead of attempting writes into the frozen verification stage.
+Ctrl-C records an explicit failed/interrupted invocation and closes the port
+without sending ABORT, SEAL or START; retained candidate progress is not cleared.
+
 Repeat `ota-lab-cache` in a new evidence directory to test duplicate handling.
 After the hardware operator explicitly performs an ordinary application
 reboot, use fresh client configuration/preflight and local status readbacks,

@@ -252,6 +252,66 @@ class LifecycleTests(unittest.TestCase):
             (ota.LOCAL_TARGET, ota.Phase.CACHE_SEALED, self.manifest_hash, 7),
         ])
 
+    def test_restart_during_verification_waits_for_seal_without_writing_blocks(self):
+        begin = ota.decode_reply(frame(
+            op=ota.Op.CACHE_BEGIN, phase=ota.Phase.VERIFYING, target=ota.LOCAL_TARGET,
+            flags=1, manifest_hash=self.manifest_hash))
+        statuses = iter([
+            ota.decode_reply(frame(
+                phase=ota.Phase.VERIFYING, target=ota.LOCAL_TARGET,
+                flags=1, manifest_hash=self.manifest_hash)),
+            ota.decode_reply(frame(
+                phase=ota.Phase.CACHE_SEALED, target=ota.LOCAL_TARGET,
+                flags=1, manifest_hash=self.manifest_hash)),
+        ])
+
+        def exchange(op, *args, **kwargs):
+            if op == ota.Op.CACHE_BEGIN:
+                return begin
+            if op == ota.Op.STATUS:
+                return next(statuses)
+            return ota.decode_reply(frame(
+                op=op, result=ota.Result.BAD_REQUEST, phase=ota.Phase.UNKNOWN,
+                target=ota.LOCAL_TARGET, flags=0, manifest_hash=bytes(32),
+                received=0, total=0, counter=0, age=ota.AGE_UNKNOWN))
+
+        self.uploader.exchange.side_effect = exchange
+        with mock.patch.object(ota.lab, "sign_manifest", return_value=bytes(64)) as sign, \
+                mock.patch.object(ota.time, "sleep"):
+            reply = self.uploader.cache(self.canonical, self.image, TARGET, time.monotonic() + 10)
+        self.assertEqual(reply.phase, ota.Phase.CACHE_SEALED)
+        self.assertEqual(reply.manifest_hash, self.manifest_hash)
+        self.assertEqual((reply.received, reply.total), (2, 2))
+        sign.assert_called_once()
+        self.assertEqual([call.args[0] for call in self.uploader.exchange.call_args_list],
+                         [ota.Op.CACHE_BEGIN, ota.Op.STATUS, ota.Op.STATUS])
+
+    def test_verifying_restart_rejects_failed_aborted_or_mismatched_completion(self):
+        begin = ota.decode_reply(frame(
+            op=ota.Op.CACHE_BEGIN, phase=ota.Phase.VERIFYING, target=ota.LOCAL_TARGET,
+            flags=1, manifest_hash=self.manifest_hash))
+        for fields in ({"phase": ota.Phase.FAILED}, {"phase": ota.Phase.ABORTED},
+                       {"manifest_hash": HASH}, {"counter": 8}, {"flags": 3},
+                       {"received": 1}):
+            with self.subTest(fields=fields):
+                status = dict(phase=ota.Phase.CACHE_SEALED, target=ota.LOCAL_TARGET,
+                              flags=1, manifest_hash=self.manifest_hash)
+                status.update(fields)
+
+                def exchange(op, *args, **kwargs):
+                    if op == ota.Op.CACHE_BEGIN:
+                        return begin
+                    self.assertEqual(op, ota.Op.STATUS)
+                    return ota.decode_reply(frame(**status))
+
+                self.uploader.exchange.reset_mock()
+                self.uploader.exchange.side_effect = exchange
+                with mock.patch.object(ota.lab, "sign_manifest", return_value=bytes(64)), \
+                        self.assertRaises(ota.UploaderError):
+                    self.uploader.cache(self.canonical, self.image, TARGET, time.monotonic() + 10)
+                self.assertEqual([call.args[0] for call in self.uploader.exchange.call_args_list],
+                                 [ota.Op.CACHE_BEGIN, ota.Op.STATUS])
+
     def test_target_selection_precedes_start_and_does_not_commit(self):
         body = ota.start_body("background", 0, 0, 0, 2000)
         self.uploader.start([TARGET, OTHER_TARGET], body, "background", time.monotonic() + 10)
@@ -539,6 +599,22 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual((result["counter"], result["received"], result["total"]), (7, 2, 2))
         self.node.close.assert_called_once()
         self.evidence.finish.assert_called_once_with(None)
+
+    def test_interrupted_partial_cache_is_recorded_as_failure_without_abort_or_seal(self):
+        def interrupted_write(payload):
+            if payload[1] == ota.Op.CACHE_PUT and payload[2:4] == b"\x00\x01":
+                raise KeyboardInterrupt()
+            self.write_frame(payload)
+
+        self.node.write_frame.side_effect = interrupted_write
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_cli(self.cache_arguments())
+        self.assertEqual([payload[1] for payload in self.sent_payloads()],
+                         [ota.Op.CACHE_BEGIN, ota.Op.CACHE_PUT, ota.Op.CACHE_PUT])
+        self.assertEqual(self.received, 1)
+        self.evidence.log.assert_any_call("fatal", error="KeyboardInterrupt: ")
+        self.evidence.finish.assert_called_once_with("KeyboardInterrupt: ")
+        self.node.close.assert_called_once()
 
     def test_duplicate_sealed_full_image_signs_and_begins_then_proves_local_status_without_writes(self):
         self.image = b"\xa5" * 537816
