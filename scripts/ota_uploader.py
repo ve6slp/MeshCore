@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Drive the signed OTA uploader through an approved lab companion."""
+"""Drive the signed OTA uploader through an approved lab companion.
+
+cache only signs/stages a local image and observes CACHE_SEALED. It never starts
+RF, selects a remote target, commits or proves installation/airtime.
+"""
 
 import argparse
 from dataclasses import dataclass
@@ -293,15 +297,17 @@ def parser():
     root.add_argument("--timeout", type=float, default=300)
     commands = root.add_subparsers(dest="command", required=True)
     upload = commands.add_parser("upload", help="cache and start; never commit automatically")
-    upload.add_argument("--manifest", required=True, type=Path)
-    upload.add_argument("--image", required=True, type=Path)
+    cache = commands.add_parser("cache", help="local signed cache only; no remote START, READY or install")
+    for command in (upload, cache):
+        command.add_argument("--manifest", required=True, type=Path)
+        command.add_argument("--image", required=True, type=Path)
+        command.add_argument("--reupload", action="store_true")
     upload.add_argument("--target", required=True, type=full_key, action="append")
     upload.add_argument("--mode", choices=tuple(MODES), default="directed")
     upload.add_argument("--channel", type=int, default=255)
     upload.add_argument("--frequency-khz", type=int, default=0)
     upload.add_argument("--lease-ms", type=int, default=0)
     upload.add_argument("--duty-milli-percent", type=int, default=2000)
-    upload.add_argument("--reupload", action="store_true")
     upload.add_argument("--wait-ready", action="store_true")
     status = commands.add_parser("status")
     status.add_argument("--target", type=full_key, default=LOCAL_TARGET)
@@ -329,8 +335,11 @@ def main():
     if canonical is not None and len(canonical) != 59:
         arguments.error("--manifest must contain exactly 59 canonical bytes")
     body = None
-    if args.command == "upload":
+    if args.command in ("upload", "cache"):
         validate_image(canonical, image)
+    if args.command == "cache" and args.client_role != "client":
+        arguments.error("cache requires the approved client role; no role override")
+    if args.command == "upload":
         body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent)
         if len(set(args.target)) != len(args.target) or len(args.target) > 32:
             arguments.error("select at most 32 distinct targets")
@@ -338,24 +347,39 @@ def main():
             arguments.error("direct and directed modes require exactly one target")
     elif args.command in ("abort", "abort-cache") and not image:
         arguments.error("--image must not be empty")
-    evidence = lab.Evidence(args.artifact_dir)
+    evidence = (lab.Evidence(args.artifact_dir, exclusive=True) if args.command == "cache"
+                else lab.Evidence(args.artifact_dir))
     node = None
     error = None
     try:
         device = lab_device.resolve(args.client_role, mode=lab_device.MODE_APP)
+        if args.command == "cache":
+            evidence.check("approved-cache-client", device.serial == lab.APPROVED_ADMIN_PAIR["client"],
+                           expected_serial=lab.APPROVED_ADMIN_PAIR["client"], observed_serial=device.serial)
         node = lab.FramedSerial(f"{args.client_role}-{device.serial}", str(device.by_id), evidence)
         time.sleep(2)
         uploader = Uploader(node, evidence, command_timeout=min(10, args.timeout))
         deadline = time.monotonic() + args.timeout
-        if args.command == "upload":
+        if args.command in ("upload", "cache"):
             identity = lab.app_info(node)["pubkey_bytes"]
-            uploader.cache(canonical, image, identity, deadline, args.reupload)
-            started = time.monotonic()
-            reply = uploader.start(args.target, body, args.mode, deadline)
-            if args.wait_ready:
-                for target in args.target:
-                    reply = uploader.wait_phase(target, Phase.READY, hashlib.sha256(canonical).digest(),
-                                                struct.unpack_from(">I", canonical, 45)[0], started, deadline)
+            since = time.monotonic()
+            reply = uploader.cache(canonical, image, identity, deadline, args.reupload)
+            if args.command == "cache":
+                blocks = (len(image) + BLOCK_BYTES - 1) // BLOCK_BYTES
+                if not (reply.target == LOCAL_TARGET and not reply.flags & REMOTE
+                        and reply.phase == Phase.CACHE_SEALED
+                        and reply.manifest_hash == hashlib.sha256(canonical).digest()
+                        and reply.counter == struct.unpack_from(">I", canonical, 45)[0]
+                        and reply.received == reply.total == blocks
+                        and reply.fresh_since(since, time.monotonic())):
+                    raise UploaderError("cache did not return fresh, complete, image-bound local CACHE_SEALED")
+            else:
+                started = time.monotonic()
+                reply = uploader.start(args.target, body, args.mode, deadline)
+                if args.wait_ready:
+                    for target in args.target:
+                        reply = uploader.wait_phase(target, Phase.READY, hashlib.sha256(canonical).digest(),
+                                                    struct.unpack_from(">I", canonical, 45)[0], started, deadline)
         elif args.command == "commit":
             reply = uploader.commit(args.target, canonical, deadline)
         elif args.command == "abort":

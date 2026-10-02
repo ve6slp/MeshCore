@@ -410,6 +410,13 @@ class CliLifecycleTests(unittest.TestCase):
         self.results = {}
         self.remote_phase = ota.Phase.READY
         self.signature_override = None
+        self.local_status = {}
+
+        def check(name, passed, **details):
+            if not passed:
+                raise AssertionError(name)
+
+        self.evidence.check.side_effect = check
 
     def advance(self, duration=0):
         self.clock.now += max(0.01, duration)
@@ -448,9 +455,11 @@ class CliLifecycleTests(unittest.TestCase):
             phase = ota.Phase.COMMIT_PENDING
         elif op == ota.Op.ABORT:
             phase = ota.Phase.ABORTED
-        response = frame(op=op, result=self.results.get(op, ota.Result.OK), phase=phase,
-                         target=target, flags=flags, manifest_hash=self.manifest_hash,
-                         received=received)
+        fields = dict(op=op, result=self.results.get(op, ota.Result.OK), phase=phase,
+                      target=target, flags=flags, manifest_hash=self.manifest_hash, received=received)
+        if op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
+            fields.update(self.local_status)
+        response = frame(**fields)
         self.pending.append((self.clock.now, response))
 
     def take_pending(self, codes):
@@ -458,14 +467,16 @@ class CliLifecycleTests(unittest.TestCase):
         self.pending[:] = [entry for entry in self.pending if entry[1][0] not in codes]
         return selected
 
-    def run_cli(self, arguments):
-        device = mock.Mock(serial="approved-client", by_id=pathlib.Path("/dev/serial/by-id/approved-client"))
+    def run_cli(self, arguments, serial=None):
+        device = mock.Mock(serial=serial or ota.lab.APPROVED_ADMIN_PAIR["client"],
+                           by_id=pathlib.Path("/dev/serial/by-id/approved-client"))
         argv = ["ota_uploader.py", "--artifact-dir", str(self.directory), "--timeout", "10", *arguments]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(ota, "time", self.clock), \
                 mock.patch.object(ota.lab, "time", self.clock), \
-                mock.patch.object(ota.lab, "Evidence", return_value=self.evidence), \
-                mock.patch.object(ota.lab_device, "resolve", return_value=device), \
-                mock.patch.object(ota.lab, "FramedSerial", return_value=self.node):
+                mock.patch.object(ota.lab, "Evidence", return_value=self.evidence) as evidence_open, \
+                mock.patch.object(ota.lab_device, "resolve", return_value=device) as resolve, \
+                mock.patch.object(ota.lab, "FramedSerial", return_value=self.node) as client_open:
+            self.evidence_open, self.resolve, self.client_open = evidence_open, resolve, client_open
             ota.main()
 
     def sent_payloads(self):
@@ -474,6 +485,139 @@ class CliLifecycleTests(unittest.TestCase):
     def upload_arguments(self):
         return ["upload", "--manifest", str(self.manifest_path), "--image", str(self.image_path),
                 "--target", TARGET.hex()]
+
+    def cache_arguments(self):
+        return ["cache", "--manifest", str(self.manifest_path), "--image", str(self.image_path)]
+
+    def test_cache_only_signs_real_owner_and_requires_fresh_full_local_seal_without_remote_ops(self):
+        self.run_cli(self.cache_arguments())
+        self.resolve.assert_called_once_with("client", mode=ota.lab_device.MODE_APP)
+        self.client_open.assert_called_once()
+        self.evidence_open.assert_called_once_with(str(self.directory), exclusive=True)
+        payloads = self.sent_payloads()
+        self.assertEqual([payload[1] for payload in payloads],
+                         [0x10, 0x11, 0x11, 0x12, 0x17])
+        self.assertEqual(payloads[0], bytes.fromhex("421000") + self.public_key + self.canonical
+                         + self.private_key.sign(self.canonical))
+        self.assertEqual(payloads[1:3],
+                         [bytes.fromhex("4211000054") + self.image[:84],
+                          bytes.fromhex("4211000110") + self.image[84:]])
+        self.assertEqual(payloads[-2:], [bytes.fromhex("4212"), bytes.fromhex("4217") + bytes(32)])
+        self.assertEqual([call.args[0][0] for call in self.node.command.call_args_list], [1, 33, 34, 35])
+        result = self.evidence.log.call_args.kwargs
+        self.assertEqual(result["phase"], "CACHE_SEALED")
+        self.assertFalse(result["remote"])
+        self.assertTrue(result["snapshot_valid"])
+        self.assertEqual(result["target"], "0" * 64)
+        self.assertEqual(result["hash"], self.manifest_hash.hex())
+        self.assertEqual((result["counter"], result["received"], result["total"]), (7, 2, 2))
+        self.node.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_cache_reupload_is_explicit_and_never_sends_abort_or_replaces_refused_cache(self):
+        self.run_cli([*self.cache_arguments(), "--reupload"])
+        self.assertEqual(self.sent_payloads()[0][2], 1)
+        self.node.reset_mock()
+        self.received = 0
+        self.results[ota.Op.CACHE_BEGIN] = ota.Result.MISMATCH
+        with self.assertRaisesRegex(ota.UploaderError, "MISMATCH"):
+            self.run_cli([*self.cache_arguments(), "--reupload"])
+        self.assertEqual([payload[1] for payload in self.sent_payloads()], [0x10])
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+        self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_cache_invalid_manifest_or_image_refuses_before_evidence_resolution_or_open(self):
+        for canonical, image, error in ((self.canonical[:-1], self.image, SystemExit),
+                                        (self.canonical + b"\x00", self.image, SystemExit),
+                                        (self.canonical, self.image[:-1], ValueError),
+                                        (self.canonical, self.image[:-1] + b"x", ValueError),
+                                        (self.canonical, b"", ValueError)):
+            with self.subTest(size=len(image)), redirect_stderr(io.StringIO()):
+                self.manifest_path.write_bytes(canonical)
+                self.image_path.write_bytes(image)
+                with self.assertRaises(error):
+                    self.run_cli(self.cache_arguments())
+                self.evidence_open.assert_not_called()
+                self.resolve.assert_not_called()
+                self.client_open.assert_not_called()
+                self.node.command.assert_not_called()
+
+    def test_cache_refuses_unapproved_target_or_pine_source_before_open(self):
+        for serial in ("3BE94917B92DC5E9", "49C5BAF21EEF44A1", "unapproved"):
+            with self.subTest(serial=serial):
+                with self.assertRaisesRegex(AssertionError, "approved-cache-client"):
+                    self.run_cli(self.cache_arguments(), serial=serial)
+                self.client_open.assert_not_called()
+                self.node.command.assert_not_called()
+                self.node.write_frame.assert_not_called()
+
+    def test_cache_cannot_select_remote_options_or_redirect_role(self):
+        for arguments in ([*self.cache_arguments(), "--target", TARGET.hex()],
+                          [*self.cache_arguments(), "--wait-ready"],
+                          [*self.cache_arguments(), "--mode", "direct"],
+                          [*self.cache_arguments(), "--frequency-khz", "908525"],
+                          ["--client-role", "target", *self.cache_arguments()],
+                          ["--client-role", "pine", *self.cache_arguments()]):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.run_cli(arguments)
+                self.resolve.assert_not_called()
+                self.client_open.assert_not_called()
+
+    def test_cache_seal_ack_alone_wrong_binding_scope_or_progress_cannot_succeed(self):
+        cases = (
+            ({"manifest_hash": HASH}, ota.UploaderError),
+            ({"counter": 8}, ota.UploaderError),
+            ({"flags": 3}, ota.UploaderError),
+            ({"received": 1}, ota.UploaderError),
+            ({"received": 1, "total": 1}, ota.UploaderError),
+            ({"phase": ota.Phase.RECEIVING}, TimeoutError),
+            ({"age": 20000}, TimeoutError),
+            ({"target": OTHER_TARGET}, TimeoutError),
+        )
+        for fields, error in cases:
+            with self.subTest(fields=fields):
+                self.setUp()
+                self.local_status = fields
+                with self.assertRaises(error):
+                    self.run_cli(self.cache_arguments())
+                self.assertEqual([payload[1] for payload in self.sent_payloads()[:4]], [0x10, 0x11, 0x11, 0x12])
+                self.assertTrue(all(payload[1] in (0x10, 0x11, 0x12, 0x17)
+                                    for payload in self.sent_payloads()))
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+                self.node.close.assert_called_once()
+
+    def test_cache_bad_signature_denied_unavailable_or_io_failure_never_starts_or_aborts(self):
+        for op, result, invalid_signature, error in (
+            (ota.Op.CACHE_BEGIN, ota.Result.OK, True, InvalidSignature),
+            (ota.Op.CACHE_BEGIN, ota.Result.DENIED, False, ota.UploaderError),
+            (ota.Op.CACHE_BEGIN, ota.Result.UNAVAILABLE, False, ota.UploaderError),
+            (ota.Op.CACHE_PUT, ota.Result.IO_ERROR, False, ota.UploaderError),
+            (ota.Op.CACHE_SEAL, ota.Result.DENIED, False, ota.UploaderError),
+        ):
+            with self.subTest(op=op, result=result, invalid_signature=invalid_signature):
+                self.setUp()
+                self.results[op] = result
+                if invalid_signature:
+                    self.signature_override = bytes(64)
+                with self.assertRaises(error):
+                    self.run_cli(self.cache_arguments())
+                self.assertTrue(all(payload[1] in (0x10, 0x11, 0x12)
+                                    for payload in self.sent_payloads()))
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.node.close.assert_called_once()
+
+    def test_cache_existing_evidence_is_refused_before_device_resolution(self):
+        argv = ["ota_uploader.py", "--artifact-dir", str(self.directory), *self.cache_arguments()]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(ota.lab_device, "resolve") as resolve, \
+                mock.patch.object(ota.lab, "FramedSerial") as client_open:
+            with self.assertRaises(FileExistsError):
+                ota.main()
+            resolve.assert_not_called()
+            client_open.assert_not_called()
+        self.assertEqual(set(self.directory.iterdir()), {self.image_path, self.manifest_path})
 
     def test_complete_upload_signs_and_waits_in_all_three_modes_without_committing(self):
         for mode in ota.MODES:

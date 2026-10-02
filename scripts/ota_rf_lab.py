@@ -715,6 +715,8 @@ def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_f
               "target_genesis_floor_verified": False,
               "target_boot_addresses_required": require_target_boot_addresses,
               "target_boot_addresses_verified": False}
+    if target is None:
+        record.update(scope="client_only", target_inspected=False, qualification_verified=False)
     evidence.summary["measurements"]["ota_preflight"] = record
     identities = {"client": serializable_app_info(app_info(client))}
     if target is not None:
@@ -794,18 +796,24 @@ def run_inspect_configuration(client, target, evidence):
     record = {"read_only": True, "inspection_complete": False, "acl_complete": False,
               "nodes": {}, "raw_serial_events": "serial-events.jsonl",
               "reboot_requested": False, "reboot_persistence_verified": False}
+    if target is None:
+        record.update(scope="client_only", target_inspected=False, target_acl_inspected=False,
+                      qualification_verified=False)
     evidence.summary["measurements"]["configuration_inspection"] = record
     for role, node, reader in (("client", client, companion_info), ("target", target, repeater_info)):
+        if node is None:
+            continue
         observed = serializable_app_info(reader(node))
         record["nodes"][role] = observed
         evidence.log("configuration_inspection_node", node=role, observed=observed, read_only=True)
-    nodes = record["nodes"]
-    evidence.check("node-identities-are-distinct",
-                   nodes["client"]["pubkey"] != nodes["target"]["pubkey"],
-                   client=nodes["client"]["pubkey"], target=nodes["target"]["pubkey"])
-    record["acl"] = target.get_acl()
-    record["acl_complete"] = True
-    record["client_permission"] = record["acl"].get(nodes["client"]["pubkey"])
+    if target is not None:
+        nodes = record["nodes"]
+        evidence.check("node-identities-are-distinct",
+                       nodes["client"]["pubkey"] != nodes["target"]["pubkey"],
+                       client=nodes["client"]["pubkey"], target=nodes["target"]["pubkey"])
+        record["acl"] = target.get_acl()
+        record["acl_complete"] = True
+        record["client_permission"] = record["acl"].get(nodes["client"]["pubkey"])
     record["inspection_complete"] = True
     evidence.log("configuration_inspection_complete", **record)
     return record
@@ -995,7 +1003,8 @@ def main():
     scope.add_argument("--inspect-ota-preflight", action="store_true",
                        help="read-only early preflight, write-latch and capability diagnostics")
     scope.add_argument("--inspect-configuration", action="store_true",
-                       help="read-only approved pair settings and complete repeater ACL; "
+                       help="read-only approved pair settings and complete repeater ACL, or client "
+                            "settings only with --client-only; "
                             "no setters, grants or reboot")
     scope.add_argument("--inspect-channels", action="store_true",
                        help="read-only approved companion channel names/indices; implicitly client-only, "
@@ -1014,8 +1023,6 @@ def main():
         parser.error("--monitor-seconds must be finite and non-negative")
     if args.grant_client_admin and args.client_only:
         parser.error("--grant-client-admin requires both approved roles; not --client-only")
-    if args.inspect_configuration and args.client_only:
-        parser.error("--inspect-configuration requires both approved roles; not --client-only")
     if args.bandwidth_hz is not None and not args.configure_only:
         parser.error("--bandwidth-hz requires --configure-only")
     if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin
@@ -1033,13 +1040,15 @@ def main():
              else (NORMAL_RADIO[0], args.bandwidth_hz, *NORMAL_RADIO[2:]))
     evidence = (Evidence(args.artifact_dir, exclusive=True)
                 if args.inspect_channels or args.inspect_measurements
+                or (args.client_only and (args.inspect_configuration or args.inspect_ota_preflight))
                 else Evidence(args.artifact_dir))
     client = target = None
     error = None
     try:
         if args.grant_client_admin:
             devices = resolve_admin_grant_roles(evidence)
-        elif args.inspect_ota_preflight or args.inspect_channels or args.inspect_measurements:
+        elif (args.inspect_ota_preflight or args.inspect_channels or args.inspect_measurements
+              or (args.inspect_configuration and args.client_only)):
             devices = resolve_preflight_roles(evidence, client_only=args.client_only)
         elif args.inspect_configuration:
             devices = resolve_configuration_inspection_roles(evidence)

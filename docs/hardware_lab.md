@@ -153,6 +153,104 @@ The helper rejects lifecycle-only, missing or malformed readbacks.
 These diagnostics require the corrected application: `bda99d13` ignores
 the companion selector and cannot report the captured early refusal.
 
+### One-client application and local-cache validation
+
+The user has authorized MAIN to validate the working client and flash only
+a qualified immutable companion application ZIP through standard stock
+application DFU. All serial/hardware operations remain MAIN-only. This does
+not authorize target/SWD recovery, bootloader/SoftDevice/MBR/UICR writes,
+raw code-region writes or a radio campaign.
+
+When only companion `4186AE911D94CDB1` is available, these routes never
+resolve or open target `3BE94917B92DC5E9` or protected Pine `49C5BAF21EEF44A1`.
+Use a **new artifact directory for every inspection and cache invocation**;
+existing directories are refused before any port opens.
+
+```sh
+make inspect-xiao-nrf52-ota-client-configuration \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-before
+make inspect-xiao-nrf52-ota-client-preflight \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-preflight
+```
+
+The first command invokes `ota_rf_lab.py --client-only --inspect-configuration`
+and records the actual public key, name, radio preferences and path-hash mode.
+It sends only ordinary companion identity/settings reads. The second invokes
+`--client-only --inspect-ota-preflight`, reading identity and diagnostic
+selectors `42 00 01` / `42 00 02`. A valid blocked diagnostic is an observation,
+not authorization to change settings. `summary.json` explicitly records
+`scope: client_only`, `target_inspected: false` and no qualification claim.
+Configuration inspection also records `acl_complete: false`,
+`target_acl_inspected: false` and `reboot_persistence_verified: false`;
+there is no target ACL or receiver-floor proof.
+
+Only the authorized hardware operator may then use the existing
+`flash-xiao-nrf52-client` route with an explicitly selected, immutable,
+qualified **companion application-only ZIP**:
+
+```sh
+make flash-xiao-nrf52-client \
+  XIAO_NRF52_CLIENT_PACKAGE=/private/qualified-companion/firmware.zip \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-app-flash
+make inspect-xiao-nrf52-ota-client-configuration \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-after
+make inspect-xiao-nrf52-ota-client-preflight \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-after-preflight
+```
+
+The flash helper validates application package geometry before entering
+standard application DFU. Do not use a receiver-role package for this flash,
+rebuild mutable source, convert roles, or write bootloader, SoftDevice, MBR
+or UICR. Compare the complete public configuration before/after; separate
+readbacks do not automatically qualify persistence. The original public-key
+baseline was not captured: a new baseline cannot prove original-image recovery.
+
+To exercise only QSPI storage/signing, supply an immutable raw **receiver-role1**
+candidate and its canonical unsigned 59-byte manifest to the existing uploader:
+
+```sh
+make ota-lab-cache \
+  OTA_UPLOAD_IMAGE=/private/candidate/receiver.bin \
+  OTA_UPLOAD_MANIFEST=/private/candidate/manifest-unsigned59.bin \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-cache
+make ota-lab-status OTA_UPLOAD_TARGET= \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-cache-status
+```
+
+`ota_uploader.py cache --image ... --manifest ... [--reupload]` validates
+size/hash before opening the approved client, uses its actual application
+public key and existing signing service, durably uploads 84-byte fragments,
+then requires fresh, manifest/counter-bound **local CACHE_SEALED** with every
+expected block present. No private key is exported. It sends no ADD_TARGET,
+START, remote STATUS, COMMIT, ABORT, administrative or radio-setting request.
+The empty `OTA_UPLOAD_TARGET=` override keeps status local even if a previous
+campaign exported a remote target. The result's `hash` is the canonical
+manifest hash; that manifest binds the validated raw image SHA256.
+
+Repeat `ota-lab-cache` in a new evidence directory to test duplicate handling.
+After the hardware operator explicitly performs an ordinary application
+reboot, use fresh client configuration/preflight and local status readbacks,
+then repeat the same image/manifest to observe cache persistence and duplicate
+acceptance. Compare full hash/counter/block counts; command acknowledgement
+alone is not proof. `OTA_UPLOAD_REUPLOAD=1` is explicit and does not authorize
+replacement of another owner/content/purpose. A conflict fails without
+automatic cleanup. Only when separately intended, clear this image explicitly:
+
+```sh
+make ota-lab-abort-cache OTA_UPLOAD_IMAGE=/private/candidate/receiver.bin \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-cache-abort
+make ota-lab-status OTA_UPLOAD_TARGET= \
+  OTA_LAB_ARTIFACT_DIR=/private/evidence/client-cache-after-abort
+```
+
+Never use trial COMMIT or a recovery bootloader experiment as a cache-refusal
+test.
+
+Stock capability must remain **CACHE_ONLY**. Storing a receiver image on the
+companion does not install it there. One working radio cannot qualify radio
+OTA, remote READY/install, rollback, duty-cycle accounting or multi-peer
+delivery; those outcomes remain blocked until the approved target is available.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
@@ -619,12 +717,15 @@ to recover an inaccessible board.
 
 ## Non-erasing SWD diagnosis
 
-**Physical work remains paused.** Target `3BE94917B92DC5E9` is still inaccessible
+**Target recovery and physical SWD diagnosis remain paused.**
+Target `3BE94917B92DC5E9` is still inaccessible
 after the `13:46:21Z` vendor bootloader-only DFU transport acknowledgement;
 reset and power reconnect did not restore USB. Actual cause is **unknown**.
 That acknowledgement is not installed-loader proof. The `13:24:51Z` address
-evidence is expired and must not be reused or re-stamped. Leave the healthy
-client `4186AE911D94CDB1` and protected Pine `49C5BAF21EEF44A1` untouched.
+evidence is expired and must not be reused or re-stamped. For this SWD
+workflow, leave the healthy client `4186AE911D94CDB1` and protected Pine
+`49C5BAF21EEF44A1` untouched. The separate user-authorized client-only
+application/local-cache validation above is not paused by this target failure.
 The Raspberry Pi Debug Probe **SC0889** (CMSIS-DAP), XIAO Expansion Board
 **103030356**, and spare **102010469** are being ordered. No diagnosis has
 been acquired with this helper.
@@ -658,7 +759,7 @@ Then use:
 
 ```sh
 make test-xiao-nrf52-swd-diagnosis
-# PHYSICAL — do NOT run while work is paused:
+# PHYSICAL TARGET/SWD — do NOT run while target recovery is paused:
 make diagnose-xiao-nrf52-target-swd \
   SWD_DIAGNOSE_PYTHON="$PWD/.tmp/swd-venv/bin/python" \
   SWD_PROBE_UID='<complete UID of the user-identified SC0889>' \

@@ -148,9 +148,10 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         install-xiao-nrf52-target-ota-bootloader flash-xiao-nrf52-target-ota-bootloader \
         package-xiao-ota-bootloader-serial flash-xiao-nrf52-target-ota-bootloader-serial \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client grant-xiao-nrf52-ota-client-admin inspect-xiao-nrf52-ota-preflight inspect-xiao-nrf52-ota-configuration inspect-xiao-nrf52-channels \
+        inspect-xiao-nrf52-ota-client-configuration inspect-xiao-nrf52-ota-client-preflight \
         inspect-xiao-nrf52-ota-measurements inspect-xiao-nrf52-ota-client-measurements \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
-        ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-abort-cache ota-lab-admin \
+        ota-lab-image ota-lab-manifest ota-lab-cache ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-abort-cache ota-lab-admin \
         qualify-xiao-nrf52-normal-peer qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
@@ -403,6 +404,12 @@ inspect-xiao-nrf52-ota-configuration: tmpdir
 	  { echo "Set OTA_LAB_ARTIFACT_DIR to a new directory for the configuration inspection" >&2; exit 1; }
 	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --inspect-configuration
 
+inspect-xiao-nrf52-ota-client-configuration: tmpdir
+	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --client-only --inspect-configuration
+
+inspect-xiao-nrf52-ota-client-preflight: tmpdir
+	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --client-only --inspect-ota-preflight
+
 inspect-xiao-nrf52-channels: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --inspect-channels
 
@@ -435,6 +442,10 @@ ota-lab-manifest: tmpdir
 	  --image "$(OTA_UPLOAD_IMAGE)" --board "$(OTA_UPLOAD_BOARD)" \
 	  --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" \
 	  --output "$(OTA_UPLOAD_MANIFEST)"
+
+ota-lab-cache: tmpdir
+	$(OTA_UPLOAD_COMMAND) cache --image "$(OTA_UPLOAD_IMAGE)" --manifest "$(OTA_UPLOAD_MANIFEST)" \
+	  $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload)
 
 ota-lab-upload: tmpdir
 	$(OTA_UPLOAD_COMMAND) upload --image "$(OTA_UPLOAD_IMAGE)" --manifest "$(OTA_UPLOAD_MANIFEST)" \

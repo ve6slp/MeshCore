@@ -354,7 +354,6 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--inspect-configuration", "--monitor-seconds=1"], "not allowed"),
             (["--inspect-configuration", "--bandwidth-hz=62500"], "requires --configure-only"),
             (["--inspect-configuration", "--bandwidth-hz=250000"], "requires --configure-only"),
-            (["--inspect-configuration", "--client-only"], "requires both approved roles"),
             (["--inspect-channels", "--configure-only"], "not allowed"),
             (["--inspect-channels", "--grant-client-admin"], "not allowed"),
             (["--inspect-channels", "--inspect-configuration"], "not allowed"),
@@ -2054,6 +2053,18 @@ class OtaPreflightInspectionTests(unittest.TestCase):
         record = self.evidence.summary["measurements"]["ota_preflight"]
         self.assertEqual(set(record["nodes"]), {"client"})
         self.assertTrue(record["inspection_complete"])
+        self.assertEqual(record["scope"], "client_only")
+        self.assertFalse(record["target_inspected"])
+        self.assertFalse(record["qualification_verified"])
+        self.assertFalse(record["target_genesis_floor_verified"])
+        self.assertFalse(record["target_boot_addresses_verified"])
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(bytes.fromhex("420001"), expected=(29, 1)),
+            mock.call(bytes.fromhex("420002"), expected=(29, 1)),
+        ])
+        self.target.get_acl.assert_not_called()
+        self.target.close.assert_not_called()
 
     def test_legacy_selector_fallback_is_fatal_with_all_raw_readbacks_retained(self):
         legacy = b"\x1dmode=direct state=0 phase=0 floor=0"
@@ -2158,8 +2169,8 @@ class ConfigurationInspectionTests(unittest.TestCase):
             ["get role", "  -> > repeater"],
         ])
 
-    def run_main(self):
-        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--inspect-configuration"]
+    def run_main(self, options=()):
+        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused", "--inspect-configuration", *options]
         with mock.patch.object(sys, "argv", arguments), \
                 mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
                 mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
@@ -2332,6 +2343,95 @@ class ConfigurationInspectionTests(unittest.TestCase):
         self.resolve.assert_not_called()
         self.client_open.assert_not_called()
         self.target_open.assert_not_called()
+
+    def test_client_only_configuration_uses_real_companion_reads_without_target_or_acl_claims(self):
+        del self.devices["target"]
+        self.run_main(["--client-only"])
+        self.resolve.assert_called_once_with("client", mode=ota_rf_lab.lab_device.MODE_APP)
+        self.client_open.assert_called_once()
+        self.target_open.assert_not_called()
+        self.target.command.assert_not_called()
+        self.target.get_acl.assert_not_called()
+        self.target._write_bytes.assert_not_called()
+        self.target.close.assert_not_called()
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(b"\x16\x0d", expected=(13,)),
+        ])
+        record = self.evidence.summary["measurements"]["configuration_inspection"]
+        self.assertEqual(record["scope"], "client_only")
+        self.assertEqual(set(record["nodes"]), {"client"})
+        self.assertTrue(record["read_only"])
+        self.assertTrue(record["inspection_complete"])
+        for field in ("target_inspected", "target_acl_inspected", "acl_complete",
+                      "qualification_verified", "reboot_requested", "reboot_persistence_verified"):
+            self.assertFalse(record[field])
+        self.assertNotIn("acl", record)
+        self.assertNotIn("client_permission", record)
+        observed = record["nodes"]["client"]
+        self.assertEqual(observed["pubkey"], CLIENT_KEY.hex())
+        self.assertNotIn("pubkey_bytes", observed)
+        self.assertEqual(observed["name"], "observed-client")
+        self.assertEqual(observed["path_hash_mode"], 1)
+        self.assertEqual(tuple(observed[key] for key in ("freq_khz", "bw_hz", "sf", "cr")),
+                         (869525, 125000, 8, 6))
+        self.configure.assert_not_called()
+        self.grant.assert_not_called()
+        self.client.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_client_only_configuration_refuses_other_usb_sources_and_role_overrides_before_open(self):
+        for serial in ("49C5BAF21EEF44A1", "3BE94917B92DC5E9", "unapproved"):
+            with self.subTest(serial=serial):
+                self.setUp()
+                self.devices["client"].serial = serial
+                with self.assertRaises(AssertionError):
+                    self.run_main(["--client-only"])
+                self.client_open.assert_not_called()
+                self.target_open.assert_not_called()
+                self.client.command.assert_not_called()
+        with mock.patch.object(ota_rf_lab, "CLIENT_ROLE", "target"):
+            with self.assertRaises(AssertionError):
+                self.run_main(["--client-only"])
+            self.resolve.assert_not_called()
+            self.client_open.assert_not_called()
+            self.target_open.assert_not_called()
+
+    def test_client_only_bad_role_key_or_settings_are_fatal_without_success_claim(self):
+        for frames in ([self_info(advert_type=2)], [self_info(public_key=bytes(32))],
+                       [self_info(), device_info()[:81]]):
+            with self.subTest(frames=frames):
+                self.setUp()
+                self.client.command.side_effect = frames
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.run_main(["--client-only"])
+                record = self.evidence.summary["measurements"]["configuration_inspection"]
+                self.assertFalse(record["inspection_complete"])
+                self.assertFalse(record["acl_complete"])
+                self.assertFalse(record["target_inspected"])
+                self.target_open.assert_not_called()
+                self.grant.assert_not_called()
+                self.configure.assert_not_called()
+                self.client.close.assert_called_once()
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_client_only_inspections_refuse_existing_evidence_before_resolution_or_open(self):
+        for scope in ("--inspect-configuration", "--inspect-ota-preflight"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                marker = pathlib.Path(parent) / "preserve.txt"
+                marker.write_text("untouched")
+                arguments = ["ota_rf_lab.py", "--artifact-dir", parent, "--client-only", scope]
+                with mock.patch.object(sys, "argv", arguments), \
+                        mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
+                        mock.patch.object(ota_rf_lab, "FramedSerial") as client_open, \
+                        mock.patch.object(ota_rf_lab, "RepeaterSerial") as target_open:
+                    with self.assertRaises(FileExistsError):
+                        ota_rf_lab.main()
+                    resolve.assert_not_called()
+                    client_open.assert_not_called()
+                    target_open.assert_not_called()
+                self.assertEqual(marker.read_text(), "untouched")
+                self.assertEqual(list(pathlib.Path(parent).iterdir()), [marker])
 
 
 class CompanionSigningTests(unittest.TestCase):
