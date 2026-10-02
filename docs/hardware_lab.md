@@ -233,12 +233,21 @@ make build-xiao-nrf52-ota-candidate XIAO_OTA_LAB_VERSION=ota-direct-001 \
   PLATFORMIO_BUILD_DIR="$PWD/.tmp/ota-direct-001"
 ```
 
-Labels must start with a letter or digit and contain only 1--19 ASCII
+Labels must start with a letter or digit and contain only 1 to 19 ASCII
 letters, digits, dots, underscores or hyphens. Normal firmware defaults
 remain unchanged. Preserve the resulting role-specific `firmware.zip`,
-extract its application using `make ota-lab-image` and compare its SHA-256
-with the retained bootstrap image before creating the manifest. Record
-the exact source tree and label with the immutable artifact inventory.
+then extract that candidate package explicitly to a new image path:
+
+```sh
+make ota-lab-image \
+  XIAO_NRF52_TARGET_PACKAGE="$PWD/.tmp/ota-direct-001/Xiao_nrf52_repeater_ota_usb_candidate/firmware.zip" \
+  OTA_UPLOAD_IMAGE="$candidate_bin"
+```
+
+Without the package override, the extraction target defaults to the
+bootstrap profile, not the candidate. Compare the extracted SHA-256 with
+the retained bootstrap image before creating the manifest. Record the
+exact source tree and label with the immutable artifact inventory.
 Do not replace inherited flags with `PLATFORMIO_BUILD_FLAGS`.
 
 Select the expected BIN hash from the immutable artifact inventory and a

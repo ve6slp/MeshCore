@@ -591,10 +591,14 @@ test-ota-rf-to-boot: tmpdir
 	        OTA_NRF_REMOTE_BOOT_PROOF_PREFIX="$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role"; \
 	    done; \
 	  done
+	@rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)"
 	env -u OTA_NRF_REMOTE_BOOT_PROOF_DIR \
-	  GTEST_FILTER='LoraOtaQualifiedOriginal.FullColdFailedMax*' \
+	  GTEST_FILTER='LoraOtaQualifiedOriginal.FullColdFailedMaxBothSdkPoliciesRestoreAfterCommandReplacementAndBindNextCommit' \
+	  GTEST_OUTPUT="json:$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)" \
 	  OTA_NRF_ORIGINAL_FAILED_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
 	  $(MAKE) --no-print-directory test-ota-integration
+	@# Google Test accepts an empty filter; require the actual returned-proof test.
+	@python3 -c 'import json, sys; report = json.load(open(sys.argv[1])); cases = [case for suite in report["testsuites"] for case in suite["testsuite"]]; valid = report["tests"] == 1 and report["failures"] == 0 and len(cases) == 1 and cases[0]["status"] == "RUN" and cases[0]["result"] == "COMPLETED"; sys.exit(0 if valid else "Returned FailedMax proof did not execute exactly one complete passing test")' "$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)"
 
 test-xiao-ota-bootloader: tmpdir test-xiao-ota-bootloader-tools test-xiao-ota-boot-process
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
