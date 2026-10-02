@@ -19,6 +19,7 @@
 #include <ota/runtime/OtaTrustInterfaces.h>
 #include <ota/storage/OtaCandidateStore.h>
 #include <helpers/ota/OtaLeanReceiver.h>
+#include <helpers/ota/OtaMeasurementDiagnostics.h>
 #include <helpers/ota/OtaRfFrames.h>
 
 namespace mesh {
@@ -364,6 +365,22 @@ public:
   }
   bool directActive() const { return direct_active_; }
   bool directPending() const { return direct_pending_; }
+  void observeRadioApply(bool succeeded, const OtaAppliedRadioProfile& profile,
+                         bool direct, uint32_t now_ms) {
+    radio_measurement_.observeApply(succeeded, profile, direct, now_ms);
+  }
+  bool formatRadioMeasurement(char* out, size_t capacity, bool driver_healthy,
+                             uint32_t driver_faults, uint32_t now_ms) const {
+    return radio_measurement_.format(out, capacity, direct_active_, direct_expiry_ms_,
+                                     driver_healthy, driver_faults, now_ms);
+  }
+  bool formatBudgetMeasurement(char* out, size_t capacity, uint32_t now_ms,
+                              uint32_t completed_tx_ms, uint32_t timeouts,
+                              uint32_t accounting_failures) const {
+    const auto measured = status(now_ms);
+    return formatOtaBudgetMeasurement(out, capacity, now_ms, measured.dutyWindowMs,
+        measured.dutyBudgetMs, measured.dutyUsedMs, completed_tx_ms, timeouts, accounting_failures);
+  }
   bool hasPendingRfWork() const {
     return commit_reboot_pending_ || direct_active_ || direct_pending_ || pending_control_frame_valid_ ||
            lean_.status().phase == ::ota::storage::OtaCandidateStore::Phase::Verifying;
@@ -544,10 +561,12 @@ public:
       return budget_ms_ != 0 && regulatory_allowed && !normal_traffic_active && remaining > 0 &&
              static_cast<uint64_t>(prospective_airtime_ms) * 3u / 2u + 20u < static_cast<uint32_t>(remaining);
     }
+    const uint64_t completion_bound_ms = static_cast<uint64_t>(prospective_airtime_ms) * 3u / 2u + 20u;
+    if (completion_bound_ms > UINT32_MAX) return false;
     meshcore::ota::runtime::OtaAirtimeDecisionInput input;
     input.regulatoryAllowed = regulatory_allowed;
     input.normalTrafficActive = normal_traffic_active;
-    return airtime_.canAdmit(now_ms, category, prospective_airtime_ms, input);
+    return airtime_.canAdmit(now_ms, category, static_cast<uint32_t>(completion_bound_ms), input);
   }
 
   bool recordTransmit(uint32_t now_ms,
@@ -1469,6 +1488,7 @@ private:
   bool direct_active_ = false, direct_pending_ = false, direct_waiting_ack_ = false, direct_have_token_ = false;
   bool direct_ack_tx_wait_ = false;
   uint8_t direct_request_[107] = {};
+  OtaRadioMeasurement radio_measurement_;
   meshcore::ota::runtime::OtaAirtimeLimiter airtime_;
   meshcore::ota::runtime::OtaReceiverStateMachine receiver_;
   meshcore::ota::runtime::OtaCoordinatorStateMachine coordinator_;

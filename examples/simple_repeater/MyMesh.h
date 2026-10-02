@@ -350,10 +350,15 @@ public:
                                     ::ota::storage::OtaCandidateStore::Snapshot& out);
 #endif
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  bool applyMeasuredRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, bool direct);
+  bool formatFirmwareOtaMeasurement(uint8_t selector, char* reply, size_t reply_size);
+#endif
   bool isOtaAdminKey(const uint8_t key[32]) const;
   static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #endif
 
+  void applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr);
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {

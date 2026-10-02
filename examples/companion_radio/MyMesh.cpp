@@ -1272,7 +1272,7 @@ void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool al
 #endif
   }
 
-  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
@@ -1404,7 +1404,7 @@ void MyMesh::abortFirmwareOta() {
   getOtaIntegration().abortSession();
 #endif
   if (revert_radio_at || set_radio_at) {
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     set_radio_at = 0;
     revert_radio_at = 0;
   }
@@ -1428,6 +1428,36 @@ void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
   snprintf(reply, reply_size, "OTA unsupported");
 #endif
 }
+
+void MyMesh::applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr) {
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  applyMeasuredRadioParams(freq, bw, sf, cr, false);
+#else
+  radio_driver.setParams(freq, bw, sf, cr);
+#endif
+}
+
+#if MESHCORE_OTA_USB_MEASUREMENTS
+bool MyMesh::applyMeasuredRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, bool direct) {
+  const bool succeeded = otaBoardApplyRfProfile(freq, bw, sf, cr);
+  const auto profile = succeeded ? mesh::ota::OtaAppliedRadioProfile{
+      static_cast<uint32_t>(std::lround(freq * 1000.0f)),
+      static_cast<uint32_t>(std::lround(bw * 1000.0f)), sf, cr} : mesh::ota::OtaAppliedRadioProfile{};
+  getOtaIntegration().observeRadioApply(succeeded, profile, direct, _ms->getMillis());
+  if (!succeeded) MESH_DEBUG_PRINTLN("OTA measurement: radio profile apply failed");
+  return succeeded;
+}
+
+bool MyMesh::formatFirmwareOtaMeasurement(uint8_t selector, char* reply, size_t reply_size) {
+  const uint32_t now = _ms->getMillis();
+  if (selector == 3) {
+    return getOtaIntegration().formatRadioMeasurement(reply, reply_size,
+        _radio->isDriverHealthy(), _radio->driverFaultCount(), now);
+  }
+  return getOtaIntegration().formatBudgetMeasurement(reply, reply_size, now,
+      static_cast<uint32_t>(getTotalAirTime()), getTxTimeoutCount(), getOtaAccountingFailureCount());
+}
+#endif
 
 bool MyMesh::isOtaAdminKey(const uint8_t key[32]) const {
 #if MESHCORE_LORA_OTA
@@ -1495,9 +1525,15 @@ bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t
 
 bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore) {
   auto* mesh = static_cast<MyMesh*>(ctx);
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  return mesh->applyMeasuredRadioParams(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
+                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5, !restore);
+#else
   return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
                          restore ? mesh->_prefs.bw : 250.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
+#endif
 }
 bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
   return otaBoardGetBootLifecycle(out);
@@ -2331,7 +2367,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.setRepeatEn(repeat != 0);
       savePrefs();
 
-      radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+      applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -3106,6 +3142,17 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint8_t op = cmd_frame[1];
     if (op == OTA_CTRL_GET_STATUS) {
       // Optional read-only selectors; the original two-byte status request is unchanged.
+#if MESHCORE_OTA_USB_MEASUREMENTS
+      if (len == 3 && (cmd_frame[2] == 3 || cmd_frame[2] == 4)) {
+        if (!formatFirmwareOtaMeasurement(cmd_frame[2], reinterpret_cast<char*>(out_frame + 1),
+                                          sizeof(out_frame) - 1)) {
+          writeErrFrame(ERR_CODE_BAD_STATE);
+        } else {
+          out_frame[0] = RESP_CODE_OTA_STATUS;
+          _serial->writeFrame(out_frame, 1 + strlen(reinterpret_cast<char*>(out_frame + 1)));
+        }
+      } else
+#endif
       if (len == 3 && (cmd_frame[2] == 1 || cmd_frame[2] == 2)) {
         const char* detail = cmd_frame[2] == 1 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus();
         const size_t count = mesh::ota::encodeOtaOrdinaryWriteDiagnostic(
@@ -3732,7 +3779,7 @@ void MyMesh::tickOtaTrialHealth() {
 
 void MyMesh::checkTempRadioLease() {
   if (set_radio_at && millisHasNowPassed(set_radio_at)) {
-    radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
+    applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
     set_radio_at = 0;
   }
 }
@@ -3749,7 +3796,7 @@ void MyMesh::checkTempRadioLease() {
 // gate is needed here.
 void MyMesh::revertTempRadioLeaseIfDue() {
   if (revert_radio_at && millisHasNowPassed(revert_radio_at)) {
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     revert_radio_at = 0;
   }
 }

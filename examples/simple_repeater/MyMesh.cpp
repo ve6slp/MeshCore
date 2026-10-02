@@ -1052,7 +1052,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // boot's radio_init() failed) rather than operate on a known-failed
   // radio, matching the same guard on repeater's loop()-driven dispatch.
   if (_radio_available_) {
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     radio_driver.setTxPower(_prefs.tx_power_dbm);
 
     radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
@@ -1133,7 +1133,7 @@ bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
 void MyMesh::abortFirmwareOta() {
   getOtaIntegration().abortSession();
   if (revert_radio_at || set_radio_at) {
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     set_radio_at = 0;
     revert_radio_at = 0;
   }
@@ -1150,6 +1150,36 @@ void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
   const auto view = integration.readback(boot);
   mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
                                          view.phase, view.snapshot.counter);
+}
+#endif
+
+void MyMesh::applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr) {
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  applyMeasuredRadioParams(freq, bw, sf, cr, false);
+#else
+  radio_driver.setParams(freq, bw, sf, cr);
+#endif
+}
+
+#if MESHCORE_OTA_USB_MEASUREMENTS
+bool MyMesh::applyMeasuredRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, bool direct) {
+  const bool succeeded = otaBoardApplyRfProfile(freq, bw, sf, cr);
+  const auto profile = succeeded ? mesh::ota::OtaAppliedRadioProfile{
+      static_cast<uint32_t>(std::lround(freq * 1000.0f)),
+      static_cast<uint32_t>(std::lround(bw * 1000.0f)), sf, cr} : mesh::ota::OtaAppliedRadioProfile{};
+  getOtaIntegration().observeRadioApply(succeeded, profile, direct, _ms->getMillis());
+  if (!succeeded) MESH_DEBUG_PRINTLN("OTA measurement: radio profile apply failed");
+  return succeeded;
+}
+
+bool MyMesh::formatFirmwareOtaMeasurement(uint8_t selector, char* reply, size_t reply_size) {
+  const uint32_t now = _ms->getMillis();
+  if (selector == 3) {
+    return getOtaIntegration().formatRadioMeasurement(reply, reply_size,
+        _radio->isDriverHealthy(), _radio->driverFaultCount(), now);
+  }
+  return getOtaIntegration().formatBudgetMeasurement(reply, reply_size, now,
+      static_cast<uint32_t>(getTotalAirTime()), getTxTimeoutCount(), getOtaAccountingFailureCount());
 }
 #endif
 
@@ -1354,9 +1384,15 @@ void MyMesh::otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t
 bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore) {
   auto* mesh = static_cast<MyMesh*>(ctx);
   if (!mesh->_radio_available_) return false;
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  return mesh->applyMeasuredRadioParams(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
+                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5, !restore);
+#else
   return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
                          restore ? mesh->_prefs.bw : 250.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
+#endif
 }
 bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
   return otaBoardGetBootLifecycle(out);
@@ -1416,14 +1452,14 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
   while (*command == ' ') command++; // skip leading spaces
 
-#if XIAO_OTA_USB_LAB_CLI
+#if XIAO_OTA_USB_LAB_CLI || MESHCORE_OTA_USB_MEASUREMENTS
   size_t reply_capacity = 160;
 #endif
   if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
     memcpy(reply, command, 3);                    // reflect the prefix back
     reply += 3;
     command += 3;
-#if XIAO_OTA_USB_LAB_CLI
+#if XIAO_OTA_USB_LAB_CLI || MESHCORE_OTA_USB_MEASUREMENTS
     reply_capacity -= 3;
 #endif
   }
@@ -1504,6 +1540,14 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     while (*sub == ' ') sub++;
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
+#if MESHCORE_OTA_USB_MEASUREMENTS
+    } else if (strcmp(sub, "radio") == 0 || strcmp(sub, "budget") == 0) {
+      if (!local_usb) {
+        strcpy(reply, "Err - USB only");
+      } else if (!formatFirmwareOtaMeasurement(strcmp(sub, "radio") == 0 ? 3 : 4, reply, reply_capacity)) {
+        strcpy(reply, "Err - OTA measurement reply overflow");
+      }
+#endif
 #if XIAO_OTA_USB_LAB_CLI
     } else if (strcmp(sub, "bootloader") == 0) {
       if (!local_usb) {
@@ -1593,7 +1637,7 @@ void MyMesh::loop() {
 
     if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
       set_radio_at = 0;                                     // clear timer
-      radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
+      applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
       MESH_DEBUG_PRINTLN("Temp radio params");
     }
   }
@@ -1610,7 +1654,7 @@ void MyMesh::loop() {
   // being cleared without ever actually restoring.
   if (_radio_available_ && revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
     revert_radio_at = 0;                                                            // clear timer
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
 

@@ -100,6 +100,7 @@ void Dispatcher::loop() {
 #if MESHCORE_LORA_OTA
       if (outbound_is_ota) {
         if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
+          ++ota_accounting_failure_count;
           MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: OTA airtime accounting ring full", getLogDateTime());
         }
         outbound_is_ota = false;
@@ -124,6 +125,9 @@ void Dispatcher::loop() {
       releasePacket(outbound);  // return to pool
       outbound = NULL;
     } else if (millisHasNowPassed(outbound_expiry)) {
+#if MESHCORE_LORA_OTA
+      ++tx_timeout_count;
+#endif
       MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: outbound packed send timed out!", getLogDateTime());
 
       _radio->onSendFinished();

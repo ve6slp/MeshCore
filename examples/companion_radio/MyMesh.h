@@ -149,6 +149,11 @@ public:
   void abortFirmwareOta();
   void rollbackFirmwareOta();
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+  void applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr);
+#if MESHCORE_OTA_USB_MEASUREMENTS
+  bool applyMeasuredRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, bool direct);
+  bool formatFirmwareOtaMeasurement(uint8_t selector, char* reply, size_t reply_size);
+#endif
 
   // Dispatches CMD_OTA_CONTROL subops 0x10..0x18 (the lean local-USB
   // uploader/status wire contract; see helpers/ota/OtaUsbProtocol.h).

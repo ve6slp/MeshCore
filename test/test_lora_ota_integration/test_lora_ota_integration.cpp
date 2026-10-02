@@ -1852,8 +1852,11 @@ TEST(LoraOtaIntegration, DutyCycleSettingChangePreservesSpentWindow) {
   EXPECT_FALSE(integration.canTransmit(0, OtaAirtimeCategory::Relay, 1, true, false));
 
   ASSERT_TRUE(integration.setDutyCyclePercent(4.0f));
-  EXPECT_TRUE(integration.canTransmit(0, OtaAirtimeCategory::Relay, 72000, true, false));
-  EXPECT_FALSE(integration.canTransmit(0, OtaAirtimeCategory::Relay, 72001, true, false));
+  EXPECT_EQ(144000u, integration.status(0).dutyBudgetMs);
+  EXPECT_EQ(72000u, integration.status(0).dutyUsedMs);
+  // The 47,987-ms estimate reserves exactly the remaining 72,000 ms at completion.
+  EXPECT_TRUE(integration.canTransmit(0, OtaAirtimeCategory::Relay, 47987, true, false));
+  EXPECT_FALSE(integration.canTransmit(0, OtaAirtimeCategory::Relay, 47988, true, false));
 }
 
 TEST(LoraOtaIntegration, ForwardingPriorityIsBelowOrdinaryUserTraffic) {

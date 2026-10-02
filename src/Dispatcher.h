@@ -225,6 +225,7 @@ class Dispatcher {
   meshcore::ota::protocol::OtaAirtimeCategory outbound_ota_category;
   mesh::ota::OtaFirmwareIntegration dispatcher_ota;
   mesh::ota::OtaFirmwareIntegration* active_ota;
+  uint32_t tx_timeout_count, ota_accounting_failure_count;
 #endif
   unsigned long next_tx_time;
   unsigned long cad_busy_start;
@@ -255,6 +256,7 @@ protected:
     outbound_is_ota = false;
     outbound_ota_category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
     active_ota = &dispatcher_ota;
+    tx_timeout_count = ota_accounting_failure_count = 0;
 #endif
     total_air_time = rx_air_time = 0;
     next_tx_time = ms.getMillis();
@@ -321,6 +323,8 @@ public:
     return used >= budget ? 0 : budget - used;
   }
   mesh::ota::FirmwareOtaStatus getOtaStatus(unsigned long now_ms) const { return active_ota->status(now_ms); }
+  uint32_t getTxTimeoutCount() const { return tx_timeout_count; }
+  uint32_t getOtaAccountingFailureCount() const { return ota_accounting_failure_count; }
 #endif
   uint32_t getNumSentFlood() const { return n_sent_flood; }
   uint32_t getNumSentDirect() const { return n_sent_direct; }

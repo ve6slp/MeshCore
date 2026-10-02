@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "helpers/ota/OtaFirmwareIntegration.h"
 #include "ota/runtime/OtaGeometry.h"
 #include "ota/runtime/OtaBitmap.h"
 #include "ota/runtime/OtaSessionIdentity.h"
@@ -747,31 +748,247 @@ TEST(OtaAirtimeLimiter, ClockWrapIsHandledCorrectly) {
 
 TEST(OtaAirtimeLimiter, RecordUsageFailsClosedWhenRingFullOfValidEntries) {
   OtaAirtimeLimiter limiter;
-  const uint32_t now = 0;
   for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries; ++i) {
-    ASSERT_TRUE(limiter.recordUsage(now, OtaAirtimeCategory::Control, 1));
+    const uint32_t timestamp = static_cast<uint32_t>(i / 2) * (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+    const auto category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+    ASSERT_TRUE(limiter.recordUsage(timestamp, category, 1));
   }
-  // Ring is full and every entry is still within the window: fails closed.
+  const uint32_t now = static_cast<uint32_t>(OtaAirtimeLimiter::kMaxEntries / 2) *
+                       (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+  // Every bucket is valid and the newest bucket is too old to coalesce.
   EXPECT_FALSE(limiter.recordUsage(now, OtaAirtimeCategory::Control, 1));
+  EXPECT_EQ(OtaAirtimeLimiter::kMaxEntries, limiter.storedUsageMs(now));
 
   // Once entries expire, room is reclaimed.
-  const uint32_t later = now + limiter.windowMs() + 1;
+  const uint32_t later = limiter.windowMs() + 1;
   EXPECT_TRUE(limiter.recordUsage(later, OtaAirtimeCategory::Control, 1));
+  EXPECT_EQ(OtaAirtimeLimiter::kMaxEntries - 1, limiter.storedUsageMs(later));
 }
 
 TEST(OtaAirtimeLimiter, CanAdmitFailsClosedWhenAccountingRingIsSaturated) {
   OtaAirtimeLimiter limiter;
   OtaAirtimeDecisionInput decision;
-  const uint32_t now = 0;
   for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries; ++i) {
-    ASSERT_TRUE(limiter.recordUsage(now, OtaAirtimeCategory::Control, 1));
+    const uint32_t timestamp = static_cast<uint32_t>(i / 2) * (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+    const auto category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+    ASSERT_TRUE(limiter.recordUsage(timestamp, category, 1));
   }
-
+  const uint32_t now = static_cast<uint32_t>(OtaAirtimeLimiter::kMaxEntries / 2) *
+                       (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
   EXPECT_FALSE(limiter.canAdmit(now, OtaAirtimeCategory::Control, 1, decision))
       << "admission must be denied before a transmission that cannot be accounted";
 
-  const uint32_t later = now + limiter.windowMs() + 1;
+  const uint32_t later = limiter.windowMs() + 1;
   EXPECT_TRUE(limiter.canAdmit(later, OtaAirtimeCategory::Control, 1, decision));
+  EXPECT_TRUE(limiter.recordUsage(later + 1, OtaAirtimeCategory::Control, 1));
+}
+
+TEST(OtaAirtimeLimiter, FullRingAdmitsCoalescenceButNotAnUnaccountableCompletion) {
+  OtaAirtimeLimiter limiter;
+  OtaAirtimeDecisionInput decision;
+  uint32_t now = 0;
+  for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries; ++i) {
+    now = static_cast<uint32_t>(i / 2) * (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+    const auto category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+    ASSERT_TRUE(limiter.recordUsage(now, category, 1));
+  }
+  ASSERT_TRUE(limiter.canAdmit(now, OtaAirtimeCategory::Repair, 200, decision));
+  ASSERT_TRUE(limiter.recordUsage(now + 200, OtaAirtimeCategory::Repair, 200));
+  EXPECT_EQ(328u, limiter.storedUsageMs(now + 200, OtaAirtimeCategory::Repair));
+  EXPECT_EQ(456u, limiter.storedUsageMs(now + 200));
+  EXPECT_FALSE(limiter.canAdmit(now + 200, OtaAirtimeCategory::Relay, 1, decision));
+  EXPECT_FALSE(limiter.recordUsage(now + 200, OtaAirtimeCategory::Relay, 1));
+
+  // A TX completing beyond the inclusive 15-second bucket boundary
+  // would require a new slot, which the ring does not have.
+  const uint32_t boundary = now + OtaAirtimeLimiter::kCoalescingBucketMs + 1;
+  EXPECT_TRUE(limiter.canAdmit(boundary - 201, OtaAirtimeCategory::Repair, 200, decision));
+  EXPECT_FALSE(limiter.canAdmit(boundary - 200, OtaAirtimeCategory::Repair, 200, decision));
+  EXPECT_FALSE(limiter.recordUsage(boundary, OtaAirtimeCategory::Repair, 200));
+  EXPECT_EQ(456u, limiter.storedUsageMs(boundary));
+}
+
+TEST(OtaAirtimeLimiter, ReclaimsExpiredNonHeadBucketWithoutDroppingValidUsage) {
+  OtaAirtimeLimiter limiter;
+  OtaAirtimeDecisionInput decision;
+  const uint32_t bucket = OtaAirtimeLimiter::kCoalescingBucketMs + 1;
+  for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries / 2; ++i) {
+    const uint32_t timestamp = static_cast<uint32_t>(i) * bucket;
+    ASSERT_TRUE(limiter.recordUsage(timestamp, OtaAirtimeCategory::Control, 1));
+    ASSERT_TRUE(limiter.recordUsage(timestamp + 100, OtaAirtimeCategory::Repair, 1));
+    if (i == 0) {
+      ASSERT_TRUE(limiter.recordUsage(bucket - 1, OtaAirtimeCategory::Control, 1));
+    }
+  }
+  const uint32_t now = limiter.windowMs() + 101;
+  EXPECT_EQ(129u, limiter.storedUsageMs(now, OtaAirtimeCategory::Control));
+  EXPECT_EQ(127u, limiter.storedUsageMs(now, OtaAirtimeCategory::Repair));
+  ASSERT_TRUE(limiter.canAdmit(now, OtaAirtimeCategory::Relay, 200, decision));
+  ASSERT_TRUE(limiter.recordUsage(now + 200, OtaAirtimeCategory::Relay, 200));
+  EXPECT_EQ(129u, limiter.storedUsageMs(now + 200, OtaAirtimeCategory::Control));
+  EXPECT_EQ(127u, limiter.storedUsageMs(now + 200, OtaAirtimeCategory::Repair));
+  EXPECT_EQ(456u, limiter.storedUsageMs(now + 200));
+}
+
+TEST(OtaAirtimeLimiter, BenchBudgetCompletesFullCandidateWithoutPerPacketCapacityStall) {
+  constexpr uint32_t frames = 6384;
+  constexpr uint32_t duration = 200;
+  constexpr uint32_t benchBudget = 3420000;
+  for (unsigned traffic = 0; traffic < 5; ++traffic) {
+    SCOPED_TRACE(traffic);
+    OtaAirtimeLimiter limiter(OtaAirtimeLimiter::kDefaultWindowMs, benchBudget);
+    OtaAirtimeDecisionInput decision;
+    uint32_t now = 0;
+    uint32_t categoryUsage[3] = {};
+    for (uint32_t i = 0; i < frames; ++i) {
+      OtaAirtimeCategory category = OtaAirtimeCategory::Control;
+      if (traffic == 1) category = OtaAirtimeCategory::Repair;
+      if (traffic == 2) category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+      if (traffic == 3) {
+        category = i % 128 == 0 ? OtaAirtimeCategory::Relay :
+                   (i % 32 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair);
+      }
+      if (traffic == 4) category = static_cast<OtaAirtimeCategory>(i % 3);
+      ASSERT_TRUE(limiter.canAdmit(now, category, duration, decision)) << "frame " << i;
+      now += duration;
+      ASSERT_TRUE(limiter.recordUsage(now, category, duration)) << "frame " << i;
+      categoryUsage[static_cast<unsigned>(category)] += duration;
+    }
+    EXPECT_EQ(frames * duration, limiter.storedUsageMs(now));
+    EXPECT_EQ(categoryUsage[0], limiter.storedUsageMs(now, OtaAirtimeCategory::Control));
+    EXPECT_EQ(categoryUsage[1], limiter.storedUsageMs(now, OtaAirtimeCategory::Repair));
+    EXPECT_EQ(categoryUsage[2], limiter.storedUsageMs(now, OtaAirtimeCategory::Relay));
+    EXPECT_LT(now, limiter.windowMs());
+    EXPECT_LT(limiter.storedUsageMs(now), benchBudget);
+  }
+}
+
+TEST(OtaAirtimeLimiter, BackgroundBudgetNeverAdmitsMoreThanTwoPercentActualRollingUsage) {
+  OtaAirtimeLimiter limiter;
+  OtaAirtimeDecisionInput decision;
+  constexpr uint32_t duration = 200;
+  uint32_t now = 0;
+  std::vector<uint32_t> completions;
+  for (uint32_t i = 0; i < 1080; ++i) {
+    const auto category = static_cast<OtaAirtimeCategory>(i % 3);
+    if (i == 360) {
+      EXPECT_EQ(72000u, limiter.storedUsageMs(now));
+      EXPECT_FALSE(limiter.canAdmit(now, category, 1, decision));
+    }
+    uint32_t retries = 0;
+    while (!limiter.canAdmit(now, category, duration, decision)) {
+      ASSERT_LT(++retries, limiter.windowMs() / 1000 + 20);
+      now += 1000;
+    }
+    uint32_t actual = 0;
+    for (const uint32_t completed : completions) {
+      if (now - completed <= limiter.windowMs()) actual += duration;
+    }
+    ASSERT_GE(limiter.storedUsageMs(now), actual);
+    ASSERT_LE(actual + duration, 72000u) << "frame " << i;
+    now += duration;
+    ASSERT_TRUE(limiter.recordUsage(now, category, duration));
+    completions.push_back(now);
+  }
+  EXPECT_GT(now, 2 * limiter.windowMs());
+}
+
+TEST(OtaAirtimeLimiter, BucketBoundaryRetainsChargesThroughLatestCompletionsFullWindow) {
+  OtaAirtimeLimiter limiter;
+  const uint32_t first = 100;
+  const uint32_t latest = first + OtaAirtimeLimiter::kCoalescingBucketMs;
+  const uint32_t next = latest + 1;
+  ASSERT_TRUE(limiter.recordUsage(first, OtaAirtimeCategory::Control, 10));
+  ASSERT_TRUE(limiter.recordUsage(latest, OtaAirtimeCategory::Control, 20));
+  ASSERT_TRUE(limiter.recordUsage(next, OtaAirtimeCategory::Control, 30));
+  EXPECT_EQ(60u, limiter.storedUsageMs(first + limiter.windowMs() + 1));
+  EXPECT_EQ(60u, limiter.storedUsageMs(latest + limiter.windowMs()));
+  EXPECT_EQ(30u, limiter.storedUsageMs(latest + limiter.windowMs() + 1));
+  EXPECT_EQ(0u, limiter.storedUsageMs(next + limiter.windowMs() + 1));
+}
+
+TEST(OtaAirtimeLimiter, ContinuousUsageCannotRefreshAFirstAnchoredBucketForever) {
+  OtaAirtimeLimiter limiter(20000, 100);
+  ASSERT_TRUE(limiter.recordUsage(0, OtaAirtimeCategory::Repair, 1));
+  ASSERT_TRUE(limiter.recordUsage(7500, OtaAirtimeCategory::Repair, 1));
+  ASSERT_TRUE(limiter.recordUsage(15000, OtaAirtimeCategory::Repair, 1));
+  ASSERT_TRUE(limiter.recordUsage(15001, OtaAirtimeCategory::Repair, 1));
+  ASSERT_TRUE(limiter.recordUsage(22501, OtaAirtimeCategory::Repair, 1));
+  ASSERT_TRUE(limiter.recordUsage(30002, OtaAirtimeCategory::Repair, 1));
+  EXPECT_EQ(6u, limiter.storedUsageMs(35000));
+  EXPECT_EQ(3u, limiter.storedUsageMs(35001));
+  EXPECT_EQ(1u, limiter.storedUsageMs(42502));
+}
+
+TEST(OtaAirtimeLimiter, SmallWindowConservativelyWaitsForLatestCompletionThenRetries) {
+  OtaAirtimeLimiter limiter(1000, 60);
+  OtaAirtimeDecisionInput decision;
+  ASSERT_TRUE(limiter.recordUsage(100, OtaAirtimeCategory::Repair, 20));
+  ASSERT_TRUE(limiter.recordUsage(300, OtaAirtimeCategory::Repair, 40));
+  EXPECT_EQ(60u, limiter.storedUsageMs(1101));
+  EXPECT_FALSE(limiter.canAdmit(1101, OtaAirtimeCategory::Repair, 20, decision));
+  EXPECT_FALSE(limiter.canAdmit(1300, OtaAirtimeCategory::Repair, 20, decision));
+  ASSERT_TRUE(limiter.canAdmit(1301, OtaAirtimeCategory::Repair, 20, decision));
+  ASSERT_TRUE(limiter.recordUsage(1321, OtaAirtimeCategory::Repair, 20));
+  EXPECT_EQ(20u, limiter.storedUsageMs(1321));
+}
+
+TEST(OtaAirtimeLimiter, CoalescenceAndBucketBoundaryAreWrapSafe) {
+  OtaAirtimeLimiter limiter;
+  const uint32_t first = UINT32_MAX - 100;
+  const uint32_t latest = first + OtaAirtimeLimiter::kCoalescingBucketMs;
+  ASSERT_TRUE(limiter.recordUsage(first, OtaAirtimeCategory::Relay, 10));
+  ASSERT_TRUE(limiter.recordUsage(50, OtaAirtimeCategory::Relay, 20));
+  ASSERT_TRUE(limiter.recordUsage(latest, OtaAirtimeCategory::Relay, 30));
+  ASSERT_TRUE(limiter.recordUsage(latest + 1, OtaAirtimeCategory::Relay, 40));
+  EXPECT_EQ(100u, limiter.storedUsageMs(first + limiter.windowMs() + 1));
+  EXPECT_EQ(100u, limiter.storedUsageMs(latest + limiter.windowMs()));
+  EXPECT_EQ(40u, limiter.storedUsageMs(latest + limiter.windowMs() + 1));
+  EXPECT_EQ(0u, limiter.storedUsageMs(latest + limiter.windowMs() + 2));
+}
+
+TEST(OtaAirtimeLimiter, RetunePreservesCoalescedHistoryAndCategoryUsage) {
+  OtaAirtimeLimiter limiter;
+  OtaAirtimeDecisionInput decision;
+  ASSERT_TRUE(limiter.recordUsage(100, OtaAirtimeCategory::Control, 10));
+  ASSERT_TRUE(limiter.recordUsage(200, OtaAirtimeCategory::Control, 20));
+  ASSERT_TRUE(limiter.recordUsage(250, OtaAirtimeCategory::Repair, 30));
+  limiter.retune(1000, 59);
+  EXPECT_EQ(1000u, limiter.windowMs());
+  EXPECT_EQ(59u, limiter.budgetMs());
+  EXPECT_EQ(60u, limiter.storedUsageMs(300));
+  EXPECT_FALSE(limiter.canAdmit(300, OtaAirtimeCategory::Relay, 0, decision));
+  EXPECT_EQ(30u, limiter.storedUsageMs(1210));
+  EXPECT_EQ(0u, limiter.storedUsageMs(1210, OtaAirtimeCategory::Control));
+  EXPECT_EQ(30u, limiter.storedUsageMs(1210, OtaAirtimeCategory::Repair));
+  limiter.retune(4000, 90);
+  EXPECT_EQ(60u, limiter.storedUsageMs(1210));
+  EXPECT_EQ(30u, limiter.storedUsageMs(1210, OtaAirtimeCategory::Control));
+  EXPECT_TRUE(limiter.canAdmit(1210, OtaAirtimeCategory::Relay, 30, decision));
+  EXPECT_FALSE(limiter.canAdmit(1210, OtaAirtimeCategory::Relay, 31, decision));
+}
+
+TEST(OtaAirtimeLimiter, CoalescedAndTotalDurationArithmeticCannotWrap) {
+  OtaAirtimeLimiter limiter(OtaAirtimeLimiter::kDefaultWindowMs, UINT32_MAX);
+  OtaAirtimeDecisionInput decision;
+  ASSERT_TRUE(limiter.recordUsage(0, OtaAirtimeCategory::Control, UINT32_MAX - 1));
+  ASSERT_TRUE(limiter.recordUsage(1, OtaAirtimeCategory::Control, 1));
+  EXPECT_EQ(UINT32_MAX, limiter.storedUsageMs(1));
+  EXPECT_FALSE(limiter.canAdmit(1, OtaAirtimeCategory::Control, 1, decision));
+  // Accounting remains safe even if actual usage unexpectedly exceeds the
+  // admitted duration: no aggregate or getter may wrap to a small value.
+  ASSERT_TRUE(limiter.recordUsage(2, OtaAirtimeCategory::Control, 1));
+  ASSERT_TRUE(limiter.recordUsage(3, OtaAirtimeCategory::Repair, 2));
+  EXPECT_EQ(UINT32_MAX, limiter.storedUsageMs(3));
+  EXPECT_EQ(UINT32_MAX, limiter.storedUsageMs(3, OtaAirtimeCategory::Control));
+  EXPECT_EQ(2u, limiter.storedUsageMs(3, OtaAirtimeCategory::Repair));
+  EXPECT_FALSE(limiter.canAdmit(3, OtaAirtimeCategory::Repair, 0, decision));
+}
+
+TEST(OtaAirtimeLimiter, AccountingMemoryRemainsBoundedTo256SixteenByteBuckets) {
+  EXPECT_EQ(256u, OtaAirtimeLimiter::kMaxEntries);
+  EXPECT_LE(sizeof(OtaAirtimeLimiter),
+            256u * 16u + 2u * sizeof(size_t) + 2u * sizeof(uint32_t));
 }
 
 TEST(OtaAirtimeLimiter, TwoPercentOfOneHourWindowEqualsSeventyTwoThousandMs) {
@@ -780,6 +997,90 @@ TEST(OtaAirtimeLimiter, TwoPercentOfOneHourWindowEqualsSeventyTwoThousandMs) {
   EXPECT_EQ(72000u, twoPercent);
   EXPECT_LE(twoPercent, 72000u);
   EXPECT_EQ(OtaAirtimeLimiter::kDefaultBudgetMs, twoPercent);
+}
+
+TEST(OtaFirmwareAirtime, FullRingDeniesUnderestimatedCompletionAcrossBucketBoundary) {
+  for (const uint32_t actualDuration : {250u, 300u}) {
+    SCOPED_TRACE(actualDuration);
+    mesh::ota::OtaFirmwareIntegration integration;
+    integration.setMode(mesh::ota::FirmwareOtaMode::Routed);
+    uint32_t newestBucket = 0;
+    for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries; ++i) {
+      newestBucket = static_cast<uint32_t>(i / 2) * (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+      const auto category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+      ASSERT_TRUE(integration.recordTransmit(newestBucket, category, 1));
+    }
+    const uint32_t boundary = newestBucket + OtaAirtimeLimiter::kCoalescingBucketMs;
+    const uint32_t start = boundary - actualDuration + 1;
+    // Raw 200ms fits this bucket; an actual 250/300ms completion does not.
+    EXPECT_FALSE(integration.canTransmit(start, OtaAirtimeCategory::Repair, 200, true, false));
+    EXPECT_EQ(256u, integration.airtimeLimiter().storedUsageMs(start));
+    EXPECT_EQ(128u, integration.airtimeLimiter().storedUsageMs(start, OtaAirtimeCategory::Repair));
+  }
+}
+
+TEST(OtaFirmwareAirtime, FullRingCountsActualLateCompletionWithinAdmissionMargin) {
+  for (const uint32_t actualDuration : {250u, 300u}) {
+    SCOPED_TRACE(actualDuration);
+    mesh::ota::OtaFirmwareIntegration integration;
+    integration.setMode(mesh::ota::FirmwareOtaMode::Routed);
+    uint32_t newestBucket = 0;
+    for (size_t i = 0; i < OtaAirtimeLimiter::kMaxEntries; ++i) {
+      newestBucket = static_cast<uint32_t>(i / 2) * (OtaAirtimeLimiter::kCoalescingBucketMs + 1);
+      const auto category = i % 2 == 0 ? OtaAirtimeCategory::Control : OtaAirtimeCategory::Repair;
+      ASSERT_TRUE(integration.recordTransmit(newestBucket, category, 1));
+    }
+    const uint32_t boundary = newestBucket + OtaAirtimeLimiter::kCoalescingBucketMs;
+    const uint32_t start = boundary - 320;
+    ASSERT_TRUE(integration.canTransmit(start, OtaAirtimeCategory::Repair, 200, true, false));
+    const uint32_t completed = start + actualDuration;
+    ASSERT_TRUE(integration.recordTransmit(completed, OtaAirtimeCategory::Repair, actualDuration));
+    EXPECT_EQ(256u + actualDuration, integration.airtimeLimiter().storedUsageMs(completed));
+    EXPECT_EQ(128u + actualDuration,
+              integration.airtimeLimiter().storedUsageMs(completed, OtaAirtimeCategory::Repair));
+    EXPECT_EQ(128u, integration.airtimeLimiter().storedUsageMs(completed, OtaAirtimeCategory::Control));
+  }
+}
+
+TEST(OtaFirmwareAirtime, BackgroundBudgetReservesCompletionMarginButRecordsOnlyActualUsage) {
+  for (const uint32_t priorUsage : {71680u, 71681u}) {
+    SCOPED_TRACE(priorUsage);
+    mesh::ota::OtaFirmwareIntegration integration;
+    EXPECT_EQ(72000u, integration.dutyBudgetMs());
+    ASSERT_TRUE(integration.recordTransmit(0, OtaAirtimeCategory::Control, priorUsage));
+    if (priorUsage == 71681) {
+      EXPECT_FALSE(integration.canTransmit(100, OtaAirtimeCategory::Repair, 200, true, false));
+      EXPECT_EQ(priorUsage, integration.airtimeLimiter().storedUsageMs(100));
+      continue;
+    }
+    ASSERT_TRUE(integration.canTransmit(100, OtaAirtimeCategory::Repair, 200, true, false));
+    ASSERT_TRUE(integration.recordTransmit(400, OtaAirtimeCategory::Repair, 300));
+    EXPECT_EQ(71980u, integration.airtimeLimiter().storedUsageMs(400));
+    // Even a raw 1ms TX needs the full 21ms prospective completion margin.
+    EXPECT_FALSE(integration.canTransmit(400, OtaAirtimeCategory::Repair, 1, true, false));
+  }
+}
+
+TEST(OtaFirmwareAirtime, CompletionMarginOverflowCannotBecomeSmallAdmissibleAirtime) {
+  mesh::ota::OtaFirmwareIntegration integration;
+  ASSERT_TRUE(integration.setDutyCyclePercent(100.0f));
+  ASSERT_TRUE(integration.canTransmit(0, OtaAirtimeCategory::Repair, 200, true, false));
+  // A truncated 64-bit margin for this estimate would wrap to just 20ms.
+  constexpr uint32_t wrappingEstimate = static_cast<uint32_t>((2ULL * UINT32_MAX) / 3 + 1);
+  EXPECT_FALSE(integration.canTransmit(0, OtaAirtimeCategory::Repair, wrappingEstimate, true, false));
+  EXPECT_FALSE(integration.canTransmit(0, OtaAirtimeCategory::Repair, UINT32_MAX, true, false));
+  EXPECT_EQ(0u, integration.airtimeLimiter().storedUsageMs(0));
+}
+
+TEST(OtaFirmwareAirtime, CompletionMarginPreservesRegulatoryAndNormalTrafficPrecedence) {
+  mesh::ota::OtaFirmwareIntegration integration;
+  for (const auto category : {OtaAirtimeCategory::Control, OtaAirtimeCategory::Repair, OtaAirtimeCategory::Relay}) {
+    SCOPED_TRACE(static_cast<unsigned>(category));
+    ASSERT_TRUE(integration.canTransmit(0, category, 200, true, false));
+    EXPECT_FALSE(integration.canTransmit(0, category, 200, false, false));
+    EXPECT_FALSE(integration.canTransmit(0, category, 200, true, true));
+  }
+  EXPECT_EQ(0u, integration.airtimeLimiter().storedUsageMs(0));
 }
 
 // ---------------------------------------------------------------------
