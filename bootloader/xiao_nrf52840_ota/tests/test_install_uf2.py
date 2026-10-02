@@ -316,7 +316,12 @@ class GuardedInstallerTest(unittest.TestCase):
     def _sense_volume(self, board_id="Seeed_XIAO_nRF52840_Sense"):
         self._use_sense_identity()
         (self.volume / "INFO_UF2.TXT").write_text(
-            f"UF2 Bootloader 0.6.1\nBoard-ID: {board_id}\nSoftDevice: S140 7.3.0\n")
+            "UF2 Bootloader 0.6.1 lib/nrfx (v2.0.0) lib/tinyusb (0.10.1-293-gaf8e5a90) "
+            "lib/uf2 (remotes/origin/configupdate-9-gadbb8c7)\n"
+            "Model: Seeed XIAO nRF52840\n"
+            f"Board-ID: {board_id}\n"
+            "SoftDevice: S140 version 7.3.0\n"
+            "Date: Nov 12 2021\n")
 
     def test_sense_profile_matches_legacy_and_pinned_board_ids_without_copying(self):
         artifact = self._sense_artifact()
@@ -1153,7 +1158,23 @@ class GuardedInstallerTest(unittest.TestCase):
     def test_physical_serial_checks_stock_version_softdevice_and_changed_identity(self):
         args = self.serial_args(dry_run=False)
         correct = (self.volume / "INFO_UF2.TXT").read_text()
-        for info in (correct.replace("0.6.1", "0.11.0"), correct.replace("7.3.0", "6.1.1")):
+        for info in (
+                correct.replace("0.6.1", "0.11.0"),
+                correct.replace("0.6.1", "0.6.10"),
+                correct.replace("0.6.1", "0.6.1-extra"),
+                correct.replace("UF2 Bootloader", "prefix UF2 Bootloader"),
+                correct.replace("UF2 Bootloader", " UF2 Bootloader"),
+                correct.replace("lib/nrfx (v2.0.0)", "lib/nrfx v2.0.0"),
+                correct.replace("S140", "S132"),
+                correct.replace("S140 version", "S140"),
+                correct.replace("7.3.0", "6.1.1"),
+                correct.replace("7.3.0", "7.3.00"),
+                correct.replace("7.3.0", "7.3.0 extra"),
+                correct.replace("SoftDevice:", "prefix SoftDevice:"),
+                correct + "UF2 Bootloader 0.6.1\n",
+                correct + "UF2 Bootloader 0.11.0\n",
+                correct + "SoftDevice: S140 version 7.3.0\n",
+                correct + "SoftDevice: S140 version 6.1.1\n"):
             with self.subTest(info=info), mock.patch.object(INSTALLER, "run_vendor_serial") as run:
                 (self.volume / "INFO_UF2.TXT").write_text(info)
                 with self.assertRaisesRegex(ValueError, "INFO must prove stock"):

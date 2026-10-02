@@ -599,8 +599,13 @@ def validate_address_evidence(path, serial):
 
 def validate_stock_info(volume):
     info = (volume / "INFO_UF2.TXT").read_text(encoding="utf-8").splitlines()
-    if (sum(line == "UF2 Bootloader 0.6.1" for line in info) != 1
-            or sum(line == "SoftDevice: S140 7.3.0" for line in info) != 1):
+    bootloader = [line for line in info if line.lstrip().startswith("UF2 Bootloader")]
+    softdevice = [line for line in info if line.lstrip().startswith("SoftDevice:")]
+    if (len(bootloader) != 1 or not re.fullmatch(
+            r"UF2 Bootloader 0\.6\.1"
+            r"(?: lib/nrfx \([^()\s]+\) lib/tinyusb \([^()\s]+\) lib/uf2 \([^()\s]+\))?",
+            bootloader[0])
+            or softdevice != ["SoftDevice: S140 version 7.3.0"]):
         raise ValueError("current INFO must prove stock bootloader 0.6.1 and S140 7.3.0")
 
 
