@@ -4564,6 +4564,192 @@ struct UnadmittedFixture {
     ASSERT_EQ(usb::UsbOtaPhase::Failed, fx.integration.reportedPhase());
   }
 };
+
+struct ConsecutiveRollbackFixture {
+  UnadmittedFixture f;
+  std::vector<uint8_t> first_image, second_image;
+  uint8_t commands[2][::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes] = {};
+  std::unique_ptr<OtaBoardBootLifecycleObserver> completed;
+  explicit ConsecutiveRollbackFixture(uint32_t board = 0x584E3430u, uint8_t role = 0) : f(board, role) {}
+  void prepare() {
+    using Cmd = ::ota::storage::XiaoOtaCommandRecordV3;
+    first_image = f.image;
+    f.recordCompletedRollback(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_TRUE(Cmd::readNewest(f.command, commands[0]));
+    f.image[12] ^= 1;
+    second_image = f.image;
+    f.stage(6); ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    f.commit(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_TRUE(Cmd::readNewest(f.command, commands[1]));
+    const auto st = f.fx.integration.leanReceiver().status();
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.eraseSector(0)));
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.eraseSector(4096)));
+    f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseFailedMax, st.counter, st.transactionNonce,
+                    st.imageHash, f.boot.hash, f.boot.accessor.image.size());
+    completed.reset(new OtaBoardBootLifecycleObserver(f.boot.state, f.boot.floor, f.boot.accessor));
+    for (int tick = 0; tick < 10; ++tick) completed->tick(true);
+    f.fx.integration.attachBootLifecycle(completed.get(), [](void* ctx, OtaBootLifecycleEvidence& out) {
+      return static_cast<OtaBoardBootLifecycleObserver*>(ctx)->read(true, out);
+    });
+    ASSERT_EQ(usb::UsbOtaPhase::Failed, f.fx.integration.reportedPhase());
+  }
+  void sequence(uint32_t slot, uint32_t value) {
+    using Cmd = ::ota::storage::XiaoOtaCommandRecordV3;
+    LifecycleFixture::le32(commands[slot] + 8, value);
+    LifecycleFixture::le32(commands[slot] + Cmd::kCrcOffset,
+        ::ota::storage::Crc32::computeFinalized(commands[slot], Cmd::kCrcOffset));
+    ASSERT_TRUE(::ota::platform::isOk(f.command.eraseSector(slot * 4096)));
+    ASSERT_TRUE(::ota::platform::isOk(f.command.program(slot * 4096, commands[slot], sizeof(commands[slot]))));
+  }
+};
+}
+
+TEST(LoraOtaLifecycle, ConsecutiveCompletedRollbacksPreserveBothCommandsAcrossAdminPrecommitAbortAndReupload) {
+  using Phase = ::ota::storage::OtaCandidateStore::Phase;
+  for (const uint32_t board : {0x584E3430u, 0x53435031u}) for (const uint8_t role : {0, 1}) {
+    for (const auto phase : {Phase::Receiving, Phase::Verifying, Phase::Ready}) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << unsigned(phase));
+      ConsecutiveRollbackFixture history(board, role); history.prepare(); ASSERT_FALSE(HasFatalFailure());
+      auto& f = history.f;
+      f.image[24] ^= 1; f.manifest(7);
+      auto& receiver = f.fx.integration.leanReceiver();
+      ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+      ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.putBlock(0, f.image.data(), 84));
+      if (phase != Phase::Receiving) {
+        ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.putBlock(1, f.image.data() + 84, 84));
+        ASSERT_EQ(usb::UsbOtaResult::Pending, receiver.requestSeal());
+        if (phase == Phase::Ready) receiver.loop();
+      }
+      ASSERT_EQ(phase, receiver.status().phase);
+      const auto before = receiver.status();
+      const auto commands = std::vector<uint8_t>(f.command_flash.rawBuffer(),
+          f.command_flash.rawBuffer() + f.command_flash.rawSize());
+      const auto image = std::vector<uint8_t>(f.fx.image_flash.rawBuffer(),
+          f.fx.image_flash.rawBuffer() + f.fx.image_flash.rawSize());
+      const auto floor = std::vector<uint8_t>(f.boot.floor_flash.rawBuffer(),
+          f.boot.floor_flash.rawBuffer() + f.boot.floor_flash.rawSize());
+      const auto states = std::vector<uint8_t>(f.boot.state_flash.rawBuffer(),
+          f.boot.state_flash.rawBuffer() + f.boot.state_flash.rawSize());
+      uint8_t seed[32] = {0xa7};
+      ::ota::test::Ed25519TestSigner admin(seed);
+      f.fx.admins.count = 0; f.fx.admins.add(admin.publicKey());
+      uint8_t message[usb::kAbortSignedBytes], signature[64];
+      usb::buildAbortSignedMessage(f.fx.target_public_key, before.imageHash, message);
+      admin.sign(message, sizeof(message), signature);
+      ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.abort(admin.publicKey(), signature, before.imageHash));
+      EXPECT_EQ(Phase::Aborted, receiver.status().phase);
+      EXPECT_EQ(before.receivedBlocks, receiver.status().receivedBlocks);
+      EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, receiver.status().ownerPublicKey, 32));
+      EXPECT_EQ(0, std::memcmp(image.data(), f.fx.image_flash.rawBuffer(), image.size()));
+      EXPECT_EQ(0, std::memcmp(commands.data(), f.command_flash.rawBuffer(), commands.size()));
+      EXPECT_EQ(0, std::memcmp(states.data(), f.boot.state_flash.rawBuffer(), states.size()));
+      EXPECT_EQ(0, std::memcmp(floor.data(), f.boot.floor_flash.rawBuffer(), floor.size()));
+      f.fx.integration = OtaFirmwareIntegration(); f.reattach(); f.fx.admins.add(admin.publicKey());
+      auto& resumed = f.fx.integration.leanReceiver();
+      uint8_t authorization[kOtaAuthorizationFrameBytes];
+      const auto length = encodeOtaAuthorizationFrame(f.owner.publicKey(), f.canonical, f.signature,
+                                                      authorization, sizeof(authorization));
+      EXPECT_FALSE(f.fx.integration.handleReceivedFrame(authorization, length, 100));
+      EXPECT_EQ(Phase::Aborted, resumed.status().phase);
+      ASSERT_EQ(usb::UsbOtaResult::Ok, resumed.abort(admin.publicKey(), signature, before.imageHash));
+      f.image[36] ^= 1; f.manifest(8); admin.sign(f.canonical, sizeof(f.canonical), f.signature);
+      ASSERT_EQ(usb::UsbOtaResult::Busy, resumed.begin(admin.publicKey(), f.canonical, f.signature, false, false));
+      ASSERT_EQ(usb::UsbOtaResult::Ok, resumed.begin(admin.publicKey(), f.canonical, f.signature, true, false));
+      for (uint16_t block = 0; block < 2; ++block)
+        ASSERT_EQ(usb::UsbOtaResult::Ok, resumed.putBlock(block, f.image.data() + block * 84, 84));
+      ASSERT_EQ(usb::UsbOtaResult::Pending, resumed.requestSeal()); resumed.loop();
+      ASSERT_EQ(Phase::Ready, resumed.status().phase);
+      EXPECT_EQ(0, std::memcmp(admin.publicKey(), resumed.status().ownerPublicKey, 32));
+      EXPECT_EQ(0, std::memcmp(commands.data(), f.command_flash.rawBuffer(), commands.size()));
+      EXPECT_EQ(0, std::memcmp(floor.data(), f.boot.floor_flash.rawBuffer(), floor.size()));
+      if (phase == Phase::Ready) if (const char* directory = std::getenv("OTA_NRF_REMOTE_BOOT_PROOF_DIR")) {
+        OtaNrf52RunningContext context; ASSERT_TRUE(f.running.read(context));
+        const auto save = [&](const char* suffix, const uint8_t* bytes, size_t size) {
+          char path[512];
+          std::snprintf(path, sizeof(path), "%s/%08x-role%u-multi-rollback-%s.bin", directory,
+                        static_cast<unsigned>(board), static_cast<unsigned>(role), suffix);
+          FILE* output = std::fopen(path, "wb"); ASSERT_NE(nullptr, output);
+          EXPECT_EQ(size, std::fwrite(bytes, 1, size, output)); EXPECT_EQ(0, std::fclose(output));
+        };
+        save("command-a", history.commands[0], sizeof(history.commands[0]));
+        save("command-b", history.commands[1], sizeof(history.commands[1]));
+        save("candidate-a", history.first_image.data(), history.first_image.size());
+        save("candidate-b", history.second_image.data(), history.second_image.size());
+        save("running", f.boot.accessor.image.data(), f.boot.accessor.image.size());
+        save("sdk", context.settings, sizeof(context.settings));
+        save("floor", floor.data(), floor.size());
+        save("command-region", commands.data(), commands.size());
+        save("next-candidate", f.image.data(), f.image.size());
+        save("next-canonical", f.canonical, sizeof(f.canonical));
+        ASSERT_FALSE(HasFatalFailure());
+      }
+    }
+  }
+}
+
+TEST(LoraOtaLifecycle, ConsecutiveRollbackNoEraseProofUsesProductionSequenceWrapAndRefusesNewerTiedOrAmbiguousSibling) {
+  struct Order { uint32_t a, b; bool allowed; };
+  const Order orders[] = {{1, 2, true}, {0xfffffffe, 0xffffffff, true}, {0xffffffff, 0, true},
+                          {2, 1, false}, {2, 2, false}, {1, 0x80000001, false},
+                          {0x80000001, 1, false}, {1, 0x80000002, false}, {0x80000002, 1, true}};
+  for (const auto order : orders) {
+    SCOPED_TRACE(::testing::Message() << order.a << '/' << order.b);
+    ConsecutiveRollbackFixture history; history.prepare(); ASSERT_FALSE(HasFatalFailure());
+    auto& f = history.f;
+    history.sequence(0, order.a); history.sequence(1, order.b); ASSERT_FALSE(HasFatalFailure());
+    f.image[24] ^= 1; f.stage(7); ASSERT_FALSE(HasFatalFailure());
+    const auto commands = std::vector<uint8_t>(f.command_flash.rawBuffer(),
+        f.command_flash.rawBuffer() + f.command_flash.rawSize());
+    const auto programs = f.fx.candidate_flash.programOpCount();
+    EXPECT_EQ(order.allowed ? usb::UsbOtaResult::Ok : usb::UsbOtaResult::TooLate, f.abort());
+    EXPECT_EQ(0, std::memcmp(commands.data(), f.command_flash.rawBuffer(), commands.size()));
+    if (!order.allowed) EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+  }
+}
+
+TEST(LoraOtaLifecycle, ConsecutiveRollbackProofNeverErasesNewerIntentOrIgnoresTornUnreadableAndActiveContext) {
+  using Flash = ::ota::test::FakeNorFlash;
+  for (int fault = 0; fault < 8; ++fault) {
+    SCOPED_TRACE(fault);
+    ConsecutiveRollbackFixture history; history.prepare(); ASSERT_FALSE(HasFatalFailure());
+    auto& f = history.f;
+    f.image[24] ^= 1; f.stage(7); ASSERT_FALSE(HasFatalFailure());
+    if (fault == 0) f.command_flash.armFault({Flash::OpKind::Read, Flash::InjectionTiming::Before,
+                                             f.command_flash.readOpCount() + 18});
+    if (fault == 1) {
+      const uint8_t zero = 0; ASSERT_TRUE(::ota::platform::isOk(f.command.program(4096, &zero, 1)));
+    }
+    if (fault == 2 || fault == 3) {
+      ASSERT_TRUE(::ota::platform::isOk(f.boot.state.eraseSector(0)));
+      if (fault == 2) f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseTrialBoot, 6,
+          ::ota::storage::XiaoOtaCommandRecordV3::transactionNonceOf(history.commands[1]));
+    }
+    if (fault == 4) f.running.bank1 = 1;
+    if (fault == 5) f.boot.accessor.image.back() ^= 1;
+    if (fault >= 6) {
+      const auto ready = f.fx.integration.leanReceiver().status();
+      uint8_t message[usb::kCommitSignedBytes], signature[64];
+      usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+      f.owner.sign(message, sizeof(message), signature);
+      f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
+                                    f.fx.candidate_flash.programOpCount() + 1});
+      ASSERT_EQ(usb::UsbOtaResult::IoError, f.fx.integration.leanReceiver().commit(ready.counter, signature));
+      f.fx.candidate_flash.clearFault();
+      if (fault == 7) {
+        ::ota::storage::OtaCandidateStore::Snapshot aborted; ASSERT_TRUE(f.fx.candidate_store.load(aborted));
+        aborted.phase = ::ota::storage::OtaCandidateStore::Phase::Aborted; ++aborted.sessionId;
+        ASSERT_TRUE(f.fx.candidate_store.append(aborted));
+      }
+      f.fx.integration = OtaFirmwareIntegration(); f.reattach();
+      const uint8_t zero = 0; ASSERT_TRUE(::ota::platform::isOk(f.fx.image_region.program(16, &zero, 1)));
+    }
+    const auto writes = f.fx.candidate_flash.programOpCount(), erases = f.command_flash.eraseOpCount();
+    const auto before = f.fx.integration.leanReceiver().status();
+    EXPECT_EQ(fault == 0 ? usb::UsbOtaResult::IoError : usb::UsbOtaResult::TooLate, f.abort());
+    EXPECT_EQ(writes, f.fx.candidate_flash.programOpCount()); EXPECT_EQ(erases, f.command_flash.eraseOpCount());
+    EXPECT_EQ(before.phase, f.fx.integration.leanReceiver().status().phase);
+    EXPECT_EQ(before.receivedBlocks, f.fx.integration.leanReceiver().status().receivedBlocks);
+  }
 }
 
 TEST(LoraOtaLifecycle, CompletedRollbackDoesNotBlockAnotherAdminAbortingNewReceivingVerifyingOrReadyCandidate) {

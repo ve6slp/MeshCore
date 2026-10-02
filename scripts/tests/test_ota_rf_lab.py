@@ -649,11 +649,61 @@ class RepeaterIdentityTests(unittest.TestCase):
         self.assertEqual(info["path_hash_mode"], 2)
         self.assertEqual(info["settings_readback_scope"], "preferences")
 
+    def test_real_float32_mhz_readback_normalizes_to_the_normal_khz_profile(self):
+        node = repeater_fixture({"get radio": ["> 907.5250244,62.5,7,5"]})
+        info = ota_rf_lab.repeater_info(node)
+        self.assertEqual((info["freq_khz"], info["bw_hz"], info["sf"], info["cr"]),
+                         ota_rf_lab.NORMAL_RADIO)
+        self.assertTrue(all(call.args[0].startswith("get ")
+                            for call in node.command.call_args_list))
+
+    def test_float32_truncation_in_either_direction_and_frequency_boundaries(self):
+        for mhz, khz in (("150.0", 150000), ("150.001007", 150001),
+                         ("900.0009765", 900001), ("907.5260009", 907526),
+                         ("2499.9990234", 2499999), ("2500.0", 2500000)):
+            with self.subTest(mhz=mhz):
+                node = repeater_fixture({"get radio": [f"> {mhz},62.5,7,5"]})
+                self.assertEqual(ota_rf_lab.repeater_info(node)["freq_khz"], khz)
+
+    def test_nearby_noncanonical_frequencies_are_not_hidden_by_rounding_or_tolerance(self):
+        for mhz in ("149.9999847", "2500.0000001", "2500.0002441",
+                    "907.5250001", "907.5250243", "907.5250245",
+                    "907.5249633", "907.5251", "907.5255", "900.0009766"):
+            with self.subTest(mhz=mhz):
+                node = repeater_fixture({"get radio": [f"> {mhz},62.5,7,5"]})
+                with self.assertRaisesRegex(ValueError, "frequency readback"):
+                    ota_rf_lab.configure_repeater(node)
+                self.assertTrue(all(call.args[0].startswith("get ")
+                                    for call in node.command.call_args_list))
+
+    def test_float32_frequency_normalization_preserves_bandwidth_sf_and_cr_boundaries(self):
+        for bw, bw_hz, sf, cr in (("7.8", 7800, 5, 5), ("500", 500000, 12, 8)):
+            with self.subTest(bw=bw, sf=sf, cr=cr):
+                node = repeater_fixture({"get radio": [f"> 907.5250244,{bw},{sf},{cr}"]})
+                info = ota_rf_lab.repeater_info(node)
+                self.assertEqual((info["freq_khz"], info["bw_hz"], info["sf"], info["cr"]),
+                                 (907525, bw_hz, sf, cr))
+        for bw, sf, cr in (("7.799", 7, 5), ("500.001", 7, 5),
+                           ("62.5000001", 7, 5), ("62.5", 4, 5), ("62.5", 13, 5),
+                           ("62.5", 7, 4), ("62.5", 7, 9)):
+            with self.subTest(bw=bw, sf=sf, cr=cr):
+                node = repeater_fixture({"get radio": [f"> 907.5250244,{bw},{sf},{cr}"]})
+                with self.assertRaises(ValueError):
+                    ota_rf_lab.configure_repeater(node)
+                self.assertTrue(all(call.args[0].startswith("get ")
+                                    for call in node.command.call_args_list))
+
     def test_invalid_radio_and_path_readbacks_are_rejected_without_configuration(self):
         for command, reply in (
             ("get radio", "> 907.525,62.5,7"),
             ("get radio", "> 907.525,62.5,7,5,0"),
             ("get radio", "> nan,62.5,7,5"),
+            ("get radio", "> NaN,62.5,7,5"),
+            ("get radio", "> inf,62.5,7,5"),
+            ("get radio", "> Infinity,62.5,7,5"),
+            ("get radio", "> 907.5250244,nan,7,5"),
+            ("get radio", "> 907.5250244,inf,7,5"),
+            ("get radio", "> 9.07525e2,62.5,7,5"),
             ("get radio", "> \u0669\u0660\u0667.525,62.5,7,5"),
             ("get radio", "> 907.525,inf,7,5"),
             ("get radio", "> 907.5250001,62.5,7,5"),
@@ -711,6 +761,20 @@ class PairedConfigurationTests(unittest.TestCase):
         self.evidence.log.assert_called_with(
             "repeater_radio_application_pending", reboot_required=True,
             reboot_requested=False, active_rf_verified=False)
+
+    def test_real_production_frequency_before_and_after_configuration_passes_full_readback(self):
+        self.target = repeater_fixture({
+            "get radio": ["> 907.5250244,62.5,7,5", "> 907.5250244,62.5,7,5"],
+        })
+        _, target_info = ota_rf_lab.run_configure(self.client, self.target, self.evidence)
+        self.assertEqual(target_info["freq_khz"], 907525)
+        measurements = self.evidence.summary["measurements"]
+        self.assertEqual(measurements["configuration_before"]["target"]["freq_khz"], 907525)
+        self.assertEqual(measurements["configured"]["target"]["freq_khz"], 907525)
+        self.assertTrue(self.evidence.summary["checks"]["default-radio-target"]["passed"])
+        self.assertEqual(measurements["acl_before"], measurements["acl_after"])
+        self.assertIn(mock.call("set radio 907.525,62.5,7,5"), self.target.command.call_args_list)
+        self.assertFalse(self.evidence.summary["checks"]["default-radio-target"]["active_rf_verified"])
 
     def test_both_roles_and_complete_acl_are_checked_before_any_setting_changes(self):
         timeline = mock.Mock()
@@ -780,6 +844,7 @@ class PairedConfigurationTests(unittest.TestCase):
         for command, reply, check in (
             ("get name", "> old name", "configured-name-target"),
             ("get radio", "> 907.525,250,7,5", "default-radio-target"),
+            ("get radio", "> 907.5260009,62.5,7,5", "default-radio-target"),
             ("get path.hash.mode", "> 1", "path-hash-mode-target"),
         ):
             with self.subTest(command=command, reply=reply):

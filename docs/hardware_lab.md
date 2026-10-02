@@ -140,6 +140,8 @@ and its mocked tests make no hardware-success claim.
 Repeater radio readbacks describe configured preferences, not the live radio
 profile; applying them requires a separate reboot. Neither role's
 configuration readback proves reboot persistence or peer reception.
+Integer-kHz frequencies also accept their float32 MHz storage value truncated
+to seven decimal places by the normal CLI, not a broad frequency tolerance.
 The radio setter must return exactly `OK - reboot to apply`; name and path
 hash setters return `OK`. Readbacks use the `> ` value prefix inside the
 text reply. These formats match `CommonCLI.cpp`, not the older mock-only

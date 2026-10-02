@@ -20,7 +20,7 @@ import sys
 import termios
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -399,6 +399,22 @@ def repeater_identity(node):
     return {"role": role, "pubkey": key.lower()}
 
 
+def repeater_frequency_khz(value):
+    mhz = Decimal(value)
+    if not mhz.is_finite() or not 150 <= mhz <= 2500:
+        raise ValueError(f"invalid repeater frequency readback: {value!r}")
+    khz = mhz * 1000
+    normalized = khz.to_integral_value(rounding=ROUND_HALF_UP)
+    if khz != normalized:
+        # MyMesh rounds to integer kHz. Only accept that kHz's float32 MHz
+        # rendered by StrHelper::ftoa (truncated to seven decimal places).
+        stored = struct.unpack("<f", struct.pack("<f", int(normalized) / 1000))[0]
+        displayed = Decimal.from_float(stored).quantize(Decimal("0.0000001"), rounding=ROUND_DOWN)
+        if mhz != displayed:
+            raise ValueError(f"invalid repeater frequency readback: {value!r}")
+    return int(normalized)
+
+
 def repeater_info(node):
     info = repeater_identity(node)
     name = repeater_value(node, "get name")
@@ -408,9 +424,10 @@ def repeater_info(node):
     fields = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?),([0-9]+(?:\.[0-9]+)?),([0-9]+),([0-9]+)", radio)
     if not fields:
         raise ValueError(f"{node.name}: malformed repeater radio readback: {radio!r}")
-    freq, bw = (Decimal(value) * 1000 for value in fields.groups()[:2])
+    freq = repeater_frequency_khz(fields.group(1))
+    bw = Decimal(fields.group(2)) * 1000
     sf, cr = (int(value) for value in fields.groups()[2:])
-    if (freq != freq.to_integral_value() or bw != bw.to_integral_value()
+    if (bw != bw.to_integral_value()
             or not 150000 <= freq <= 2500000 or not 7800 <= bw <= 500000
             or not 5 <= sf <= 12 or not 5 <= cr <= 8):
         raise ValueError(f"{node.name}: invalid repeater radio readback: {radio!r}")

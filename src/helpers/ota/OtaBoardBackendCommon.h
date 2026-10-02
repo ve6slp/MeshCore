@@ -341,7 +341,7 @@ public:
     if (!current.active_image_extent) return Result::TooLate;
 
     uint8_t records[2][Command::kRecordBytes];
-    bool valid[2] = {}, matches[2] = {};
+    bool valid[2] = {}, matches[2] = {}, floor_refusal[2] = {}, completed_rollback[2] = {};
     bool consumed_unbound = false;
     int newest = -1;
     for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -363,40 +363,45 @@ public:
           !memcmp(Command::wireDescriptorOf(records[slot]), candidate.canonical, 59) &&
           !memcmp(Command::signatureOf(records[slot]), candidate.signature, 64) &&
           !memcmp(Command::admittedSignerKeyOf(records[slot]), candidate.ownerPublicKey, 32);
-      if (newest < 0 || Command::sequenceOf(records[slot]) >= Command::sequenceOf(records[newest]))
+      if (newest < 0 || commandSequenceNewer(Command::sequenceOf(records[slot]), Command::sequenceOf(records[newest])))
         newest = slot;
-      // An above-floor unbound command needs proven consumption, never temporary admission refusal.
-      const bool floor_refusal = d.securityCounter <= floor;
-      if (!matches[slot] && !floor_refusal) {
-        const bool completed_rollback = state_status == State::ReadStatus::Found &&
-            State::phase(state) == State::kPhaseFailedMax && before.settingsTailErased &&
-            State::transactionNonce(state) == Command::transactionNonceOf(records[slot]) &&
-            State::candidateCounter(state) == d.securityCounter &&
-            !memcmp(State::candidateHashSha256(state), d.sha256, 32) &&
-            State::activeImageExtent(state) == current.active_image_extent &&
-            !memcmp(state + 76, current.active_image_hash_sha256, 32);
-        if (!completed_rollback) return Result::TooLate;
-        consumed_unbound = true;
+      floor_refusal[slot] = d.securityCounter <= floor;
+      completed_rollback[slot] = state_status == State::ReadStatus::Found &&
+          State::phase(state) == State::kPhaseFailedMax && before.settingsTailErased &&
+          State::transactionNonce(state) == Command::transactionNonceOf(records[slot]) &&
+          State::candidateCounter(state) == d.securityCounter &&
+          !memcmp(State::candidateHashSha256(state), d.sha256, 32) &&
+          State::activeImageExtent(state) == current.active_image_extent &&
+          !memcmp(state + 76, current.active_image_hash_sha256, 32);
+      if (!matches[slot] && !floor_refusal[slot]) consumed_unbound = true;
+    }
+    const bool have_match = matches[0] || matches[1];
+    if (candidate.phase == Store::Phase::Committed && !have_match) return Result::TooLate;
+    // Actual cancellation cannot expose any unbound sibling above the protected floor.
+    if (have_match && consumed_unbound) return Result::TooLate;
+    if (have_match && (newest < 0 || !matches[newest] || candidate.receivedBlocks != candidate.totalBlocks))
+      return Result::TooLate;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      if (!valid[slot]) continue;
+      if (!matches[slot] && !floor_refusal[slot]) {
+        // Without erasing either slot, the loader keeps selecting the proven consumed newest command.
+        if (!completed_rollback[slot] &&
+            (have_match || newest < 0 || !completed_rollback[newest] ||
+             !commandSequenceNewer(Command::sequenceOf(records[newest]), Command::sequenceOf(records[slot]))))
+          return Result::TooLate;
         continue;
       }
-      const bool refused_now = floor_refusal || !before.settingsTailErased ||
+      const bool refused_now = floor_refusal[slot] || !before.settingsTailErased ||
           Command::activeImageExtentOf(records[slot]) != current.active_image_extent ||
           memcmp(Command::activeImageHashOf(records[slot]), current.active_image_hash_sha256, 32);
       if (!refused_now) {
         // Only this exactly bound candidate may use a fresh QSPI hash refusal.
         if (!matches[slot]) return Result::TooLate;
         uint8_t digest[32];
-        if (!hashCandidate(d.exactSizeBytes, digest)) return Result::IoError;
-        if (!memcmp(digest, d.sha256, 32)) return Result::TooLate;
+        if (!hashCandidate(candidate.exactSizeBytes, digest)) return Result::IoError;
+        if (!memcmp(digest, descriptor.sha256, 32)) return Result::TooLate;
       }
     }
-    const bool have_match = matches[0] || matches[1];
-    if (candidate.phase == Store::Phase::Committed && !have_match) return Result::TooLate;
-    // No current intent: a proven consumed rollback must not block ordinary precommit ABORT.
-    // Actual cancellation still cannot leave any unbound sibling above the protected floor.
-    if (have_match && consumed_unbound) return Result::TooLate;
-    if (have_match && (newest < 0 || !matches[newest] || candidate.receivedBlocks != candidate.totalBlocks))
-      return Result::TooLate;
 
     uint8_t latest_state[State::kRecordBytes] = {};
     uint32_t latest_floor = 0;
@@ -436,6 +441,10 @@ public:
   }
 
 private:
+  static bool commandSequenceNewer(uint32_t next, uint32_t previous) {
+    const uint32_t difference = next - previous;
+    return difference != 0 && difference < 0x80000000u;
+  }
   Result inspectStateWindows(const uint8_t newest[State::kRecordBytes], State::ReadStatus status,
                              uint64_t nonce, uint8_t digest[32]) const {
     // Frozen boot-private XSID/88 sidecars share each state sector at offset 0x100.

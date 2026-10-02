@@ -534,7 +534,11 @@ test-ota-rf-to-boot: tmpdir
 	        retired-candidate retired-canonical retired-command-region retired-floor \
 	        retired-previous-command retired-running retired-sdk retired-state-region \
 	        rollback-command rollback-candidate rollback-running rollback-sdk rollback-floor \
-	        rollback-next-candidate rollback-next-canonical rollback-retained-command-region; do \
+	        rollback-next-candidate rollback-next-canonical rollback-retained-command-region \
+	        multi-rollback-command-a multi-rollback-command-b \
+	        multi-rollback-candidate-a multi-rollback-candidate-b \
+	        multi-rollback-running multi-rollback-sdk multi-rollback-floor \
+	        multi-rollback-command-region multi-rollback-next-candidate multi-rollback-next-canonical; do \
 	        rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role-$$suffix.bin"; \
 	      done; \
 	    done; \

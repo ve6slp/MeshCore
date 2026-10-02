@@ -264,6 +264,132 @@ static void test_consumed_failed_command_does_not_install_replacement_after_prec
          (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID);
 }
 
+static void run_unconfirmed_fixture_rollback(fake_io_state_t *s, const xiao_ota_command_v2_t *command,
+                                            uint32_t counter, size_t extent, const uint8_t backup_hash[32]) {
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t digest[32];
+  unsigned attempt;
+  assert(fake_io_run_boot(s) == 0 && s->force_recovery_calls == 0);
+  assert(read_state(s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(state.transaction_nonce == command->transaction_nonce && state.candidate_counter == counter);
+  for (attempt = 0; attempt < XIAO_OTA_MAX_TRIAL_BOOTS; ++attempt)
+    assert(fake_io_run_boot(s) == 0 && s->force_recovery_calls == 0);
+  assert(read_state(s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+  assert(state.transaction_nonce == command->transaction_nonce && state.candidate_counter == counter);
+  assert(state.active_image_extent == extent && memcmp(state.backup_hash_sha256, backup_hash, 32) == 0);
+  assert(read_floor(s, &floor) && floor.confirmed_counter_floor == 4);
+  sha256_of(s->internal_flash + XIAO_OTA_APP_START, extent, digest);
+  assert(memcmp(digest, backup_hash, 32) == 0);
+}
+
+static void test_two_real_rollbacks_keep_older_command_safe_only_without_erasing_newest(const char *prefix) {
+  fake_io_state_t s;
+  xiao_ota_command_v2_t a, b;
+  xiao_ota_wire_descriptor_t da, db, next;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t settings[28], canonical[59], digest[32], running_hash[32], next_hash[32];
+  uint8_t pair[2 * XIAO_OTA_QSPI_SECTOR_SIZE], closed_state[2 * XIAO_OTA_QSPI_SECTOR_SIZE];
+  const uint32_t safe_orders[][2] = {{1, 2}, {UINT32_MAX - 1, UINT32_MAX},
+                                     {UINT32_MAX, 0}, {UINT32_C(0x80000002), 1}};
+  size_t running_size, size;
+  unsigned attempt, order, control;
+  fake_io_reset(&s);
+  assert(read_remote_fixture(prefix, "multi-rollback-command-a", (uint8_t *)&a, sizeof(a)) == sizeof(a));
+  assert(read_remote_fixture(prefix, "multi-rollback-command-b", (uint8_t *)&b, sizeof(b)) == sizeof(b));
+  assert(xiao_ota_command_v2_valid(&a) && xiao_ota_command_v2_valid(&b));
+  assert(xiao_ota_wire_descriptor_decode(a.wire_descriptor, &da) && da.security_counter == 5);
+  assert(xiao_ota_wire_descriptor_decode(b.wire_descriptor, &db) && db.security_counter == 6);
+  assert(a.sequence == 1 && b.sequence == 2 && a.transaction_nonce != b.transaction_nonce);
+  assert((((uint32_t)db.board_family << 16) | db.board_variant) == XIAO_OTA_BOARD_TARGET);
+  assert(db.role == XIAO_OTA_COMPILED_ROLE_ID);
+  running_size = read_remote_fixture(prefix, "multi-rollback-running", s.internal_flash + XIAO_OTA_APP_START,
+                                     XIAO_OTA_APP_MAX_SIZE);
+  assert(running_size == a.active_image_extent && running_size == b.active_image_extent);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, running_size, running_hash);
+  assert(read_remote_fixture(prefix, "multi-rollback-sdk", settings, sizeof(settings)) == sizeof(settings));
+  fake_io_write_settings_raw(&s, settings);
+  assert(read_remote_fixture(prefix, "multi-rollback-floor", s.qspi + XIAO_OTA_FLOOR_A,
+                             2 * XIAO_OTA_QSPI_SECTOR_SIZE) == 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  memcpy(s.qspi + XIAO_OTA_COMMAND_A, &a, sizeof(a));
+  assert(read_remote_fixture(prefix, "multi-rollback-candidate-a", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                             XIAO_OTA_CANDIDATE_SIZE) == da.exact_size_bytes);
+  run_unconfirmed_fixture_rollback(&s, &a, 5, running_size, running_hash);
+  assert(read_remote_fixture(prefix, "multi-rollback-command-region", pair, sizeof(pair)) == sizeof(pair));
+  assert(memcmp(pair, &a, sizeof(a)) == 0 &&
+         memcmp(pair + XIAO_OTA_QSPI_SECTOR_SIZE, &b, sizeof(b)) == 0);
+  memcpy(s.qspi + XIAO_OTA_COMMAND_A, pair, sizeof(pair));
+  assert(read_remote_fixture(prefix, "multi-rollback-candidate-b", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                             XIAO_OTA_CANDIDATE_SIZE) == db.exact_size_bytes);
+  run_unconfirmed_fixture_rollback(&s, &b, 6, running_size, running_hash);
+  assert(memcmp(pair, s.qspi + XIAO_OTA_COMMAND_A, sizeof(pair)) == 0);
+  memcpy(closed_state, s.qspi + XIAO_OTA_STATE_A, sizeof(closed_state));
+
+  assert(read_remote_fixture(prefix, "multi-rollback-next-canonical", canonical, sizeof(canonical)) == sizeof(canonical));
+  assert(xiao_ota_wire_descriptor_decode(canonical, &next) && next.security_counter == 8);
+  assert(next.role == db.role && next.board_family == db.board_family && next.board_variant == db.board_variant);
+  size = read_remote_fixture(prefix, "multi-rollback-next-candidate", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                             XIAO_OTA_CANDIDATE_SIZE);
+  assert(size == next.exact_size_bytes);
+  sha256_of(s.qspi + XIAO_OTA_CANDIDATE_BASE, size, next_hash);
+  assert(memcmp(next_hash, next.sha256, 32) == 0);
+  for (attempt = 0; attempt < 3; ++attempt) {
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    assert(state.transaction_nonce == b.transaction_nonce && state.candidate_counter == 6);
+    assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 4);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, running_size, digest);
+    assert(memcmp(digest, running_hash, 32) == 0);
+    sha256_of(s.qspi + XIAO_OTA_CANDIDATE_BASE, size, digest);
+    assert(memcmp(digest, next_hash, 32) == 0);
+    assert(memcmp(pair, s.qspi + XIAO_OTA_COMMAND_A, sizeof(pair)) == 0);
+  }
+
+  /* B's exact staged bytes remove temporary hash refusal as an explanation.
+   * The frozen loader must still select its consumed nonce, including wrap. */
+  for (order = 0; order < sizeof(safe_orders) / sizeof(safe_orders[0]); ++order) {
+    a.sequence = safe_orders[order][0]; b.sequence = safe_orders[order][1];
+    a.crc32 = xiao_ota_crc32(&a, offsetof(xiao_ota_command_v2_t, crc32));
+    b.crc32 = xiao_ota_crc32(&b, offsetof(xiao_ota_command_v2_t, crc32));
+    memcpy(s.qspi + XIAO_OTA_COMMAND_A, &a, sizeof(a));
+    memcpy(s.qspi + XIAO_OTA_COMMAND_B, &b, sizeof(b));
+    assert(read_remote_fixture(prefix, "multi-rollback-candidate-b", s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                               XIAO_OTA_CANDIDATE_SIZE) == db.exact_size_bytes);
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    assert(state.transaction_nonce == b.transaction_nonce && state.candidate_counter == 6);
+  }
+
+  /* Erasing the newest, losing the terminal state, or misranking an older,
+   * tied or half-range-ambiguous record really can admit an old intent. */
+  for (control = 0; control < 5; ++control) {
+    memcpy(s.qspi + XIAO_OTA_STATE_A, closed_state, sizeof(closed_state));
+    memcpy(s.qspi + XIAO_OTA_COMMAND_A, pair, sizeof(pair));
+    assert(read_remote_fixture(prefix, "multi-rollback-running", s.internal_flash + XIAO_OTA_APP_START,
+                               XIAO_OTA_APP_MAX_SIZE) == running_size);
+    fake_io_write_settings_raw(&s, settings);
+    if (control == 0) memset(s.qspi + XIAO_OTA_COMMAND_B, 0xff, XIAO_OTA_QSPI_SECTOR_SIZE);
+    if (control == 1) memset(s.qspi + XIAO_OTA_STATE_A, 0xff, sizeof(closed_state));
+    if (control >= 2) {
+      memcpy(&a, pair, sizeof(a)); memcpy(&b, pair + XIAO_OTA_QSPI_SECTOR_SIZE, sizeof(b));
+      a.sequence = control == 2 ? 3 : control == 3 ? 2 : 1;
+      b.sequence = control == 4 ? UINT32_C(0x80000001) : 2;
+      a.crc32 = xiao_ota_crc32(&a, offsetof(xiao_ota_command_v2_t, crc32));
+      b.crc32 = xiao_ota_crc32(&b, offsetof(xiao_ota_command_v2_t, crc32));
+      memcpy(s.qspi + XIAO_OTA_COMMAND_A, &a, sizeof(a)); memcpy(s.qspi + XIAO_OTA_COMMAND_B, &b, sizeof(b));
+    }
+    assert(read_remote_fixture(prefix, control == 1 ? "multi-rollback-candidate-b" : "multi-rollback-candidate-a",
+                               s.qspi + XIAO_OTA_CANDIDATE_BASE, XIAO_OTA_CANDIDATE_SIZE) > 0);
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+    assert(state.candidate_counter == (control == 1 ? 6u : 5u));
+  }
+  printf("two real Trial->FailedMax rollbacks/floor4 board=%08x role=%u: signed precommit ABORT/reupload "
+         "preserves both commands safely; production wrap + erase/newer/tie/half-range negative controls passed\n",
+         (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID);
+}
+
 int main(int argc, char **argv) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
   test_valid_usb_reflash_refuses_original_command_without_admission();
@@ -272,6 +398,7 @@ int main(int argc, char **argv) {
     test_exact_rf_commit_deferred_reset_handoff_installs_and_confirms(argv[1]);
     test_retired_intent_cannot_install_ready_without_new_commit_after_bank_restore(argv[1]);
     test_consumed_failed_command_does_not_install_replacement_after_precommit_abort(argv[1]);
+    test_two_real_rollbacks_keep_older_command_safe_only_without_erasing_newest(argv[1]);
   }
   return frozen_boot_process_tests_main();
 }

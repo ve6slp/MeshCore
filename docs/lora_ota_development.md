@@ -301,9 +301,13 @@ cancelled command. Candidate bytes, the original owner and the floor
 remain intact until authorized replacement. Missing or corrupt command
 evidence does not become a generic unlock.
 An unrelated consumed command from a completed rollback does not block
-aborting a newer, uncommitted candidate when its authenticated nonce,
-counter and image hash match the terminal rollback and the running bank
-matches the restored backup. A command bound to the current candidate,
+aborting a newer, uncommitted candidate when the newest authenticated
+command's nonce, counter and image hash match the terminal rollback and
+the running bank matches the restored backup. A strictly older authenticated
+command may remain shadowed by that proof only when no current-candidate
+command is bound and neither slot is erased. Sequence ordering follows the
+bootloader's wrap-aware comparison; ambiguous ordering stays protected.
+A command bound to the current candidate,
 including READY after an uncertain commit journal write, still requires
 the full cancellation proof.
 
