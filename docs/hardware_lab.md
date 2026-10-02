@@ -241,7 +241,7 @@ then extract that candidate package explicitly to a new image path:
 ```sh
 make ota-lab-image \
   XIAO_NRF52_TARGET_PACKAGE="$PWD/.tmp/ota-direct-001/Xiao_nrf52_repeater_ota_usb_candidate/firmware.zip" \
-  OTA_UPLOAD_IMAGE="$candidate_bin"
+  OTA_UPLOAD_IMAGE="$PWD/.tmp/ota-direct-001/candidate.bin"
 ```
 
 Without the package override, the extraction target defaults to the
