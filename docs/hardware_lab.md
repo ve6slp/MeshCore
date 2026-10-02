@@ -766,12 +766,61 @@ The Raspberry Pi Debug Probe **SC0889** (CMSIS-DAP), XIAO Expansion Board
 been acquired with this helper.
 
 After equipment arrives, the user must identify the physical approved target
-and the exact probe UID and authorize this physical workflow. Verify fixture
-pin labels against the manufacturers' documentation; pin orientation on this
-fixture is not yet verified. Power the target normally from USB; connect only
+and the exact probe UID and authorize this physical workflow. Published
+connector mapping is documented below; actual fixture revision, seating and
+contact continuity remain unverified. Power the target normally from USB; connect only
 **common GND, SWDIO and SWCLK**, with **3.3 V target logic**. Leave probe power
 outputs and target reset disconnected: no probe-powered target or reset wire.
 Do not attach to another board to try the procedure.
+
+**One-time manufacturer pinout qualification, Oct. 2, 2026:** this is a
+conditional wiring reference, not permission to connect. Use the SC0889
+**D / DEBUG** connector, not **U / UART**. Its numbered DEBUG interface is
+pin 1 SWCLK, pin 2 GND, pin 3 SWDIO, with nominal 3.3 V I/O and no VTREF
+or target-power pin. The manufacturer's cable drawing locates the pin-1
+mark on the underside; do not infer socket left/right or trust cable colours.
+
+| SC0889 D / DEBUG | Expansion Board 103030356 J7 |
+|---|---|
+| Pin 1, SC / SWCLK | Pin 1, SWCLK |
+| Pin 2, GND | Pin 4 or 5, GND |
+| Pin 3, SD / SWDIO | Pin 2, SWDIO |
+
+J7 is **not a standard 10-pin ARM debug header**. Seeed's v1.0 board drawing,
+viewed from the top/component side with the XIAO socket to the left, gives:
+
+```text
+1 SWCLK       8 RX
+2 SWDIO       7 TX
+3 SYS_3V3     6 VBOOST_5V
+4 GND         5 GND
+```
+
+**J7.3 is not ground; J7.6 is boosted 5 V.** Leave both power pins and
+the UART pins unused. Use the explicit GND connection for the common signal
+reference. Do not add another fixture power source or drive an unpowered
+target from a powered probe.
+
+The published non-Plus nRF52840 **Sense V1.1** design maps the expansion
+contacts U2.17 to TP3/SWDCLK, U2.18 to TP5/SWDIO, U2.16 to TP1/GND, and
+U2.15 to TP2/RESET. Header-aligned nominal contact centres fall within the
+published Sense lands. This supports the planar electrical mapping, not
+verified fit to the inaccessible target's revision, pogo stroke, tip clearance
+or header seating. Check the received revisions and contact continuity before
+any probe connection; do not substitute SAMD/ESP compatibility marketing.
+
+**Reset caveat:** the stock base already connects its RESET pogo to onboard
+button K2. Leaving out an external reset wire does not physically isolate that
+contact. Do not press K2. The unmodified fixture does not meet a literal
+reset-disconnected setup; resolve this explicitly with the user before use,
+without silently changing the setup or modifying the fixture.
+
+Primary references: Raspberry Pi's
+[connector specification](https://pip-assets.raspberrypi.com/categories/885-raspberry-pi-debug-probe/documents/RP-008189-DS-1-debug-connector-specification.pdf),
+[DEBUG cable drawing](https://pip-assets.raspberrypi.com/categories/885-raspberry-pi-debug-probe/documents/RP-008190-DS-1-debug-swd-cable-specification.pdf)
+and [product brief](https://pip-assets.raspberrypi.com/categories/885-raspberry-pi-debug-probe/documents/RP-008193-DS-1-raspberry-pi-debug-probe-product-brief.pdf);
+Seeed's [Expansion Board v1.0 Eagle design](https://files.seeedstudio.com/wiki/Seeeduino-XIAO-Expansion-Board/document/Seeeduino%20XIAO%20Expansion%20board_v1.0_200824.brd)
+and [Sense V1.1 KiCad design](https://files.seeedstudio.com/wiki/XIAO-BLE/Seeed-Studio-XIAO-nRF52840V1.1-KiCad-Project-260105.zip).
 
 `scripts/swd_diagnose.py` is independent of USB application/serial discovery.
 It requires the explicit full probe UID and approved target serial/role in
