@@ -400,14 +400,26 @@ names, radio/path preferences and the complete target ACL were unchanged
 afterward. This proves target-to-client ordinary reception only. The two
 earlier probe timeouts remain failed runs, not retrospectively passed
 qualifications.
-No qualified target-loader installation, radio OTA transfer, READY,
-COMMIT, installation or rollback has been performed with these applications.
+The reviewed recovery corrections in `e62cf33b` subsequently passed the
+immutable software gate: fresh application fixtures, all four production-C
+boot drivers and the C++ consumer of their actual rollback outputs, under
+both original SDK CRC policies. Cache cut-and-retry coverage, 345 host tests
+and all six OTA firmware profile builds also passed.
+The newly preserved, role-specific applications were flashed to both approved
+boards. Read-only inspection at `09:15:35Z` confirmed their existing identities,
+names, radio/path preferences and complete target ACL without reconfiguration.
+Both still reported healthy stock boot, ordinary writes allowed and cache-only.
+The target-only loader installer then passed artifact validation but refused
+the vendor's actual stable boot-port product name before writing.
+No qualified target-loader installation, replacement-protocol radio OTA
+transfer, READY, COMMIT, installation or rollback has been performed.
 
 The uploader must remain on the stock bootloader, with only cache staging
 available after its preflight succeeds. The ordinary settings-write
 refusal is not permission to install a custom uploader loader.
-Local power-failure recovery for torn or orphaned cache
-metadata remains an open risk. This is not production qualification.
+Torn and partially erased cache metadata now has native cut-and-retry
+coverage. Physical power-failure recovery remains unqualified. This is not
+production qualification.
 
 The archives contain the diagnostic applications, not the lost original
 502,300-byte application artifact. The original public-key baseline is also

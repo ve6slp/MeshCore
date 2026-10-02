@@ -133,8 +133,9 @@ An interrupted initial write leaves the original SDK, application and user
 configuration untouched and permits ordinary boot; a nonblank torn floor is
 not automatically cleared or retried. The application must distinguish a
 present valid floor from blank storage: blank means staging-only and no
-COMMIT, not an assumed trusted counter 0. This app-side integration and the
-actual first-boot floor readback remain qualification gates.
+COMMIT, not an assumed trusted counter 0. App-side integration passed the
+immutable software gate for `e62cf33b`; actual first-boot floor readback
+remains a separate hardware qualification gate.
 
 Cache slots with bad magic or CRC are ignored exactly as in the candidate
 store, without importing their owner or phase. Interrupted record-body
@@ -641,9 +642,27 @@ names, radio preferences, both observed path modes and the target ACL.
 Packet/radio counters were diagnostics, not the success witness. This
 establishes only target-to-client ordinary reception; the two earlier
 timeouts remain failures, and neither bidirectional nor OTA operation is
-implied. Application recovery integration still awaits production-C to
-C++ rollback proof. The target's qualified custom loader is not installed,
-and no replacement-protocol radio OTA installation has been demonstrated.
+implied.
+
+Reviewed recovery changes in `e62cf33b` passed the immutable software gate
+for tree `0aec89d94991625f31aa620646470e438005daee`. The gate generated fresh
+application fixtures, ran all four production-C board/role boot drivers
+and imported their actual FailedMax rollback outputs into the C++ application.
+Both vendor-unused CRC 0 and matching nonzero CRC policies passed, including
+restored ordinary configuration writes and subsequent update admission.
+Cache cut-and-retry coverage, 345 host tests and all six OTA firmware profiles
+also passed. This closes the software recovery defects, not physical
+rollback qualification.
+
+The immutable, role-specific `e62cf33b` applications were then flashed to
+the approved pair. Read-only inspection at `09:15:35Z` confirmed both
+identities, names, 907.525 MHz/250 kHz/SF7/CR5 preferences, both path modes
+and the complete target ACL without setters or replacement grants.
+Both reported healthy stock boot, ordinary writes allowed and cache-only
+OTA. The subsequent target-only loader installer passed artifact validation
+but refused the vendor's actual stable boot-port product name before writing.
+The target's qualified custom loader is not installed, and no
+replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and
 destructive shared-domain power-cut qualification remains deferred.
 
