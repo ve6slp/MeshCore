@@ -3695,6 +3695,339 @@ static void test_candidate_zero_sdk_crc_mismatch_stays_strict(bool floor_repair)
   assert(s.force_recovery_calls == 0);
 }
 
+static void provision_factory_original(fake_io_state_t *s, bool unused_crc,
+                                       uint8_t hash[32]) {
+  fake_io_reset(s);
+  provision_vendor_zero_crc_original(s, 32768, hash);
+  if (!unused_crc)
+    fake_io_provision_bank0_settings(s, 1, crc16_compute(
+        s->internal_flash + XIAO_OTA_APP_START, 32768, NULL), 32768);
+  memset(s->qspi + XIAO_OTA_JOURNAL_BASE, 0xFF, XIAO_OTA_JOURNAL_SIZE);
+}
+
+static void count_factory_writes(fake_io_state_t *s) {
+  s->crash.op = FAKE_IO_OP_QSPI_ERASE;
+  s->crash.after = -1;
+  s->crash.count = 0;
+  s->tear.op = FAKE_IO_OP_QSPI_WRITE;
+  s->tear.after = -1;
+  s->tear.count = 0;
+}
+
+static void assert_factory_no_writes(const fake_io_state_t *s) {
+  assert(s->crash.count == 0 && s->tear.count == 0);
+}
+
+static void assert_genesis_floor(const fake_io_state_t *s) {
+  xiao_ota_floor_t floor;
+  assert(read_floor(s, &floor));
+  assert(floor.sequence == 1 && floor.confirmed_counter_floor == 0);
+  assert(floor.active_image_extent == 0);
+  for (unsigned i = 0; i < 32; ++i) assert(floor.confirmed_hash_sha256[i] == 0);
+  assert(xiao_ota_floor_valid(
+      (const xiao_ota_floor_t *)(s->qspi + XIAO_OTA_FLOOR_A)));
+}
+
+static void test_factory_genesis_and_lifecycle(bool unused_crc, bool confirm) {
+  fake_io_state_t s;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t old_hash[32], candidate_hash[32], restored_hash[32];
+  uint8_t original_sdk[28], restored_sdk[28];
+  uint8_t *internal_before = malloc(FAKE_IO_INTERNAL_SIZE);
+  uint8_t *qspi_before = malloc(FAKE_IO_QSPI_SIZE);
+  assert(internal_before && qspi_before);
+  provision_factory_original(&s, unused_crc, old_hash);
+  fake_io_read_settings_raw(&s, original_sdk);
+  memcpy(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE);
+  memcpy(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE);
+  assert(fake_io_run_boot(&s) == 0);
+  assert_genesis_floor(&s);
+  assert(!read_state(&s, &state));
+  assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == 0);
+  assert(memcmp(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE) == 0);
+  memcpy(qspi_before + XIAO_OTA_FLOOR_A, s.qspi + XIAO_OTA_FLOOR_A,
+         sizeof(floor));
+  assert(memcmp(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+  count_factory_writes(&s);
+  assert(fake_io_run_boot(&s) == 0);
+  assert_factory_no_writes(&s);
+  assert(memcmp(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+
+  write_candidate(&s, 40960, 0x77, candidate_hash);
+  build_and_write_command(&s, 91, 1, 1, 40960, candidate_hash, 32768, old_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  if (confirm) {
+    write_confirmation(&s, 91, 1, candidate_hash);
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_CONFIRMED);
+    assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 1);
+    assert(floor.active_image_extent == 40960);
+    assert(memcmp(floor.confirmed_hash_sha256, candidate_hash, 32) == 0);
+  } else {
+    for (unsigned i = 0; i < XIAO_OTA_MAX_TRIAL_BOOTS; ++i)
+      assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    fake_io_read_settings_raw(&s, restored_sdk);
+    assert(memcmp(original_sdk, restored_sdk, 28) == 0);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, 32768, restored_hash);
+    assert(memcmp(old_hash, restored_hash, 32) == 0);
+    assert_genesis_floor(&s);
+  }
+  assert(s.force_recovery_calls == 0);
+  free(internal_before);
+  free(qspi_before);
+}
+
+static void test_factory_journal_denials(void) {
+  const uint32_t positions[] = {0, XIAO_OTA_SETTINGS_SIDECAR_OFFSET, 4095};
+  for (unsigned sector = 0; sector < 8; ++sector) {
+    for (unsigned test = 0; test < 4; ++test) {
+      fake_io_state_t s;
+      xiao_ota_floor_t floor;
+      uint8_t hash[32];
+      uint8_t *before = malloc(FAKE_IO_QSPI_SIZE);
+      assert(before);
+      provision_factory_original(&s, true, hash);
+      const uint32_t address = XIAO_OTA_JOURNAL_BASE + sector * 4096;
+      if (test < 3) s.qspi[address + positions[test]] = 0;
+      else {
+        s.fail.op = FAKE_IO_OP_QSPI_READ;
+        s.fail.addr_lo = address;
+        s.fail.addr_hi = address + 4096;
+        s.fail.after = 1;
+      }
+      memcpy(before, s.qspi, FAKE_IO_QSPI_SIZE);
+      count_factory_writes(&s);
+      assert(fake_io_run_boot(&s) == 0);
+      assert_factory_no_writes(&s);
+      assert(!read_floor(&s, &floor));
+      assert(memcmp(before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+      if (test == 3) assert(s.force_recovery_calls == 0);
+      free(before);
+    }
+  }
+}
+
+static void test_factory_original_denials(void) {
+  for (unsigned test = 0; test < 12; ++test) {
+    fake_io_state_t s;
+    uint8_t hash[32];
+    uint8_t *before = malloc(FAKE_IO_INTERNAL_SIZE);
+    assert(before);
+    provision_factory_original(&s, true, hash);
+    switch (test) {
+      case 0: fake_io_provision_bank0_settings(&s, 0xFF, 0, 32768); break;
+      case 1: fake_io_provision_bank0_settings(&s, 1, 0, 0); break;
+      case 2: fake_io_provision_bank0_settings(&s, 1, 0, 7); break;
+      case 3:
+        fake_io_provision_bank0_settings(&s, 1, 0, XIAO_OTA_INSTALL_MAX_SIZE + 4);
+        break;
+      case 4:
+        s.internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4] = 1;
+        break;
+      case 5: memset(s.internal_flash + XIAO_OTA_APP_START, 0xFF, 8); break;
+      case 6:
+        fake_io_provision_bank0_settings(&s, 1, 1, 32768);
+        assert(crc16_compute(s.internal_flash + XIAO_OTA_APP_START,
+                             32768, NULL) != 1);
+        break;
+      case 7: fake_io_poison_settings_tail(&s, 4095, 0); break;
+      case 8:
+      case 9:
+      case 10:
+        s.fail.op = FAKE_IO_OP_INTERNAL_READ;
+        s.fail.after = 1;
+        s.fail.addr_lo = test == 8 ? XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS
+                                  : XIAO_OTA_APP_START + 256;
+        s.fail.addr_hi = s.fail.addr_lo + 4;
+        if (test == 9) s.fail.after = 2; /* Actual CRC, after first SHA. */
+        break;
+      case 11:
+        s.fail.op = FAKE_IO_OP_QSPI_READ;
+        s.fail.addr_lo = XIAO_OTA_FLOOR_A;
+        s.fail.addr_hi = s.fail.addr_lo + 4;
+        s.fail.after = 2; /* Independent immediate pre-erase floor check. */
+        break;
+    }
+    memcpy(before, s.internal_flash, FAKE_IO_INTERNAL_SIZE);
+    count_factory_writes(&s);
+    assert(fake_io_run_boot(&s) == 0);
+    assert_factory_no_writes(&s);
+    assert(s.force_recovery_calls == 0);
+    assert(memcmp(before, s.internal_flash, FAKE_IO_INTERNAL_SIZE) == 0);
+    for (uint32_t i = 0; i < XIAO_OTA_JOURNAL_SIZE; ++i)
+      assert(s.qspi[XIAO_OTA_JOURNAL_BASE + i] == 0xFF);
+    free(before);
+  }
+}
+
+/* Wrap the existing fake's real read callbacks, preserving its NOR and
+ * fault semantics. No parallel processor or flash writer is modelled. */
+static xiao_ota_io_t factory_base_io;
+static unsigned factory_read_mode, factory_sdk_reads, factory_app_reads;
+static bool factory_mask_floor;
+
+static bool factory_qspi_read(void *ctx, uint32_t address, void *out, size_t n) {
+  if (!factory_base_io.qspi_read(ctx, address, out, n)) return false;
+  if (factory_mask_floor && address >= XIAO_OTA_FLOOR_A &&
+      address < XIAO_OTA_FLOOR_B + 4096) {
+    memset(out, 0xFF, n);
+    if (address + n == XIAO_OTA_FLOOR_B + 4096) factory_mask_floor = false;
+  }
+  return true;
+}
+
+static bool factory_internal_read(void *ctx, uint32_t address, void *out,
+                                  size_t n) {
+  fake_io_state_t *s = ctx;
+  if (address == XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS) {
+    factory_sdk_reads++;
+    if (factory_read_mode == 1 && factory_sdk_reads == 3)
+      s->internal_flash[address + 6] ^= 1; /* Ancillary SDK drift only. */
+  }
+  if (address == XIAO_OTA_APP_START) {
+    factory_app_reads++;
+    if (factory_read_mode == 2 && factory_app_reads == 3)
+      s->internal_flash[address + 512] ^= 1; /* Drift after the first SHA. */
+  }
+  return factory_base_io.internal_read(ctx, address, out, n);
+}
+
+static void run_factory_read_fault(fake_io_state_t *s, unsigned mode,
+                                    bool mask_floor) {
+  factory_base_io = fake_io_interface(s);
+  xiao_ota_io_t io = factory_base_io;
+  factory_read_mode = mode;
+  factory_sdk_reads = factory_app_reads = 0;
+  factory_mask_floor = mask_floor;
+  io.qspi_read = factory_qspi_read;
+  io.internal_read = factory_internal_read;
+  xiao_ota_boot_process_io(&io);
+}
+
+static void test_factory_stability_and_floor_misread(void) {
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    fake_io_state_t s;
+    xiao_ota_floor_t floor;
+    uint8_t hash[32];
+    uint8_t *before = malloc(FAKE_IO_QSPI_SIZE);
+    assert(before);
+    provision_factory_original(&s, true, hash);
+    if (mode == 0) write_floor_direct(&s, 7, 32768, hash);
+    memcpy(before, s.qspi, FAKE_IO_QSPI_SIZE);
+    count_factory_writes(&s);
+    run_factory_read_fault(&s, mode, mode == 0);
+    assert(memcmp(before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    assert_factory_no_writes(&s);
+    if (mode == 0) {
+      assert(!factory_mask_floor);
+      assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 7);
+    } else assert(!read_floor(&s, &floor));
+    assert(s.force_recovery_calls == 0);
+    free(before);
+  }
+}
+
+static void test_factory_existing_floor_history(void) {
+  for (unsigned kind = 0; kind < 4; ++kind) {
+    fake_io_state_t s;
+    uint8_t hash[32];
+    uint8_t *before = malloc(FAKE_IO_QSPI_SIZE);
+    assert(before);
+    provision_factory_original(&s, true, hash);
+    write_floor_direct(&s, kind == 0 ? 0 : 7, 32768, hash);
+    if (kind == 2) s.qspi[XIAO_OTA_FLOOR_A] ^= 1;
+    if (kind == 3)
+      memset(s.qspi + XIAO_OTA_FLOOR_A +
+             offsetof(xiao_ota_floor_t, commit_marker), 0xFF, 4);
+    memcpy(before, s.qspi, FAKE_IO_QSPI_SIZE);
+    count_factory_writes(&s);
+    assert(fake_io_run_boot(&s) == 0);
+    assert_factory_no_writes(&s);
+    assert(memcmp(before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    assert(s.force_recovery_calls == 0);
+    free(before);
+  }
+}
+
+static void test_factory_write_cut_matrix(void) {
+  for (unsigned test = 0; test < 13; ++test) {
+    fake_io_state_t s;
+    uint8_t hash[32];
+    uint8_t *internal_before = malloc(FAKE_IO_INTERNAL_SIZE);
+    uint8_t *qspi_before = malloc(FAKE_IO_QSPI_SIZE);
+    assert(internal_before && qspi_before);
+    provision_factory_original(&s, true, hash);
+    /* Non-journal userdata sentinels, including app filesystem/security. */
+    s.qspi[XIAO_OTA_INSTALL_MAX_SIZE] = 0x12;
+    s.qspi[XIAO_OTA_BACKUP_BASE + XIAO_OTA_INSTALL_MAX_SIZE] = 0x34;
+    s.qspi[XIAO_OTA_FILESYSTEM_BASE] = 0x56;
+    s.internal_flash[XIAO_OTA_INSTALL_ALLOWED_END] = 0x78;
+    memcpy(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE);
+    memcpy(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE);
+    fake_io_fault_t *fault = test == 1 || test == 4 || test == 7 ||
+                                   test == 9 || test == 11 ? &s.crash
+                            : test == 3 || test == 6 ? &s.tear : &s.fail;
+    fault->addr_lo = XIAO_OTA_FLOOR_A;
+    fault->addr_hi = fault->addr_lo + 4;
+    fault->after = 1;
+    if (test < 2) fault->op = FAKE_IO_OP_QSPI_ERASE;
+    else if (test < 5) {
+      fault->op = FAKE_IO_OP_QSPI_WRITE;
+      if (test == 3) s.tear_bytes = 20;
+      if (test == 4) {
+        fault = &s.tear;
+        *fault = s.crash;
+        s.crash.op = FAKE_IO_OP_NONE;
+        fault->op = FAKE_IO_OP_QSPI_WRITE;
+        s.tear_bytes = 20;
+        s.tear_crash = true;
+      }
+    } else if (test < 8) {
+      fault->op = FAKE_IO_OP_QSPI_WRITE;
+      fault->addr_lo += offsetof(xiao_ota_floor_t, commit_marker);
+      fault->addr_hi = fault->addr_lo + 4;
+      if (test == 6) s.tear_bytes = 2;
+    } else if (test < 12) {
+      fault->op = FAKE_IO_OP_QSPI_READ;
+      fault->after = test < 10 ? 3 : 4; /* Two blank scans, body/final verify. */
+    } else {
+      fault = &s.tear;
+      fault->op = FAKE_IO_OP_QSPI_WRITE;
+      fault->addr_lo = XIAO_OTA_FLOOR_A + offsetof(xiao_ota_floor_t, commit_marker);
+      fault->addr_hi = fault->addr_lo + 4;
+      fault->after = 1;
+      s.tear_bytes = 2;
+      s.tear_crash = true;
+    }
+    const bool crash = test == 1 || test == 4 || test == 7 ||
+                       test == 9 || test == 11 || test == 12;
+    assert(fake_io_run_boot(&s) == (crash ? 1 : 0));
+    assert(s.force_recovery_calls == 0);
+    assert(memcmp(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE) == 0);
+    memcpy(qspi_before + XIAO_OTA_FLOOR_A, s.qspi + XIAO_OTA_FLOOR_A, 4096);
+    assert(memcmp(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    const bool untouched = test < 3;
+    s.fail.op = s.crash.op = s.tear.op = FAKE_IO_OP_NONE;
+    s.tear_crash = false;
+    count_factory_writes(&s);
+    s.crash.addr_lo = s.tear.addr_lo = 0;
+    s.crash.addr_hi = s.tear.addr_hi = UINT32_MAX;
+    assert(fake_io_run_boot(&s) == 0);
+    if (untouched) assert_genesis_floor(&s); /* Still wholly blank may retry. */
+    else {
+      assert_factory_no_writes(&s);
+      assert(memcmp(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    }
+    assert(s.force_recovery_calls == 0);
+    assert(memcmp(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE) == 0);
+    free(internal_before);
+    free(qspi_before);
+  }
+}
+
 int main(void) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
 
@@ -3844,6 +4177,15 @@ int main(void) {
   test_candidate_zero_sdk_crc_mismatch_stays_strict(false);
   test_candidate_zero_sdk_crc_mismatch_stays_strict(true);
   printf("vendor CRC-unused original lifecycle and strict candidate/floor guards passed\n");
+  test_factory_stability_and_floor_misread();
+  test_factory_genesis_and_lifecycle(true, true);
+  test_factory_genesis_and_lifecycle(true, false);
+  test_factory_genesis_and_lifecycle(false, true);
+  test_factory_journal_denials();
+  test_factory_original_denials();
+  test_factory_existing_floor_history();
+  test_factory_write_cut_matrix();
+  printf("factory unknown-image floor genesis, history guards and cut matrix passed\n");
 
   printf("xiao OTA boot process integration tests passed\n");
   return 0;

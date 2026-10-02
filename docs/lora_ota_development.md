@@ -122,6 +122,20 @@ computed zero. Rollback restores the exact original SDK28; it does not
 normalize vendor metadata. A genuinely blank target still needs durable
 initial floor creation before this transition is physically qualified.
 
+The qualified loader now initializes that floor only after verified QSPI
+JEDEC identification, a full erased-byte scan of all eight journal sectors
+and a healthy, repeat-stable vendor SDK/image proof. It rechecks both floor
+sectors immediately before the only erase, then uses the existing durable
+floor writer for sequence 1, counter 0, extent 0 and an all-zero hash.
+This records an initial counter, not a confirmed original image. Existing
+history, damage, ambiguity or failed reads cannot authorize initialization.
+An interrupted initial write leaves the original SDK, application and user
+configuration untouched and permits ordinary boot; a nonblank torn floor is
+not automatically cleared or retried. The application must distinguish a
+present valid floor from blank storage: blank means staging-only and no
+COMMIT, not an assumed trusted counter 0. This app-side integration and the
+actual first-boot floor readback remain qualification gates.
+
 Cache slots with bad magic or CRC are ignored exactly as in the candidate
 store, without importing their owner or phase. Interrupted record-body
 writes, torn commit markers and partial metadata erases can therefore
@@ -778,9 +792,12 @@ release notes:
     native tests**. Packaged HEX and UF2 build artifacts with marker
     verification now build separately for both the XIAO and SenseCAP
     profiles, in their own board/role-specific output directories. All
-    four reviewed `7861fdc0` no-SWD packages use 38,004 of 38,912 bytes,
-    leaving 908 bytes free. These packages do not yet include factory
-    floor initialization and must not commission a blank target.
+    four reviewed factory-initialization no-SWD packages use 38,324 of
+    38,912 bytes, including initialized-data load bytes, leaving 588 bytes
+    free. Their source fingerprint is `23384fd9…`; the earlier
+    `7861fdc0` packages lack initialization and must not commission a
+    blank target. App-side integration and actual floor readback are
+    still required before claiming commissioning.
     Historical footprints do not describe this build.
   - The candidate and backup regions each hold at most 708,608 bytes,
     preserving the extra-filesystem range `0xD4000`–`0xED000`.

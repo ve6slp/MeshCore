@@ -164,6 +164,10 @@ void fake_io_poison_settings_tail(fake_io_state_t *s, uint32_t offset_in_page,
  */
 int fake_io_run_boot(fake_io_state_t *s);
 
+/* Allows literal processor tests to wrap reads without duplicating this
+ * flash/fault model or changing any persisted device fields. */
+xiao_ota_io_t fake_io_interface(fake_io_state_t *s);
+
 /*
  * Durably serialises/restores exactly the bytes a real device's power-
  * cycle (or loader-only reflash) would retain -- the simulated QSPI and
@@ -181,4 +185,3 @@ int fake_io_run_boot(fake_io_state_t *s);
  */
 bool fake_io_dump_to_file(const fake_io_state_t *s, const char *path);
 bool fake_io_load_from_file(fake_io_state_t *s, const char *path);
-

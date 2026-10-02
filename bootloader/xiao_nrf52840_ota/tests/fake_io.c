@@ -270,7 +270,7 @@ static void fake_force_recovery(void *ctx) {
   ((fake_io_state_t *)ctx)->force_recovery_calls++;
 }
 
-int fake_io_run_boot(fake_io_state_t *s) {
+xiao_ota_io_t fake_io_interface(fake_io_state_t *s) {
   xiao_ota_io_t io;
   io.ctx = s;
   io.device_address = fake_device_address;
@@ -284,7 +284,11 @@ int fake_io_run_boot(fake_io_state_t *s) {
   io.internal_erase_page = fake_internal_erase_page;
   io.start_trial_watchdog = fake_start_trial_watchdog;
   io.force_recovery = fake_force_recovery;
+  return io;
+}
 
+int fake_io_run_boot(fake_io_state_t *s) {
+  xiao_ota_io_t io = fake_io_interface(s);
   if (setjmp(s->crash_jump) != 0) return 1;
   xiao_ota_boot_process_io(&io);
   return 0;

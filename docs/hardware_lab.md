@@ -410,6 +410,17 @@ role, complete flash load and boot-info marker have been checked. Follow the
 and physical acceptance requirements. Artifact verification alone is not
 installed recovery qualification.
 
+The reviewed factory-initialization loader can create the initial durable
+floor only with verified flash, healthy vendor boot evidence and all eight
+journal sectors erased. It does not erase existing history. After the first
+normal boot, commissioning must establish a **present, valid** counter-0
+floor with zero extent and zero image hash, followed by install-capable
+application status. A default counter getter returning zero is not that
+proof. If initialization did not complete, leave installation unavailable;
+do not clear a damaged or historical floor to make commissioning pass.
+The original application remains unconfirmed until an authorized candidate
+completes the normal install and confirmation lifecycle.
+
 `make validate-xiao-nrf52-client-archive` and
 `make validate-xiao-nrf52-target-archive` authenticate an existing encrypted
 full-media capture without opening either board. Set `OTA_LAB_ARCHIVE_KEY`

@@ -214,6 +214,18 @@ static bool qspi_confirm_quad_enable(void) {
   return (status & XIAO_OTA_P25Q16H_SR2_QE_BIT) != 0;
 }
 
+/* Both supported board profiles use P25Q16H (JEDEC 85:60:15).
+ * READY/QE alone can succeed with floating or wrong-part read data. */
+static bool qspi_confirm_jedec(void) {
+  NRF_QSPI->EVENTS_READY = 0;
+  NRF_QSPI->CINSTRCONF =
+      (0x9Fu << QSPI_CINSTRCONF_OPCODE_Pos) |
+      (QSPI_CINSTRCONF_LENGTH_4B << QSPI_CINSTRCONF_LENGTH_Pos) |
+      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
+  return qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS) &&
+         (NRF_QSPI->CINSTRDAT0 & 0xFFFFFFu) == 0x156085u;
+}
+
 static bool hw_qspi_init(void *ctx) {
   (void)ctx;
   NRF_QSPI->PSEL.SCK = XIAO_OTA_QSPI_SCK_PIN;
@@ -237,7 +249,7 @@ static bool hw_qspi_init(void *ctx) {
    * read/program, but that says nothing about the FLASH CHIP's own Quad
    * Enable bit -- confirm/set it explicitly rather than assuming a prior
    * boot (or the factory default) left it that way. */
-  return qspi_confirm_quad_enable();
+  return qspi_confirm_jedec() && qspi_confirm_quad_enable();
 }
 
 static bool hw_qspi_read(void *ctx, uint32_t address, void *destination,

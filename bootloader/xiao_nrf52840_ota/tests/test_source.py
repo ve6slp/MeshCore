@@ -29,6 +29,17 @@ bypass = boot.index("if (io->explicit_dfu_requested(io->ctx)) return;")
 qspi = boot.index("io->qspi_init(io->ctx)")
 assert bypass < qspi, "explicit upstream DFU requests must bypass QSPI/OTA work"
 
+init = hw_text[hw_text.index("static bool hw_qspi_init("):
+               hw_text.index("static bool hw_qspi_read(")]
+assert "return qspi_confirm_jedec() && qspi_confirm_quad_enable();" in init
+jedec = hw_text[hw_text.index("static bool qspi_confirm_jedec("):
+                hw_text.index("static bool hw_qspi_init(")]
+assert "0x9Fu << QSPI_CINSTRCONF_OPCODE_Pos" in jedec
+assert "QSPI_CINSTRCONF_LENGTH_4B" in jedec
+assert "XIAO_OTA_HW_QSPI_CINSTR_LEVELS" in jedec
+assert "qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS)" in jedec
+assert "(NRF_QSPI->CINSTRDAT0 & 0xFFFFFFu) == 0x156085u" in jedec
+
 finalize = text[text.index("static bool finalize_install_and_verify("):
                 text.index("void xiao_ota_boot_process_io(")]
 candidate_settings = finalize.index("xiao_ota_settings_apply_bank0(io,")

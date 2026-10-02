@@ -1751,6 +1751,49 @@ static bool original_extent_from_settings(const xiao_ota_io_t *io,
   return true;
 }
 
+/* Factory-only metadata genesis, before any command exists. False means
+ * journal history is present or unknown: leave it to the transaction
+ * processor. True stops OTA work and returns to ordinary vendor boot,
+ * including on a failed/torn initialization; never clear damaged history.
+ * Counter zero claims no confirmed image (extent/hash remain zero). */
+static bool factory_floor_initialize(const xiao_ota_io_t *io) {
+  xiao_ota_settings_raw_t before, after;
+  xiao_ota_floor_t floor;
+  uint8_t before_hash[32], after_hash[32];
+  uint32_t extent, verified_extent, slot_address = XIAO_OTA_FLOOR_B;
+  bool blank;
+  for (uint32_t offset = 0; offset < XIAO_OTA_JOURNAL_SIZE;
+       offset += XIAO_OTA_QSPI_SECTOR_SIZE) {
+    blank = true;
+    if (!range_erased(io, XIAO_OTA_JOURNAL_BASE + offset, 0,
+                      XIAO_OTA_QSPI_SECTOR_SIZE, &blank)) return false;
+    if (!blank) return false;
+  }
+  if (!settings_read_raw(io, &before) ||
+      before.bank_0_size < 8 ||
+      before.bank_0_size > XIAO_OTA_INSTALL_MAX_SIZE ||
+      !settings_page_tail_erased(io, &blank) || !blank) return true;
+  extent = xiao_ota_safe_backup_extent(before.bank_0_size,
+                                      XIAO_OTA_INSTALL_MAX_SIZE);
+  if (!hash_internal(io, XIAO_OTA_APP_START, extent, before_hash) ||
+      !original_extent_from_settings(io, before_hash, &verified_extent) ||
+      verified_extent != extent ||
+      !hash_internal(io, XIAO_OTA_APP_START, extent, after_hash) ||
+      !all_equal(before_hash, after_hash) ||
+      !settings_read_raw(io, &after) ||
+      memcmp(&before, &after, sizeof(before)) != 0 ||
+      !settings_page_tail_erased(io, &blank) || !blank) return true;
+
+  /* Independent full-floor recheck immediately before the only erase:
+   * a transient erased read of older history must not reopen counter 0. */
+  blank = true;
+  if (!range_erased(io, XIAO_OTA_FLOOR_A, 0,
+                    2 * XIAO_OTA_QSPI_SECTOR_SIZE, &blank) || !blank) return true;
+  memset(&floor, 0, sizeof(floor));
+  (void)persist_floor(io, &floor, &slot_address);
+  return true;
+}
+
 static bool copy_internal_to_qspi(const xiao_ota_io_t *io,
                                   xiao_ota_state_t *state,
                                   xiao_ota_settings_sidecar_t *sidecar,
@@ -1893,6 +1936,7 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
      * unknown, not "absent" -- fail closed before touching anything. */
     goto recover;
   }
+  if (factory_floor_initialize(io)) return;
 
   /*
    * Zero BOTH raw physical command buffers before read_pair() touches
