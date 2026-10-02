@@ -305,13 +305,27 @@ any hardware result from this lab elsewhere.
 On 2026-10-01, the existing read-only diagnostic on each approved board
 returned its full internal-flash and QSPI contents for comparison with its
 authenticated encrypted archive. Both comparisons matched byte for byte.
-No flash, reset, power cycle or install command was issued, and the
-protected board was not opened. This establishes preservation of the
+That comparison issued no flash, reset, power cycle or install command, and
+the protected board was not opened. This establishes preservation of the
 captured media, not a mesh connection or a working OTA installation.
-The boards still require qualified companion and repeater applications.
+
+The eight-profile firmware gate passed for `bda99d13`, and immutable,
+role-specific applications have now been flashed to both approved boards.
+The first companion NAME setter (`0x08`, `OTA-LAB-CLIENT`) still returns
+`0104 BAD_STATE` before mutation. Normal settings and paired radio
+configuration are therefore incomplete. No administrator change, qualified
+target custom-loader installation, radio OTA transfer, READY, COMMIT,
+installation or rollback has been performed with these applications.
+The uploader must remain on the stock bootloader, with only cache staging
+available after its preflight succeeds. Its ordinary settings-write
+refusal is under diagnosis, not permission to install a custom loader.
+Local power-failure recovery for torn or orphaned cache
+metadata remains an open risk. This is not production qualification.
 
 The archives contain the diagnostic applications, not the lost original
-application artifact. Preserve newly qualified, role-specific recovery
+502,300-byte application artifact. The original public-key baseline is also
+absent. New captures can preserve evidence going forward, not restore the
+lost original identity. Preserve newly qualified, role-specific recovery
 packages before commissioning. Destructive power-cut qualification is
 deferred because the target shares a protected power domain; do not bypass
 that protection or describe power-failure recovery as physically qualified.

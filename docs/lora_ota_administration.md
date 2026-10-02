@@ -11,6 +11,13 @@ results do not qualify the replacement. No physical node has completed a
 LoRa-delivered firmware install, confirmation or rollback. Do not use these
 controls to manage a deployed network.
 
+The approved bench pair now has immutable applications, but normal settings
+and radio setup remain incomplete. No administrator change or qualified
+target custom-loader installation has been performed. Keep the uploader on
+the stock bootloader; only cache staging is available after its preflight
+succeeds. Its ordinary settings-write refusal is under diagnosis;
+installing a custom loader is not a workaround.
+
 ## Update policy
 
 The following is the required behaviour, not a hardware acceptance claim.
@@ -21,21 +28,25 @@ The following is the required behaviour, not a hardware acceptance claim.
    Targets verify with the public key; never distribute the private key.
 3. Select direct, routed or background mode and an airtime budget. A device
    can retain only one candidate and its original owner. A competing image
-   or administrator is refused; there is no automatic takeover timeout.
+   or administrator receives `BUSY`; there is no automatic takeover timeout.
 4. Transfer signed blocks. Duplicates do not rewrite flash. Bad or missing
    frames preserve valid progress and normal radio service. For severe loss,
    repair missing blocks or explicitly restart the upload.
 5. Wait for each target's durable `READY` result after full-image validation.
    Finishing reception does not install the image or start a reboot timer.
-6. Have the original owner, still trusted as an administrator, commit each
-   target separately. Sequence the commits to preserve network service and
-   confirm each device has returned before proceeding.
+6. Have the original owner, still trusted as an administrator, send an
+   explicit, target-bound COMMIT to each target separately. Sequence commits
+   to preserve network service and confirm each device has returned before
+   proceeding.
 
 Any currently trusted administrator may abort before commit. The target
-then ignores multicast for that image until an explicit restart. Abort
+then suppresses reception of that image until an explicit restart. Abort
 does not hand the staging slot to a competing uploader. Once a committed
 install has begun, local boot recovery completes it or restores the previous
 image; a radio abort is no longer the recovery mechanism.
+Vendor boot staging must tolerate interruption and retry without discarding
+the recoverable running image. This remains a physical qualification gate,
+not an assurance of recovery on the current bench.
 
 After a confirmed install or completed rollback, a subsequent update can
 reuse the staging slot once the device proves the previous boot transaction
@@ -87,11 +98,15 @@ ESP build support does not establish physical installation or rollback.
 and background modes use the normal mesh settings. Background accepts
 several full target keys in the quoted `OTA_UPLOAD_TARGET` value and
 requires `OTA_UPLOAD_CHANNEL` to identify a configured group channel.
-Direct accepts one target and requires an off-frequency channel in
-`OTA_UPLOAD_FREQ_KHZ` plus a bounded `OTA_UPLOAD_LEASE_MS`.
+Background uses multicast, a receiver census and selective repair; every
+member must pass full-image validation for durable READY before its own
+explicit commit. Direct accepts one target and requires an off-frequency
+channel in `OTA_UPLOAD_FREQ_KHZ` plus a bounded `OTA_UPLOAD_LEASE_MS`.
 On the approved lab mesh, the direct frequency is 908525 kHz; normal
 traffic remains at 907525 kHz. Both direct and directed use channel 255
-as the unused group-channel value.
+as the unused group-channel value. The uploader applies the leased direct
+profile and restores normal settings afterwards.
+The default bandwidth is 62.5 kHz (62500 Hz).
 
 Upload **never commits**, including with `OTA_UPLOAD_WAIT_READY=1`.
 That option waits for fresh, complete READY snapshots within
@@ -110,7 +125,9 @@ accepted command is not proof of installation, reboot or trial
 confirmation. Confirm that node's health and normal mesh service before
 committing the next one.
 After a newly durable remote COMMIT, nRF firmware schedules its own
-reboot; no USB reset is required. It gives replies a short grace period
+reboot; no USB reset is required. If that autonomous reboot is absent, stop:
+a USB reset must not be used to turn a blocked qualification into a pass.
+It gives replies a short grace period
 and restores an off-frequency session first. READY, denied commands and
 uncertain writes do not arm a reboot. Retrying the same accepted COMMIT
 does not rewrite the intent or postpone its deadline.
@@ -172,9 +189,11 @@ boot-journal cleanup are not an alternative upload workflow; their host
 helpers have been removed.
 
 The repeater's ordinary text CLI remains the way to inspect its full public
-key and existing administrator ACL. An ACL read is not evidence that a
-recent permission change has survived a restart: allow the normal lazy
-save to complete and verify it after reboot. Do not replace the ACL or
+key and existing administrator ACL. Normal permission setup uses
+`setperm <full-companion-public-key> 3`, not a new OTA authority.
+A live ACL readback and a six-second lazy-save opportunity do not prove
+durability; a normal reboot does not flush dirty ACL entries. Verify the
+complete ACL after a separately authorized restart. Do not replace the ACL or
 export an administrator's private key to enable OTA.
 
 `start ota`, the existing local firmware-update facility, is separate from
@@ -194,6 +213,8 @@ repeater profile is unchanged; USB recovery remains separate.
   scheduled maintenance window.
 - Direct mode is a short, supervised session and is expected to be bounded
   by the same radio and regulatory limits as any other transmission.
+- A supervised 95% or 100% full-image smoke run is not measured 2%
+  acceptance and must not be reported as such.
 - OTA traffic shares the same underlying MeshCore airtime/duty-cycle
   admission control as normal traffic (in `Dispatcher`); OTA does not bypass
   it. A dedicated per-region or per-sub-band legal airtime ceiling for OTA
@@ -230,8 +251,10 @@ for the full policy model.
   [developer guide](lora_ota_development.md#current-hardware-evidence) for
   specifics and dates.
 - Nothing here yet results in an installed firmware update on a real device.
-  Treat any OTA activity on hardware you rely on as experimental and
-  reversible only by falling back to USB/BLE re-flashing.
+  Local power-failure recovery for torn or orphaned cache metadata remains
+  an open risk. Preserve a validated recovery package before bench work;
+  the lost original application and missing public-key baseline cannot be
+  reconstructed by capturing new evidence.
 
 This feature is developed on a dedicated branch and has not been merged
 into upstream `main`; nothing in this guide is available in a released
