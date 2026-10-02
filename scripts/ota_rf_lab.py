@@ -582,6 +582,36 @@ def run_grant_client_admin(client, target, evidence):
     return record
 
 
+def parse_ota_floor_observation(reason):
+    floor = {"state": "missing", "seq": None, "ctr": None, "ext": None, "sha": None, "io": None}
+    fields = r"\b(?:floor|seq|ctr|ext|sha|io)\s*="
+    if not re.search(fields, reason, re.IGNORECASE):
+        return floor
+    start = re.search(r"(?:^| )floor=", reason)
+    if not start or re.search(fields, reason[:start.start()], re.IGNORECASE):
+        raise ValueError("malformed or incomplete OTA floor observation")
+    suffix = reason[start.start():].lstrip(" ")
+    if suffix == "floor=unavailable io=buffer":
+        return {**floor, "state": "unavailable", "io": "buffer"}
+    match = re.fullmatch(
+        r"floor=(present|blank|corrupt|read-error|unavailable) "
+        r"seq=([0-9A-F]{8}|\?) ctr=([0-9A-F]{8}|\?) ext=([0-9A-F]{8}|\?) "
+        r"sha=([0-9A-F]{64}|\?) io=(ok|read-error|geometry)", suffix)
+    if not match:
+        raise ValueError("malformed, truncated or duplicate OTA floor tuple")
+    state, seq, ctr, ext, sha, io = match.groups()
+    if state == "present":
+        if "?" in (seq, ctr, ext, sha) or io != "ok":
+            raise ValueError("incomplete or inconsistent present OTA floor tuple")
+        return {"state": state, "seq": int(seq, 16), "ctr": int(ctr, 16),
+                "ext": int(ext, 16), "sha": sha, "io": io}
+    expected_io = {"blank": "ok", "corrupt": "ok", "read-error": "read-error",
+                   "unavailable": "geometry"}
+    if (seq, ctr, ext, sha) != ("?", "?", "?", "?") or io != expected_io[state]:
+        raise ValueError("inconsistent nonpresent OTA floor tuple")
+    return {**floor, "state": state, "io": io}
+
+
 def parse_ota_preflight_diagnostic(text, kind):
     if not re.fullmatch(rf"[\x20-\x7e]{{1,{MAX_SERIAL_FRAME_SIZE - 1}}}", text):
         raise ValueError("OTA diagnostic must be bounded printable ASCII")
@@ -611,13 +641,16 @@ def parse_ota_preflight_diagnostic(text, kind):
         if not capability:
             raise ValueError("unrecognized or incomplete OTA capability diagnostic")
         result["capability"], result["reason"] = capability.groups()
+        result["floor"] = parse_ota_floor_observation(result["reason"])
     else:
         raise ValueError(f"unknown OTA diagnostic kind: {kind!r}")
     return result
 
 
-def run_inspect_ota_preflight(client, target, evidence):
-    record = {"read_only": True, "inspection_complete": False, "nodes": {}}
+def run_inspect_ota_preflight(client, target, evidence, require_target_genesis_floor=False):
+    record = {"read_only": True, "inspection_complete": False, "nodes": {},
+              "target_genesis_floor_required": require_target_genesis_floor,
+              "target_genesis_floor_verified": False}
     evidence.summary["measurements"]["ota_preflight"] = record
     identities = {"client": serializable_app_info(app_info(client))}
     if target is not None:
@@ -656,6 +689,18 @@ def run_inspect_ota_preflight(client, target, evidence):
                 raise
             evidence.log("ota_preflight_diagnostic", node=role, kind=kind, **row)
     record["inspection_complete"] = True
+    if require_target_genesis_floor:
+        capability = record["nodes"]["target"]["capability"]
+        early_writes_allowed = record["nodes"]["target"]["preflight"]["writes_allowed"]
+        expected = {"state": "present", "seq": 1, "ctr": 0, "ext": 0, "sha": "0" * 64, "io": "ok"}
+        evidence.check("target-genesis-floor",
+                       capability["capability"] == "INSTALL_CAPABLE"
+                       and early_writes_allowed and capability["writes_allowed"]
+                       and capability["floor"] == expected,
+                       capability=capability["capability"], writes_allowed=capability["writes_allowed"],
+                       early_writes_allowed=early_writes_allowed,
+                       observed_floor=capability["floor"], expected_floor=expected, read_only=True)
+        record["target_genesis_floor_verified"] = True
     evidence.log("ota_preflight_inspection_complete", read_only=True,
                  qualification_verified=False, install_authority_verified=False)
     return record
@@ -734,6 +779,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--client-only", action="store_true")
+    parser.add_argument("--require-target-genesis-floor", action="store_true",
+                       help="paired preflight only: require target INSTALL_CAPABLE, allowed writes "
+                            "and freshly observed present genesis floor")
     parser.add_argument("--bandwidth-hz", type=int, choices=SUPPORTED_LORA_BANDWIDTHS_HZ,
                        help="configure-only LoRa bandwidth in integer Hz (default: 62500)")
     scope = parser.add_mutually_exclusive_group()
@@ -750,6 +798,9 @@ def main():
                        help="read-only approved pair settings and complete repeater ACL; "
                             "no setters, grants or reboot")
     args = parser.parse_args()
+    if args.require_target_genesis_floor and (not args.inspect_ota_preflight or args.client_only):
+        parser.error("--require-target-genesis-floor requires --inspect-ota-preflight "
+                     "with both approved roles; not --client-only or another mode")
     if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
         parser.error("--monitor-seconds must be finite and non-negative")
     if args.grant_client_admin and args.client_only:
@@ -802,7 +853,8 @@ def main():
         elif args.grant_client_admin:
             run_grant_client_admin(client, target, evidence)
         elif args.inspect_ota_preflight:
-            run_inspect_ota_preflight(client, target, evidence)
+            run_inspect_ota_preflight(client, target, evidence,
+                                     require_target_genesis_floor=args.require_target_genesis_floor)
         elif args.inspect_configuration:
             run_inspect_configuration(client, target, evidence)
         else:

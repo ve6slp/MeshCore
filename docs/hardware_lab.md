@@ -458,6 +458,21 @@ do not clear a damaged or historical floor to make commissioning pass.
 The original application remains unconfirmed until an authorized candidate
 completes the normal install and confirmation lifecycle.
 
+With the matching application and reviewed loader installed, require that
+actual first-boot record through the existing read-only inspection:
+
+```sh
+make inspect-xiao-nrf52-ota-preflight OTA_LAB_REQUIRE_GENESIS_FLOOR=1 \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/genesis-readback-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The target must report install capability, ordinary writes allowed and
+`floor=present seq=00000001 ctr=00000000 ext=00000000`, an all-zero
+64-digit image hash and `io=ok`. Missing, blank, damaged or unreadable
+fields fail this gate; no values are supplied by default. The uploader
+remains stock and is not expected to have a floor. This command observes
+the record and cannot create, repair or erase it.
+
 `make validate-xiao-nrf52-client-archive` and
 `make validate-xiao-nrf52-target-archive` authenticate an existing encrypted
 full-media capture without opening either board. Set `OTA_LAB_ARCHIVE_KEY`

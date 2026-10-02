@@ -344,6 +344,15 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--inspect-configuration", "--bandwidth-hz=62500"], "requires --configure-only"),
             (["--inspect-configuration", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--inspect-configuration", "--client-only"], "requires both approved roles"),
+            (["--require-target-genesis-floor"], "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--configure-only"], "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--grant-client-admin"], "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--inspect-configuration"], "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--monitor-seconds=1"], "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--inspect-ota-preflight", "--client-only"],
+             "requires --inspect-ota-preflight"),
+            (["--require-target-genesis-floor", "--inspect-ota-preflight", "--bandwidth-hz=250000"],
+             "requires --configure-only"),
             (["--monitor-seconds=1", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--grant-client-admin", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--bandwidth-hz=250000"], "requires --configure-only"),
@@ -1451,6 +1460,9 @@ class AdminGrantModeTests(unittest.TestCase):
 class OtaPreflightInspectionTests(unittest.TestCase):
     EARLY = "writes=blocked marker=blank proof=sdk-read sdk=unread"
     CAPABILITY = "writes=blocked CACHE_UNAVAILABLE: SDK bank0 read failed"
+    GENESIS_REASON = ("floor=present seq=00000001 ctr=00000000 ext=00000000 sha="
+                      + "0" * 64 + " io=ok")
+    GENESIS_CAPABILITY = "writes=allowed INSTALL_CAPABLE: " + GENESIS_REASON
 
     def setUp(self):
         self.evidence = evidence_fixture()
@@ -1483,6 +1495,213 @@ class OtaPreflightInspectionTests(unittest.TestCase):
             self.resolve, self.client_open, self.target_open = resolve, client_open, target_open
             resolve.side_effect = lambda role, mode: self.devices[role]
             ota_rf_lab.main()
+
+    def genesis_fixture(self, capability=None, early_blocked=False):
+        self.client.command.side_effect = [
+            self_info(), b"\x1d" + self.EARLY.replace("blocked", "allowed").encode("ascii"),
+            b"\x1dwrites=allowed CACHE_ONLY: verified stock boot",
+        ]
+        writes = "blocked" if early_blocked else "allowed"
+        self.target.command.side_effect = [
+            "> repeater", "> " + TARGET_KEY.hex(),
+            f"writes={writes} marker=qualified proof=qualified-state state=0 phase=0 decision=0",
+            self.GENESIS_CAPABILITY if capability is None else capability,
+        ]
+
+    def assert_probe_commands(self):
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(bytes.fromhex("420001"), expected=(29, 1)),
+            mock.call(bytes.fromhex("420002"), expected=(29, 1)),
+        ])
+        self.assertEqual(self.target.command.call_args_list, [
+            mock.call("get role"), mock.call("get public.key"),
+            mock.call("ota preflight"), mock.call("ota capability"),
+        ])
+        self.client.get_acl.assert_not_called()
+        self.target.get_acl.assert_not_called()
+
+    def test_floor_suffix_parses_full_hex_values_without_losing_the_opaque_reason(self):
+        reason = ("floor=present seq=A0000001 ctr=00000002 ext=00010000 sha="
+                  + "AB" * 32 + " io=ok")
+        parsed = ota_rf_lab.parse_ota_preflight_diagnostic(
+            "writes=blocked INSTALL_CAPABLE: " + reason, "capability")
+        self.assertEqual(parsed["reason"], reason)
+        self.assertFalse(parsed["writes_allowed"])
+        self.assertEqual(parsed["floor"], {
+            "state": "present", "seq": 0xA0000001, "ctr": 2, "ext": 0x10000,
+            "sha": "AB" * 32, "io": "ok",
+        })
+
+    def test_old_opaque_reasons_explicitly_report_missing_floor_fields_not_zero(self):
+        for capability, reason in (("CACHE_ONLY", "verified stock boot"),
+                                   ("INSTALL_CAPABLE", "qualified custom bootloader detected (command v3)"),
+                                   ("STAGING_ONLY", "floor not initialized")):
+            with self.subTest(capability=capability):
+                parsed = ota_rf_lab.parse_ota_preflight_diagnostic(
+                    f"writes=allowed {capability}: {reason}", "capability")
+                self.assertEqual(parsed["capability"], capability)
+                self.assertEqual(parsed["reason"], reason)
+                self.assertEqual(parsed["floor"], {
+                    "state": "missing", "seq": None, "ctr": None, "ext": None, "sha": None, "io": None,
+                })
+
+    def test_nonpresent_floor_states_keep_unknown_values_and_actual_io_reason(self):
+        for state, io in (("blank", "ok"), ("corrupt", "ok"),
+                          ("read-error", "read-error"), ("unavailable", "geometry")):
+            with self.subTest(state=state):
+                prefix = "floor not initialized " if state == "blank" else ""
+                reason = f"{prefix}floor={state} seq=? ctr=? ext=? sha=? io={io}"
+                parsed = ota_rf_lab.parse_ota_preflight_diagnostic(
+                    "writes=blocked STAGING_ONLY: " + reason, "capability")
+                self.assertEqual(parsed["reason"], reason)
+                self.assertEqual(parsed["floor"], {
+                    "state": state, "seq": None, "ctr": None, "ext": None, "sha": None, "io": io,
+                })
+        parsed = ota_rf_lab.parse_ota_preflight_diagnostic(
+            "writes=blocked STAGING_ONLY: floor=unavailable io=buffer", "capability")
+        self.assertEqual(parsed["floor"], {
+            "state": "unavailable", "seq": None, "ctr": None, "ext": None, "sha": None, "io": "buffer",
+        })
+
+    def test_malformed_truncated_duplicate_or_ambiguous_floor_tuples_are_not_opaque_fallback(self):
+        for reason in (
+            self.GENESIS_REASON.replace("seq=00000001 ", ""),
+            self.GENESIS_REASON.replace("floor=present ", ""),
+            self.GENESIS_REASON.replace("seq=00000001", "seq=0000001"),
+            self.GENESIS_REASON.replace("ctr=00000000", "ctr=0000000G"),
+            self.GENESIS_REASON.replace("ext=00000000", "ext=0000000a"),
+            self.GENESIS_REASON.replace("sha=" + "0" * 64, "sha=" + "0" * 63),
+            self.GENESIS_REASON.replace("sha=" + "0" * 64, "sha=" + "G" * 64),
+            self.GENESIS_REASON.removesuffix(" io=ok"),
+            self.GENESIS_REASON.replace("seq=00000001", "seq=?"),
+            self.GENESIS_REASON.replace("io=ok", "io=read-error"),
+            self.GENESIS_REASON + " ctr=00000000",
+            "seq=00000001 " + self.GENESIS_REASON,
+            "floor=blank seq=00000000 ctr=00000000 ext=00000000 sha=? io=ok",
+            "floor=corrupt seq=? ctr=? ext=? sha=? io=geometry",
+            "floor=read-error seq=? ctr=? ext=? sha=? io=ok",
+            "floor=unavailable seq=? ctr=? ext=? sha=? io=ok",
+            "floor=unknown seq=? ctr=? ext=? sha=? io=ok",
+            "floor=unavailable io=geometry",
+            "floor=present floor=present",
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError):
+                    ota_rf_lab.parse_ota_preflight_diagnostic(
+                        "writes=allowed INSTALL_CAPABLE: " + reason, "capability")
+
+    def test_exact_target_genesis_assertion_succeeds_with_stock_cache_only_client_without_floor(self):
+        self.genesis_fixture()
+        self.run_main(["--require-target-genesis-floor"])
+        self.assert_probe_commands()
+        self.assertEqual(self.resolve.call_args_list, [
+            mock.call("client", mode=ota_rf_lab.lab_device.MODE_APP),
+            mock.call("target", mode=ota_rf_lab.lab_device.MODE_APP),
+        ])
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertTrue(record["inspection_complete"])
+        self.assertTrue(record["target_genesis_floor_required"])
+        self.assertTrue(record["target_genesis_floor_verified"])
+        client = record["nodes"]["client"]["capability"]
+        target = record["nodes"]["target"]["capability"]
+        self.assertEqual(client["capability"], "CACHE_ONLY")
+        self.assertEqual(client["floor"]["state"], "missing")
+        self.assertIsNone(client["floor"]["ctr"])
+        self.assertEqual(target["text"], self.GENESIS_CAPABILITY)
+        self.assertEqual(target["floor"], {
+            "state": "present", "seq": 1, "ctr": 0, "ext": 0, "sha": "0" * 64, "io": "ok",
+        })
+        self.assertTrue(self.evidence.summary["checks"]["target-genesis-floor"]["passed"])
+        self.evidence.finish.assert_called_once_with(None)
+
+    def test_genesis_requirement_refuses_stock_missing_nonpresent_nonzero_or_blocked_target(self):
+        reasons = [
+            "CACHE_ONLY: verified stock boot",
+            "INSTALL_CAPABLE: qualified custom bootloader detected (command v3)",
+            "INSTALL_CAPABLE: floor not initialized",
+            "STAGING_ONLY: floor not initialized floor=blank seq=? ctr=? ext=? sha=? io=ok",
+            "STAGING_ONLY: floor=corrupt seq=? ctr=? ext=? sha=? io=ok",
+            "STAGING_ONLY: floor=read-error seq=? ctr=? ext=? sha=? io=read-error",
+            "STAGING_ONLY: floor=unavailable seq=? ctr=? ext=? sha=? io=geometry",
+            "STAGING_ONLY: floor=unavailable io=buffer",
+            "CACHE_ONLY: " + self.GENESIS_REASON,
+            "STAGING_ONLY: " + self.GENESIS_REASON,
+            "INSTALL_CAPABLE: floor=blank seq=? ctr=? ext=? sha=? io=ok",
+            "INSTALL_CAPABLE: " + self.GENESIS_REASON.replace("seq=00000001", "seq=00000000"),
+            "INSTALL_CAPABLE: " + self.GENESIS_REASON.replace("seq=00000001", "seq=00000002"),
+            "INSTALL_CAPABLE: " + self.GENESIS_REASON.replace("ctr=00000000", "ctr=00000001"),
+            "INSTALL_CAPABLE: " + self.GENESIS_REASON.replace("ext=00000000", "ext=00000001"),
+            "INSTALL_CAPABLE: " + self.GENESIS_REASON.replace("sha=" + "0" * 64, "sha=" + "0" * 63 + "1"),
+        ]
+        cases = [("writes=allowed " + reason, False) for reason in reasons]
+        cases.extend([(self.GENESIS_CAPABILITY.replace("allowed", "blocked"), True),
+                      (self.GENESIS_CAPABILITY, True)])
+        for text, early_blocked in cases:
+            with self.subTest(text=text, early_blocked=early_blocked):
+                self.setUp()
+                self.genesis_fixture(text, early_blocked=early_blocked)
+                with self.assertRaisesRegex(AssertionError, "target-genesis-floor"):
+                    self.run_main(["--require-target-genesis-floor"])
+                self.assert_probe_commands()
+                record = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertTrue(record["inspection_complete"])
+                self.assertTrue(record["target_genesis_floor_required"])
+                self.assertFalse(record["target_genesis_floor_verified"])
+                self.assertEqual(record["nodes"]["target"]["capability"]["text"], text)
+                check = self.evidence.summary["checks"]["target-genesis-floor"]
+                self.assertFalse(check["passed"])
+                self.assertEqual(check["writes_allowed"], not text.startswith("writes=blocked"))
+                self.assertEqual(check["early_writes_allowed"], not early_blocked)
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIn("target-genesis-floor", self.evidence.finish.call_args.args[0])
+                self.client.close.assert_called_once()
+                self.target.close.assert_called_once()
+
+    def test_genesis_floor_observation_without_requirement_does_not_assert_commissioning_ready(self):
+        self.genesis_fixture(self.GENESIS_CAPABILITY.replace("allowed", "blocked"), early_blocked=True)
+        self.run_main()
+        self.assert_probe_commands()
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertTrue(record["inspection_complete"])
+        self.assertFalse(record["target_genesis_floor_required"])
+        self.assertFalse(record["target_genesis_floor_verified"])
+        target = record["nodes"]["target"]["capability"]
+        self.assertFalse(target["writes_allowed"])
+        self.assertEqual(target["floor"]["state"], "present")
+        self.assertEqual(target["floor"]["ctr"], 0)
+        self.assertNotIn("target-genesis-floor", self.evidence.summary["checks"])
+
+    def test_malformed_floor_probe_retains_raw_evidence_and_cannot_satisfy_genesis_requirement(self):
+        text = self.GENESIS_CAPABILITY.replace("seq=00000001 ", "")
+        self.genesis_fixture(text)
+        with self.assertRaisesRegex(ValueError, "floor tuple"):
+            self.run_main(["--require-target-genesis-floor"])
+        self.assert_probe_commands()
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertFalse(record["inspection_complete"])
+        self.assertFalse(record["target_genesis_floor_verified"])
+        target = record["nodes"]["target"]["capability"]
+        self.assertEqual(target["text"], text)
+        self.assertIn("error", target)
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_genesis_requirement_cannot_bypass_existing_approved_roles_and_actual_identity_checks(self):
+        for serial, key in (("49C5BAF21EEF44A1", TARGET_KEY), ("unapproved", TARGET_KEY),
+                            ("3BE94917B92DC5E9", CLIENT_KEY)):
+            with self.subTest(serial=serial, key=key):
+                self.setUp()
+                self.genesis_fixture()
+                self.devices["target"].serial = serial
+                if key == CLIENT_KEY:
+                    self.target.command.side_effect = ["> repeater", "> " + key.hex()]
+                with self.assertRaises(AssertionError):
+                    self.run_main(["--require-target-genesis-floor"])
+                if serial != "3BE94917B92DC5E9":
+                    self.client_open.assert_not_called()
+                    self.target_open.assert_not_called()
+                self.assertFalse(any(call.args[0].startswith("ota ")
+                                     for call in self.target.command.call_args_list))
 
     def test_parser_consumes_frozen_early_formatter_shapes_without_interpreting_proof(self):
         for detail in (

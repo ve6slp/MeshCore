@@ -77,6 +77,7 @@ VERIFY_OTA_INSTALL_ARTIFACT = python3 bootloader/xiao_nrf52840_ota/tools/install
 OTA_LAB_ARTIFACT_DIR ?= $(TMPDIR)/ota-rf-lab/$(shell date -u +%Y%m%dT%H%M%SZ)
 OTA_LAB_MONITOR_SECONDS ?= 60
 OTA_LAB_BANDWIDTH_HZ ?= 62500
+OTA_LAB_REQUIRE_GENESIS_FLOOR ?= 0
 OTA_LAB_CLIENT_PROTOCOL ?= companion
 OTA_LAB_TARGET_PROTOCOL ?= repeater
 OTA_UPLOAD_IMAGE ?=
@@ -357,7 +358,8 @@ inspect-xiao-nrf52-ota-preflight: tmpdir
 	@mkdir -p -- "$$(dirname -- "$(OTA_LAB_ARTIFACT_DIR)")"
 	@mkdir -- "$(OTA_LAB_ARTIFACT_DIR)" || \
 	  { echo "Set OTA_LAB_ARTIFACT_DIR to a new directory for the preflight inspection" >&2; exit 1; }
-	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --inspect-ota-preflight
+	python3 scripts/ota_rf_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --inspect-ota-preflight \
+	  $(if $(filter 1,$(OTA_LAB_REQUIRE_GENESIS_FLOOR)),--require-target-genesis-floor)
 
 inspect-xiao-nrf52-ota-configuration: tmpdir
 	@mkdir -p -- "$$(dirname -- "$(OTA_LAB_ARTIFACT_DIR)")"
