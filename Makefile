@@ -27,6 +27,9 @@ XIAO_OTA_LAB_VERSION ?=
 # These use recursive `=` on purpose: they are resolved only when a hardware
 # target actually runs, not on every make invocation.
 LAB_DEVICE ?= python3 $(CURDIR)/scripts/lab_device.py
+SWD_DIAGNOSE_PYTHON ?= python3
+SWD_PROBE_UID ?=
+SWD_TARGET_SERIAL ?=
 XIAO_NRF52_CLIENT_PORT = $(shell $(LAB_DEVICE) path client)
 XIAO_NRF52_TARGET_PORT = $(shell $(LAB_DEVICE) path target)
 XIAO_NRF52_BOOT_PORT = $(shell $(LAB_DEVICE) path target --mode bootloader)
@@ -136,6 +139,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         lab-bootloader-client lab-bootloader-target lab-bootloader-uf2-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
         lab-wait-client lab-wait-target \
+        test-xiao-nrf52-swd-diagnosis diagnose-xiao-nrf52-target-swd \
         build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets build-ota-baseline-targets build-non-ota-targets \
         inspect-xiao-s3-ota-bootloader \
         clean-xiao-nrf52-lab build-xiao-nrf52-lab build-xiao-nrf52-ota-lab build-xiao-nrf52-ota-candidate upload-xiao-nrf52-client upload-xiao-nrf52-target upload-xiao-nrf52-lab \
@@ -215,6 +219,16 @@ test-ota-lab-host: tmpdir
 
 test-ota-lab-archive: tmpdir
 	python3 -m unittest discover -s scripts/tests -p 'test_ota_lab_archive.py'
+
+## Offline only: bounded product safety/behavior tests against fake targets.
+test-xiao-nrf52-swd-diagnosis: tmpdir
+	python3 -m unittest discover -s scripts/tests -p 'test_swd_diagnose.py'
+
+## PHYSICAL: paused until equipment arrives and the user identifies target and exact probe.
+diagnose-xiao-nrf52-target-swd:
+	@$(SWD_DIAGNOSE_PYTHON) scripts/swd_diagnose.py diagnose --role target \
+	  --config "$(CURDIR)/lab/devices.ini" \
+	  --target-serial "$(SWD_TARGET_SERIAL)" --probe-uid "$(SWD_PROBE_UID)"
 
 ## Compile the OTA-capable firmware targets.
 build-ota-targets: tmpdir

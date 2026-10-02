@@ -617,6 +617,172 @@ genesis-floor and radio-installation acceptance therefore remain
 **blocked**, not passed. Do not repeat commissioning or bypass its guards
 to recover an inaccessible board.
 
+## Non-erasing SWD diagnosis
+
+**Physical work remains paused.** Target `3BE94917B92DC5E9` is still inaccessible
+after the `13:46:21Z` vendor bootloader-only DFU transport acknowledgement;
+reset and power reconnect did not restore USB. Actual cause is **unknown**.
+That acknowledgement is not installed-loader proof. The `13:24:51Z` address
+evidence is expired and must not be reused or re-stamped. Leave the healthy
+client `4186AE911D94CDB1` and protected Pine `49C5BAF21EEF44A1` untouched.
+The Raspberry Pi Debug Probe **SC0889** (CMSIS-DAP), XIAO Expansion Board
+**103030356**, and spare **102010469** are being ordered. No diagnosis has
+been acquired with this helper.
+
+After equipment arrives, the user must identify the physical approved target
+and the exact probe UID and authorize this physical workflow. Verify fixture
+pin labels against the manufacturers' documentation; pin orientation on this
+fixture is not yet verified. Power the target normally from USB; connect only
+**common GND, SWDIO and SWCLK**, with **3.3 V target logic**. Leave probe power
+outputs and target reset disconnected: no probe-powered target or reset wire.
+Do not attach to another board to try the procedure.
+
+`scripts/swd_diagnose.py` is independent of USB application/serial discovery.
+It requires the explicit full probe UID and approved target serial/role in
+`lab/devices.ini`, ignores role environment overrides, and has no first-probe
+fallback. CMSIS-DAP discovery occurs **only** in the physical `diagnose`
+command; native tests never import pyOCD or open probes.
+
+The qualified optional dependency/API is **pyOCD 0.43.1**. It is not needed for
+help or native tests. If physical invocation reports it missing, install
+that version in a private repo-local virtualenv, not shared/global Python:
+
+```sh
+make tmpdir
+TMPDIR="$PWD/.tmp" python3 -m venv .tmp/swd-venv
+TMPDIR="$PWD/.tmp" PIP_CACHE_DIR="$PWD/.tmp/pip-cache" \
+  .tmp/swd-venv/bin/python -m pip install 'pyocd==0.43.1'
+```
+
+Then use:
+
+```sh
+make test-xiao-nrf52-swd-diagnosis
+# PHYSICAL — do NOT run while work is paused:
+make diagnose-xiao-nrf52-target-swd \
+  SWD_DIAGNOSE_PYTHON="$PWD/.tmp/swd-venv/bin/python" \
+  SWD_PROBE_UID='<complete UID of the user-identified SC0889>' \
+  SWD_TARGET_SERIAL=3BE94917B92DC5E9 > approved-target-swd.json
+```
+
+Use `SWD_DIAGNOSE_PYTHON=/path/to/python` for a separate dependency environment.
+`make test-ota-lab-host` also discovers the product safety tests.
+The JSON and process exit must both be checked: `ok: false`, acquisition or
+state-restoration/teardown errors, or a nonzero exit are **not** a completed
+readout. Failed/missing/protected debug access means **stop**; never
+automatically retry, unlock, recover, mass erase, flash, or reset.
+
+**One-time offline API/init qualification, Oct. 2, 2026:** the installed
+pyOCD 0.43.1 safety-critical sources were inspected and 15 source files matched
+the public version tag, without connecting to hardware. There is no recurring
+pyOCD/Make infrastructure qualification target. Physical invocation checks the
+qualified API version, built-in NRF52840 class and effective safety options
+before attach; unsupported/unsafe configurations fail explicitly, without an
+automatic dependency download, upgrade or retry.
+
+The supported `no_config=True` option suppresses default/cwd and probe-specific
+configuration. It does **not** suppress the separate Python user-script loader:
+the diagnostic Session subclass makes `_load_user_script` a no-op. Only this
+helper's restricted init delegate is installed. Exact full UID equality is
+checked **before constructing the Session**, not through ConnectHelper's
+substring selection. Before `session.open()`, the helper checks the actual
+built-in NRF52840 class and every effective safety option, including disabled
+pack/cbuild-run overrides. Offline product tests exercise these guards and the
+script suppression without importing an installed pyOCD or opening any probe.
+
+The reviewed public sources are:
+
+- [NRF52 security/init](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/target/family/target_nRF52.py):
+  default `auto_unlock` can mass erase and `persist_unlock` can write UICR.
+  This helper explicitly sets `auto_unlock=False`, replaces the security task
+  with a read-only CTRL-AP APPROTECT refusal, and removes both unlock tasks.
+- [CoreSight attach](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/coresight/coresight_target.py)
+  and [Cortex-M](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/coresight/cortex_m.py):
+  `connect_mode=attach` skips reset and halt; this helper also suppresses core
+  init's DHCSR rewrite (C_HALT can be unknown when C_DEBUGEN is clear).
+  `resume_on_disconnect=False` plus explicit non-resuming teardown
+  prevents detach from resuming a preexisting halted CPU. The helper only
+  resumes a CPU it temporarily halted from an initially running or sleeping
+  state. Original DHCSR.C_DEBUGEN is measured before halt and verified again
+  during cleanup. After successful normal resume, originally disabled halting
+  debug is restored by the single direct volatile write `DHCSR=0xA05F0000`.
+  Originally enabled debug is preserved. Failed/no-op resume never triggers
+  that clear as a forced-resume workaround. DEMCR/TRCENA are never rewritten.
+- [Session](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/core/session.py),
+  [discovery](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/coresight/discovery.py)
+  and [CMSIS-DAP transport](https://github.com/pyocd/pyOCD/blob/v0.43.1/pyocd/probe/pydapaccess/dap_access_cmsis_dap.py):
+  config/pack overrides and separate user scripts are disabled; flash object
+  creation and non-core FPB/DWT initialization are removed. Connect/disconnect
+  use debug transport operations, not target reset or flash programming.
+
+The security gate precedes system-memory discovery. The full public FICR
+DEVICEID and chip part are verified **before core creation or any halt/resume**,
+not inferred from an application serial. The pinned vendor
+[`usb_desc_init`](https://github.com/adafruit/Adafruit_nRF52_Bootloader/blob/c67f0bcf0fa8e841426335b1bbde91cda6ca1f50/src/usb/usb_desc.c)
+constructs its TinyUSB serial from the eight little-endian FICR DEVICEID bytes:
+`DEVICEID[1]` then `DEVICEID[0]`, each eight uppercase hexadecimal digits.
+Its pinned TinyUSB `9775e76910d569ec73b8dd946f3fa5fe5414acdb`
+[`GET_DESCRIPTOR` path](https://github.com/hathach/tinyusb/blob/9775e76910d569ec73b8dd946f3fa5fe5414acdb/src/device/usbd.c)
+uses the vendor string callback, not a different chip-ID construction.
+Another chip/serial, APPROTECT, missing core, or uncertain CPU state refuses
+without reset, erase, unlock or a fallback.
+
+Only individual whitelisted public words are acquired: FICR identity,
+flash `0xFF8/0xFFC`, UICR `0x10001014/0x10001018`, two words at the effective
+page-aligned boot vector **within `0xF4000..0xFD000` only**, the SDK header
+`[0xFF000,0xFF01C)` (exactly 28 bytes/seven words), the first 16 bytes of the
+known OTA marker at `0xFDC00`, DHCSR `0xE000EDF0`,
+SCB fault/status words, CPU PC/SP/LR/xPSR/MSP/PSP, public WDT
+RUNSTATUS/CONFIG/CRV, RESETREAS/GPREGRET and the single reserved
+double-reset RAM word described below. pyOCD additionally reads
+DP/AP and CoreSight discovery/debug metadata; it does not dump ROM, flash,
+RAM, filesystems or QSPI. InternalFS `0xED000..0xF4000`, ExtraFS
+`0xD4000..0xED000`, keys/configuration and OTA journal sectors are never read
+or written. An untrusted effective boot pointer is recorded but never chased
+into those regions. The pinned `nrf_mbr.h:71` defines `MBR_BOOTLOADER_ADDR`
+as **`0xFF8`**, not the NMI vector at `0x8`. Previous address evidence remains
+expired; correcting this source-derived address does not re-stamp old data.
+A boot-vector policy refusal records `boot_vector: null` and a `boot_vector`
+error with the rejected address, then continues SDK/SCB/WDT metadata and CPU
+capture subject to identity/watchdog guards. Its JSON remains failed and exit
+is nonzero. Actual read/transport failures on legal words remain fatal.
+
+The pinned Nordic `lib/nrfx/mdk/nrf52840.h` register definitions establish
+WDT RUNSTATUS `0x40010400`, CONFIG `0x4001050C`, CRV `0x40010504`,
+POWER RESETREAS `0x40000400` and GPREGRET `0x4000051C`. These status reads
+neither clear reset reasons nor feed/reconfigure the watchdog. The pinned
+`nrf52840_bitfields.h` defines CONFIG.HALT at **bit 3**: clear means pause
+while debugger-halted, set means keep running. This is interpreted only from
+fresh readback, not the retained trial loader's settings. An active watchdog
+configured to run during halt, or an unrecognized RUNSTATUS, blocks a new
+halt/snapshot of an initially running or sleeping CPU; its public
+status and other completed reads remain in the explicit failure JSON.
+The pinned vendor [`main.c`](https://github.com/adafruit/Adafruit_nRF52_Bootloader/blob/c67f0bcf0fa8e841426335b1bbde91cda6ca1f50/src/main.c)
+and [`linker/nrf52840.ld`](https://github.com/adafruit/Adafruit_nRF52_Bootloader/blob/c67f0bcf0fa8e841426335b1bbde91cda6ca1f50/linker/nrf52840.ld)
+agree on `DFU_DBL_RESET_MEM`/`DBL_RESET`: **one 32-bit word at `0x20007F7C`**.
+Both retained OTA linker variants reserve the same address. Only that word
+is read; adjacent NOINIT bond-sharing memory at `0x20007F80` and every other
+RAM data address remain outside the whitelist. A magic value is reference
+boot metadata, not installed-loader proof.
+
+The **expected**, not currently measured, canonical values are MBR boot/params
+`FFFFFFFF/FFFFFFFF`, UICR boot/params `000F4000/000FE000`, and effective
+boot/params `000F4000/000FE000`. Fresh results separate these expectations from
+actual reads and timestamp all acquisitions/errors. SDK/image metadata may be
+malformed; raw public words are
+reported, never silently repaired or treated as a validated image.
+Halt/resume and enabling debug affect **volatile state and timing**, and resume
+clears volatile debug cause bits; SCB fault/status is sampled beforehand.
+Running and sleeping are both runnable states; either may be observed after
+resume (including a wake from sleep). CPU-state and C_DEBUGEN restoration
+flags are separate, and any read/write/verification error fails the workflow.
+The helper never resumes a preexisting halted CPU. Firmware can still act during ordinary execution;
+this workflow is not a proof against firmware-originated writes or hardware
+faults. Installed image identity, USB recovery, counter floor and radio
+acceptance remain blocked. Any later comparison or symbolication using a
+retained supplied ELF (e.g. `63d1ccf9…`) or raw image (`abb02642…`) is
+**reference-only**, never proof that those bytes are installed.
+
 **UF2 self-update is blocked for this layout.** The retained upstream
 0.6.1 and pinned vendor sources stage the bootloader update at
 `0xE0000..0xEA000`, inside protected ExtraFS, before copying it to the
