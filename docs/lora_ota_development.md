@@ -112,6 +112,16 @@ CRC check. Stock-only preflight honours that documented convention while
 still computing the full CRC and stable SHA; nonzero stored CRC must match.
 This does not change qualified installation or trial CRC checks.
 
+For a qualified loader, an original vendor bank with unused CRC zero is
+accepted only through a separate baseline resolver: valid SDK geometry,
+successful fresh CRC reads and a full SHA matching the app-bound original
+hash at admission, or the verified backup hash during continuation.
+Nonzero stored CRC must still match. New-image trial confirmation and
+CONFIRMED floor repair keep strict CRC equality, including genuinely
+computed zero. Rollback restores the exact original SDK28; it does not
+normalize vendor metadata. A genuinely blank target still needs durable
+initial floor creation before this transition is physically qualified.
+
 Cache slots with bad magic or CRC are ignored exactly as in the candidate
 store, without importing their owner or phase. Interrupted record-body
 writes, torn commit markers and partial metadata erases can therefore

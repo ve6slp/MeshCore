@@ -609,16 +609,23 @@ static void test_failed_retry_then_new_nonce(void) {
  * to the QSPI backup rather than blindly continuing the install. That is
  * intentional fail-closed behaviour, not a partial-copy bug: this test
  * exercises exactly that path end to end. */
-static void test_crash_mid_install_then_rollback(void) {
+static void test_crash_mid_install_then_rollback(bool sdk_crc_unused) {
   fake_io_state_t s;
   uint8_t old_hash[32];
   uint8_t candidate_hash[32];
+  uint8_t original_settings[28], restored_settings[28];
   xiao_ota_state_t state;
   const uint32_t old_size = 32768;
   const uint32_t new_size = 65536;
 
   fake_io_reset(&s);
   provision_old_image(&s, old_size, 0x33, old_hash);
+  if (sdk_crc_unused) {
+    assert(crc16_compute(s.internal_flash + XIAO_OTA_APP_START,
+                         old_size, NULL) != 0);
+    fake_io_provision_bank0_settings(&s, XIAO_OTA_BANK_VALID_APP, 0, old_size);
+  }
+  fake_io_read_settings_raw(&s, original_settings);
   write_candidate(&s, new_size, 0xCC, candidate_hash);
   build_and_write_command(&s, 7, 1, 1, new_size, candidate_hash, old_size,
                           old_hash);
@@ -637,17 +644,22 @@ static void test_crash_mid_install_then_rollback(void) {
   /* Bank-0 metadata must still show the OLD image -- the crash landed
    * strictly before write_boot_settings() could ever run. */
   assert(read_bank0_size(&s) == old_size);
+  fake_io_read_settings_raw(&s, restored_settings);
+  assert(memcmp(original_settings, restored_settings,
+                sizeof(original_settings)) == 0);
 
-  /* Power restored: disable further injection and resume. The fresh bank-0
-   * CRC recheck against the (now partially overwritten) app region fails
-   * closed immediately, so this single boot call rolls back to the
-   * verified backup and reaches FAILED without ever exposing TRIAL_BOOT. */
+  /* A nonzero SDK CRC rejects the partial candidate by CRC; an unused
+   * zero SDK CRC MUST reject it by the fresh whole-original SHA instead.
+   * Removing that SHA gate makes the zero-CRC case wrongly reach TRIAL. */
   s.crash.op = FAKE_IO_OP_NONE;
   s.crash.after = -1;
   assert(fake_io_run_boot(&s) == 0);
   assert(read_state(&s, &state));
   assert(state.phase == XIAO_OTA_PHASE_FAILED);
   assert(read_bank0_size(&s) == old_size);
+  fake_io_read_settings_raw(&s, restored_settings);
+  assert(memcmp(original_settings, restored_settings,
+                sizeof(original_settings)) == 0);
   {
     uint8_t restored_hash[32];
     sha256_of(s.internal_flash + XIAO_OTA_APP_START, old_size, restored_hash);
@@ -1610,7 +1622,7 @@ static void test_rollback_restores_settings_raw_verbatim(void) {
     xiao_ota_bank0_settings_t current;
     fake_io_read_bank0_settings(&s, &current);
     build_settings_raw(current.bank_0, current.bank_0_crc,
-                       current.bank_0_size, 0x1234u, 0x22222222u,
+                       current.bank_0_size, 0xFEu, 0x22222222u,
                        0x33333333u, 0x44444444u, 0x55555555u, custom_raw);
   }
   fake_io_write_settings_raw(&s, custom_raw);
@@ -3444,6 +3456,245 @@ static void test_stored_zero_crc_no_longer_matches_recomputed_nonzero_refuses(vo
   assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
 }
 
+static void provision_vendor_zero_crc_original(fake_io_state_t *s,
+                                                uint32_t size,
+                                                uint8_t out_hash[32]) {
+  uint8_t raw[28];
+  provision_old_image(s, size, 0x33, out_hash);
+  assert(crc16_compute(s->internal_flash + XIAO_OTA_APP_START, size, NULL) != 0);
+  fake_io_provision_bank0_settings(s, XIAO_OTA_BANK_VALID_APP, 0, size);
+  fake_io_read_settings_raw(s, raw);
+  raw[4] = 0xFF;
+  raw[5] = 0;
+  fake_io_write_settings_raw(s, raw);
+}
+
+static void test_vendor_zero_crc_original_lifecycle(bool confirm) {
+  fake_io_state_t s;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor_before, floor_after;
+  xiao_ota_bank0_settings_t settings;
+  uint8_t old_hash[32], candidate_hash[32], digest[32];
+  uint8_t original_settings[28], restored_settings[28];
+  const uint32_t old_size = 32768, candidate_size = 40960;
+
+  fake_io_reset(&s);
+  provision_vendor_zero_crc_original(&s, old_size, old_hash);
+  fake_io_read_settings_raw(&s, original_settings);
+  assert(read_floor(&s, &floor_before));
+  write_candidate(&s, candidate_size, 0x77, candidate_hash);
+  build_and_write_command(&s, 91, 1, 1, candidate_size, candidate_hash,
+                          old_size, old_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(state.previous_bank_0_crc == 0);
+  sha256_of(s.qspi + XIAO_OTA_BACKUP_BASE, old_size, digest);
+  assert(memcmp(digest, old_hash, 32) == 0);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, candidate_size, digest);
+  assert(memcmp(digest, candidate_hash, 32) == 0);
+  fake_io_read_bank0_settings(&s, &settings);
+  assert(settings.bank_0_crc != 0);
+  assert(settings.bank_0_crc == crc16_compute(
+      s.internal_flash + XIAO_OTA_APP_START, candidate_size, NULL));
+
+  if (!confirm) {
+    for (uint32_t attempt = 0; attempt < XIAO_OTA_MAX_TRIAL_BOOTS; ++attempt)
+      assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    fake_io_read_settings_raw(&s, restored_settings);
+    assert(memcmp(restored_settings, original_settings, 28) == 0);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, old_size, digest);
+    assert(memcmp(digest, old_hash, 32) == 0);
+    assert(read_floor(&s, &floor_after));
+    assert(memcmp(&floor_before, &floor_after, sizeof(floor_before)) == 0);
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    assert(s.watchdog_start_calls == XIAO_OTA_MAX_TRIAL_BOOTS);
+    build_and_write_command(&s, 92, 2, 2, candidate_size, candidate_hash,
+                            old_size, old_hash);
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+    assert(state.previous_bank_0_crc == 0);
+  }
+  write_confirmation(&s, confirm ? 91 : 92, confirm ? 1 : 2, candidate_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(read_floor(&s, &floor_after));
+  assert(floor_after.confirmed_counter_floor == (confirm ? 1u : 2u));
+  assert(floor_after.active_image_extent == candidate_size);
+  assert(memcmp(floor_after.confirmed_hash_sha256, candidate_hash, 32) == 0);
+  fake_io_read_bank0_settings(&s, &settings);
+  assert(settings.bank_0_crc == crc16_compute(
+      s.internal_flash + XIAO_OTA_APP_START, candidate_size, NULL));
+  assert(s.force_recovery_calls == 0);
+}
+
+static void test_original_baseline_rejections(void) {
+  for (unsigned test = 0; test < 13; ++test) {
+    fake_io_state_t s;
+    xiao_ota_state_t state;
+    uint8_t old_hash[32], candidate_hash[32];
+    uint8_t *internal_before = malloc(FAKE_IO_INTERNAL_SIZE);
+    uint8_t *qspi_before = malloc(FAKE_IO_QSPI_SIZE);
+    const uint32_t size = 32768;
+    assert(internal_before && qspi_before);
+    fake_io_reset(&s);
+    provision_vendor_zero_crc_original(&s, size, old_hash);
+    write_candidate(&s, size, 0x77, candidate_hash);
+    switch (test) {
+      case 0: old_hash[0] ^= 1; break;
+      case 1: fake_io_provision_bank0_settings(&s, 0xFF, 0, size); break;
+      case 2: fake_io_provision_bank0_settings(&s, 1, 0, 0); break;
+      case 3:
+        fake_io_provision_bank0_settings(&s, 1, 0, XIAO_OTA_INSTALL_MAX_SIZE + 4);
+        break;
+      case 4:
+        s.internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4] = 1;
+        break;
+      case 5:
+        memset(s.internal_flash + XIAO_OTA_APP_START, 0xFF, 8);
+        sha256_of(s.internal_flash + XIAO_OTA_APP_START, size, old_hash);
+        break;
+      case 6: {
+        uint16_t wrong = crc16_compute(
+            s.internal_flash + XIAO_OTA_APP_START, size, NULL) ^ 1u;
+        assert(wrong != 0);
+        fake_io_provision_bank0_settings(&s, 1, wrong, size);
+        break;
+      }
+      case 7:
+      case 8:
+      case 9:
+      case 10:
+        s.fail.op = FAKE_IO_OP_INTERNAL_READ;
+        s.fail.after = 1;
+        if (test == 7) {
+          s.fail.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+          s.fail.addr_hi = s.fail.addr_lo + 28;
+          s.fail.after = 2; /* Resolver read, after orphan-sidecar inspection. */
+        } else if (test == 8) {
+          s.fail.addr_lo = XIAO_OTA_APP_START;
+          s.fail.addr_hi = s.fail.addr_lo + 8;
+        } else {
+          s.fail.addr_lo = XIAO_OTA_APP_START + 256;
+          s.fail.addr_hi = s.fail.addr_lo + 256;
+          if (test == 10) s.fail.after = 2; /* SHA read after CRC succeeds. */
+        }
+        break;
+      case 11:
+        memset(s.qspi + XIAO_OTA_FLOOR_A, 0xFF,
+               2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+        break;
+      case 12:
+        s.qspi[XIAO_OTA_FLOOR_A] ^= 1;
+        break;
+    }
+    build_and_write_command(&s, 91, 1, 1, size, candidate_hash, size, old_hash);
+    memcpy(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE);
+    memcpy(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE);
+    assert(fake_io_run_boot(&s) == 0);
+    if (read_state(&s, &state))
+      fprintf(stderr, "original rejection case %u reached phase %u\n",
+              test, state.phase);
+    assert(!read_state(&s, &state));
+    assert(s.watchdog_start_calls == 0);
+    assert(memcmp(internal_before, s.internal_flash, FAKE_IO_INTERNAL_SIZE) == 0);
+    assert(memcmp(qspi_before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    free(internal_before);
+    free(qspi_before);
+  }
+}
+
+static void test_vendor_zero_crc_original_continuation(bool backup_ready,
+                                                       bool read_failure) {
+  fake_io_state_t s;
+  xiao_ota_state_t state;
+  uint8_t old_hash[32], candidate_hash[32], digest[32];
+  uint8_t original_settings[28], restored[28];
+  const uint32_t size = 32768;
+  fake_io_reset(&s);
+  provision_vendor_zero_crc_original(&s, size, old_hash);
+  fake_io_read_settings_raw(&s, original_settings);
+  write_candidate(&s, size, 0x77, candidate_hash);
+  build_and_write_command(&s, 91, 1, 1, size, candidate_hash, size, old_hash);
+  if (backup_ready) {
+    /* Second candidate hash starts after BACKUP_READY is durable. */
+    s.crash.op = FAKE_IO_OP_QSPI_READ;
+    s.crash.addr_lo = XIAO_OTA_CANDIDATE_BASE;
+    s.crash.addr_hi = s.crash.addr_lo + 256;
+    s.crash.after = 2;
+  } else {
+    /* INSTALL_COPYING is durable but no original bytes are erased yet. */
+    s.crash.op = FAKE_IO_OP_INTERNAL_ERASE;
+    s.crash.addr_lo = XIAO_OTA_APP_START;
+    s.crash.addr_hi = s.crash.addr_lo + XIAO_OTA_QSPI_SECTOR_SIZE;
+    s.crash.after = 1;
+  }
+  assert(fake_io_run_boot(&s) == 1);
+  assert(read_state(&s, &state));
+  assert(state.phase == (backup_ready ? XIAO_OTA_PHASE_BACKUP_READY
+                                     : XIAO_OTA_PHASE_INSTALL_COPYING));
+  assert(state.progress_bytes == 0);
+  s.crash.op = FAKE_IO_OP_NONE;
+  if (read_failure) {
+    s.fail.op = FAKE_IO_OP_INTERNAL_READ;
+    s.fail.addr_lo = XIAO_OTA_APP_START + 256;
+    s.fail.addr_hi = s.fail.addr_lo + 256;
+    s.fail.after = 1;
+  }
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  assert(state.phase == (read_failure ? XIAO_OTA_PHASE_FAILED
+                                     : XIAO_OTA_PHASE_TRIAL_BOOT));
+  if (read_failure) {
+    fake_io_read_settings_raw(&s, restored);
+    assert(memcmp(restored, original_settings, 28) == 0);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, size, digest);
+    assert(memcmp(digest, old_hash, 32) == 0);
+  }
+  assert(s.force_recovery_calls == 0);
+}
+
+static void test_candidate_zero_sdk_crc_mismatch_stays_strict(bool floor_repair) {
+  fake_io_state_t s;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t old_hash[32], candidate_hash[32], original_settings[28], restored[28];
+  const uint32_t size = 32768;
+  fake_io_reset(&s);
+  provision_vendor_zero_crc_original(&s, size, old_hash);
+  fake_io_read_settings_raw(&s, original_settings);
+  write_candidate(&s, size, 0x77, candidate_hash);
+  assert(crc16_compute(s.qspi + XIAO_OTA_CANDIDATE_BASE, size, NULL) != 0);
+  build_and_write_command(&s, 91, 1, 1, size, candidate_hash, size, old_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  write_confirmation(&s, 91, 1, candidate_hash);
+  if (floor_repair) {
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_CONFIRMED);
+    memset(s.qspi + XIAO_OTA_FLOOR_A, 0xFF, 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  }
+  /* Keep the exact candidate SHA, but disable the CRC as if SDK stock DFU
+   * had written it. Neither qualified confirmation nor floor repair may
+   * use the original-image SHA exception to accept this candidate. */
+  fake_io_provision_bank0_settings(&s, 1, 0, size);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &state));
+  if (floor_repair) {
+    assert(state.phase == XIAO_OTA_PHASE_CONFIRMED);
+    assert(!read_floor(&s, &floor));
+    for (uint32_t i = 0; i < 2 * XIAO_OTA_QSPI_SECTOR_SIZE; ++i)
+      assert(s.qspi[XIAO_OTA_FLOOR_A + i] == 0xFF);
+  } else {
+    assert(state.phase == XIAO_OTA_PHASE_FAILED);
+    assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 0);
+    fake_io_read_settings_raw(&s, restored);
+    assert(memcmp(restored, original_settings, 28) == 0);
+  }
+  assert(s.force_recovery_calls == 0);
+}
+
 int main(void) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
 
@@ -3463,7 +3714,8 @@ int main(void) {
   printf("torn command preserves prior confirmed record passed\n");
   test_failed_retry_then_new_nonce();
   printf("failed-retry / new-nonce passed\n");
-  test_crash_mid_install_then_rollback();
+  test_crash_mid_install_then_rollback(false);
+  test_crash_mid_install_then_rollback(true);
   printf("crash mid install / rollback passed\n");
   test_stale_confirmation_never_advances_floor();
   printf("stale confirmation never advances floor passed\n");
@@ -3582,6 +3834,16 @@ int main(void) {
   printf("signed zero-CRC candidate installs/confirms/resolves next boot passed\n");
   test_stored_zero_crc_no_longer_matches_recomputed_nonzero_refuses();
   printf("stored zero CRC no longer matches recomputed nonzero refuses passed\n");
+  test_vendor_zero_crc_original_lifecycle(true);
+  test_vendor_zero_crc_original_lifecycle(false);
+  test_original_baseline_rejections();
+  test_vendor_zero_crc_original_continuation(true, false);
+  test_vendor_zero_crc_original_continuation(false, false);
+  test_vendor_zero_crc_original_continuation(true, true);
+  test_vendor_zero_crc_original_continuation(false, true);
+  test_candidate_zero_sdk_crc_mismatch_stays_strict(false);
+  test_candidate_zero_sdk_crc_mismatch_stays_strict(true);
+  printf("vendor CRC-unused original lifecycle and strict candidate/floor guards passed\n");
 
   printf("xiao OTA boot process integration tests passed\n");
   return 0;

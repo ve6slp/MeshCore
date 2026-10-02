@@ -1709,6 +1709,48 @@ static bool active_extent_from_settings(const xiao_ota_io_t *io,
       out_extent);
 }
 
+/* Original-image admission/continuation only. SDK11's serial/BLE DFU
+ * leaves CRC checking disabled (stored CRC == 0); accepting that baseline
+ * requires the whole fresh image to match the app-stamped command snapshot
+ * or the transaction's frozen backup hash. These hashes are outside the
+ * descriptor's Ed25519 signature. Trial confirmation and floor repair
+ * must continue using the strict resolver above. */
+static bool original_extent_from_settings(const xiao_ota_io_t *io,
+                                          const uint8_t expected_hash[32],
+                                          uint32_t *out_extent) {
+  xiao_ota_settings_raw_t settings;
+  uint32_t vectors[2];
+  uint32_t extent;
+  uint16_t computed_crc;
+  uint8_t fresh_hash[32];
+  if (!settings_read_raw(io, &settings) ||
+      settings.bank_0 != XIAO_OTA_BANK_VALID_APP ||
+      settings.bank_0_size < sizeof(vectors) ||
+      settings.bank_0_size > XIAO_OTA_INSTALL_MAX_SIZE ||
+      (settings.bank_1 != 0xFEu && settings.bank_1 != 0xFFu &&
+       settings.bank_1 != UINT16_MAX)) {
+    return false;
+  }
+  /* Match the vendor's valid-bank vector check; an erased bank-1 field
+   * (0xFFFF) also cannot describe a pending SDK image. */
+  if (!io->internal_read(io->ctx, XIAO_OTA_APP_START, vectors, sizeof(vectors)) ||
+      (vectors[0] == UINT32_MAX && vectors[1] == UINT32_MAX) ||
+      !crc16_over_internal(io, XIAO_OTA_APP_START, settings.bank_0_size,
+                           &computed_crc)) {
+    return false;
+  }
+  extent = xiao_ota_safe_backup_extent(settings.bank_0_size,
+                                      XIAO_OTA_INSTALL_MAX_SIZE);
+  if (settings.bank_0_crc != 0) {
+    if (computed_crc != settings.bank_0_crc) return false;
+  } else if (!hash_internal(io, XIAO_OTA_APP_START, extent, fresh_hash) ||
+             !all_equal(fresh_hash, expected_hash)) {
+    return false;
+  }
+  *out_extent = extent;
+  return true;
+}
+
 static bool copy_internal_to_qspi(const xiao_ota_io_t *io,
                                   xiao_ota_state_t *state,
                                   xiao_ota_settings_sidecar_t *sidecar,
@@ -2103,17 +2145,12 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
   }
 
 
-  /* Always re-derive the active extent from what is actually in internal
-   * flash right now (fresh XIAO_OTA_BANK_VALID_APP + nonzero bounded size + a
-   * recomputed CRC-16 over that exact extent) -- never from
-   * floor.active_image_extent, which only reflects whatever OTA install
-   * last completed and goes stale the moment a user reflashes a different
-   * image over USB/CDC without going through this bootloader at all.
-   * Missing/invalid fresh metadata fails closed (have_active_extent=false)
-   * rather than silently substituting a guessed extent. This does not
-   * touch floor.confirmed_counter_floor, which remains the sole
-   * anti-rollback authority regardless of bank-0 state. */
-  have_active_extent = active_extent_from_settings(io, &expected_active_extent);
+  /* CONFIRMED floor repair requires strict fresh settings/CRC verification,
+   * never the original-baseline exception or the floor's stale extent.
+   * Admission and install continuation resolve their original separately
+   * below; no resolver decides whether the floor is trustworthy. */
+  have_active_extent = have_state && state.phase == XIAO_OTA_PHASE_CONFIRMED &&
+      active_extent_from_settings(io, &expected_active_extent);
   if (have_state && state.phase == XIAO_OTA_PHASE_CONFIRMED && have_active_extent &&
       (!floor_trustworthy || !have_floor ||
        floor.confirmed_counter_floor < state.candidate_counter)) {
@@ -2210,7 +2247,9 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
      * from an unverified assumption. */
   }
   if (xiao_ota_command_acceptable_phase(have_state, (xiao_ota_phase_t)state.phase)) {
-    if (!floor_trustworthy || !have_active_extent ||
+    if (!floor_trustworthy ||
+        !original_extent_from_settings(io, intent.active_image_hash_sha256,
+                                        &expected_active_extent) ||
         !command_policy_valid(io, &command, floor.confirmed_counter_floor,
                               expected_active_extent, &intent)) {
       return;
@@ -2336,11 +2375,12 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
   }
   if (state.phase == XIAO_OTA_PHASE_BACKUP_READY ||
       state.phase == XIAO_OTA_PHASE_INSTALL_COPYING) {
-    /* have_active_extent is re-checked explicitly (not just relying on the
-     * expected_active_extent==0 default) so a bank-0 metadata failure mid-
-     * transaction always rolls back, defense-in-depth alongside the
-     * initial acceptance gate above. */
-    if (!floor_trustworthy || !have_active_extent ||
+    /* Re-read the original now, including its whole SHA when SDK CRC
+     * checking was disabled. A partial candidate after an INSTALL_COPYING
+     * power cut must roll back, never pass as the old zero-CRC baseline. */
+    if (!floor_trustworthy ||
+        !original_extent_from_settings(io, state.backup_hash_sha256,
+                                        &expected_active_extent) ||
         !command_policy_valid(io, &command, floor.confirmed_counter_floor,
                               expected_active_extent, &intent) ||
         intent.transaction_nonce != state.transaction_nonce ||
