@@ -18,6 +18,8 @@ OTA_NRF52_TARGET_ENVS ?= Xiao_nrf52_companion_radio_usb SenseCap_Solar_companion
 XIAO_NRF52_CLIENT_ENV ?= Xiao_nrf52_companion_radio_usb
 XIAO_NRF52_TARGET_ENV ?= Xiao_nrf52_repeater_ota_usb
 XIAO_NRF52_LAB_ENVS ?= $(XIAO_NRF52_CLIENT_ENV) $(XIAO_NRF52_TARGET_ENV)
+XIAO_NRF52_CANDIDATE_ENV ?= Xiao_nrf52_repeater_ota_usb_candidate
+XIAO_OTA_LAB_VERSION ?=
 
 # Lab boards are addressed by role, never by ttyACMn. scripts/lab_device.py
 # resolves a role to the current stable /dev/serial/by-id path using the
@@ -130,7 +132,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         lab-wait-client lab-wait-target \
         build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets build-ota-baseline-targets build-non-ota-targets \
         inspect-xiao-s3-ota-bootloader \
-        clean-xiao-nrf52-lab build-xiao-nrf52-lab build-xiao-nrf52-ota-lab upload-xiao-nrf52-client upload-xiao-nrf52-target upload-xiao-nrf52-lab \
+        clean-xiao-nrf52-lab build-xiao-nrf52-lab build-xiao-nrf52-ota-lab build-xiao-nrf52-ota-candidate upload-xiao-nrf52-client upload-xiao-nrf52-target upload-xiao-nrf52-lab \
         flash-xiao-nrf52-client flash-xiao-nrf52-target flash-xiao-nrf52-lab \
         enter-xiao-nrf52-target-bootloader \
         install-xiao-nrf52-target-ota-bootloader flash-xiao-nrf52-target-ota-bootloader \
@@ -304,6 +306,12 @@ build-xiao-nrf52-ota-lab: tmpdir
 	  echo "==> building $$env (OTA enabled)"; \
 	  $(PLATFORMIO) run -e $$env || exit 1; \
 	done
+
+## Build distinct bench firmware without replacing inherited board or OTA flags.
+build-xiao-nrf52-ota-candidate: tmpdir
+	@test -n "$(XIAO_OTA_LAB_VERSION)" || \
+	  { echo "Set XIAO_OTA_LAB_VERSION to an explicit candidate label (1..19 ASCII letters/digits/._-)." >&2; exit 1; }
+	XIAO_OTA_LAB_VERSION="$(XIAO_OTA_LAB_VERSION)" $(PLATFORMIO) run -e "$(XIAO_NRF52_CANDIDATE_ENV)"
 
 ## Flash the companion client and repeater target. Both variants of the fragile
 ## PlatformIO upload path (app port and bootloader port) collapse into one

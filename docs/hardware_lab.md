@@ -222,6 +222,25 @@ completed commissioning and the companion's existing administrator
 permission on the target. They do not install a bootloader, grant
 permissions, reset a board or bypass a conflicting candidate.
 
+The OTA candidate must differ from the currently running bootstrap image.
+A matching post-install hash is not replacement proof if those bytes were
+already installed. Build a labelled bench candidate through the dedicated
+profile, which inherits the existing role-1 OTA configuration and appends
+only the guarded firmware-version definition:
+
+```sh
+make build-xiao-nrf52-ota-candidate XIAO_OTA_LAB_VERSION=ota-direct-001 \
+  PLATFORMIO_BUILD_DIR="$PWD/.tmp/ota-direct-001"
+```
+
+Labels must start with a letter or digit and contain only 1--19 ASCII
+letters, digits, dots, underscores or hyphens. Normal firmware defaults
+remain unchanged. Preserve the resulting role-specific `firmware.zip`,
+extract its application using `make ota-lab-image` and compare its SHA-256
+with the retained bootstrap image before creating the manifest. Record
+the exact source tree and label with the immutable artifact inventory.
+Do not replace inherited flags with `PLATFORMIO_BUILD_FLAGS`.
+
 Select the expected BIN hash from the immutable artifact inventory and a
 planned counter above the observed floor. Each invocation needs a new
 artifact directory. For example, with the shell variables below set to
