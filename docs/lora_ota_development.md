@@ -94,6 +94,17 @@ only the six OTA application profiles add its sources and C++17 explicitly.
 It does not substitute the ESP32-S3 profile for the XIAO nRF52840 companion
 or qualify custom-loader installation.
 
+A healthy stock-loader nRF uploader can retain ordinary MeshCore settings,
+contacts and filesystem writes while caching an image for another device.
+Before filesystem mounting, this requires a blank custom-loader marker,
+fresh stable SDK bank, CRC and image-hash evidence, no pending bank, a fully
+erased install journal, and empty or authenticated local-cache metadata.
+Backend attachment rechecks the proof. This permits ordinary writes, not
+filesystem formatting or identity replacement; the device remains cache-only
+and cannot install an image. Trial, unknown, corrupt and unreadable contexts
+retain the write guard. A failed stock-cache attachment reports
+`CACHE_UNAVAILABLE` with its reason instead of silently enabling installation.
+
 `build-ota-esp32-targets` builds `Xiao_S3_WIO_companion_radio_usb` and
 `Xiao_S3_WIO_repeater_ota_usb`. The new repeater profile inherits the
 ordinary repeater's configuration and dependencies, adding the OTA flag,

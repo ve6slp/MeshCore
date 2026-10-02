@@ -159,9 +159,9 @@ void setup() {
   // migration storage -- see otaBoardEarlyBootTrialOrUnknown()'s doc
   // comment. Only a genuinely qualified board whose persisted OTA state
   // record carries POSITIVE, already-bootloader-verified CONFIRMED
-  // evidence AND a real fresh baseline proof (not currently wired --
-  // see resolveOtaBoardStartupDecision()) reports false (allow); every
-  // other case -- unqualified device, no install history,
+  // evidence AND a real fresh baseline proof, or a stock board proves a
+  // fresh valid SDK/image and no install intent, reports false (allow).
+  // Other cases -- unproven stock device, no qualified install history,
   // active/ambiguous/failed trial, CONFIRMED-without-fresh-proof, or an
   // OTA=1 build with no board-specific backend linked at all -- reports
   // true (block) -- "not currently mid-trial" is NOT the same as

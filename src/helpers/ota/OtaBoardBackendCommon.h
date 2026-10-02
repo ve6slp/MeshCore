@@ -551,8 +551,8 @@ private:
 // authority is wired in (a separate owner's responsibility), this
 // function NEVER produces Normal: a genuinely blank/erased marker
 // (`BlankUncertifiedStock`) is an uncertified stock board and stays
-// Unknown -- read-only local maintenance for this whole boot, honestly
-// reported, never a fabricated permissive default. `Qualified` means a
+// Unknown -- never installation authority. Ordinary stock writes need the
+// separate fresh SDK/image and no-install-intent proof below. `Qualified` means a
 // valid, fully-matching marker is present (trial-boot concept applies;
 // consult the confirmer). `Unknown` also covers every other case -- a
 // non-blank record that fails validation (corruption/torn write), OR a
@@ -608,13 +608,9 @@ inline OtaBoardBootQualification resolveOtaBoardBootQualificationFromRecordStatu
   if (record_status == ::ota::storage::XiaoOtaBootInfoReader::RecordStatus::Blank) {
     // Genuinely blank/erased marker: an uncertified stock/never-flashed
     // board. NOT, by itself, sufficient for a positive Normal
-    // classification -- see OtaBoardQualificationStatus's doc comment
-    // Normal requires a
-    // separately signed CertifyExistingBaseline record, which no call
-    // site constructs/verifies yet. Stays Unknown: read-only local
-    // maintenance for this whole boot (never the bounded trial/reboot
-    // machinery -- that only ever activates via the Qualified branch
-    // below).
+    // classification. Stock ordinary-write permission is a separate
+    // runtime proof, never a Normal marker or install qualification.
+    // Trial/reboot machinery only activates through Qualified below.
     result.status = OtaBoardQualificationStatus::Unknown;
     result.reason = OtaBoardQualificationReason::BlankUncertifiedStock;
     return result;
@@ -643,6 +639,117 @@ inline OtaBoardBootQualification resolveOtaBoardBootQualificationFromRecordStatu
   result.info = info;
   return result;
 }
+
+// Ordinary stock-app writes are not installation, formatting or identity-generation authority.
+class OtaBoardStockBootPreflight {
+public:
+  enum class Result { Healthy, NotStock, InvalidRunning, InstallJournalPresent, InvalidCache, IoError, Changed };
+
+  static Result check(const OtaBoardBootQualification& qualification, const IOtaNrf52RunningContext& running,
+                      ::ota::platform::FlashRegion& journal, ::ota::platform::FlashRegion& cache_records,
+                      const ::ota::trust::SignatureVerifier& signatures) {
+    if (qualification.status != OtaBoardQualificationStatus::Unknown || qualification.qualified ||
+        qualification.reason != OtaBoardQualificationReason::BlankUncertifiedStock) return Result::NotStock;
+    OtaNrf52RunningContext before, after;
+    if (!running.read(before)) return Result::IoError;
+    const auto bank = ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(before.settings);
+    const uint16_t bank1 = uint16_t(before.settings[4]) | (uint16_t(before.settings[5]) << 8);
+    if (!before.settingsTailErased || (bank1 != 0xfe && bank1 != 0xff)) return Result::InvalidRunning;
+    const auto current = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(bank, before.image, before.capacity);
+    if (!current.active_image_extent) return Result::InvalidRunning;
+    uint8_t digest[32], rechecked[32];
+    auto result = inspect(journal, cache_records, signatures, digest);
+    if (result != Result::Healthy) return result;
+    if (!running.read(after)) return Result::IoError;
+    const auto current_after = ::ota::storage::XiaoOtaActiveExtentBridge::resolve(
+        ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(after.settings), after.image, after.capacity);
+    if (memcmp(before.settings, after.settings, sizeof(before.settings)) || before.image != after.image ||
+        before.capacity != after.capacity || before.settingsTailErased != after.settingsTailErased ||
+        current_after.active_image_extent != current.active_image_extent ||
+        memcmp(current_after.active_image_hash_sha256, current.active_image_hash_sha256, 32)) return Result::Changed;
+    result = inspect(journal, cache_records, signatures, rechecked);
+    if (result != Result::Healthy) return result;
+    return memcmp(digest, rechecked, sizeof(digest)) ? Result::Changed : Result::Healthy;
+  }
+
+  static const char* reason(Result result) {
+    switch (result) {
+      case Result::Healthy: return "verified stock boot";
+      case Result::NotStock: return "stock marker unproven";
+      case Result::InvalidRunning: return "stock SDK/image unproven";
+      case Result::InstallJournalPresent: return "install journal present";
+      case Result::InvalidCache: return "cache metadata unproven";
+      case Result::IoError: return "stock preflight read error";
+      case Result::Changed: return "stock proof changed";
+    }
+    return "stock proof unavailable";
+  }
+
+private:
+  using Store = ::ota::storage::OtaCandidateStore;
+  static uint32_t le32(const uint8_t* bytes) {
+    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) | (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+  }
+  static bool blank(const uint8_t* bytes, size_t count) {
+    for (size_t i = 0; i < count; ++i) if (bytes[i] != 0xff) return false;
+    return true;
+  }
+  static Result inspect(::ota::platform::FlashRegion& journal, ::ota::platform::FlashRegion& records,
+                        const ::ota::trust::SignatureVerifier& signatures, uint8_t digest[32]) {
+    if (!journal.isValid() || journal.sizeBytes() != 4 * Store::kExpectedRegionBytes ||
+        journal.eraseUnitBytes() != Store::kSectorBytes || !records.isValid() ||
+        records.sizeBytes() != Store::kExpectedRegionBytes || records.eraseUnitBytes() != Store::kSectorBytes)
+      return Result::IoError;
+    ::ota::trust::Sha256 hash;
+    uint8_t bytes[Store::kRecordBytes];
+    for (uint32_t offset = 0; offset < journal.sizeBytes(); offset += sizeof(bytes)) {
+      if (!::ota::platform::isOk(journal.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
+      if (!blank(bytes, sizeof(bytes))) return Result::InstallJournalPresent;
+      hash.update(bytes, sizeof(bytes));
+    }
+    bool found_cache = false, found_blank = false;
+    uint32_t sequence = 0, total_blocks = 0, received = 0;
+    uint8_t latest_phase = 0;
+    for (uint32_t offset = 0; offset < Store::kSectorBytes; offset += sizeof(bytes)) {
+      if (!::ota::platform::isOk(records.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
+      hash.update(bytes, sizeof(bytes));
+      if (blank(bytes, sizeof(bytes))) { found_blank = true; continue; }
+      const uint8_t phase = bytes[12] & 0x7f;
+      if (found_blank || le32(bytes) != Store::kMagic || bytes[4] != Store::kVersion || bytes[5] ||
+          bytes[6] != (Store::kRecordBytes & 0xff) || bytes[7] != (Store::kRecordBytes >> 8) ||
+          !(bytes[12] & 0x80) || phase > uint8_t(Store::Phase::Failed) || phase == uint8_t(Store::Phase::Committed) ||
+          le32(bytes + 8) <= sequence || le32(bytes + 188) != Store::kCommitMarker ||
+          le32(bytes + 184) != ::ota::storage::Crc32::computeFinalized(bytes, 184) ||
+          !blank(bytes + 192, sizeof(bytes) - 192)) return Result::InvalidCache;
+      meshcore::ota::protocol::OtaDescriptor descriptor;
+      if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(bytes + 29, 59, descriptor) !=
+              meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
+          !descriptor.exactSizeBytes || descriptor.exactSizeBytes > meshcore::ota::runtime::kOtaMaxImageBytes ||
+          descriptor.formatId != 1 || descriptor.algorithmId != 1 || !descriptor.keyId || !descriptor.appAddress ||
+          le32(bytes + 15) != descriptor.exactSizeBytes ||
+          (uint16_t(bytes[13]) | (uint16_t(bytes[14]) << 8)) !=
+              (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes ||
+          !signatures.verify(bytes + 120, 64, bytes + 29, 59, bytes + 88, 32)) return Result::InvalidCache;
+      sequence = le32(bytes + 8);
+      total_blocks = uint16_t(bytes[13]) | (uint16_t(bytes[14]) << 8);
+      latest_phase = phase;
+      found_cache = true;
+    }
+    for (uint32_t offset = Store::kBitmapSectorOffset; offset < records.sizeBytes(); offset += sizeof(bytes)) {
+      if (!::ota::platform::isOk(records.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
+      hash.update(bytes, sizeof(bytes));
+      for (uint32_t i = 0; i < sizeof(bytes); ++i) for (uint8_t bit = 0; bit < 8; ++bit) {
+        if (bytes[i] & (1u << bit)) continue;
+        if ((offset - Store::kBitmapSectorOffset + i) * 8 + bit >= total_blocks) return Result::InvalidCache;
+        ++received;
+      }
+    }
+    if (found_cache && (latest_phase == uint8_t(Store::Phase::Verifying) || latest_phase == uint8_t(Store::Phase::Ready)) &&
+        received != total_blocks) return Result::InvalidCache;
+    hash.finish(digest);
+    return Result::Healthy;
+  }
+};
 
 // Fail-closed boot-marker qualification check, shared by both backends.
 // Only a struct that passes XiaoOtaBootInfoReader's magic/format/CRC

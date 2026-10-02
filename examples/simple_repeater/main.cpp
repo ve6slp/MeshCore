@@ -94,8 +94,8 @@ void setup() {
 #if MESHCORE_LORA_OTA
   // Same contract as examples/companion_radio/main.cpp: "not currently
   // mid-trial" is NOT the same as "positively proven safe" -- every case
-  // except a genuinely qualified, bootloader-CONFIRMED board reports
-  // true (block destructive identity/filesystem writes for this boot).
+  // except a positively verified stock boot or genuine qualified
+  // baseline reports true (block ordinary filesystem writes this boot).
   const bool ota_allow_destructive_boot_writes = !otaBoardEarlyBootTrialOrUnknown();
   if (!ota_allow_destructive_boot_writes) {
     // Same policy MyMesh's own identity-generation path below already
@@ -174,7 +174,12 @@ void setup() {
     // generation, zero writes, self_id left unset, degraded-dispatch-
     // only) instead of inventing a second decision path or promoting
     // millis-seeded entropy into an identity.
+#if MESHCORE_LORA_OTA
+    // A verified stock boot permits ordinary writes, not replacement of an unreadable identity.
+    const bool identity_generation_safe = false;
+#else
     const bool identity_generation_safe = ota_allow_destructive_boot_writes && radio_ok;
+#endif
     const ota_identity_boot::Outcome identity_outcome = ota_identity_boot::resolveIdentityTrialSafe(
         identity_generation_safe,
         [](){ return false; },  // load_fn: already known-failed above, never re-invoked.

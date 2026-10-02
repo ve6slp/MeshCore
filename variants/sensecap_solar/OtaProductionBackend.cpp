@@ -117,6 +117,7 @@ ota::platform::FlashRegion xiao_command_region =
     ota::platform::SenseCapQspiLayout::xiaoCommandRegion(flash);
 ota::platform::FlashRegion xiao_state_region = ota::platform::SenseCapQspiLayout::xiaoStateRegion(flash);
 ota::platform::FlashRegion xiao_confirm_region = ota::platform::SenseCapQspiLayout::xiaoConfirmRegion(flash);
+ota::platform::FlashRegion xiao_journal_full_region = ota::platform::SenseCapQspiLayout::xiaoJournalFullRegion(flash);
 ota::platform::FlashRegion candidate_record_scratch_region =
     ota::platform::SenseCapQspiLayout::candidateRecordScratchRegion(flash);
 mesh::ota::OtaBoardFailClosedMonotonicCounter counter(xiao_floor_region);
@@ -157,8 +158,16 @@ bool g_backend_qualified_and_bank0_valid = false;
 // True whenever a genuinely qualified custom-bootloader marker is
 // present, REGARDLESS of bank0/floor validity -- see the identical
 // comment in variants/xiao_nrf52/OtaLabBackend.cpp. Health-tick
-// eligibility and erase-admission blocking depend only on this flag.
+// eligibility depends on this flag; stock cache writes require a separate boot proof.
 bool g_qualified = false;
+mesh::ota::OtaBoardStockBootPreflight::Result g_stock_boot_result =
+    mesh::ota::OtaBoardStockBootPreflight::Result::NotStock;
+bool stockBootOrdinaryWritesAllowed(const mesh::ota::OtaBoardBootQualification& qualification) {
+  mesh::ota::OtaBoardNrf52RunningContext running;
+  g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::check(
+      qualification, running, xiao_journal_full_region, candidate_record_scratch_region, signature_verifier);
+  return g_stock_boot_result == mesh::ota::OtaBoardStockBootPreflight::Result::Healthy;
+}
 mesh::ota::OtaBoardBootLifecycleObserver& bootLifecycleObserver() {
   static mesh::ota::OtaBoardBootLifecycleObserver observer(xiao_state_region, xiao_floor_region);
   return observer;
@@ -209,7 +218,7 @@ mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(uint32_
 // health window is in progress/unresolved). See the identical comment in
 // variants/xiao_nrf52/OtaLabBackend.cpp.
 bool otaBoardTrialHealthWindowActive() {
-  if (!g_qualified) return false;
+  if (!g_qualified) return g_stock_boot_result != mesh::ota::OtaBoardStockBootPreflight::Result::Healthy;
   if (trial_boot_confirmer_ptr == nullptr) return true;
   return trial_boot_confirmer_ptr->isTrialActive();
 }
@@ -217,29 +226,18 @@ bool otaBoardTrialHealthWindowActive() {
 // Genuine earliest-boot-phase preflight -- see the identical comment in
 // variants/xiao_nrf52/OtaLabBackend.cpp and MyMesh.cpp's weak default.
 bool otaBoardEarlyBootTrialOrUnknown() {
+  g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::Result::IoError;
   if (!ota::platform::SenseCapQspiLayout::isValid() || !ota::platform::isOk(flash.begin())) {
     // Cannot even read the OTA state region -- genuinely UNKNOWN (a real
     // flash/IO failure, not a positive "no trial concept" observation).
     // Fail closed: block destructive writes rather than allow them.
     return true;
   }
+  const uint8_t* jedec = flash.jedecId();
+  if (jedec[0] != 0x85 || jedec[1] != 0x60 || jedec[2] != 0x15) return true;
   const mesh::ota::OtaBoardBootQualification qualification = mesh::ota::resolveOtaBoardBootQualification(
       kExpectedBoardTargetId, kExpectedRoleId, kExpectedCapabilityFlags);
-  if (qualification.status == mesh::ota::OtaBoardQualificationStatus::Normal) {
-    // Reserved for a FUTURE, separately signed CertifyExistingBaseline
-    // authority -- NOT reachable
-    // today: resolveOtaBoardBootQualification() never produces Normal
-    // from a blank/missing marker alone anymore. Left in place so a
-    // future owner wiring that authority in doesn't also have to touch
-    // this call site.
-    return false;
-  }
-  if (qualification.status == mesh::ota::OtaBoardQualificationStatus::Unknown) {
-    // Corrupt marker, or a validly-formed marker that doesn't match this
-    // build's expected board/role/capability/algorithm -- ambiguous, must
-    // never be treated the same as genuine stock/factory. Fail closed.
-    return true;
-  }
+  if (!qualification.qualified) return !stockBootOrdinaryWritesAllowed(qualification);
   g_qualified = true;
   if (trial_boot_confirmer_ptr == nullptr) {
     static mesh::ota::OtaBoardTrialBootHealthConfirmer real_confirmer(xiao_state_region, xiao_confirm_region,
@@ -268,6 +266,7 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   // the single fully-qualified INSTALL_CAPABLE path below.
   g_backend_qualified_and_bank0_valid = false;
   g_qualified = false;
+  g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::Result::IoError;
   install_provider_v3 = nullptr;
   g_active_guarded_staging = nullptr;
   if (!ota::platform::SenseCapQspiLayout::isValid() ||
@@ -313,7 +312,12 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
       running_context, g_qualified, kExpectedBoardTargetId, kExpectedRoleId);
   integration.attachUnadmittedAbort(&recovery, &mesh::ota::OtaBoardUnadmittedCommandRecovery::invoke);
   if (!qualification.qualified) {
-    return attach_cache_only("CACHE_ONLY: no qualified custom boot detected (production)");
+    const bool stock_healthy = stockBootOrdinaryWritesAllowed(qualification);
+    snprintf(g_install_capability_status, sizeof(g_install_capability_status), "%s: %s",
+             stock_healthy ? "CACHE_ONLY" : "CACHE_UNAVAILABLE",
+             mesh::ota::OtaBoardStockBootPreflight::reason(g_stock_boot_result));
+    g_install_capability_reason = g_install_capability_status;
+    return stock_healthy && cache_backend.attach(integration, signature_verifier);
   }
   g_qualified = true;
   // Construct the confirmer NOW -- lazily, exactly once (static local),
