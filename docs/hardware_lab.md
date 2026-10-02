@@ -543,6 +543,16 @@ and complete the board and artifact checks before using the guarded
 installer. Successful UF2 entry alone proves neither package compatibility
 nor an installed recovery loader.
 
+The approved target passed this address and UF2-entry sequence on
+Oct. 2, 2026, using the reviewed `47b40e59` bench application. Its current
+volume reports Board-ID `Seeed_XIAO_nRF52840_Sense` and USB identity
+`2886:0045`, not the base package's CF2 identity `2886:0044`.
+The virtual `CURRENT.UF2` does not expose the bootloader region, so it
+cannot establish the current CF2 contents. Keep that distinction:
+current public identity can qualify a matching vendor board profile,
+but an old archive cannot serve as a fresh CF2 readback. No qualified
+loader has been written; the volume remains mounted read-only.
+
 The reviewed factory-initialization loader can create the initial durable
 floor only with verified flash, healthy vendor boot evidence and all eight
 journal sectors erased. It does not erase existing history. After the first

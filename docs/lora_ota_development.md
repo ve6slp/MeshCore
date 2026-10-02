@@ -668,14 +668,30 @@ without mass storage in the mode selected by the 1200-baud helper.
 Vendor and Arduino source inspection established that the helper requests
 serial-only DFU; the loader deliberately hides MSC in that mode. The
 separate vendor UF2 API and physical double-reset entry must not be
-confused with that application-flash path. Current MBR/UICR addresses,
-UF2 Board-ID and CF2 compatibility remain unproven; historical archive
-metadata cannot substitute for fresh observations.
+confused with that application-flash path. Historical archive metadata
+cannot substitute for fresh observations.
 The bench-only USB adapter and `make lab-bootloader-uf2-target` use the
 existing vendor API rather than a parallel updater. The paired read-only
-address gate and host application-to-bootloader mass-storage check remain
-software safeguards until exercised on the approved target; they do not
-close the physical compatibility or commissioning gates.
+address gate and host application-to-bootloader mass-storage check qualify
+only those observed conditions, not an installed recovery loader.
+The reviewed `47b40e59` bench application was subsequently flashed to
+the target only. At `10:33:47Z`, fresh metadata showed erased flash
+address words, UICR boot address `000F4000`, parameter address `000FE000`
+and matching effective addresses, with healthy stock boot and ordinary
+writes allowed. At `10:33:49Z`, read-only configuration inspection
+confirmed both identities, names, 907.525 MHz/250 kHz/SF7/CR5 preferences,
+path modes and the complete target ACL unchanged, without setters.
+The guarded vendor UF2 entry then passed on the actual target, including
+USB disappearance and bootloader re-enumeration with mass storage.
+The serial-matched volume reported current Board-ID
+`Seeed_XIAO_nRF52840_Sense` and USB identity `2886:0045`; it was mounted
+read-only. These observations rule out commissioning the preserved
+base-board package with CF2 USB identity `2886:0044`.
+The volume's virtual `CURRENT.UF2` excludes the bootloader region, so it
+does not provide a current CF2 readback. No plaintext firmware was copied,
+and historical CF2 evidence remains historical. A genuine Sense-profile
+package must match the current public board and USB identities before
+installation; a string change or relaxed Board-ID check is not a fix.
 The target's qualified custom loader is not installed, and no
 replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and
