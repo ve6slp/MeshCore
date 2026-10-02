@@ -251,6 +251,41 @@ companion does not install it there. One working radio cannot qualify radio
 OTA, remote READY/install, rollback, duty-cycle accounting or multi-peer
 delivery; those outcomes remain blocked until the approved target is available.
 
+**Actual working-client validation, Oct. 2, 2026:** application-only stock DFU
+completed with the exact `Device programmed.` acknowledgement and application
+USB re-enumeration. The immutable companion ZIP SHA256 is
+`13bbf70d41d3966a7f43510543a5a21be43db52d019c18b79f8364b5546da629`;
+its validated application is 547,828 bytes. Fresh before/after inspection
+preserved the public key, name, 907525 kHz / 250000 Hz / SF7 / CR5 preferences
+and path-hash mode 2. Early proof remained healthy with SDK size 547828,
+CRC `0000/9815`, allowed writes and **CACHE_ONLY**. This is not independent
+bootloader-byte readback or installation qualification.
+
+At `19:58:57Z`, the client's existing identity signed and sealed the full
+537,816-byte receiver candidate: counter 1, 6,403/6,403 durable blocks,
+canonical manifest hash
+`8eeecabdcd7bf8a42b955e32bde9c62476a32b3cc75a368fd5deb71c10e9e741`.
+An ordinary application reboot retained the same sealed snapshot at
+`20:00:40Z`, with unchanged captured settings and healthy stock proof.
+
+The initial duplicate attempt exposed a host bug: accepted sealed BEGIN
+was followed by PUT, which the device correctly refused without losing the
+cache. The host-only correction in `10a31cca` retains signing and BEGIN,
+then requires fresh matching local STATUS instead of writing a sealed image.
+The corrected hardware retry passed at `20:07:24Z`; its transcript contains
+no PUT or SEAL. Explicit image-bound local ABORT then returned **ABORTED**,
+confirmed independently at `20:07:47Z`. The retained block counts describe
+an aborted snapshot, not physical erasure or an installed image.
+
+Final readbacks at `20:08:21Z` showed unchanged captured settings, healthy
+allowed writes / CACHE_ONLY, zero reported radio faults or apply failures,
+and zero reported OTA airtime/TX/timeouts/accounting failures. No START,
+ADD_TARGET, COMMIT or administrative request was sent. No bootloader,
+SoftDevice, MBR or UICR update was requested, and neither Pine nor the failed
+target was opened. Full serial evidence is retained privately under
+`review-candidates/working-client-app83-final-evidence/`; the radio,
+installation, rollback and full-window duty outcomes above remain unverified.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
