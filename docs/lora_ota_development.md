@@ -633,9 +633,17 @@ The inspection used no setters or fallback grant. Its evidence retains
 `reboot_persistence_verified: false` because the inspection does not itself
 reboot a device; persistence follows from comparison with the separately
 recorded commissioning and reboot operations.
-Fresh peer reception on this profile remains unverified. The target's
-qualified custom loader is not installed, and no replacement-protocol
-radio OTA installation has been demonstrated.
+At `07:27:09Z`, the bounded ordinary-peer probe passed on this profile:
+two advert requests produced a native companion notification for the actual
+target in 4.194 seconds, with an independently signature-verified raw
+MeshCore advert. Complete before/after reads preserved both identities,
+names, radio preferences, both observed path modes and the target ACL.
+Packet/radio counters were diagnostics, not the success witness. This
+establishes only target-to-client ordinary reception; the two earlier
+timeouts remain failures, and neither bidirectional nor OTA operation is
+implied. Application recovery integration still awaits production-C to
+C++ rollback proof. The target's qualified custom loader is not installed,
+and no replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and
 destructive shared-domain power-cut qualification remains deferred.
 

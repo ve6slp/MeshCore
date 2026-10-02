@@ -184,6 +184,35 @@ assumptions. `make test-xiao-nrf52-ota-lab` continues to refuse
 qualification before opening either port: paired configuration and mocked
 host tests are not an end-to-end OTA result.
 
+### Ordinary peer reception
+
+After configuration and normal reboot, request a fresh ordinary radio advert
+without starting an OTA campaign:
+
+```sh
+make qualify-xiao-nrf52-normal-peer \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/normal-peer-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+This explicitly transmits the target's normal zero-hop advert. It requires
+matching approved radio preferences, the client's three-byte path setting
+and the existing administrator ACL, then records radio arrival after the
+request, bound to the target's full public key. It prefers native companion
+advert notifications. A raw receive is accepted only after decoding the
+ordinary advert and verifying its existing MeshCore Ed25519 signature.
+Evidence distinguishes host verification from observed companion acceptance;
+it does not establish fresh emission or replay resistance. A stale contact,
+transmit ACK, unsigned raw key or unrelated peer is not success.
+The probe rereads settings and the full
+ACL without correcting them and records whether target path preferences were
+exposed by the readback. It works before custom-loader commissioning and
+never starts an image operation, grants permission or resets a board. Its result is only
+target-to-client ordinary reception, not bidirectional, routed or OTA proof.
+It requests at most three adverts, at least two seconds apart after each ACK,
+within the same deadline. Normal packet/radio counters are diagnostic only,
+never peer proof. Use a new evidence directory; the whole probe has a
+30-second bound.
+
 ### Signed full-image qualification
 
 `qualify-xiao-nrf52-signed-stage` and
@@ -362,7 +391,15 @@ After the six-second save opportunity and normal protocol reboots of both
 boards, read-only inspection at `06:25:47Z` confirmed the same identities,
 names, radio preferences, client path mode and complete target ACL.
 It issued no setters or replacement grant. This establishes persistence
-across those reboots, not fresh on-air peer reception or OTA installation.
+across those reboots, not by itself on-air peer reception or OTA installation.
+At `07:27:09Z`, the bounded ordinary-advert probe passed on the same
+profile after two requests: the companion produced the target's native
+advert notification in 4.194 seconds, and host verification independently
+validated the received advert's existing MeshCore signature. Both identities,
+names, radio/path preferences and the complete target ACL were unchanged
+afterward. This proves target-to-client ordinary reception only. The two
+earlier probe timeouts remain failed runs, not retrospectively passed
+qualifications.
 No qualified target-loader installation, radio OTA transfer, READY,
 COMMIT, installation or rollback has been performed with these applications.
 

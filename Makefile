@@ -136,7 +136,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client grant-xiao-nrf52-ota-client-admin inspect-xiao-nrf52-ota-preflight inspect-xiao-nrf52-ota-configuration \
         monitor-xiao-nrf52-ota-lab monitor-xiao-nrf52-ota-client test-xiao-nrf52-ota-lab \
         ota-lab-image ota-lab-manifest ota-lab-upload ota-lab-status ota-lab-commit ota-lab-abort ota-lab-abort-cache ota-lab-admin \
-        qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
+        qualify-xiao-nrf52-normal-peer qualify-xiao-nrf52-signed-stage qualify-xiao-nrf52-signed-commit \
         build-xiao-nrf52-qspi-test upload-xiao-nrf52-qspi-test \
         run-xiao-nrf52-qspi-test validate-xiao-nrf52-qspi-hardware \
         build-xiao-nrf52-archive generate-ota-lab-archive-key \
@@ -412,6 +412,10 @@ ota-lab-abort-cache: tmpdir
 
 ota-lab-admin: tmpdir
 	$(OTA_UPLOAD_COMMAND) admin --target "$(OTA_UPLOAD_TARGET)" --enabled "$(OTA_UPLOAD_ADMIN_ENABLED)"
+
+qualify-xiao-nrf52-normal-peer: tmpdir
+	python3 scripts/ota_signed_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" \
+	  --timeout "$(OTA_SIGNED_LAB_TIMEOUT)" probe-peer --probe-timeout 30
 
 qualify-xiao-nrf52-signed-stage: tmpdir
 	python3 scripts/ota_signed_lab.py --artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" \

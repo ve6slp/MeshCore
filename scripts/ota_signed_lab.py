@@ -1,6 +1,40 @@
 #!/usr/bin/env python3
 """Signed, single-target HOST HARDWARE campaign; stage never auto-commits.
 
+probe-peer is a separate, explicit ordinary RF test, usable on stock firmware:
+
+    python3 scripts/ota_signed_lab.py --artifact-dir .tmp/new-normal-peer \
+      probe-peer --probe-timeout 30
+
+It reads approved-role identities/settings/ACL, drains pre-request serial
+events, requests the target's ordinary zero-hop advert and requires a fresh
+native advert push or signature-verified raw advert bound to the actual full
+target public key. It repeats
+the configuration/ACL readbacks and writes normal-peer.json. This is NOT
+read-only: an ordinary RF advert is explicitly requested. It never queries OTA
+status/floor, signs/caches an image, grants permissions, aborts, commits or
+reboots. The result proves only target-to-client ordinary peer reception,
+not bidirectional, multihop, airtime fairness or signed OTA qualification.
+Client path mode 2 is required; target path mode is not a prerequisite and is
+not claimed observed when absent from the existing target inspection API.
+The normal APP_START handshake is repeated before the RF request. Native
+0x80/0x8A advert notifications are preferred. Firmware may suppress them after
+its duplicate/contact timestamp filters; APP_START does not override those.
+A fresh 0x88 LOG_RX is eligible only after exact packet/path/app-data parsing
+and Ed25519 verification of the existing signed advert against the live target
+public key. Evidence distinguishes host signature verification from observed
+companion PKI acceptance. Freshness is host receive-after-request, NOT proof
+of fresh emission, replay resistance or a challenge response.
+--probe-timeout bounds the entire probe (default 30s); the global --timeout,
+if shorter, remains the outer bound. Evidence directories must be new.
+Up to three ordinary advert requests are made, at least two seconds after the
+previous ACK, stopping on authenticated reception. No ACK or counter delta
+qualifies reception. Before/after packet and radio stats use normal read-only
+CMD_GET_STATS (56, subtypes 2/1) and stats-packets/stats-radio CLI queries.
+Unavailable stats are explicit; aggregates cannot identify an individual
+advert or diagnose saturation. Part of the same deadline is reserved for the
+after-stats and preserved-configuration reads. No power/clock setters are used.
+
 MAIN integration handoff (do not retire the legacy transport refusal):
 
     OTA_SIGNED_LAB_MODE ?= directed
@@ -105,6 +139,9 @@ import re
 import struct
 import time
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 import lab_device
 import ota_rf_lab as lab
 import ota_uploader as ota
@@ -114,6 +151,13 @@ APPROVED = {"client": "4186AE911D94CDB1", "target": "3BE94917B92DC5E9"}
 APPROVED_RADIOS = ((907525, 62500, 7, 5), (907525, 250000, 7, 5))
 RECORD_VERSION = 1
 ACTIVE_PHASES = {"erasing", "receiving", "verifying", "ready"}
+PUSH_ADVERT = 0x80
+PUSH_LOG_RX_DATA = 0x88
+PUSH_NEW_ADVERT = 0x8A
+PEER_PUSH_CODES = {PUSH_ADVERT, PUSH_LOG_RX_DATA, PUSH_NEW_ADVERT}
+CMD_GET_STATS = 56
+RESP_STATS = 24
+PACKET_STATS_FIELDS = ("recv", "sent", "flood_tx", "direct_tx", "flood_rx", "direct_rx", "recv_errors")
 BOOT_PATTERN = re.compile(
     r"boot=(unknown|trial|confirmed|failed) "
     r"phase=(unknown|idle|erasing|receiving|verifying|ready|commit-pending|trial|installed|aborted|failed|cache-sealed) "
@@ -380,21 +424,240 @@ def bound_snapshot(reply, candidate, target, complete=False):
         require(reply.received == candidate.blocks, "full-image durable blocks are incomplete")
 
 
+def verified_raw_advert(frame, target_key):
+    """Decode Packet::writeTo and verify Mesh::createAdvert's existing signature."""
+    if len(frame) < 5 or frame[0] != PUSH_LOG_RX_DATA:
+        raise ValueError("not a complete LOG_RX frame")
+    raw = frame[3:]  # LOG_RX's code, signed SNR*4 and RSSI are not part of Packet.
+    header = raw[0]
+    if header >> 6 != 0 or (header >> 2) & 15 != 4:
+        raise ValueError("not a version-1 ordinary advertisement")
+    route = header & 3
+    offset = 5 if route in (0, 3) else 1
+    if len(raw) <= offset:
+        raise ValueError("truncated packet transport/path header")
+    encoded_path = raw[offset]
+    hash_size, count = (encoded_path >> 6) + 1, encoded_path & 63
+    path_bytes = hash_size * count
+    if hash_size == 4 or path_bytes > 64:
+        raise ValueError("invalid packet path encoding")
+    offset += 1 + path_bytes
+    body = raw[offset:]
+    if not 102 <= len(body) <= 132:
+        raise ValueError("truncated or oversized signed advert body")
+    public_key, emitted_time, signature, app = body[:32], body[32:36], body[36:100], body[100:]
+    if public_key != target_key:
+        raise ValueError("wrong peer full public key")
+    name_offset = 1 + (8 if app[0] & 0x10 else 0) + (2 if app[0] & 0x20 else 0) \
+        + (2 if app[0] & 0x40 else 0)
+    if app[0] & 15 != 2 or not app[0] & 0x80 or name_offset >= len(app):
+        raise ValueError("invalid or unnamed repeater advert data")
+    name = app[name_offset:].decode("utf-8")
+    if "\x00" in name or any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError("malformed signed advert name")
+    Ed25519PublicKey.from_public_bytes(public_key).verify(signature, public_key + emitted_time + app)
+    return {"target": public_key.hex(), "advert_timestamp": struct.unpack("<I", emitted_time)[0],
+            "advert_name": name, "route_type": route, "path_hash_size": hash_size,
+            "path_hash_count": count, "signature_verified": True,
+            "reported_snr_db": struct.unpack("b", frame[1:2])[0] / 4,
+            "reported_rssi_dbm": struct.unpack("b", frame[2:3])[0],
+            "verification_source": "MeshCore_Ed25519_pubkey_timestamp_app_data"}
+
+
+def normal_peer_stats(pair, evidence, deadline, phase):
+    snapshots = {}
+    for role, node in (("client", pair.client), ("target", pair.target)):
+        snapshots[role] = {}
+        for subtype, kind in ((2, "packets"), (1, "radio")):
+            row = snapshots[role][kind] = {"available": False, "aggregate_only_not_peer_proof": True}
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("probe deadline expired; no stats request sent")
+                if role == "client":
+                    request = bytes([CMD_GET_STATS, subtype])
+                    row["request_hex"] = request.hex()
+                    frame = node.command(request, expected=(RESP_STATS, lab.RESP_ERR),
+                                         timeout=min(0.5, remaining))
+                    row["response_hex"] = frame.hex()
+                    expected_size = 30 if subtype == 2 else 14
+                    if len(frame) != expected_size or frame[:2] != bytes([RESP_STATS, subtype]):
+                        raise ValueError("unsupported, refused or malformed normal stats reply")
+                    if subtype == 2:
+                        values = dict(zip(PACKET_STATS_FIELDS, struct.unpack("<7I", frame[2:])))
+                    else:
+                        noise, rssi, snr, tx, rx = struct.unpack("<hbbII", frame[2:])
+                        values = {"noise_floor": noise, "last_rssi": rssi, "last_snr": snr / 4,
+                                  "tx_air_secs": tx, "rx_air_secs": rx}
+                else:
+                    row["command"] = "stats-" + kind
+                    row["response_text"] = node.command(row["command"], timeout=min(0.5, remaining))
+                    values = json.loads(row["response_text"])
+                    if not isinstance(values, dict):
+                        raise ValueError("normal stats reply is not an object")
+                    fields = PACKET_STATS_FIELDS if subtype == 2 else (
+                        "noise_floor", "last_rssi", "last_snr", "tx_air_secs", "rx_air_secs")
+                    if set(values) != set(fields):
+                        raise ValueError("unsupported or incomplete normal stats fields")
+                    if any(type(value) not in (int, float) or not math.isfinite(value)
+                           for value in values.values()):
+                        raise ValueError("invalid normal stats values")
+                    counts = fields if subtype == 2 else ("tx_air_secs", "rx_air_secs")
+                    if any(type(values[field]) is not int or not 0 <= values[field] <= 0xFFFFFFFF
+                           for field in counts):
+                        raise ValueError("invalid normal stats counters")
+                row.update(available=True, values=values)
+            except (TimeoutError, OSError, ValueError) as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+            evidence.log("normal_peer_stats_readback", node=role, phase=phase, kind=kind, **row)
+    return snapshots
+
+
 def ordinary_peer(pair, target_key, evidence, deadline):
-    pair.client.poll()
-    pair.client.take_pending({0x80, 0x8A})
+    session = lab.serializable_app_info(lab.app_info(pair.client))
+    evidence.log("ordinary_peer_session_started", client=session["pubkey"],
+                 target=target_key.hex(), protocol="CMD_APP_START")
+    drain_peer_events(pair.client, evidence, deadline)
     since = time.monotonic()
-    lab.require_repeater_ok(pair.target, "advert.zerohop", expected="OK - zerohop advert sent")
+    requests = evidence.summary["measurements"]["ordinary_peer_requests"] = []
+    raw_witness, native_wait_until = None, None
+
+    def request_advert():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("peer deadline expired; no advert request sent")
+        row = {"attempt": len(requests) + 1, "command": "advert.zerohop", "target": target_key.hex(),
+               "request_monotonic": time.monotonic(), "rf_request_attempted": True, "ack_is_peer_proof": False}
+        requests.append(row)
+        evidence.log("ordinary_peer_advert_requested", **row)
+        probe_record = evidence.summary["measurements"].get("normal_peer_probe")
+        if probe_record is not None:
+            probe_record["rf_request_attempted"] = True
+        lab.require_repeater_ok(pair.target, "advert.zerohop", expected="OK - zerohop advert sent")
+        row["ack_monotonic"] = time.monotonic()
+        evidence.log("ordinary_peer_advert_ack", **row)
+        return row["ack_monotonic"] + 2
+
+    def received(witness):
+        witness["elapsed_seconds"] = time.monotonic() - since
+        witness["attempts_requested"] = len(requests)
+        evidence.log("ordinary_peer_advert_received", **witness)
+        return witness
+
+    next_request = request_advert()
     while time.monotonic() < deadline:
         pair.client.poll(min(0.1, max(0, deadline - time.monotonic())))
-        for timestamp, frame in pair.client.take_pending({0x80, 0x8A}):
-            valid_shape = (frame[0] == 0x80 and len(frame) == 33
-                           or frame[0] == 0x8A and len(frame) >= 36)
+        for timestamp, frame in pair.client.take_pending(PEER_PUSH_CODES):
+            if frame[0] == PUSH_LOG_RX_DATA:
+                if timestamp < since:
+                    evidence.log("ordinary_peer_raw_advert_ignored", frame_hex=frame.hex(), reason="stale",
+                                 received_monotonic=timestamp, request_monotonic=since)
+                    continue
+                try:
+                    authenticated = verified_raw_advert(frame, target_key)
+                    if authenticated["route_type"] != 2 or authenticated["path_hash_count"] != 0:
+                        raise ValueError("not the requested zero-hop direct advert")
+                except (ValueError, InvalidSignature) as exc:
+                    evidence.log("ordinary_peer_raw_advert_ignored", frame_hex=frame.hex(),
+                                 reason="signature_invalid" if isinstance(exc, InvalidSignature) else str(exc),
+                                 received_monotonic=timestamp, request_monotonic=since,
+                                 authenticated_peer_proof=False)
+                    continue
+                raw_witness = {**authenticated, "frame_hex": frame.hex(), "code": frame[0],
+                               "request_monotonic": since, "received_monotonic": timestamp,
+                               "fresh_after_request": True, "source": "host_verified_signed_advert",
+                               "companion_pki_acceptance_observed": False,
+                               "emission_freshness_verified": False, "multihop_verified": False}
+                if native_wait_until is None:
+                    native_wait_until = min(deadline, time.monotonic() + 1)
+                evidence.log("ordinary_peer_raw_advert_signature_verified", **raw_witness)
+                continue
+            valid_shape = (frame[0] == PUSH_ADVERT and len(frame) == 33
+                           or frame[0] == PUSH_NEW_ADVERT and len(frame) == 148 and frame[33] == 2)
             if timestamp >= since and valid_shape and frame[1:33] == target_key:
-                evidence.log("ordinary_peer_advert_received", target=target_key.hex(),
-                             elapsed_seconds=time.monotonic() - since, multihop_verified=False)
-                return
+                witness = {"target": target_key.hex(), "frame_hex": frame.hex(), "code": frame[0],
+                           "request_monotonic": since, "received_monotonic": timestamp,
+                           "fresh_after_request": True, "source": "companion_advert_push",
+                           "companion_pki_acceptance_observed": True,
+                           "emission_freshness_verified": False, "multihop_verified": False}
+                if raw_witness is not None:
+                    witness["signed_raw_advert"] = raw_witness
+                return received(witness)
+            evidence.log("ordinary_peer_advert_ignored", frame_hex=frame.hex(),
+                         received_monotonic=timestamp, request_monotonic=since,
+                         expected_target=target_key.hex(),
+                         reason="malformed" if not valid_shape else
+                         "stale" if timestamp < since else "wrong_peer")
+        if raw_witness is not None and time.monotonic() >= native_wait_until:
+            return received(raw_witness)
+        if raw_witness is None and len(requests) < 3 and time.monotonic() >= next_request:
+            if time.monotonic() < deadline:
+                next_request = request_advert()
+    if raw_witness is not None:
+        return received(raw_witness)
     raise TimeoutError("no fresh ordinary advert from the actual target on the restored mesh")
+
+
+def drain_peer_events(client, evidence, deadline):
+    while time.monotonic() < deadline:
+        before_count = len(client.pending)
+        before_buffer = bytes(getattr(client, "buffer", b""))
+        client.poll(min(0.05, max(0, deadline - time.monotonic())))
+        after_count = len(client.pending)
+        after_buffer = bytes(getattr(client, "buffer", b""))
+        for timestamp, frame in client.take_pending(PEER_PUSH_CODES):
+            evidence.log("normal_peer_pre_request_discard", frame_hex=frame.hex(),
+                         received_monotonic=timestamp, peer_proof=False)
+        if before_count == after_count and before_buffer == after_buffer:
+            require(not after_buffer, "incomplete pre-request serial frame; fresh peer event is unproven")
+            return
+    raise TimeoutError("companion serial did not become quiet before the normal peer request")
+
+
+def normal_peer_configuration(pair, evidence):
+    inspected = lab.run_inspect_configuration(pair.client, pair.target, evidence)
+    nodes = inspected["nodes"]
+    for role, info in nodes.items():
+        require(tuple(info[k] for k in ("freq_khz", "bw_hz", "sf", "cr")) in APPROVED_RADIOS,
+                f"{role} has an unapproved normal radio configuration")
+    require(nodes["client"].get("path_hash_mode") == lab.PATH_HASH_MODE,
+            "client has an unapproved or unavailable normal path hash mode; requires mode 2")
+    evidence.log("normal_peer_path_observability", client_path_hash_mode=nodes["client"]["path_hash_mode"],
+                 target_path_hash_mode_observed="path_hash_mode" in nodes["target"])
+    require(tuple(nodes["client"][k] for k in ("freq_khz", "bw_hz", "sf", "cr"))
+            == tuple(nodes["target"][k] for k in ("freq_khz", "bw_hz", "sf", "cr")),
+            "approved client and target normal radio configurations disagree")
+    require(inspected["acl"].get(nodes["client"]["pubkey"], 0) & 3 == 3,
+            "actual companion public key lacks existing target ADMIN ACL; no grant attempted")
+    return {"client": nodes["client"], "target": nodes["target"], "acl": inspected["acl"]}
+
+
+def probe_peer(pair, evidence, deadline):
+    record = {"version": RECORD_VERSION, "kind": "normal-peer-probe", "serials": APPROVED,
+              "read_only": False, "rf_request_attempted": False, "probe_complete": False,
+              "scope": "target_to_client_ordinary_zerohop_advert", "signed_ota_qualified": False,
+              "raw_serial_events": "serial-events.jsonl"}
+    evidence.summary["measurements"]["normal_peer_probe"] = record
+    before = normal_peer_configuration(pair, evidence)
+    record["configuration_before"] = before
+    evidence.log("normal_peer_probe_configuration", **before, serials=APPROVED)
+    stats = record["statistics"] = {}
+    stats["before"] = normal_peer_stats(pair, evidence, deadline, "before")
+    remaining = max(0, deadline - time.monotonic())
+    receive_deadline = deadline - min(5, remaining / 3)
+    try:
+        witness = ordinary_peer(pair, bytes.fromhex(before["target"]["pubkey"]), evidence, receive_deadline)
+    finally:
+        stats["after"] = normal_peer_stats(pair, evidence, deadline, "after")
+    record["peer_receive"] = witness
+    after = normal_peer_configuration(pair, evidence)
+    record["configuration_after"] = after
+    require(after == before, "normal peer identity/configuration/ACL changed during the probe")
+    record.update(probe_complete=True, identity_config_acl_preserved=True,
+                  ordinary_peer_received=True, outcome="normal_peer_received")
+    write_record(evidence.directory / "normal-peer.json", record)
+    evidence.summary["measurements"]["outcome"] = record["outcome"]
+    evidence.log("normal_peer_probe_complete", **record)
+    return record
 
 
 def fresh_candidate(uploader, candidate, target_key, deadline):
@@ -611,6 +874,10 @@ def parser():
     root.add_argument("--artifact-dir", required=True, type=Path)
     root.add_argument("--timeout", type=float, default=86400)
     commands = root.add_subparsers(dest="command", required=True)
+    probe = commands.add_parser("probe-peer", allow_abbrev=False,
+                                help="explicit ordinary RF advert/receive probe; no OTA status, image or reboot")
+    probe.add_argument("--probe-timeout", type=float, default=30,
+                       help="finite positive bound for the entire normal peer probe, including readbacks")
     for name in ("stage", "commit"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--manifest", required=True, type=Path)
@@ -639,26 +906,32 @@ def main(argv=None):
     args = arguments.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         arguments.error("--timeout must be finite and positive")
+    if args.command == "probe-peer" and (not math.isfinite(args.probe_timeout) or args.probe_timeout <= 0):
+        arguments.error("--probe-timeout must be finite and positive")
     if args.command == "commit":
         for option in ("reboot_timeout", "trial_timeout", "install_timeout"):
             value = getattr(args, option)
             if not math.isfinite(value) or value <= 0:
                 arguments.error(f"--{option.replace('_', '-')} must be finite and positive")
-    candidate = load_candidate(args)
+    candidate = None if args.command == "probe-peer" else load_candidate(args)
     if args.command == "stage":
         profile(args)
-    else:
+    elif args.command == "commit":
         record = read_record(args.ready_record, "ready")
         require(record["candidate"] == candidate.metadata, "READY record candidate mismatch")
     require(not args.artifact_dir.exists(), "use a new artifact directory; never overwrite prior evidence")
     evidence = lab.Evidence(args.artifact_dir)
     pair, error = None, None
     try:
-        deadline = time.monotonic() + args.timeout
+        timeout = min(args.timeout, args.probe_timeout) if args.command == "probe-peer" else args.timeout
+        deadline = time.monotonic() + timeout
         pair = Pair(evidence, deadline)
-        uploader = ota.Uploader(pair.client, evidence, command_timeout=min(10, args.timeout))
-        operation = stage if args.command == "stage" else commit
-        operation(pair, uploader, candidate, args, evidence, deadline)
+        if args.command == "probe-peer":
+            probe_peer(pair, evidence, deadline)
+        else:
+            uploader = ota.Uploader(pair.client, evidence, command_timeout=min(10, args.timeout))
+            operation = stage if args.command == "stage" else commit
+            operation(pair, uploader, candidate, args, evidence, deadline)
     except BaseException as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal_preserving_progress", error=error, abort_sent=False, force_overwrite=False)

@@ -19,6 +19,17 @@ import ota_signed_lab as signed
 
 ota, lab = signed.ota, signed.lab
 TARGET_KEY = bytes(reversed(range(32)))
+BENCH_ADVERT_KEY = bytes.fromhex("f76c046e6f463a02c71df1e5ed4d78fa0bd118e05810c3012a672ad0d10b6bb6")
+BENCH_LOG_RX_ADVERT = bytes.fromhex(
+    "8837fb1200f76c046e6f463a02c71df1e5ed4d78fa0bd118e05810c3012a672ad0d10b6bb64"
+    "a9944668b4b509a4209a91ae83864fbda27066be45a54fe803f24298aa5682757f67ec91b18ddd"
+    "e735ec1b2ff1b3f1025e82df84628478b27c2e4222f8fb8affe58c80a920000000000000000"
+    "4f54412d4c41422d544152474554")
+
+
+def new_advert_push(key):
+    return (b"\x8a" + key + bytes([2, 0, 255]) + bytes(64)
+            + b"OTA-LAB-TARGET".ljust(32, b"\x00") + struct.pack("<IIII", 1, 0, 0, 1))
 
 
 class Clock:
@@ -62,22 +73,35 @@ class Companion:
         self.commands = []
         self.pending = []
         self.radio = lab.NORMAL_RADIO
+        self.app_name = "captured-client"
+        self.packet_stats = dict.fromkeys(signed.PACKET_STATS_FIELDS, 0)
+        self.radio_stats = {"noise_floor": -110, "last_rssi": -100, "last_snr": 3.0,
+                            "tx_air_secs": 0, "rx_air_secs": 0}
         self.boot = b"boot=unknown phase=unknown floor=unknown counter=0 verified=0 image=unknown"
         self.signed_data = None
 
     def command(self, payload, **kwargs):
         self.commands.append(payload)
         if payload[0] == lab.CMD_APP_START:
+            if len(payload) < 8:
+                raise AssertionError("APP_START requires seven reserved bytes before the application name")
             frame = bytearray(58)
             frame[0], frame[1] = lab.RESP_SELF_INFO, lab.ADV_TYPE_CHAT
             frame[4:36] = self.public_key
             struct.pack_into("<II", frame, 48, *self.radio[:2])
             frame[56:58] = bytes(self.radio[2:])
-            return bytes(frame) + b"captured-client"
+            return bytes(frame) + self.app_name.encode("utf-8")
         if payload[0] == lab.CMD_DEVICE_QUERY:
             frame = bytearray(82)
             frame[0], frame[1], frame[81] = lab.RESP_DEVICE_INFO, 13, lab.PATH_HASH_MODE
             return bytes(frame)
+        if payload == bytes([56, 2]):
+            return bytes([24, 2]) + struct.pack("<7I", *(self.packet_stats[field]
+                                                       for field in signed.PACKET_STATS_FIELDS))
+        if payload == bytes([56, 1]):
+            values = self.radio_stats
+            return bytes([24, 1]) + struct.pack("<hbbII", values["noise_floor"], values["last_rssi"],
+                int(values["last_snr"] * 4), values["tx_air_secs"], values["rx_air_secs"])
         if payload == bytes([66, 0]):
             return b"\x1d" + self.boot
         if payload == bytes([lab.CMD_SIGN_START]):
@@ -114,15 +138,23 @@ class Target:
         self.peer = companion
         self.key = TARGET_KEY
         self.radio = lab.NORMAL_RADIO
+        self.app_name = "captured-target"
+        self.packet_stats = dict.fromkeys(signed.PACKET_STATS_FIELDS, 0)
+        self.radio_stats = {"noise_floor": -110, "last_rssi": -100, "last_snr": 3.0,
+                            "tx_air_secs": 0, "rx_air_secs": 0}
 
     def command(self, command, **kwargs):
         self.commands.append(command)
         values = {"get role": "repeater", "get public.key": self.key.hex(),
-                  "get name": "captured-target",
+                  "get name": self.app_name,
                   "get radio": f"{self.radio[0] / 1000:g},{self.radio[1] / 1000:g},{self.radio[2]},{self.radio[3]}",
                   "get path.hash.mode": "2"}
         if command in values:
             return "> " + values[command]
+        if command == "stats-packets":
+            return json.dumps(self.packet_stats)
+        if command == "stats-radio":
+            return json.dumps(self.radio_stats)
         if command == "ota status":
             if self.lifecycle is not None:
                 return self.lifecycle.pop(0)
@@ -759,6 +791,40 @@ class SignedLabTests(unittest.TestCase):
         self.assertTrue((evidence.directory / "installed.json").exists())
         self.assertNotIn("reboot", self.target.commands)
 
+    def test_stage_and_post_install_peer_checks_accept_verified_raw_not_ack_only(self):
+        self.target.key = BENCH_ADVERT_KEY
+        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+        self.client.app_name, self.target.app_name = "OTA-LAB-CLIENT", "OTA-LAB-TARGET"
+        self.uploader.ready_reply = reply(self.candidate, ota.Phase.READY, target=BENCH_ADVERT_KEY)
+        self.client.poll = mock.Mock(side_effect=lambda timeout=0: self.clock.sleep(max(0.01, timeout)))
+        original = self.target.command
+
+        def command(value, **kwargs):
+            if value != "advert.zerohop":
+                return original(value, **kwargs)
+            self.target.commands.append(value)
+            self.client.pending.append((self.clock.now, BENCH_LOG_RX_ADVERT))
+            return "OK - zerohop advert sent"
+
+        self.target.command = command
+        args, evidence = self.prepare_commit()
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+        outcome = signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        self.assertEqual(self.uploader.ops.count(ota.Op.COMMIT), 1)
+        self.assertTrue(outcome["remote_install_qualified"])
+        self.assertTrue(outcome["ordinary_peer_received"])
+        self.assertEqual(outcome["lifecycle"]["image"], self.candidate.metadata["image_sha256"])
+        self.assertEqual(outcome["lifecycle"]["floor"], self.candidate.counter)
+        self.assertEqual(self.target.commands.count("advert.zerohop"), 2)
+        self.assertNotIn("reboot", self.target.commands)
+        evidence.events.flush()
+        events = [json.loads(line) for line in evidence.events_path.read_text().splitlines()]
+        received = [event for event in events if event["event"] == "ordinary_peer_advert_received"]
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["source"], "host_verified_signed_advert")
+        self.assertTrue(received[0]["signature_verified"])
+        self.assertFalse(received[0]["companion_pki_acceptance_observed"])
+
     def test_missing_remote_commit_reboot_is_explicitly_blocked_without_usb_reset(self):
         args, evidence = self.prepare_commit()
         self.pair.reenumerate.side_effect = TimeoutError("target stayed in application")
@@ -1107,6 +1173,725 @@ class SignedLabTests(unittest.TestCase):
                     "--ready-record", "ready.json"] + self.arguments)
         with self.assertRaisesRegex(FileExistsError, ""):
             signed.write_record(self.image_path, {})
+
+
+class NormalPeerProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(__file__).resolve().parents[2] / ".tmp" / ("normal-peer-" + uuid.uuid4().hex)
+        self.directory.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.directory)
+        self.clock = Clock()
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(signed.time, "monotonic", self.clock.monotonic).start()
+        mock.patch.object(signed.time, "sleep", self.clock.sleep).start()
+        mock.patch("sys.stdout", io.StringIO()).start()
+        self.new_pair()
+
+    def new_pair(self):
+        self.client = Companion()
+        self.client.boot = b"stock firmware: no OTA lifecycle service"
+        self.client.poll = mock.Mock(side_effect=lambda timeout=0: self.clock.sleep(max(0.01, timeout)))
+        self.target = Target(self.client)
+        self.target.floor = "unknown"
+        self.client.radio = self.target.radio = (907525, 62500, 7, 5)
+        self.pair = SimpleNamespace(client=self.client, target=self.target,
+                                    reenumerate=mock.Mock(), close=mock.Mock())
+
+    def run_probe(self, name="probe", timeout=None, outer_timeout=None):
+        artifact = self.directory / name
+        arguments = ["--artifact-dir", str(artifact)]
+        if outer_timeout is not None:
+            arguments += ["--timeout", str(outer_timeout)]
+        arguments += ["probe-peer"]
+        if timeout is not None:
+            arguments += ["--probe-timeout", str(timeout)]
+        with mock.patch.object(signed, "Pair", return_value=self.pair) as opened, \
+                mock.patch.object(signed, "load_candidate", side_effect=AssertionError("image operation")) as image, \
+                mock.patch.object(ota, "Uploader", side_effect=AssertionError("OTA operation")) as uploader:
+            try:
+                signed.main(arguments)
+            finally:
+                image.assert_not_called()
+                uploader.assert_not_called()
+                self.pair.reenumerate.assert_not_called()
+                self.pair.close.assert_called_once()
+                opened.assert_called_once()
+                self.opened_deadline = opened.call_args.args[1]
+                self.assertTrue(all(command[0] in (lab.CMD_APP_START, lab.CMD_DEVICE_QUERY, signed.CMD_GET_STATS)
+                                    for command in self.client.commands))
+                self.assertTrue(all(command.startswith("get ") or command in (
+                                    "advert.zerohop", "stats-packets", "stats-radio")
+                                    for command in self.target.commands))
+                self.assertNotIn("ota status", self.target.commands)
+                self.assertIsNone(self.client.signed_data)
+        return json.loads((artifact / "normal-peer.json").read_text())
+
+    def advert_reply(self, frame=None, stale=False, mutate=None):
+        original = self.target.command
+
+        def command(value, **kwargs):
+            if value != "advert.zerohop":
+                return original(value, **kwargs)
+            self.target.commands.append(value)
+            if frame is not None:
+                timestamp = self.clock.now - 1 if stale else self.clock.now
+                self.client.pending.append((timestamp, frame))
+            if mutate:
+                mutate()
+            return "OK - zerohop advert sent"
+
+        self.target.command = command
+
+    def framed_client(self, chunks):
+        client = object.__new__(lab.FramedSerial)
+        client.name, client.buffer, client.pending = "client", bytearray(), []
+        client.commands = self.client.commands
+        client.signed_data = None
+        client.command = self.client.command
+
+        def read(timeout):
+            self.clock.sleep(max(0.01, timeout))
+            return chunks.pop(0) if chunks else b""
+
+        client._read_bytes = read
+        self.pair.client = client
+        return client
+
+    def test_stock_probe_uses_real_normal_queries_and_unknown_floor_is_not_an_ota_gate(self):
+        for bandwidth in (62500, 250000):
+            with self.subTest(bandwidth=bandwidth):
+                self.new_pair()
+                self.client.radio = self.target.radio = (907525, bandwidth, 7, 5)
+                result = self.run_probe(str(bandwidth))
+                self.assertEqual(result["configuration_before"], result["configuration_after"])
+                self.assertEqual(result["configuration_before"]["client"]["pubkey"], self.client.public_key.hex())
+                self.assertEqual(result["configuration_before"]["target"]["pubkey"], TARGET_KEY.hex())
+                self.assertEqual(result["configuration_before"]["target"]["bw_hz"], bandwidth)
+                self.assertEqual(result["configuration_before"]["acl"], self.target.acl)
+                self.assertTrue(result["probe_complete"])
+                self.assertTrue(result["identity_config_acl_preserved"])
+                self.assertTrue(result["ordinary_peer_received"])
+                self.assertFalse(result["read_only"])
+                self.assertFalse(result["signed_ota_qualified"])
+                self.assertEqual(result["scope"], "target_to_client_ordinary_zerohop_advert")
+                witness = result["peer_receive"]
+                self.assertEqual(witness["frame_hex"], (b"\x80" + TARGET_KEY).hex())
+                self.assertGreaterEqual(witness["received_monotonic"], witness["request_monotonic"])
+                self.assertTrue(witness["fresh_after_request"])
+                self.assertEqual(self.target.commands.count("advert.zerohop"), 1)
+                summary = json.loads((self.directory / str(bandwidth) / "summary.json").read_text())
+                self.assertIsNone(summary["error"])
+
+    def test_real_bench_log_rx_advert_has_existing_meshcore_signature(self):
+        decoded = signed.verified_raw_advert(BENCH_LOG_RX_ADVERT, BENCH_ADVERT_KEY)
+        self.assertEqual(len(BENCH_LOG_RX_ADVERT), 128)
+        self.assertEqual(decoded["target"], BENCH_ADVERT_KEY.hex())
+        self.assertEqual(decoded["advert_name"], "OTA-LAB-TARGET")
+        self.assertEqual(decoded["path_hash_count"], 0)
+        self.assertEqual(decoded["route_type"], 2)
+        self.assertTrue(decoded["signature_verified"])
+        self.assertEqual(decoded["reported_snr_db"], 13.75)
+        self.assertEqual(decoded["reported_rssi_dbm"], -5)
+
+    def test_real_bench_raw_frame_qualifies_only_after_signature_verification_and_normal_handshake(self):
+        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+        self.client.app_name, self.target.app_name = "OTA-LAB-CLIENT", "OTA-LAB-TARGET"
+        self.target.key = BENCH_ADVERT_KEY
+        chunks = []
+        client = self.framed_client(chunks)
+        original = self.target.command
+
+        def command(value, **kwargs):
+            if value != "advert.zerohop":
+                return original(value, **kwargs)
+            app_starts = [payload for payload in self.client.commands if payload[0] == lab.CMD_APP_START]
+            self.assertEqual(len(app_starts), 2)
+            self.assertTrue(all(payload == b"\x01" + bytes(7) + b"ota-rf-lab" for payload in app_starts))
+            self.target.commands.append(value)
+            wire = b">" + struct.pack("<H", len(BENCH_LOG_RX_ADVERT)) + BENCH_LOG_RX_ADVERT
+            chunks.extend([wire[:20], wire[20:]])
+            return "OK - zerohop advert sent"
+
+        self.target.command = command
+        original_evidence = lab.Evidence
+
+        def evidence(directory):
+            observed = original_evidence(directory)
+            client.evidence = observed
+            return observed
+
+        with mock.patch.object(lab, "Evidence", side_effect=evidence):
+            result = self.run_probe()
+        witness = result["peer_receive"]
+        self.assertEqual(witness["frame_hex"], BENCH_LOG_RX_ADVERT.hex())
+        self.assertEqual(witness["source"], "host_verified_signed_advert")
+        self.assertEqual(witness["target"], BENCH_ADVERT_KEY.hex())
+        self.assertEqual(witness["advert_name"], "OTA-LAB-TARGET")
+        self.assertTrue(witness["signature_verified"])
+        self.assertFalse(witness["companion_pki_acceptance_observed"])
+        self.assertFalse(witness["emission_freshness_verified"])
+        self.assertFalse(result["signed_ota_qualified"])
+        self.assertEqual(result["configuration_before"], result["configuration_after"])
+        self.assertEqual(result["configuration_before"]["client"]["path_hash_mode"], 2)
+        self.assertEqual(result["configuration_before"]["acl"][self.client.public_key.hex()], 3)
+        events = (self.directory / "probe" / "serial-events.jsonl").read_text()
+        self.assertIn("ordinary_peer_session_started", events)
+        self.assertIn("ordinary_peer_raw_advert_signature_verified", events)
+        self.assertIn(BENCH_LOG_RX_ADVERT.hex(), events)
+
+    def test_raw_authentication_does_not_accept_wrong_peer_unsigned_body_or_stale_event(self):
+        corrupted = bytearray(BENCH_LOG_RX_ADVERT)
+        corrupted[41] ^= 1
+        unsigned = bytearray(BENCH_LOG_RX_ADVERT)
+        unsigned[41:105] = bytes(64)
+        altered_name = bytearray(BENCH_LOG_RX_ADVERT)
+        altered_name[-1] ^= 1
+        for kind, payload, stale, key in (
+                ("bad_signature", bytes(corrupted), False, BENCH_ADVERT_KEY),
+                ("unsigned", bytes(unsigned), False, BENCH_ADVERT_KEY),
+                ("signed_body_changed", bytes(altered_name), False, BENCH_ADVERT_KEY),
+                ("stale_raw", BENCH_LOG_RX_ADVERT, True, BENCH_ADVERT_KEY),
+                ("wrong_raw_peer", BENCH_LOG_RX_ADVERT, False, TARGET_KEY)):
+            with self.subTest(kind=kind):
+                self.new_pair()
+                self.target.key = key
+                self.advert_reply(payload, stale)
+                with self.assertRaisesRegex(TimeoutError, "fresh ordinary advert"):
+                    self.run_probe(kind, timeout=0.5)
+                self.assertFalse((self.directory / kind / "normal-peer.json").exists())
+                events = (self.directory / kind / "serial-events.jsonl").read_text()
+                self.assertIn("ordinary_peer_raw_advert_ignored", events)
+                self.assertNotIn("ordinary_peer_advert_received", events)
+
+    def test_exact_packet_header_transport_path_and_advert_data_bounds_are_checked(self):
+        for name, payload in (
+                ("short_log", b"\x88\x00"),
+                ("version", BENCH_LOG_RX_ADVERT[:3] + b"\x52" + BENCH_LOG_RX_ADVERT[4:]),
+                ("other_type", BENCH_LOG_RX_ADVERT[:3] + b"\x0e" + BENCH_LOG_RX_ADVERT[4:]),
+                ("truncated_transport", b"\x88\x00\x00\x10\x00"),
+                ("reserved_path_size", BENCH_LOG_RX_ADVERT[:4] + b"\xc0" + BENCH_LOG_RX_ADVERT[5:]),
+                ("path_too_long", BENCH_LOG_RX_ADVERT[:4] + b"\xbf" + BENCH_LOG_RX_ADVERT[5:]),
+                ("truncated_path", BENCH_LOG_RX_ADVERT[:4] + b"\x95"),
+                ("short_body", BENCH_LOG_RX_ADVERT[:80]),
+                ("oversized_app", BENCH_LOG_RX_ADVERT + bytes(10)),
+                ("unnamed", BENCH_LOG_RX_ADVERT[:105] + b"\x12" + BENCH_LOG_RX_ADVERT[106:]),
+                ("truncated_location", BENCH_LOG_RX_ADVERT[:105] + b"\x92\x01"),
+                ("wrong_role", BENCH_LOG_RX_ADVERT[:105] + b"\x91" + BENCH_LOG_RX_ADVERT[106:])):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                signed.verified_raw_advert(payload, BENCH_ADVERT_KEY)
+        for route in (0, 3):
+            transported = (BENCH_LOG_RX_ADVERT[:3] + bytes([0x10 | route])
+                           + b"\x01\x02\x03\x04" + BENCH_LOG_RX_ADVERT[4:])
+            parsed = signed.verified_raw_advert(transported, BENCH_ADVERT_KEY)
+            self.assertEqual(parsed["route_type"], route)
+            self.assertTrue(parsed["signature_verified"])
+        for path, encoded in ((b"\x01", 1), (b"\x01\x02", 0x41), (b"\x01\x02\x03", 0x81)):
+            routed = BENCH_LOG_RX_ADVERT[:4] + bytes([encoded]) + path + BENCH_LOG_RX_ADVERT[5:]
+            parsed = signed.verified_raw_advert(routed, BENCH_ADVERT_KEY)
+            self.assertEqual(parsed["path_hash_size"], len(path))
+            self.assertEqual(parsed["path_hash_count"], 1)
+
+    def test_signed_but_nonzerohop_raw_packet_does_not_qualify_the_requested_probe(self):
+        for name, payload in (
+                ("relayed", BENCH_LOG_RX_ADVERT[:4] + b"\x81" + bytes(3) + BENCH_LOG_RX_ADVERT[5:]),
+                ("flood", BENCH_LOG_RX_ADVERT[:3] + b"\x11" + BENCH_LOG_RX_ADVERT[4:])):
+            with self.subTest(name=name):
+                self.new_pair()
+                self.target.key = BENCH_ADVERT_KEY
+                self.advert_reply(payload)
+                with self.assertRaises(TimeoutError):
+                    self.run_probe(name, timeout=0.5)
+
+    def test_native_advert_acceptance_is_preferred_over_a_verified_raw_receipt(self):
+        self.target.key = BENCH_ADVERT_KEY
+        self.advert_reply(BENCH_LOG_RX_ADVERT)
+        original_poll = self.client.poll
+        polls_after_request = 0
+
+        def poll(timeout=0):
+            nonlocal polls_after_request
+            original_poll(timeout)
+            if "advert.zerohop" in self.target.commands:
+                polls_after_request += 1
+                if polls_after_request == 2:
+                    self.client.pending.append((self.clock.now, new_advert_push(BENCH_ADVERT_KEY)))
+
+        self.client.poll = poll
+        result = self.run_probe()
+        witness = result["peer_receive"]
+        self.assertEqual(witness["code"], 0x8A)
+        self.assertEqual(len(bytes.fromhex(witness["frame_hex"])), 148)
+        self.assertEqual(witness["source"], "companion_advert_push")
+        self.assertTrue(witness["companion_pki_acceptance_observed"])
+        self.assertTrue(witness["signed_raw_advert"]["signature_verified"])
+
+    def test_io_failure_after_verified_raw_is_not_hidden_by_the_native_push_grace_period(self):
+        self.target.key = BENCH_ADVERT_KEY
+        self.advert_reply(BENCH_LOG_RX_ADVERT)
+        original_poll = self.client.poll
+        polls_after_request = 0
+
+        def poll(timeout=0):
+            nonlocal polls_after_request
+            original_poll(timeout)
+            if "advert.zerohop" in self.target.commands:
+                polls_after_request += 1
+                if polls_after_request > 1:
+                    raise OSError("serial disconnected after raw receive")
+
+        self.client.poll = poll
+        with self.assertRaisesRegex(OSError, "after raw receive"):
+            self.run_probe()
+        self.assertFalse((self.directory / "probe" / "normal-peer.json").exists())
+        events = (self.directory / "probe" / "serial-events.jsonl").read_text()
+        self.assertIn("ordinary_peer_raw_advert_signature_verified", events)
+        self.assertNotIn("ordinary_peer_advert_received", events)
+
+    def test_pre_request_signed_raw_is_discarded_and_cannot_authorize_later_ack_only(self):
+        self.target.key = BENCH_ADVERT_KEY
+        self.client.pending.append((self.clock.now, BENCH_LOG_RX_ADVERT))
+        self.advert_reply()
+        with self.assertRaises(TimeoutError):
+            self.run_probe(timeout=0.5)
+        events = (self.directory / "probe" / "serial-events.jsonl").read_text()
+        self.assertIn("normal_peer_pre_request_discard", events)
+        self.assertNotIn("ordinary_peer_raw_advert_signature_verified", events)
+
+    def test_second_native_or_third_signed_raw_advert_recovers_packet_loss_with_bounded_spacing(self):
+        for successful_attempt, raw in ((2, False), (3, True)):
+            with self.subTest(attempt=successful_attempt, raw=raw):
+                self.new_pair()
+                self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+                if raw:
+                    self.target.key = BENCH_ADVERT_KEY
+                original = self.target.command
+                requests = []
+
+                def command(value, **kwargs):
+                    if value != "advert.zerohop":
+                        return original(value, **kwargs)
+                    self.target.commands.append(value)
+                    requests.append(self.clock.now)
+                    self.target.packet_stats["sent"] += 1
+                    if len(requests) == successful_attempt:
+                        self.client.packet_stats["recv"] += 1
+                        frame = BENCH_LOG_RX_ADVERT if raw else b"\x80" + self.target.key
+                        self.client.pending.append((self.clock.now, frame))
+                    return "OK - zerohop advert sent"
+
+                self.target.command = command
+                started = self.clock.now
+                result = self.run_probe(str(successful_attempt))
+                self.assertEqual(len(requests), successful_attempt)
+                self.assertTrue(all(later - earlier >= 2 for earlier, later in zip(requests, requests[1:])))
+                self.assertLess(self.clock.now - started, 30)
+                witness = result["peer_receive"]
+                self.assertEqual(witness["attempts_requested"], successful_attempt)
+                self.assertEqual(witness["companion_pki_acceptance_observed"], not raw)
+                self.assertFalse(witness["emission_freshness_verified"])
+                if raw:
+                    self.assertTrue(witness["signature_verified"])
+                stats = result["statistics"]
+                self.assertEqual(stats["before"]["target"]["packets"]["values"]["sent"], 0)
+                self.assertEqual(stats["after"]["target"]["packets"]["values"]["sent"], successful_attempt)
+                self.assertEqual(stats["after"]["client"]["packets"]["values"]["recv"], 1)
+                self.assertTrue(stats["after"]["client"]["radio"]["available"])
+                self.assertTrue(stats["after"]["target"]["radio"]["available"])
+
+    def test_three_acks_and_increased_tx_rx_counters_without_receive_event_remain_failure(self):
+        original = self.target.command
+        requests = []
+
+        def command(value, **kwargs):
+            if value != "advert.zerohop":
+                return original(value, **kwargs)
+            self.target.commands.append(value)
+            requests.append(self.clock.now)
+            self.target.packet_stats["sent"] += 1
+            self.client.packet_stats["recv"] += 1
+            return "OK - zerohop advert sent"
+
+        self.target.command = command
+        started = self.clock.now
+        with self.assertRaisesRegex(TimeoutError, "fresh ordinary advert"):
+            self.run_probe()
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(later - earlier >= 2 for earlier, later in zip(requests, requests[1:])))
+        self.assertLessEqual(self.clock.now - started, 30)
+        summary = json.loads((self.directory / "probe" / "summary.json").read_text())
+        probe = summary["measurements"]["normal_peer_probe"]
+        self.assertFalse(probe["probe_complete"])
+        self.assertFalse(probe["signed_ota_qualified"])
+        self.assertEqual(probe["statistics"]["after"]["target"]["packets"]["values"]["sent"], 3)
+        self.assertEqual(probe["statistics"]["after"]["client"]["packets"]["values"]["recv"], 3)
+        self.assertFalse((self.directory / "probe" / "normal-peer.json").exists())
+        self.assertEqual(len(summary["measurements"]["ordinary_peer_requests"]), 3)
+
+    def test_retry_does_not_waive_bad_signature_or_wrong_bound_peer(self):
+        corrupted = bytearray(BENCH_LOG_RX_ADVERT)
+        corrupted[41] ^= 1
+        for name, frame, key in (
+                ("signature", bytes(corrupted), BENCH_ADVERT_KEY),
+                ("peer", BENCH_LOG_RX_ADVERT, TARGET_KEY)):
+            with self.subTest(name=name):
+                self.new_pair()
+                self.target.key = key
+                self.advert_reply(frame)
+                with self.assertRaises(TimeoutError):
+                    self.run_probe(name, timeout=8)
+                self.assertEqual(self.target.commands.count("advert.zerohop"), 3)
+                events = (self.directory / name / "serial-events.jsonl").read_text()
+                self.assertNotIn("ordinary_peer_advert_received", events)
+                self.assertEqual(events.count('"event": "ordinary_peer_raw_advert_ignored"'), 3)
+
+    def test_stats_are_read_only_exact_normal_protocol_and_unavailable_is_explicit(self):
+        self.client.packet_stats.update(recv=12, sent=34, recv_errors=2)
+        self.target.packet_stats.update(recv=56, sent=78, recv_errors=3)
+        result = self.run_probe()
+        stats = result["statistics"]
+        for phase in ("before", "after"):
+            self.assertEqual(stats[phase]["client"]["packets"]["request_hex"], "3802")
+            self.assertEqual(stats[phase]["client"]["radio"]["request_hex"], "3801")
+            self.assertEqual(stats[phase]["target"]["packets"]["command"], "stats-packets")
+            self.assertEqual(stats[phase]["target"]["radio"]["command"], "stats-radio")
+            self.assertEqual(stats[phase]["client"]["packets"]["values"]["sent"], 34)
+            self.assertEqual(stats[phase]["target"]["packets"]["values"]["sent"], 78)
+            self.assertEqual(stats[phase]["client"]["radio"]["values"]["last_snr"], 3)
+            self.assertTrue(stats[phase]["target"]["radio"]["aggregate_only_not_peer_proof"])
+        self.new_pair()
+        client_command, target_command = self.client.command, self.target.command
+
+        def refused_client(payload, **kwargs):
+            if payload[0] == 56:
+                self.client.commands.append(payload)
+                return bytes([1, 2])
+            return client_command(payload, **kwargs)
+
+        def unknown_target(value, **kwargs):
+            if value.startswith("stats-"):
+                self.target.commands.append(value)
+                return "Unknown command"
+            return target_command(value, **kwargs)
+
+        self.client.command, self.target.command = refused_client, unknown_target
+        result = self.run_probe("unavailable")
+        self.assertTrue(result["ordinary_peer_received"])
+        for phase in ("before", "after"):
+            for role in ("client", "target"):
+                for kind in ("packets", "radio"):
+                    row = result["statistics"][phase][role][kind]
+                    self.assertFalse(row["available"])
+                    self.assertIn("error", row)
+                    self.assertNotIn("values", row)
+
+    def test_readability_timeouts_reserve_after_stats_and_do_not_extend_probe_deadline(self):
+        original_client, original_target = self.client.command, self.target.command
+        stats_timeouts = []
+
+        def slow_client(payload, **kwargs):
+            if payload[0] == 56:
+                self.client.commands.append(payload)
+                stats_timeouts.append(kwargs["timeout"])
+                self.clock.sleep(kwargs["timeout"])
+                raise TimeoutError("stats unsupported")
+            return original_client(payload, **kwargs)
+
+        def slow_target(value, **kwargs):
+            if value.startswith("stats-"):
+                self.target.commands.append(value)
+                stats_timeouts.append(kwargs["timeout"])
+                self.clock.sleep(kwargs["timeout"])
+                raise TimeoutError("stats unsupported")
+            if value == "advert.zerohop":
+                self.target.commands.append(value)
+                return "OK - zerohop advert sent"
+            return original_target(value, **kwargs)
+
+        self.client.command, self.target.command = slow_client, slow_target
+        started = self.clock.now
+        with self.assertRaises(TimeoutError):
+            self.run_probe()
+        self.assertLessEqual(self.clock.now - started, 30)
+        self.assertEqual(len(stats_timeouts), 8)
+        self.assertTrue(all(0 < value <= 0.5 for value in stats_timeouts))
+        summary = json.loads((self.directory / "probe" / "summary.json").read_text())
+        self.assertIn("after", summary["measurements"]["normal_peer_probe"]["statistics"])
+
+    def test_late_ack_spaces_retries_from_ack_and_short_deadline_does_not_force_three_attempts(self):
+        original = self.target.command
+        requested, acknowledged = [], []
+
+        def command(value, **kwargs):
+            if value != "advert.zerohop":
+                return original(value, **kwargs)
+            self.target.commands.append(value)
+            requested.append(self.clock.now)
+            self.clock.sleep(0.4)
+            acknowledged.append(self.clock.now)
+            return "OK - zerohop advert sent"
+
+        self.target.command = command
+        with self.assertRaises(TimeoutError):
+            self.run_probe(timeout=8)
+        self.assertEqual(len(requested), 3)
+        self.assertTrue(all(requested[index + 1] - acknowledged[index] >= 2 for index in range(2)))
+        self.new_pair()
+        self.advert_reply()
+        with self.assertRaises(TimeoutError):
+            self.run_probe("short", timeout=1)
+        self.assertEqual(self.target.commands.count("advert.zerohop"), 1)
+
+    def test_real_target_inspection_shape_without_path_mode_supports_fresh_probe(self):
+        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+        observed_target = {"bw_hz": 250000, "cr": 5, "freq_khz": 907525,
+                           "name": "OTA-LAB-TARGET", "pubkey": self.target.key.hex(),
+                           "role": "repeater", "settings_readback_scope": "preferences", "sf": 7}
+        with mock.patch.object(lab, "repeater_info", return_value=observed_target) as target_info:
+            result = self.run_probe()
+        self.assertEqual(target_info.call_count, 2)
+        self.assertEqual(result["configuration_before"]["target"], observed_target)
+        self.assertEqual(result["configuration_after"]["target"], observed_target)
+        self.assertNotIn("path_hash_mode", result["configuration_before"]["target"])
+        self.assertEqual(result["configuration_before"]["client"]["path_hash_mode"], 2)
+        self.assertEqual(result["configuration_before"]["acl"][self.client.public_key.hex()], 3)
+        self.assertEqual(result["peer_receive"]["frame_hex"], (b"\x80" + TARGET_KEY).hex())
+        self.assertTrue(result["probe_complete"])
+        self.assertNotIn("get path.hash.mode", self.target.commands)
+        events = [json.loads(line) for line in
+                  (self.directory / "probe" / "serial-events.jsonl").read_text().splitlines()]
+        observability = [event for event in events if event["event"] == "normal_peer_path_observability"]
+        self.assertEqual(len(observability), 2)
+        self.assertTrue(all(event["client_path_hash_mode"] == 2
+                            and not event["target_path_hash_mode_observed"] for event in observability))
+
+    def test_wrong_stale_malformed_contact_table_and_ack_only_do_not_prove_peer_reception(self):
+        for kind, frame, stale in (
+                ("wrong", b"\x80" + b"\xbb" * 32, False),
+                ("stale", b"\x80" + TARGET_KEY, True),
+                ("malformed", b"\x80" + TARGET_KEY[:-1], False),
+                ("short_new_advert", b"\x8a" + TARGET_KEY + bytes(3), False),
+                ("contact_table", b"\x03" + TARGET_KEY, False),
+                ("ack_only", None, False)):
+            with self.subTest(kind=kind):
+                self.new_pair()
+                self.advert_reply(frame, stale)
+                with self.assertRaisesRegex(TimeoutError, "fresh ordinary advert"):
+                    self.run_probe(kind, timeout=0.5)
+                artifact = self.directory / kind
+                self.assertFalse((artifact / "normal-peer.json").exists())
+                summary = json.loads((artifact / "summary.json").read_text())
+                probe = summary["measurements"]["normal_peer_probe"]
+                self.assertIn("TimeoutError", summary["error"])
+                self.assertFalse(probe["probe_complete"])
+                self.assertFalse(probe["signed_ota_qualified"])
+                self.assertTrue(probe["rf_request_attempted"])
+                events = (artifact / "serial-events.jsonl").read_text()
+                self.assertIn("ordinary_peer_advert_requested", events)
+                self.assertNotIn("ordinary_peer_advert_received", events)
+                if kind in ("wrong", "stale", "malformed", "short_new_advert"):
+                    self.assertIn("ordinary_peer_advert_ignored", events)
+                    self.assertIn(frame.hex(), events)
+
+    def test_pre_request_correct_peer_event_is_discarded_not_reused(self):
+        self.client.pending.append((self.clock.now, b"\x80" + TARGET_KEY))
+        self.advert_reply()
+        with self.assertRaises(TimeoutError):
+            self.run_probe(timeout=0.5)
+        events = (self.directory / "probe" / "serial-events.jsonl").read_text()
+        self.assertIn("normal_peer_pre_request_discard", events)
+        self.assertNotIn("ordinary_peer_advert_received", events)
+
+    def test_real_framed_backlog_is_drained_and_fresh_push_is_recorded_raw(self):
+        for code in (0x80, 0x8A):
+            with self.subTest(code=code):
+                self.new_pair()
+                payload = new_advert_push(TARGET_KEY) if code == 0x8A else b"\x80" + TARGET_KEY
+                wire = b">" + struct.pack("<H", len(payload)) + payload
+                chunks = [wire[:8], wire[8:], wire]
+                client = self.framed_client(chunks)
+                original = self.target.command
+
+                def command(value, **kwargs):
+                    if value == "advert.zerohop":
+                        self.target.commands.append(value)
+                        chunks.extend([wire[:9], wire[9:]])
+                        return "OK - zerohop advert sent"
+                    return original(value, **kwargs)
+
+                self.target.command = command
+                artifact = self.directory / str(code)
+                original_evidence = lab.Evidence
+
+                def evidence(directory):
+                    observed = original_evidence(directory)
+                    client.evidence = observed
+                    return observed
+
+                with mock.patch.object(lab, "Evidence", side_effect=evidence):
+                    result = self.run_probe(str(code))
+                events = [json.loads(line) for line in (artifact / "serial-events.jsonl").read_text().splitlines()]
+                discarded = [event for event in events if event["event"] == "normal_peer_pre_request_discard"]
+                self.assertEqual(len(discarded), 2)
+                self.assertTrue(all(not event["peer_proof"] for event in discarded))
+                self.assertTrue(all(event["received_monotonic"] < result["peer_receive"]["request_monotonic"]
+                                    for event in discarded))
+                self.assertEqual(result["peer_receive"]["frame_hex"], payload.hex())
+                self.assertEqual(result["peer_receive"]["code"], code)
+                self.assertTrue(any(event["event"] == "serial_rx" and event["hex"] == payload.hex()
+                                    for event in events))
+
+    def test_incomplete_old_serial_frame_refuses_rf_request(self):
+        client = self.framed_client([])
+        client.buffer.extend(b">\x21\x00\x80" + TARGET_KEY[:5])
+        with self.assertRaisesRegex(signed.QualificationError, "incomplete pre-request"):
+            self.run_probe()
+        self.assertNotIn("advert.zerohop", self.target.commands)
+        summary = json.loads((self.directory / "probe" / "summary.json").read_text())
+        self.assertFalse(summary["measurements"]["normal_peer_probe"]["rf_request_attempted"])
+
+    def test_missing_existing_admin_acl_or_invalid_radio_refuses_rf_without_mutation(self):
+        for kind in ("acl", "mismatch", "unapproved"):
+            with self.subTest(kind=kind):
+                self.new_pair()
+                if kind == "acl":
+                    self.target.acl.pop(self.client.public_key.hex())
+                elif kind == "mismatch":
+                    self.target.radio = (907525, 250000, 7, 5)
+                    self.client.radio = (907525, 62500, 7, 5)
+                else:
+                    self.client.radio = self.target.radio = (907525, 500000, 7, 5)
+                with self.assertRaises(signed.QualificationError):
+                    self.run_probe(kind)
+                self.assertNotIn("advert.zerohop", self.target.commands)
+
+    def test_identity_role_and_path_are_validated_before_rf(self):
+        for kind in ("same_key", "zero_key", "role", "path"):
+            with self.subTest(kind=kind):
+                self.new_pair()
+                original = self.target.command
+                if kind == "same_key":
+                    self.target.key = self.client.public_key
+                elif kind == "zero_key":
+                    self.target.key = bytes(32)
+                else:
+                    def command(value, **kwargs):
+                        if kind == "role" and value == "get role":
+                            self.target.commands.append(value)
+                            return "> companion"
+                        return original(value, **kwargs)
+                    self.target.command = command
+                    if kind == "path":
+                        original_client = self.client.command
+
+                        def client_command(payload, **kwargs):
+                            response = original_client(payload, **kwargs)
+                            if payload[0] == lab.CMD_DEVICE_QUERY:
+                                response = bytearray(response)
+                                response[81] = 0
+                                return bytes(response)
+                            return response
+
+                        self.client.command = client_command
+                with self.assertRaises((signed.QualificationError, RuntimeError, AssertionError)):
+                    self.run_probe(kind)
+                self.assertNotIn("advert.zerohop", self.target.commands)
+
+    def test_fresh_peer_does_not_waive_postprobe_identity_configuration_or_acl_changes(self):
+        for kind in ("identity", "radio", "acl"):
+            with self.subTest(kind=kind):
+                self.new_pair()
+
+                def change():
+                    if kind == "identity":
+                        self.target.key = b"\xcc" * 32
+                    elif kind == "radio":
+                        self.client.radio = self.target.radio = (907525, 250000, 7, 5)
+                    else:
+                        self.target.acl[(b"\xaa" * 32).hex()] = 2
+
+                self.advert_reply(b"\x80" + TARGET_KEY, mutate=change)
+                with self.assertRaisesRegex(signed.QualificationError, "changed during"):
+                    self.run_probe(kind)
+                artifact = self.directory / kind
+                self.assertFalse((artifact / "normal-peer.json").exists())
+                probe = json.loads((artifact / "summary.json").read_text())["measurements"]["normal_peer_probe"]
+                self.assertIn("peer_receive", probe)
+                self.assertFalse(probe["probe_complete"])
+
+    def test_io_failure_or_rejected_advert_is_fatal_and_never_rebooted_or_retried_as_success(self):
+        for kind in ("io", "denied"):
+            with self.subTest(kind=kind):
+                self.new_pair()
+                original = self.target.command
+
+                def command(value, **kwargs):
+                    if value != "advert.zerohop":
+                        return original(value, **kwargs)
+                    self.target.commands.append(value)
+                    if kind == "io":
+                        raise OSError("serial disconnected")
+                    return "ERR - denied"
+
+                self.target.command = command
+                with self.assertRaises(OSError if kind == "io" else RuntimeError):
+                    self.run_probe(kind)
+                self.assertEqual(self.target.commands.count("advert.zerohop"), 1)
+                self.assertFalse((self.directory / kind / "normal-peer.json").exists())
+
+    def test_probe_timeout_is_bounded_and_invalid_or_image_flags_fail_before_open(self):
+        started = self.clock.now
+        self.run_probe()
+        self.assertEqual(self.opened_deadline, started + 30)
+        self.new_pair()
+        started = self.clock.now
+        self.run_probe("outer", outer_timeout=0.5)
+        self.assertEqual(self.opened_deadline, started + 0.5)
+        args = signed.parser().parse_args(["--artifact-dir", "unused", "probe-peer"])
+        self.assertEqual(args.probe_timeout, 30)
+        for option in ("--timeout", "--probe-timeout"):
+            for value in ("0", "-1", "nan", "inf"):
+                flags = ["--artifact-dir", str(self.directory / "unused")]
+                flags = flags + [option, value, "probe-peer"] if option == "--timeout" else \
+                    flags + ["probe-peer", option, value]
+                with self.subTest(option=option, value=value), mock.patch("sys.stderr", io.StringIO()), \
+                        mock.patch.object(signed, "Pair") as opened:
+                    with self.assertRaises(SystemExit):
+                        signed.main(flags)
+                    opened.assert_not_called()
+        for flags in (["--image", "unused.bin"], ["--qualified-commit"], ["--mode", "direct"],
+                      ["--duty-milli-percent", "95000"], ["--supervised-full-image-smoke"]):
+            with self.subTest(flags=flags), mock.patch("sys.stderr", io.StringIO()), \
+                    mock.patch.object(signed, "Pair") as opened:
+                with self.assertRaises(SystemExit):
+                    signed.main(["--artifact-dir", str(self.directory / "unused"), "probe-peer"] + flags)
+                opened.assert_not_called()
+
+    def test_probe_rejects_existing_evidence_directory_before_open(self):
+        with mock.patch.object(signed, "Pair") as opened:
+            with self.assertRaisesRegex(signed.QualificationError, "new artifact directory"):
+                signed.main(["--artifact-dir", str(self.directory), "probe-peer"])
+            opened.assert_not_called()
+
+    def test_no_quiet_pre_request_window_refuses_rf(self):
+        def noisy(timeout=0):
+            self.clock.sleep(max(0.01, timeout))
+            self.client.pending.append((self.clock.now, b"\x80" + TARGET_KEY))
+
+        self.client.poll = noisy
+        with self.assertRaisesRegex(TimeoutError, "did not become quiet"):
+            self.run_probe(timeout=0.5)
+        self.assertNotIn("advert.zerohop", self.target.commands)
+
+    def test_probe_pins_both_roles_before_any_port_is_opened(self):
+        with mock.patch.object(signed.lab_device, "resolve", side_effect=[
+                SimpleNamespace(serial=signed.APPROVED["client"], by_id="/dev/serial/by-id/client"),
+                SimpleNamespace(serial="49C5BAF21EEF44A1", by_id="/dev/serial/by-id/pine")]), \
+                mock.patch.object(lab, "FramedSerial") as client_opened, \
+                mock.patch.object(lab, "RepeaterSerial") as target_opened:
+            with self.assertRaisesRegex(signed.QualificationError, "unapproved target"):
+                signed.main(["--artifact-dir", str(self.directory / "protected"), "probe-peer"])
+            client_opened.assert_not_called()
+            target_opened.assert_not_called()
 
 
 if __name__ == "__main__":
