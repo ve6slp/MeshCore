@@ -173,7 +173,10 @@ bool stockBootOrdinaryWritesAllowed(const mesh::ota::OtaBoardBootQualification& 
   return g_stock_boot_result == mesh::ota::OtaBoardStockBootPreflight::Result::Healthy;
 }
 mesh::ota::OtaBoardBootLifecycleObserver& bootLifecycleObserver() {
-  static mesh::ota::OtaBoardBootLifecycleObserver observer(xiao_state_region, xiao_floor_region);
+  static mesh::ota::OtaBoardNrf52RunningContext running;
+  static mesh::ota::OtaBoardOriginalSnapshotProvider original(xiao_state_region, xiao_floor_region, running,
+      g_qualified);
+  static mesh::ota::OtaBoardBootLifecycleObserver observer(xiao_state_region, xiao_floor_region, original);
   return observer;
 }
 
@@ -188,10 +191,13 @@ mesh::ota::OtaBoardTrialGuardedStagingSink* g_active_guarded_staging = nullptr;
 
 const char* otaProductionInstallCapabilityReason() { return g_install_capability_reason; }
 
-// Compact (<=63 byte) install-capability status line, suitable for
-// embedding directly in the existing OTA status serial frame (<=176 byte
-// budget) alongside other fields -- not just an unwired getter.
-const char* otaBoardInstallCapabilityStatus() { return g_install_capability_status; }
+const char* otaBoardInstallCapabilityStatus() {
+  if (!g_qualified) return g_install_capability_status;
+  static char diagnostic[mesh::ota::kOtaBoardFloorCapabilityStatusBytes];
+  mesh::ota::formatOtaBoardFloorCapabilityStatus(diagnostic, sizeof(diagnostic),
+                                                g_install_capability_status, xiao_floor_region);
+  return diagnostic;
+}
 const char* otaBoardEarlyWriteDiagnostic() { return g_early_write_diagnostic; }
 bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
   return bootLifecycleObserver().read(g_qualified, out);
@@ -263,13 +269,14 @@ bool otaBoardEarlyBootTrialOrUnknown() {
   // (blank state region) board AND for a board whose last install
   // outcome is FAILED/mid-transaction, neither of which is positive
   // proof of a safe baseline. resolveOtaBoardStartupDecision() draws
-  // that distinction explicitly; its Normal outcome additionally requires
-  // a positive `has_verified_fresh_baseline_proof` (not supplied here --
-  // no real fresh SDK/CRC/SHA/signature/role provider is wired yet), so
-  // this call is HONESTLY Unknown-or-Trial today even on a CONFIRMED
-  // record, never a fabricated Normal.
-  const mesh::ota::OtaBoardStartupDecision decision = mesh::ota::resolveOtaBoardStartupDecision(
-      /*qualified=*/true, trial_boot_confirmer_ptr->stateReadStatus(), trial_boot_confirmer_ptr->statePhase());
+  // that distinction explicitly. Normal additionally requires fresh original
+  // SDK/hash/floor evidence and absence of active or unexplained commands.
+  mesh::ota::OtaBoardNrf52RunningContext running;
+  mesh::ota::OtaBoardOriginalSnapshotProvider original(xiao_state_region, xiao_floor_region, running, g_qualified);
+  const bool original_safe = original.ordinaryWritesAllowed(
+      xiao_command_region, xiao_confirm_region, signature_verifier, kExpectedBoardTargetId, kExpectedRoleId);
+  const mesh::ota::OtaBoardStartupDecision decision = mesh::ota::resolveOtaBoardOriginalStartupDecision(
+      true, trial_boot_confirmer_ptr->stateReadStatus(), trial_boot_confirmer_ptr->statePhase(), original_safe);
   snprintf(g_early_write_diagnostic, sizeof(g_early_write_diagnostic),
            "marker=qualified proof=qualified-state state=%u phase=%u decision=%u",
            unsigned(trial_boot_confirmer_ptr->stateReadStatus()), unsigned(trial_boot_confirmer_ptr->statePhase()),
@@ -375,24 +382,14 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   std::memcpy(anchor.trusted_signer_public_key_ed25519, active_wire_public_key,
               sizeof(anchor.trusted_signer_public_key_ed25519));
   // A qualified marker alone is not sufficient: this build must also be
-  // running from a genuinely valid, freshly resolved bank-0 record
-  // (BANK_VALID_APP + matching CRC/size). An invalid bank0 disables
+  // running from a verified original SDK/hash/floor/state snapshot. An invalid snapshot disables
   // receiver/install admission while leaving a non-installable cache.
-  const ::ota::storage::XiaoOtaActiveExtentInfo bank0 = ::ota::storage::XiaoOtaActiveExtentBridge::resolveCurrent();
-  if (bank0.active_image_extent == 0) {
-    return attach_cache_only("CACHE_ONLY: qualified boot marker but bank0 invalid or unresolved");
-  }
-  // A qualified marker and valid bank0 are still not sufficient: the
-  // bootloader-owned confirmed-counter floor must also be genuinely
-  // readable (a valid record, or both slots legitimately blank -- a real
-  // first-ever-device baseline of 0) before receiver/install admission.
-  // A corrupt/unreadable floor leaves only a cache; it never defaults the
-  // install floor to zero. Shared, natively-testable predicate (see
-  // OtaBoardBackendCommon.h) rather than duplicated inline logic.
+  static mesh::ota::OtaBoardOriginalSnapshotProvider original_snapshot(
+      xiao_state_region, xiao_floor_region, running_context, g_qualified);
   const mesh::ota::OtaBoardInstallGateResult gate =
-      mesh::ota::resolveOtaBoardInstallGate(qualification.qualified, bank0.active_image_extent, counter);
+      mesh::ota::resolveOtaBoardOriginalInstallGate(qualification.qualified, original_snapshot, counter);
   if (!gate.install_capable) {
-    return attach_cache_only("CACHE_ONLY: qualified boot marker and valid bank0 but floor unreadable");
+    return attach_cache_only(gate.reason);
   }
   // This reflects the protocol-level capability this firmware image is
   // built for, independent of whether THIS PARTICULAR flashed device
@@ -429,7 +426,7 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   verifier = &production_verifier;
   trust = &production_trust;
 
-  static mesh::ota::OtaBoardInstallCommandProviderV3 production_install_provider_v3;
+  static mesh::ota::OtaBoardInstallCommandProviderV3 production_install_provider_v3(original_snapshot);
   production_install_provider_v3.setTrialActivePredicate(&otaBoardTrialHealthWindowActive);
   static mesh::ota::OtaFirmwareStorageSink production_staging(candidate, &xiao_command_region,
                                                               &production_install_provider_v3);
@@ -443,7 +440,7 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
   staging = &production_guarded_staging;
   g_active_guarded_staging = &production_guarded_staging;
   install_provider_v3 = &production_install_provider_v3;
-  g_install_capability_reason = "INSTALL_CAPABLE: qualified custom bootloader detected (command v3)";
+  g_install_capability_reason = gate.reason;
   g_backend_qualified_and_bank0_valid = true;
   mesh::ota::formatOtaBoardCapabilityStatus(g_install_capability_status, sizeof(g_install_capability_status),
                                             g_install_capability_reason);

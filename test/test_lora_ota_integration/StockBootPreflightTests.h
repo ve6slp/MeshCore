@@ -617,6 +617,234 @@ TEST(LoraOtaStockBoot, RealCacheAppendAndResetCutsColdBootWritableAndRecoverOnly
   }
 }
 
+TEST(LoraOtaStockBoot, PartialEraseOwnedSuffixKeepsSignedAbortDurableAcrossColdBootUntilExplicitRestart) {
+  using Flash = ::ota::test::FakeNorFlash;
+  using Store = ::ota::storage::OtaCandidateStore;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (bool vendor_zero : {false, true}) for (bool another_admin : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << vendor_zero << '/' << another_admin);
+      StockBootFixture f(board, role);
+      f.running.vendorCrcDisabled = vendor_zero;
+      f.cache(Store::Phase::Ready); ASSERT_FALSE(HasFatalFailure());
+      Store::Snapshot original;
+      ASSERT_TRUE(f.fx.candidate_store.load(original));
+      ASSERT_EQ(Store::Phase::Ready, original.phase);
+      uint8_t begin[158] = {usb::kCommand, uint8_t(usb::UsbOtaOp::CacheBegin), usb::kCacheBeginFlagReupload};
+      std::memcpy(begin + 3, original.ownerPublicKey, 32);
+      std::memcpy(begin + 35, original.canonical, 59);
+      std::memcpy(begin + 94, original.signature, 64);
+      f.fx.candidate_flash.armFault({Flash::OpKind::Erase, Flash::InjectionTiming::Mid,
+                                    f.fx.candidate_flash.eraseOpCount() + 1, 512});
+      ASSERT_EQ(usb::UsbOtaResult::IoError,
+                f.fx.integration.leanReceiver().handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      f.fx.candidate_flash.clearFault();
+      ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
+      expectOrdinaryStockWrites(f); ASSERT_FALSE(HasFatalFailure());
+      stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
+      OtaFirmwareIntegration cold;
+      cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+      cold.setLeanTargetPublicKey(f.fx.target_public_key);
+      OtaBoardCacheOnlyBackend backend(f.fx.image_region, f.fx.candidate_store_region,
+                                      +[]() { return stock_cache_blocked; });
+      ASSERT_TRUE(backend.attach(cold, f.fx.sig_verifier));
+      const auto before = cold.leanReceiver().status();
+      ASSERT_EQ(Store::Phase::Ready, before.phase);
+      EXPECT_EQ(1u, before.receivedBlocks);
+      EXPECT_EQ(0, std::memcmp(original.ownerPublicKey, before.ownerPublicKey, 32));
+      const uint8_t admin_seed[32] = {0x79};
+      ::ota::test::Ed25519TestSigner admin(admin_seed);
+      f.fx.admins.add(admin.publicKey());
+      const auto& signer = another_admin ? admin : f.owner;
+      uint8_t message[usb::kAbortSignedBytes], signature[64];
+      usb::buildAbortSignedMessage(f.fx.target_public_key, before.imageHash, message);
+      signer.sign(message, sizeof(message), signature);
+      const auto erases = f.fx.candidate_flash.eraseOpCount();
+      ASSERT_EQ(usb::UsbOtaResult::Ok,
+                cold.leanReceiver().abort(signer.publicKey(), signature, before.imageHash));
+      EXPECT_EQ(Store::Phase::Aborted, cold.leanReceiver().status().phase);
+      EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
+
+      OtaFirmwareIntegration rebooted;
+      rebooted.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+      rebooted.setLeanTargetPublicKey(f.fx.target_public_key);
+      OtaBoardCacheOnlyBackend rebooted_backend(f.fx.image_region, f.fx.candidate_store_region,
+                                               +[]() { return stock_cache_blocked; });
+      ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()) && rebooted_backend.attach(rebooted, f.fx.sig_verifier));
+      auto& cache = rebooted.leanReceiver();
+      ASSERT_EQ(Store::Phase::Aborted, cache.status().phase);
+      EXPECT_EQ(1u, cache.status().receivedBlocks);
+      Store::Snapshot aborted;
+      ASSERT_TRUE(f.fx.candidate_store.load(aborted));
+      EXPECT_EQ(original.sessionId + 1, aborted.sessionId);
+      EXPECT_GT(aborted.sequence, original.sequence);
+      EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, cache.status().ownerPublicKey, 32));
+      begin[2] = 0;
+      EXPECT_EQ(usb::UsbOtaResult::Denied, cache.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      for (uint8_t mode : {usb::kStartModeDirect, usb::kStartModeDirected, usb::kStartModeBackground}) {
+        OtaRfUploader uploader;
+        EXPECT_FALSE(uploader.start(rebooted, mode, f.fx.target_public_key, 1, 908525, 60, 7, false));
+      }
+      EXPECT_EQ(Store::Phase::Aborted, cache.status().phase);
+      EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
+      begin[2] = usb::kCacheBeginFlagReupload;
+      ASSERT_EQ(usb::UsbOtaResult::Ok, cache.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      EXPECT_EQ(Store::Phase::Receiving, cache.status().phase);
+      EXPECT_EQ(0u, cache.status().receivedBlocks);
+      EXPECT_EQ(StockProof::Result::Healthy, f.cacheProof());
+      EXPECT_EQ(0u, f.journal_flash.programOpCount());
+      EXPECT_EQ(0u, f.journal_flash.eraseOpCount());
+    }
+}
+
+TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppressionAndExplicitRestart) {
+  using Flash = ::ota::test::FakeNorFlash;
+  using Store = ::ota::storage::OtaCandidateStore;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (bool vendor_zero : {false, true}) for (bool heal_ready : {false, true})
+      for (bool another_admin : {false, true}) for (bool abort_cut : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << vendor_zero << '/'
+                   << heal_ready << '/' << another_admin << '/' << abort_cut);
+      StockBootFixture f(board, role);
+      f.running.vendorCrcDisabled = vendor_zero;
+      f.cache(Store::Phase::Receiving); ASSERT_FALSE(HasFatalFailure());
+      const uint8_t image[40] = {0x57};
+      uint8_t put[45] = {usb::kCommand, uint8_t(usb::UsbOtaOp::CachePut), 0, 0, sizeof(image)};
+      std::memcpy(put + 5, image, sizeof(image));
+      auto& initial = f.fx.integration.leanReceiver();
+      ASSERT_EQ(usb::UsbOtaResult::Ok, initial.handleUsbCacheFrame(put, sizeof(put), f.owner.publicKey()));
+      const uint8_t seal[] = {usb::kCommand, uint8_t(usb::UsbOtaOp::CacheSeal)};
+      ASSERT_EQ(usb::UsbOtaResult::Pending, initial.handleUsbCacheFrame(seal, sizeof(seal), f.owner.publicKey()));
+      f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
+                                    f.fx.candidate_flash.programOpCount() + 2});
+      f.fx.integration.loop();
+      ASSERT_EQ(Store::Phase::Verifying, initial.status().phase);
+      f.fx.candidate_flash.clearFault();
+      ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
+      expectOrdinaryStockWrites(f); ASSERT_FALSE(HasFatalFailure());
+      stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
+      OtaFirmwareIntegration cold;
+      cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+      cold.setLeanTargetPublicKey(f.fx.target_public_key);
+      OtaBoardCacheOnlyBackend backend(f.fx.image_region, f.fx.candidate_store_region,
+                                      +[]() { return stock_cache_blocked; });
+      ASSERT_TRUE(backend.attach(cold, f.fx.sig_verifier));
+      auto& cache = cold.leanReceiver();
+      ASSERT_EQ(Store::Phase::Verifying, cache.status().phase);
+      if (heal_ready) {
+        ASSERT_EQ(usb::UsbOtaResult::Pending, cache.handleUsbCacheFrame(seal, sizeof(seal), f.owner.publicKey()));
+        cold.loop();
+        ASSERT_EQ(Store::Phase::Ready, cache.status().phase);
+        ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
+      }
+      Store::Snapshot before;
+      ASSERT_TRUE(f.fx.candidate_store.load(before));
+      const uint8_t admin_seed[32] = {0x79}, other_seed[32] = {0x78}, outsider_seed[32] = {0x7b};
+      ::ota::test::Ed25519TestSigner admin(admin_seed), other(other_seed), outsider(outsider_seed);
+      f.fx.admins.add(admin.publicKey());
+      f.fx.admins.add(other.publicKey());
+      uint8_t begin[158] = {usb::kCommand, uint8_t(usb::UsbOtaOp::CacheBegin), usb::kCacheBeginFlagReupload};
+      std::memcpy(begin + 3, before.ownerPublicKey, 32);
+      std::memcpy(begin + 35, before.canonical, 59);
+      std::memcpy(begin + 94, before.signature, 64);
+      uint8_t other_begin[158];
+      std::memcpy(other_begin, begin, sizeof(begin));
+      std::memcpy(other_begin + 3, other.publicKey(), 32);
+      other.sign(other_begin + 35, 59, other_begin + 94);
+      EXPECT_EQ(usb::UsbOtaResult::Busy,
+                cache.handleUsbCacheFrame(other_begin, sizeof(other_begin), f.owner.publicKey()));
+      uint8_t message[usb::kAbortSignedBytes], signature[64];
+      const auto status = cache.status();
+      usb::buildAbortSignedMessage(f.fx.target_public_key, status.imageHash, message);
+      outsider.sign(message, sizeof(message), signature);
+      EXPECT_EQ(usb::UsbOtaResult::Denied, cache.abort(outsider.publicKey(), signature, status.imageHash));
+      const auto& signer = another_admin ? admin : f.owner;
+      signer.sign(message, sizeof(message), signature);
+      const auto erases = f.fx.candidate_flash.eraseOpCount();
+      if (abort_cut) f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
+                                                  f.fx.candidate_flash.programOpCount() + 2});
+      ASSERT_EQ(abort_cut ? usb::UsbOtaResult::IoError : usb::UsbOtaResult::Ok,
+                cache.abort(signer.publicKey(), signature, status.imageHash));
+      f.fx.candidate_flash.clearFault();
+      ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
+      if (abort_cut) {
+        OtaFirmwareIntegration retry;
+        retry.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+        retry.setLeanTargetPublicKey(f.fx.target_public_key);
+        OtaBoardCacheOnlyBackend retry_backend(f.fx.image_region, f.fx.candidate_store_region,
+                                               +[]() { return stock_cache_blocked; });
+        ASSERT_TRUE(retry_backend.attach(retry, f.fx.sig_verifier));
+        EXPECT_EQ(before.phase, retry.leanReceiver().status().phase);
+        ASSERT_EQ(usb::UsbOtaResult::Ok,
+                  retry.leanReceiver().abort(signer.publicKey(), signature, status.imageHash));
+        ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
+      }
+      OtaFirmwareIntegration rebooted;
+      rebooted.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+      rebooted.setLeanTargetPublicKey(f.fx.target_public_key);
+      OtaBoardCacheOnlyBackend rebooted_backend(f.fx.image_region, f.fx.candidate_store_region,
+                                               +[]() { return stock_cache_blocked; });
+      ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()) && rebooted_backend.attach(rebooted, f.fx.sig_verifier));
+      auto& resumed = rebooted.leanReceiver();
+      ASSERT_EQ(Store::Phase::Aborted, resumed.status().phase);
+      EXPECT_EQ(1u, resumed.status().receivedBlocks);
+      Store::Snapshot aborted;
+      ASSERT_TRUE(f.fx.candidate_store.load(aborted));
+      EXPECT_EQ(before.sessionId + 1, aborted.sessionId);
+      EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, aborted.ownerPublicKey, 32));
+      begin[2] = 0;
+      EXPECT_EQ(usb::UsbOtaResult::Denied, resumed.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      other_begin[2] = 0;
+      EXPECT_EQ(usb::UsbOtaResult::Busy,
+                resumed.handleUsbCacheFrame(other_begin, sizeof(other_begin), f.owner.publicKey()));
+      for (uint8_t mode : {usb::kStartModeDirect, usb::kStartModeDirected, usb::kStartModeBackground}) {
+        OtaRfUploader uploader;
+        EXPECT_FALSE(uploader.start(rebooted, mode, f.fx.target_public_key, 1, 908525, 60, 7, false));
+      }
+      EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
+      begin[2] = usb::kCacheBeginFlagReupload;
+      ASSERT_EQ(usb::UsbOtaResult::Ok, resumed.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      EXPECT_EQ(Store::Phase::Receiving, resumed.status().phase);
+      EXPECT_EQ(0u, resumed.status().receivedBlocks);
+      EXPECT_EQ(StockProof::Result::Healthy, f.cacheProof());
+      EXPECT_EQ(0u, f.journal_flash.programOpCount());
+      EXPECT_EQ(0u, f.journal_flash.eraseOpCount());
+    }
+}
+
+TEST(LoraOtaStockBoot, TornCacheBindingIgnoresOnlySessionAttemptWhileCompetingOwnerContentAndCampaignStayRefused) {
+  using Flash = ::ota::test::FakeNorFlash;
+  using Store = ::ota::storage::OtaCandidateStore;
+  for (int fault = 0; fault < 4; ++fault) {
+    SCOPED_TRACE(fault);
+    StockBootFixture f;
+    f.cache(Store::Phase::Ready); ASSERT_FALSE(HasFatalFailure());
+    Store::Snapshot snapshot;
+    ASSERT_TRUE(f.fx.candidate_store.load(snapshot));
+    for (int torn = 0; torn < 2; ++torn) {
+      ++snapshot.sessionId;
+      ++snapshot.attemptId;
+      if (torn && fault == 1) ++snapshot.campaignId;
+      if (torn && fault == 2) {
+        const uint8_t image[40] = {0x59};
+        f.fx.buildSmallManifest(image, sizeof(image), snapshot.canonical);
+        f.owner.sign(snapshot.canonical, sizeof(snapshot.canonical), snapshot.signature);
+      }
+      if (torn && fault == 3) {
+        const uint8_t seed[32] = {0x7c};
+        ::ota::test::Ed25519TestSigner other(seed);
+        std::memcpy(snapshot.ownerPublicKey, other.publicKey(), sizeof(snapshot.ownerPublicKey));
+        other.sign(snapshot.canonical, sizeof(snapshot.canonical), snapshot.signature);
+      }
+      f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
+                                    f.fx.candidate_flash.programOpCount() + 2});
+      ASSERT_FALSE(f.fx.candidate_store.append(snapshot));
+      f.fx.candidate_flash.clearFault();
+    }
+    EXPECT_EQ(fault ? StockProof::Result::InvalidCache : StockProof::Result::CacheNeedsReset, f.cacheProof());
+    EXPECT_EQ(!fault, StockProof::cacheAttachAllowed(f.cacheProof()));
+  }
+}
+
 TEST(LoraOtaStockBoot, GenuineQualifiedTrialRemainsReadOnlyBeforeFilesystemMountAndNeverGeneratesIdentity) {
   LifecycleFixture boot;
   boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseTrialBoot);

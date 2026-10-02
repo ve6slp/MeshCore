@@ -283,6 +283,78 @@ TEST(OtaCandidateStoreTest, DuplicateBitmapMarksAreIdempotentWithoutReprogrammin
   EXPECT_EQ(1u, store.countReceived(snapshot.totalBlocks));
 }
 
+TEST(OtaCandidateStoreTest, AppendAfterPartialEraseUsesNewestValidSuffixNotTheFirstFreeSlot) {
+  using Store = OtaCandidateStore;
+  for (auto phase : {Store::Phase::Receiving, Store::Phase::Verifying, Store::Phase::Aborted})
+    for (bool damaged_sequence : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << unsigned(phase) << '/' << damaged_sequence);
+      FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+      FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+      Store store(region);
+      Store::Snapshot snapshot;
+      snapshot.valid = true; snapshot.localCache = true; snapshot.totalBlocks = 3;
+      snapshot.exactSizeBytes = 200; snapshot.sessionId = 17;
+      snapshot.ownerPublicKey[0] = 0x87;
+      snapshot.phase = Store::Phase::Receiving;
+      ASSERT_TRUE(store.reset(snapshot));
+      ASSERT_TRUE(store.markReceived(0)); ASSERT_TRUE(store.markReceived(2));
+      snapshot.phase = Store::Phase::Verifying; ASSERT_TRUE(store.append(snapshot));
+      snapshot.phase = Store::Phase::Ready; ASSERT_TRUE(store.append(snapshot));
+      flash.armFault({FakeNorFlash::OpKind::Erase, FakeNorFlash::InjectionTiming::Mid,
+                      flash.eraseOpCount() + 1, 2 * Store::kRecordBytes});
+      ASSERT_FALSE(ota::platform::isOk(region.eraseSector(0)));
+      flash.clearFault();
+      if (damaged_sequence) {
+        uint8_t record[Store::kRecordBytes];
+        ASSERT_TRUE(ota::platform::isOk(region.read(2 * Store::kRecordBytes, record, sizeof(record))));
+        std::memset(record + 8, 0xff, 4);
+        ASSERT_TRUE(ota::platform::isOk(region.program(Store::kRecordBytes, record, sizeof(record))));
+      }
+      Store::Snapshot surviving;
+      ASSERT_TRUE(store.load(surviving));
+      ASSERT_EQ(Store::Phase::Ready, surviving.phase);
+      ASSERT_EQ(3u, surviving.sequence);
+      surviving.phase = phase; ++surviving.sessionId;
+      const auto erases = flash.eraseOpCount();
+      ASSERT_TRUE(store.append(surviving));
+      Store cold(region);
+      Store::Snapshot reloaded;
+      ASSERT_TRUE(cold.load(reloaded));
+      EXPECT_EQ(phase, reloaded.phase);
+      EXPECT_EQ(4u, reloaded.sequence);
+      EXPECT_EQ(18u, reloaded.sessionId);
+      EXPECT_EQ(2u, reloaded.receivedBlocks);
+      EXPECT_EQ(0, std::memcmp(snapshot.ownerPublicKey, reloaded.ownerPublicKey, sizeof(snapshot.ownerPublicKey)));
+      EXPECT_EQ(erases, flash.eraseOpCount());
+    }
+}
+
+TEST(OtaCandidateStoreTest, AppendCannotGuessSequenceWhenAValidSuffixIsUnreadable) {
+  using Store = OtaCandidateStore;
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  Store::Snapshot snapshot;
+  snapshot.valid = true; snapshot.totalBlocks = 1; snapshot.exactSizeBytes = 40;
+  snapshot.phase = Store::Phase::Receiving; ASSERT_TRUE(store.reset(snapshot));
+  snapshot.phase = Store::Phase::Verifying; ASSERT_TRUE(store.append(snapshot));
+  snapshot.phase = Store::Phase::Ready; ASSERT_TRUE(store.append(snapshot));
+  flash.armFault({FakeNorFlash::OpKind::Erase, FakeNorFlash::InjectionTiming::Mid,
+                  flash.eraseOpCount() + 1, 2 * Store::kRecordBytes});
+  ASSERT_FALSE(ota::platform::isOk(region.eraseSector(0)));
+  flash.clearFault();
+  snapshot.phase = Store::Phase::Aborted;
+  const auto programs = flash.programOpCount();
+  flash.armFault({FakeNorFlash::OpKind::Read, FakeNorFlash::InjectionTiming::Before, flash.readOpCount() + 5});
+  EXPECT_FALSE(store.append(snapshot));
+  EXPECT_EQ(programs, flash.programOpCount());
+  flash.clearFault();
+  Store cold(region);
+  ASSERT_TRUE(cold.load(snapshot));
+  EXPECT_EQ(Store::Phase::Ready, snapshot.phase);
+  EXPECT_EQ(3u, snapshot.sequence);
+}
+
 // -----------------------------------------------------------------------
 // ReceiptMap exactness, including the required >=5069 chunk count.
 // -----------------------------------------------------------------------
@@ -1905,9 +1977,9 @@ TEST(OtaBoardFailClosedMonotonicCounterTest, CommitRejectsNonIncreasingValueAndU
 
 // ---------------------------------------------------------------------
 // resolveOtaBoardInstallGate(): the shared "qualified marker && valid
-// bank0 && readable floor" predicate both backends (.cpp, Arduino-
+// bank0 && initialized floor" predicate both backends (.cpp, Arduino-
 // dependent, otherwise untestable natively) must consult before
-// attaching a durable v2 install-command provider/enabling confirmation.
+// attaching a durable install-command provider.
 // Each of the three inputs is exercised independently to prove none is
 // individually sufficient, and that a corrupt/unreadable floor disables
 // install capability even when the other two both hold (never silently
@@ -2000,15 +2072,38 @@ TEST(OtaBoardInstallGateTest, RefusesWhenBlankHeaderHasNonBlankTailRatherThanDef
   EXPECT_FALSE(result.install_capable);
 }
 
-TEST(OtaBoardInstallGateTest, InstallCapableOnlyWhenQualifiedAndBank0ValidAndFloorReadableIncludingLegitimateBlankBaseline) {
+TEST(OtaBoardInstallGateTest, BlankNumericZeroIsNeverQualifiedInstallerPermission) {
   FakeNorFlash flash(8192, 4096);
   FlashRegion region(flash, 0, 8192);
   mesh::ota::OtaBoardFailClosedMonotonicCounter counter(region);  // both slots blank -> legitimate baseline 0.
 
   const auto result =
       mesh::ota::resolveOtaBoardInstallGate(/*qualified=*/true, /*bank0_active_image_extent=*/0x20000u, counter);
-  EXPECT_TRUE(result.install_capable);
+  uint32_t numeric = 99;
+  ASSERT_TRUE(counter.currentValue(numeric));
+  EXPECT_EQ(0u, numeric);
+  EXPECT_FALSE(result.install_capable);
   EXPECT_EQ(result.floor_value, 0u);
+}
+
+TEST(OtaBoardInstallGateTest, PresentGenesisZeroIsQualifiedInstallerPermissionNotInstalledEvidence) {
+  FakeNorFlash flash(8192, 4096);
+  FlashRegion region(flash, 0, 8192);
+  auto genesis = makeFloorRecordBytes(1, 0, 0);
+  std::memset(genesis.data() + 20, 0, 32);
+  const auto crc = ota::storage::Crc32::computeFinalized(genesis.data(), 52);
+  for (uint32_t i = 0; i < 4; ++i) genesis[52 + i] = static_cast<uint8_t>(crc >> (i * 8));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, genesis.data(), genesis.size())));
+  mesh::ota::OtaBoardFailClosedMonotonicCounter counter(region);
+  const auto result = mesh::ota::resolveOtaBoardInstallGate(true, 9004, counter);
+  EXPECT_TRUE(result.install_capable);
+  EXPECT_EQ(0u, result.floor_value);
+  uint8_t hash[32]; uint32_t floor = 99, extent = 99;
+  ASSERT_TRUE(ota::storage::XiaoOtaFloorReader::readNewestConfirmedEvidenceFailClosed(region, floor, hash, &extent));
+  EXPECT_EQ(0u, floor);
+  EXPECT_EQ(0u, extent);
+  const uint8_t unknown[32] = {};
+  EXPECT_EQ(0, std::memcmp(hash, unknown, sizeof(hash)));
 }
 
 TEST(OtaBoardInstallGateTest, InstallCapableWithAGenuineNonZeroFloorRecord) {
@@ -2485,6 +2580,98 @@ TEST(FormatOtaBoardCapabilityStatusTest, TruncatesLongReasonWithoutOverflow) {
   char buf[8];
   mesh::ota::formatOtaBoardCapabilityStatus(buf, sizeof(buf), "this reason is much longer than the buffer");
   EXPECT_EQ(strlen(buf), 7u);  // out_len - 1, NUL-terminated, no overflow.
+}
+
+TEST(OtaBoardFloorDiagnosticTest, PresentGenesisIsNotAZeroDefaultAndReadbackNeverWrites) {
+  using Diagnostic = mesh::ota::OtaBoardFloorDiagnostic;
+  FakeNorFlash flash(8192, 4096);
+  FlashRegion region(flash, 0, 8192);
+  EXPECT_EQ(Diagnostic::Status::Blank, Diagnostic::read(region).status);
+  char detail[mesh::ota::kOtaBoardFloorCapabilityStatusBytes];
+  mesh::ota::formatOtaBoardFloorCapabilityStatus(detail, sizeof(detail), "INSTALL_CAPABLE: old cached reason", region);
+  EXPECT_STREQ("STAGING_ONLY: floor not initialized floor=blank seq=? ctr=? ext=? sha=? io=ok", detail);
+  const auto genesis = makeFloorRecordBytes(1, 0, 0);
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, genesis.data(), genesis.size())));
+  const auto before = std::vector<uint8_t>(flash.rawBuffer(), flash.rawBuffer() + flash.rawSize());
+  const auto programs = flash.programOpCount(), erases = flash.eraseOpCount();
+  const auto evidence = Diagnostic::read(region);
+  EXPECT_EQ(Diagnostic::Status::Present, evidence.status);
+  EXPECT_EQ(1u, evidence.sequence);
+  EXPECT_EQ(0u, evidence.counter);
+  EXPECT_EQ(0u, evidence.extent);
+  const uint8_t zero_hash[32] = {};
+  EXPECT_EQ(0, std::memcmp(zero_hash, evidence.hash, sizeof(zero_hash)));
+  mesh::ota::formatOtaBoardFloorCapabilityStatus(detail, sizeof(detail), "INSTALL_CAPABLE: verified original", region);
+  EXPECT_STREQ(("INSTALL_CAPABLE: floor=present seq=00000001 ctr=00000000 ext=00000000 sha=" +
+                std::string(64, '0') + " io=ok").c_str(), detail);
+  EXPECT_EQ(programs, flash.programOpCount());
+  EXPECT_EQ(erases, flash.eraseOpCount());
+  EXPECT_EQ(0, std::memcmp(before.data(), flash.rawBuffer(), before.size()));
+}
+
+TEST(OtaBoardFloorDiagnosticTest, FullNewestRecordAndHashFitBothExistingResponsesWithoutTruncation) {
+  FakeNorFlash flash(8192, 4096);
+  FlashRegion region(flash, 0, 8192);
+  const auto older = makeFloorRecordBytes(1, 0, 0);
+  auto newest = makeFloorRecordBytes(0xffffffff, 0xffffffff, 0xffffffff);
+  std::memset(newest.data() + 20, 0xff, 32);
+  const uint32_t crc = Crc32::computeFinalized(newest.data(), ota::storage::XiaoOtaFloorReader::kCrcOffset);
+  for (uint32_t i = 0; i < 4; ++i) newest[52 + i] = crc >> (8 * i);
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, older.data(), older.size())));
+  ASSERT_TRUE(ota::platform::isOk(region.program(4096, newest.data(), newest.size())));
+  char detail[mesh::ota::kOtaBoardFloorCapabilityStatusBytes], repeater[160];
+  mesh::ota::formatOtaBoardFloorCapabilityStatus(detail, sizeof(detail), "INSTALL_CAPABLE: verified original", region);
+  const std::string expected = "INSTALL_CAPABLE: floor=present seq=FFFFFFFF ctr=FFFFFFFF ext=FFFFFFFF sha=" +
+      std::string(64, 'F') + " io=ok";
+  EXPECT_EQ(expected, detail);
+  EXPECT_EQ(144u, std::strlen(detail));
+  for (bool blocked : {false, true}) {
+    mesh::ota::formatOtaOrdinaryWriteDiagnostic(repeater, sizeof(repeater), blocked, detail);
+    const std::string text = std::string(blocked ? "writes=blocked " : "writes=allowed ") + expected;
+    EXPECT_EQ(text, repeater);
+    EXPECT_EQ(159u, std::strlen(repeater));
+    uint8_t companion[176];
+    const auto bytes = mesh::ota::encodeOtaOrdinaryWriteDiagnostic(companion, sizeof(companion), 29, blocked, detail);
+    EXPECT_EQ(160u, bytes);
+    EXPECT_EQ(29, companion[0]);
+    EXPECT_EQ(text, reinterpret_cast<char*>(companion + 1));
+  }
+  char short_detail[64];
+  mesh::ota::formatOtaBoardFloorCapabilityStatus(short_detail, sizeof(short_detail),
+                                               "INSTALL_CAPABLE: verified original", region);
+  EXPECT_STREQ("STAGING_ONLY: floor=unavailable io=buffer", short_detail);
+}
+
+TEST(OtaBoardFloorDiagnosticTest, TornCrcTailAndReadErrorsNeverInventPresentZeroEvidence) {
+  using Diagnostic = mesh::ota::OtaBoardFloorDiagnostic;
+  for (int fault = 0; fault < 6; ++fault) {
+    FakeNorFlash flash(8192, 4096);
+    FlashRegion region(flash, 0, 8192);
+    auto record = makeFloorRecordBytes(1, 0, 0);
+    if (fault == 0) record[52] ^= 1;
+    if (fault == 1)
+      flash.armFault({FakeNorFlash::OpKind::Program, FakeNorFlash::InjectionTiming::Mid, 1, 17});
+    if (fault <= 1) {
+      EXPECT_EQ(fault == 0, ota::platform::isOk(region.program(0, record.data(), record.size())));
+      flash.clearFault();
+    } else if (fault == 2 || fault == 3) {
+      if (fault == 3) ASSERT_TRUE(ota::platform::isOk(region.program(0, record.data(), record.size())));
+      const uint8_t tail = 0;
+      ASSERT_TRUE(ota::platform::isOk(region.program(8191, &tail, 1)));
+    }
+    if (fault >= 4)
+      flash.armFault({FakeNorFlash::OpKind::Read, FakeNorFlash::InjectionTiming::Before,
+                     flash.readOpCount() + (fault == 4 ? 1u : 18u)});
+    char detail[mesh::ota::kOtaBoardFloorCapabilityStatusBytes];
+    mesh::ota::formatOtaBoardFloorCapabilityStatus(detail, sizeof(detail), "INSTALL_CAPABLE: stale", region);
+    EXPECT_NE(nullptr, std::strstr(detail, fault < 4 ? "floor=corrupt" : "floor=read-error"));
+    EXPECT_NE(nullptr, std::strstr(detail, "seq=? ctr=? ext=? sha=?"));
+    EXPECT_NE(nullptr, std::strstr(detail, fault < 4 ? "io=ok" : "io=read-error"));
+    EXPECT_EQ(0, std::strncmp(detail, "STAGING_ONLY: ", 14));
+  }
+  FakeNorFlash flash(4096, 4096);
+  FlashRegion wrong_geometry(flash, 0, 4096);
+  EXPECT_EQ(Diagnostic::Status::Unavailable, Diagnostic::read(wrong_geometry).status);
 }
 
 // ---------------------------------------------------------------------

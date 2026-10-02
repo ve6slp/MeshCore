@@ -208,33 +208,35 @@ private:
   bool findNextSlot(uint32_t& out_slot, uint32_t& out_previous_sequence) const {
     out_slot = 0;
     out_previous_sequence = 0;
-    bool found_any = false;
     uint32_t first_free = kRecordSlots;
     for (uint32_t slot = 0; slot < kRecordSlots; ++slot) {
       Snapshot current;
-      if (readSlot(slot, current)) {
-        found_any = true;
+      bool unreadable = false;
+      if (readSlot(slot, current, &unreadable)) {
         if (current.sequence >= out_previous_sequence) out_previous_sequence = current.sequence;
         continue;
       }
+      if (unreadable) return false;
       uint8_t first4[4] = {0, 0, 0, 0};
       if (!platform::isOk(region_.read(kMetadataSectorOffset + slot * kRecordBytes, first4, 4))) return false;
-      if (first4[0] == 0xFFu && first4[1] == 0xFFu && first4[2] == 0xFFu && first4[3] == 0xFFu) {
+      if (first_free == kRecordSlots &&
+          first4[0] == 0xFFu && first4[1] == 0xFFu && first4[2] == 0xFFu && first4[3] == 0xFFu) {
         first_free = slot;
-        break;
       }
     }
     if (first_free >= kRecordSlots) return false;
-    (void)found_any;
     out_slot = first_free;
     return true;
   }
 
-  bool readSlot(uint32_t slot, Snapshot& out) const {
+  bool readSlot(uint32_t slot, Snapshot& out, bool* unreadable = nullptr) const {
     if (slot >= kRecordSlots) return false;
     uint8_t record[192];
     const uint32_t offset = kMetadataSectorOffset + slot * kRecordBytes;
-    if (!platform::isOk(region_.read(offset, record, sizeof(record)))) return false;
+    if (!platform::isOk(region_.read(offset, record, sizeof(record)))) {
+      if (unreadable) *unreadable = true;
+      return false;
+    }
     if (getU32(record + 0) != kMagic) return false;
     if (getU16(record + 4) != kVersion) return false;
     if (getU16(record + 6) != kRecordBytes) return false;

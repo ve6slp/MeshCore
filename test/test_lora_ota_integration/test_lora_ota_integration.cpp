@@ -5337,6 +5337,9 @@ TEST(LoraOtaLifecycle, UnadmittedRecoveryAcceptsPairedTerminalSidecarButNeverUne
     LifecycleFixture::le32(sidecar, 0x58534944);
     sidecar[4] = 1; sidecar[6] = sizeof(sidecar);
     std::memcpy(sidecar + 8, state + 8, 12);
+    uint8_t accepted_command[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
+    ASSERT_TRUE(::ota::storage::XiaoOtaCommandRecordV3::readNewest(f.command, accepted_command));
+    ::ota::trust::Sha256::hash(accepted_command, sizeof(accepted_command), sidecar + 20);
     std::memcpy(sidecar + 52, state + 36, 4);
     std::memcpy(sidecar + 60, state + 40, 4);
     if (fault == 1) sidecar[8] ^= 1;
@@ -6274,6 +6277,781 @@ TEST(LoraOtaRfProduct, CheckedProfileChangesPhysicalParamsAndRestartsRxRatherTha
 }
 
 #include "StockBootPreflightTests.h"
+
+namespace {
+struct QualifiedOriginalRunningContext : StockRunningContext {
+  uint8_t unusedSdkByte = 0;
+  uint32_t hookAt = 0;
+  void* hookContext = nullptr;
+  void (*hook)(void*) = nullptr;
+  explicit QualifiedOriginalRunningContext(std::vector<uint8_t>& bytes) : StockRunningContext(bytes) {}
+  bool read(OtaNrf52RunningContext& out) const override {
+    if (!StockRunningContext::read(out)) return false;
+    if (!vendorCrcDisabled && sizeOverride != UINT32_MAX && sizeOverride <= out.capacity) {
+      const auto crc = ::ota::storage::XiaoOtaActiveExtentBridge::crc16Compute(out.image, sizeOverride) ^
+          (badCrc ? 1 : 0);
+      out.settings[2] = crc; out.settings[3] = crc >> 8;
+    }
+    out.settings[24] = unusedSdkByte;
+    if (hook && reads == hookAt) hook(hookContext);
+    return true;
+  }
+};
+struct QualifiedOriginalFixture {
+  UnadmittedFixture f;
+  QualifiedOriginalRunningContext running{f.boot.accessor.image};
+  OtaBoardOriginalSnapshotProvider original{f.boot.state, f.boot.floor, running, f.qualified};
+  OtaBoardInstallCommandProviderV3 provider{original};
+  OtaFirmwareStorageSink sink{f.fx.image_region, &f.command, &provider};
+  OtaBoardUnadmittedCommandRecovery recovery{f.command, f.boot.state, f.boot.floor, f.fx.image_region,
+      f.fx.sig_verifier, running, f.qualified, f.target, f.role};
+  std::unique_ptr<OtaBoardBootLifecycleObserver> observer;
+  explicit QualifiedOriginalFixture(uint32_t board = 0x584e3430, uint8_t role = 0) : f(board, role) {
+    f.boot.accessor.image.resize(9004, 0xff);
+    running.vendorCrcDisabled = true;
+    running.sizeOverride = 9001;
+    ::ota::trust::Sha256::hash(f.boot.accessor.image.data(), f.boot.accessor.image.size(), f.boot.hash);
+    setGenesisFloor();
+    attach();
+  }
+  void setGenesisFloor() {
+    using Floor = ::ota::storage::XiaoOtaFloorReader;
+    uint8_t record[Floor::kRecordBytes] = {};
+    LifecycleFixture::le32(record, Floor::kMagic);
+    record[4] = Floor::kRecordVersion; record[6] = sizeof(record);
+    LifecycleFixture::le32(record + 8, 1);
+    LifecycleFixture::le32(record + Floor::kCrcOffset, ::ota::storage::Crc32::computeFinalized(record, Floor::kCrcOffset));
+    LifecycleFixture::le32(record + Floor::kCommitMarkerOffset, Floor::kCommitMarker);
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.floor.program(0, record, sizeof(record))));
+  }
+  void attach() {
+    f.reattach();
+    f.fx.integration.attachStagingSink(&sink);
+    f.fx.integration.attachUnadmittedAbort(&recovery, &OtaBoardUnadmittedCommandRecovery::invoke);
+    observer.reset(new OtaBoardBootLifecycleObserver(f.boot.state, f.boot.floor, original));
+    f.fx.integration.attachBootLifecycle(observer.get(), [](void* ctx, OtaBootLifecycleEvidence& out) {
+      return static_cast<OtaBoardBootLifecycleObserver*>(ctx)->read(true, out);
+    });
+  }
+  void restoredState() {
+    using State = ::ota::storage::XiaoOtaStateReader;
+    const auto status = f.fx.integration.leanReceiver().status();
+    OtaNrf52RunningContext sdk;
+    ASSERT_TRUE(running.read(sdk));
+    f.boot.setState(State::kPhaseFailedMax, status.counter, status.transactionNonce, status.imageHash,
+                   f.boot.hash, f.boot.accessor.image.size());
+    uint8_t state[State::kRecordBytes];
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.read(0, state, sizeof(state))));
+    std::memcpy(state + 36, sdk.settings, 4); std::memcpy(state + 40, sdk.settings + 8, 4);
+    LifecycleFixture::le32(state + State::kCrcOffset, ::ota::storage::Crc32::computeFinalized(state, State::kCrcOffset));
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.eraseSector(0)));
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.program(0, state, sizeof(state))));
+    uint8_t sidecar[88] = {};
+    LifecycleFixture::le32(sidecar, 0x58534944);
+    sidecar[4] = 1; sidecar[6] = sizeof(sidecar);
+    std::memcpy(sidecar + 8, state + 8, 12);
+    uint8_t command[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
+    ASSERT_TRUE(::ota::storage::XiaoOtaCommandRecordV3::readNewest(f.command, command));
+    ::ota::trust::Sha256::hash(command, sizeof(command), sidecar + 20);
+    std::memcpy(sidecar + 52, sdk.settings, sizeof(sdk.settings));
+    LifecycleFixture::le32(sidecar + 80, ::ota::storage::Crc32::computeFinalized(sidecar, 80));
+    LifecycleFixture::le32(sidecar + 84, State::kCommitMarker);
+    ASSERT_TRUE(::ota::platform::isOk(f.boot.state.program(0x100, sidecar, sizeof(sidecar))));
+  }
+};
+}
+
+TEST(LoraOtaQualifiedOriginal, VendorZeroFactoryFloorProducesRealSignedCommitWordRoundedV3AndLiteralHandoff) {
+  using Command = ::ota::storage::XiaoOtaCommandRecordV3;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1}) {
+    SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role));
+    QualifiedOriginalFixture q(board, role);
+    ASSERT_FALSE(HasFatalFailure());
+    OtaBoardOriginalImageSnapshot snapshot;
+    OtaBoardOriginalSnapshotProvider::Context context;
+    ASSERT_TRUE(q.original.read(snapshot, context));
+    EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::FactoryFloor, context);
+    ASSERT_NE(0, snapshot.computedCrc);
+    EXPECT_EQ(9004u, snapshot.image.active_image_extent);
+    EXPECT_EQ(0, snapshot.running.settings[2]); EXPECT_EQ(0, snapshot.running.settings[3]);
+    EXPECT_EQ(0u, ::ota::storage::XiaoOtaActiveExtentBridge::resolve(
+        ::ota::storage::XiaoOtaActiveExtentBridge::decodeBank0FromRaw28Bytes(snapshot.running.settings),
+        snapshot.running.image, snapshot.running.capacity).active_image_extent);
+    q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
+    const auto ready = q.f.fx.integration.leanReceiver().status();
+    uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
+    usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+    q.f.owner.sign(message, sizeof(message), signature);
+    const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter,
+                                            signature, frame, sizeof(frame));
+    int resets = 0;
+    q.f.fx.integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
+    ASSERT_TRUE(q.f.fx.integration.handleReceivedFrame(frame, length, 100));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Committed, q.f.fx.integration.leanReceiver().status().phase);
+    q.f.fx.integration.releaseOutboundControlFrame();
+    ASSERT_TRUE(q.f.fx.integration.tickCommitReboot(2100, false, false));
+    EXPECT_EQ(1, resets);
+    uint8_t command[Command::kRecordBytes];
+    ASSERT_TRUE(Command::readNewest(q.f.command, command));
+    ASSERT_EQ(220u, sizeof(command));
+    EXPECT_EQ(9004u, Command::activeImageExtentOf(command));
+    EXPECT_EQ(0, std::memcmp(Command::activeImageHashOf(command), q.f.boot.hash, 32));
+    EXPECT_EQ(0, std::memcmp(Command::wireDescriptorOf(command), q.f.canonical, 59));
+    EXPECT_EQ(0, std::memcmp(Command::admittedSignerKeyOf(command), q.f.owner.publicKey(), 32));
+    OtaNrf52RunningContext sdk;
+    ASSERT_TRUE(q.running.read(sdk));
+    EXPECT_EQ(0, std::memcmp(sdk.settings, snapshot.running.settings, sizeof(sdk.settings)));
+    EXPECT_EQ(0u, q.f.boot.state_flash.programOpCount());
+    EXPECT_EQ(1u, q.f.boot.floor_flash.programOpCount());
+    if (const char* directory = std::getenv("OTA_NRF_REMOTE_BOOT_PROOF_DIR")) {
+      const auto save = [&](const char* suffix, const uint8_t* bytes, size_t size) {
+        char path[512];
+        const int length = std::snprintf(path, sizeof(path), "%s/%08x-role%u-original-%s.bin",
+                                         directory, board, unsigned(role), suffix);
+        ASSERT_GT(length, 0); ASSERT_LT(static_cast<size_t>(length), sizeof(path));
+        FILE* output = std::fopen(path, "wb"); ASSERT_NE(nullptr, output);
+        EXPECT_EQ(size, std::fwrite(bytes, 1, size, output)); EXPECT_EQ(0, std::fclose(output));
+      };
+      save("command", command, sizeof(command));
+      save("candidate", q.f.image.data(), q.f.image.size());
+      save("running", q.f.boot.accessor.image.data(), q.f.boot.accessor.image.size());
+      save("sdk", sdk.settings, sizeof(sdk.settings));
+      save("floor", q.f.boot.floor_flash.rawBuffer(), q.f.boot.floor_flash.rawSize());
+      save("state-region", q.f.boot.state_flash.rawBuffer(), q.f.boot.state_flash.rawSize());
+      ASSERT_FALSE(HasFatalFailure());
+    }
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, ProductionColdGateRequiresPresentGenesisAndReadyCommitNeverDefaultsBlankOrTornFloor) {
+  using Flash = ::ota::test::FakeNorFlash;
+  using Store = ::ota::storage::OtaCandidateStore;
+  using Floor = OtaBoardOriginalSnapshotProvider::FloorInitialization;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (int fault = 0; fault < 4; ++fault) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << fault);
+      QualifiedOriginalFixture q(board, role);
+      q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
+      if (fault == 0 || fault == 2) {
+        uint8_t genesis[::ota::storage::XiaoOtaFloorReader::kRecordBytes];
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.read(0, genesis, sizeof(genesis))));
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+        if (fault == 2) {
+          q.f.boot.floor_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Mid,
+                                        q.f.boot.floor_flash.programOpCount() + 1, 17});
+          ASSERT_FALSE(::ota::platform::isOk(q.f.boot.floor.program(0, genesis, sizeof(genesis))));
+          q.f.boot.floor_flash.clearFault();
+        }
+      }
+      q.f.fx.integration = OtaFirmwareIntegration();
+      q.attach();
+      if (fault == 3)
+        q.f.boot.floor_flash.armFault({Flash::OpKind::Read, Flash::InjectionTiming::Before,
+                                      q.f.boot.floor_flash.readOpCount() + 1});
+      OtaBoardFailClosedMonotonicCounter counter(q.f.boot.floor);
+      const auto gate = resolveOtaBoardOriginalInstallGate(true, q.original, counter);
+      EXPECT_EQ(fault == 1, gate.install_capable);
+      if (fault == 0) {
+        EXPECT_STREQ("STAGING_ONLY: floor not initialized", gate.reason);
+        EXPECT_EQ(Floor::Blank, q.original.floorInitialization());
+      }
+      if (fault == 2) EXPECT_EQ(Floor::Unproven, q.original.floorInitialization());
+      if (fault == 1) {
+        EXPECT_EQ(Floor::Initialized, q.original.floorInitialization());
+        EXPECT_EQ(0u, gate.floor_value);
+      }
+      OtaFirmwareStorageSink cold_sink(q.f.fx.image_region, &q.f.command, gate.install_capable ? &q.provider : nullptr);
+      q.f.fx.integration.attachStagingSink(&cold_sink);
+      ASSERT_EQ(Store::Phase::Ready, q.f.fx.integration.leanReceiver().status().phase);
+      const auto ready = q.f.fx.integration.leanReceiver().status();
+      uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
+      usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+      q.f.owner.sign(message, sizeof(message), signature);
+      const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter,
+                                              signature, frame, sizeof(frame));
+      int resets = 0;
+      q.f.fx.integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
+      EXPECT_EQ(fault == 1, q.f.fx.integration.handleReceivedFrame(frame, length, 100));
+      q.f.fx.integration.releaseOutboundControlFrame();
+      EXPECT_EQ(fault == 1, q.f.fx.integration.tickCommitReboot(2100, false, false));
+      EXPECT_EQ(fault == 1 ? 1 : 0, resets);
+      EXPECT_EQ(fault == 1 ? Store::Phase::Committed : Store::Phase::Ready,
+                q.f.fx.integration.leanReceiver().status().phase);
+      q.observer->tick(true);
+      OtaBootLifecycleEvidence evidence;
+      ASSERT_TRUE(q.observer->read(true, evidence));
+      EXPECT_NE(usb::UsbOtaPhase::Installed, evidence.phase);
+      if (fault == 0 || fault == 2) EXPECT_FALSE(evidence.floorKnown);
+      if (fault == 1) {
+        EXPECT_TRUE(evidence.floorKnown); EXPECT_EQ(0u, evidence.confirmedFloor);
+        uint8_t command[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
+        ASSERT_TRUE(::ota::storage::XiaoOtaCommandRecordV3::readNewest(q.f.command, command));
+        EXPECT_EQ(9004u, ::ota::storage::XiaoOtaCommandRecordV3::activeImageExtentOf(command));
+        EXPECT_EQ(0, std::memcmp(q.f.boot.hash,
+                               ::ota::storage::XiaoOtaCommandRecordV3::activeImageHashOf(command), 32));
+      } else {
+        EXPECT_EQ(0u, q.f.command_flash.programOpCount());
+        if (fault == 0 || fault == 2) {
+          Flash confirm_flash(8192, 4096);
+          ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+          const bool safe = q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier, board, role);
+          EXPECT_FALSE(safe);
+          const auto decision = resolveOtaBoardOriginalStartupDecision(
+              true, ::ota::storage::XiaoOtaStateReader::ReadStatus::Blank, 0, safe);
+          EXPECT_NE(OtaBoardStartupDecisionStatus::Normal, decision.status);
+          Adafruit_LittleFS filesystem;
+          PacketBoundaryRtc clock;
+          DataStore store(filesystem, clock);
+          store.begin(decision.status == OtaBoardStartupDecisionStatus::Normal, false);
+          NodePrefs prefs;
+          EXPECT_FALSE(store.savePrefs(prefs));
+          EXPECT_EQ(0u, filesystem.mounts);
+          EXPECT_EQ(0u, filesystem.writes);
+        }
+      }
+    }
+}
+
+TEST(LoraOtaQualifiedOriginal, ActualFloorCapabilityReadbackFitsBothRolesAndKeepsBlockedObservationReadOnly) {
+  using Flash = ::ota::test::FakeNorFlash;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (int fault = 0; fault < 5; ++fault) for (bool blocked : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << fault << '/' << blocked);
+      QualifiedOriginalFixture q(board, role);
+      ASSERT_FALSE(HasFatalFailure());
+      if (fault == 1 || fault == 2) {
+        uint8_t record[::ota::storage::XiaoOtaFloorReader::kRecordBytes];
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.read(0, record, sizeof(record))));
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+        if (fault == 2) {
+          q.f.boot.floor_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Mid,
+                                        q.f.boot.floor_flash.programOpCount() + 1, 17});
+          ASSERT_FALSE(::ota::platform::isOk(q.f.boot.floor.program(0, record, sizeof(record))));
+          q.f.boot.floor_flash.clearFault();
+        }
+      }
+      if (fault == 3) {
+        const uint8_t tail = 0;
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.program(8191, &tail, 1)));
+      }
+      if (fault == 4)
+        q.f.boot.floor_flash.armFault({Flash::OpKind::Read, Flash::InjectionTiming::Before,
+                                      q.f.boot.floor_flash.readOpCount() + 18});
+      const auto before = std::vector<uint8_t>(q.f.boot.floor_flash.rawBuffer(),
+                                               q.f.boot.floor_flash.rawBuffer() + q.f.boot.floor_flash.rawSize());
+      const auto programs = q.f.boot.floor_flash.programOpCount(), erases = q.f.boot.floor_flash.eraseOpCount();
+      Adafruit_LittleFS filesystem;
+      PacketBoundaryRtc clock;
+      DataStore store(filesystem, clock);
+      store.begin(!blocked, false);
+      const auto filesystem_writes = filesystem.writes, filesystem_mounts = filesystem.mounts;
+      char detail[kOtaBoardFloorCapabilityStatusBytes], repeater[160];
+      formatOtaBoardFloorCapabilityStatus(detail, sizeof(detail), "INSTALL_CAPABLE: verified original", q.f.boot.floor);
+      formatOtaOrdinaryWriteDiagnostic(repeater, sizeof(repeater), store.destructiveWritesDisallowed(), detail);
+      uint8_t companion[176];
+      const auto bytes = encodeOtaOrdinaryWriteDiagnostic(companion, sizeof(companion), 29,
+                                                         store.destructiveWritesDisallowed(), detail);
+      ASSERT_GT(bytes, 1u);
+      EXPECT_EQ(29, companion[0]);
+      EXPECT_STREQ(repeater, reinterpret_cast<char*>(companion + 1));
+      EXPECT_NE(nullptr, std::strstr(repeater, blocked ? "writes=blocked " : "writes=allowed "));
+      if (!fault) {
+        const std::string expected = "INSTALL_CAPABLE: floor=present seq=00000001 ctr=00000000 ext=00000000 sha=" +
+            std::string(64, '0') + " io=ok";
+        EXPECT_EQ(expected, detail);
+        EXPECT_EQ(159u, std::strlen(repeater));
+        EXPECT_EQ(160u, bytes);
+      } else {
+        EXPECT_NE(nullptr, std::strstr(detail, fault == 1 ? "floor=blank" :
+                                     fault == 4 ? "floor=read-error" : "floor=corrupt"));
+        EXPECT_NE(nullptr, std::strstr(detail, "seq=? ctr=? ext=? sha=?"));
+      }
+      EXPECT_EQ(programs, q.f.boot.floor_flash.programOpCount());
+      EXPECT_EQ(erases, q.f.boot.floor_flash.eraseOpCount());
+      EXPECT_EQ(0, std::memcmp(before.data(), q.f.boot.floor_flash.rawBuffer(), before.size()));
+      EXPECT_EQ(filesystem_writes, filesystem.writes);
+      EXPECT_EQ(filesystem_mounts, filesystem.mounts);
+    }
+}
+
+TEST(LoraOtaQualifiedOriginal, FullColdFailedMaxBothSdkPoliciesRestoreAfterCommandReplacementAndBindNextCommit) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  using Store = ::ota::storage::OtaCandidateStore;
+  using Command = ::ota::storage::XiaoOtaCommandRecordV3;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (bool vendor_crc_unused : {true, false}) {
+    SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << vendor_crc_unused);
+    QualifiedOriginalFixture q(board, role);
+    q.running.vendorCrcDisabled = vendor_crc_unused;
+    q.f.stage(1); q.f.commit(); ASSERT_FALSE(HasFatalFailure());
+    if (const char* directory = std::getenv("OTA_NRF_ORIGINAL_FAILED_PROOF_DIR")) {
+      const auto read = [&](const char* suffix, uint8_t* bytes, size_t size) {
+        char path[512];
+        const int length = std::snprintf(path, sizeof(path), "%s/%08x-role%u-original-failed%s-%s.bin",
+                                         directory, board, unsigned(role), vendor_crc_unused ? "" : "-nonzero", suffix);
+        ASSERT_GT(length, 0); ASSERT_LT(static_cast<size_t>(length), sizeof(path));
+        FILE* input = std::fopen(path, "rb"); ASSERT_NE(nullptr, input);
+        EXPECT_EQ(size, std::fread(bytes, 1, size, input)); EXPECT_EQ(EOF, std::fgetc(input));
+        EXPECT_EQ(0, std::fclose(input));
+      };
+      for (auto* region : {&q.f.boot.state, &q.f.command}) {
+        std::vector<uint8_t> bytes(region->sizeBytes());
+        read(region == &q.f.boot.state ? "state-region" : "command-region", bytes.data(), bytes.size());
+        ASSERT_FALSE(HasFatalFailure());
+        for (uint32_t offset = 0; offset < region->sizeBytes(); offset += region->eraseUnitBytes())
+          ASSERT_TRUE(::ota::platform::isOk(region->eraseSector(offset)));
+        ASSERT_TRUE(::ota::platform::isOk(region->program(0, bytes.data(), bytes.size())));
+      }
+      read("running", q.f.boot.accessor.image.data(), q.f.boot.accessor.image.size());
+      uint8_t sdk[28]; read("sdk", sdk, sizeof(sdk)); ASSERT_FALSE(HasFatalFailure());
+      OtaNrf52RunningContext running;
+      ASSERT_TRUE(q.running.read(running));
+      ASSERT_EQ(0, std::memcmp(sdk, running.settings, sizeof(sdk)));
+    } else {
+      q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+    }
+    q.f.fx.integration = OtaFirmwareIntegration();
+    q.f.fx.admins.count = 0;
+    q.attach(); q.observer->tick(true);
+    OtaBoardFailClosedMonotonicCounter counter(q.f.boot.floor);
+    const auto gate = resolveOtaBoardOriginalInstallGate(true, q.original, counter);
+    ASSERT_TRUE(gate.install_capable); EXPECT_EQ(0u, gate.floor_value);
+    OtaBootLifecycleEvidence evidence;
+    ASSERT_TRUE(q.observer->read(true, evidence));
+    EXPECT_EQ(usb::UsbOtaPhase::Failed, evidence.phase);
+    EXPECT_TRUE(evidence.floorKnown); EXPECT_EQ(0u, evidence.confirmedFloor);
+    const auto previous = q.f.fx.integration.leanReceiver().status();
+    EXPECT_EQ(0, std::memcmp(previous.imageHash, evidence.imageHash, 32));
+    uint8_t state[State::kRecordBytes], saved[28];
+    ASSERT_EQ(State::ReadStatus::Found, State::readNewestWithStatus(q.f.boot.state, state));
+    ASSERT_TRUE(q.original.readSavedOriginalSettings(state, saved));
+    const auto saved_crc = uint16_t(saved[2]) | uint16_t(saved[3]) << 8;
+    if (vendor_crc_unused) EXPECT_EQ(0, saved_crc);
+    else EXPECT_EQ(::ota::storage::XiaoOtaActiveExtentBridge::crc16Compute(q.f.boot.accessor.image.data(), 9001),
+                   saved_crc);
+    uint8_t accepted[Command::kRecordBytes], accepted_digest[32], historical_digest[32];
+    ASSERT_TRUE(Command::readNewest(q.f.command, accepted));
+    ::ota::trust::Sha256::hash(accepted, sizeof(accepted), accepted_digest);
+    const uint32_t state_slot = !std::memcmp(state, q.f.boot.state_flash.rawBuffer(), sizeof(state)) ? 0 : 4096;
+    ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.read(state_slot + 0x100 + 20, historical_digest, 32)));
+    EXPECT_EQ(0, std::memcmp(accepted_digest, historical_digest, 32));
+    ::ota::storage::XiaoOtaCommandV3Fields replacement;
+    replacement.transaction_nonce = Command::transactionNonceOf(accepted);
+    std::memcpy(replacement.wire_descriptor, Command::wireDescriptorOf(accepted), sizeof(replacement.wire_descriptor));
+    std::memcpy(replacement.signature_ed25519, Command::signatureOf(accepted), sizeof(replacement.signature_ed25519));
+    std::memcpy(replacement.admitted_signer_public_key_ed25519, Command::admittedSignerKeyOf(accepted),
+                sizeof(replacement.admitted_signer_public_key_ed25519));
+    replacement.active_image_extent = Command::activeImageExtentOf(accepted);
+    std::memcpy(replacement.active_image_hash_sha256, Command::activeImageHashOf(accepted), 32);
+    // Two legitimate A/B appends retire both copies of the historical accepted command.
+    ASSERT_TRUE(Command::writeNext(q.f.command, replacement));
+    ASSERT_TRUE(Command::writeNext(q.f.command, replacement));
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      uint8_t record[Command::kRecordBytes], digest[32];
+      ASSERT_TRUE(::ota::platform::isOk(q.f.command.read(slot * 4096, record, sizeof(record))));
+      ASSERT_TRUE(Command::isValidRecord(record, sizeof(record)));
+      ::ota::trust::Sha256::hash(record, sizeof(record), digest);
+      EXPECT_NE(0, std::memcmp(historical_digest, digest, 32));
+    }
+    ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+    ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+    const bool ordinary_proven = q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier, board, role);
+    ASSERT_TRUE(ordinary_proven);
+    const auto decision = resolveOtaBoardOriginalStartupDecision(true, State::ReadStatus::Found,
+                                                                 State::kPhaseFailedMax, ordinary_proven);
+    ASSERT_EQ(OtaBoardStartupDecisionStatus::Normal, decision.status);
+    Adafruit_LittleFS filesystem;
+    ASSERT_EQ(0u, filesystem.mounts);
+    ASSERT_TRUE(filesystem.begin());
+    PacketBoundaryRtc clock;
+    DataStore store(filesystem, clock);
+    store.begin(decision.status == OtaBoardStartupDecisionStatus::Normal, false);
+    NodePrefs prefs;
+    std::strcpy(prefs.node_name, "OTA-LAB-RESTORED");
+    ASSERT_TRUE(store.savePrefs(prefs));
+    stock_acl_test::ClientACL acl;
+    ASSERT_NE(nullptr, acl.putClient(mesh::Identity(q.f.owner.publicKey()), PERM_ACL_ADMIN));
+    acl.save(&filesystem);
+    EXPECT_EQ(PERM_ACL_ADMIN, filesystem.files.at("/s_contacts")->at(32));
+    ASSERT_TRUE(resolveOtaBoardOriginalInstallGate(true, q.original, counter).install_capable);
+    for (int fault = 0; fault < 3; ++fault) {
+      if (fault == 0) q.running.unusedSdkByte = 1;
+      if (fault == 1) q.f.boot.accessor.image[100] ^= 1;
+      if (fault == 2) { q.running.vendorCrcDisabled = false; q.running.badCrc = true; }
+      OtaBoardOriginalImageSnapshot snapshot;
+      OtaBoardOriginalSnapshotProvider::Context context;
+      EXPECT_FALSE(q.original.read(snapshot, context));
+      EXPECT_FALSE(q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier, board, role));
+      if (fault == 0) q.running.unusedSdkByte = 0;
+      if (fault == 1) q.f.boot.accessor.image[100] ^= 1;
+      if (fault == 2) { q.running.vendorCrcDisabled = vendor_crc_unused; q.running.badCrc = false; }
+    }
+    OtaBoardOriginalImageSnapshot restored;
+    OtaBoardOriginalSnapshotProvider::Context restored_context;
+    ASSERT_TRUE(q.original.read(restored, restored_context));
+    ASSERT_EQ(OtaBoardOriginalSnapshotProvider::Context::RestoredOriginal, restored_context);
+    q.f.image[12] ^= 1; q.f.stage(2); ASSERT_FALSE(HasFatalFailure());
+    const auto ready = q.f.fx.integration.leanReceiver().status();
+    uint8_t seed[32] = {0x97}, message[usb::kAbortSignedBytes], signature[64];
+    ::ota::test::Ed25519TestSigner admin(seed);
+    q.f.fx.admins.add(admin.publicKey());
+    usb::buildAbortSignedMessage(q.f.fx.target_public_key, ready.imageHash, message);
+    admin.sign(message, sizeof(message), signature);
+    const auto erases = q.f.command_flash.eraseOpCount();
+    ASSERT_EQ(usb::UsbOtaResult::Ok, q.f.fx.integration.leanReceiver().abort(admin.publicKey(), signature, ready.imageHash));
+    EXPECT_EQ(erases, q.f.command_flash.eraseOpCount());
+    q.f.fx.integration = OtaFirmwareIntegration();
+    q.f.fx.admins.count = 0;
+    q.attach();
+    q.f.fx.admins.add(admin.publicKey());
+    EXPECT_EQ(Store::Phase::Aborted, q.f.fx.integration.leanReceiver().status().phase);
+    EXPECT_EQ(usb::UsbOtaResult::Denied, q.f.fx.integration.leanReceiver().begin(
+        q.f.owner.publicKey(), q.f.canonical, q.f.signature, false, false));
+    q.f.image[24] ^= 1; q.f.stage(3, true); ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(Store::Phase::Ready, q.f.fx.integration.leanReceiver().status().phase);
+    q.f.commit(); ASSERT_FALSE(HasFatalFailure());
+    uint8_t next_command[Command::kRecordBytes];
+    ASSERT_TRUE(Command::readNewest(q.f.command, next_command));
+    EXPECT_EQ(9004u, Command::activeImageExtentOf(next_command));
+    EXPECT_EQ(0, std::memcmp(restored.image.active_image_hash_sha256, Command::activeImageHashOf(next_command), 32));
+    EXPECT_EQ(0, std::memcmp(q.f.canonical, Command::wireDescriptorOf(next_command), sizeof(q.f.canonical)));
+    EXPECT_EQ(0, std::memcmp(q.f.signature, Command::signatureOf(next_command), sizeof(q.f.signature)));
+    EXPECT_EQ(0, std::memcmp(q.f.owner.publicKey(), Command::admittedSignerKeyOf(next_command), 32));
+    EXPECT_EQ(Store::Phase::Committed, q.f.fx.integration.leanReceiver().status().phase);
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, OriginalSnapshotNeverSkipsMissingFloorHistoryTrialCopySdkAndIoProofs) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  using Flash = ::ota::test::FakeNorFlash;
+  for (int fault = 0; fault < 16; ++fault) {
+    SCOPED_TRACE(fault);
+    QualifiedOriginalFixture q;
+    if (fault == 0) ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+    if (fault == 1) { const uint8_t byte = 0; ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.program(0, &byte, 1))); }
+    if (fault >= 2 && fault <= 4) {
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+      q.f.boot.setFloor(fault == 2 ? 4 : 0, fault == 3, fault == 4);
+    }
+    if (fault == 5) q.f.boot.setState(State::kPhaseTrialBoot);
+    if (fault == 6) q.f.boot.setState(4);
+    if (fault == 7) q.f.boot.setState(State::kPhaseConfirmed, 0);
+    if (fault == 8) q.running.invalid = true;
+    if (fault == 9) q.running.bank1 = 1;
+    if (fault == 10) q.running.tailErased = false;
+    if (fault == 11) { q.running.vendorCrcDisabled = false; q.running.badCrc = true; }
+    if (fault == 12) q.running.sizeOverride = q.f.boot.accessor.image.size() + 1;
+    if (fault == 13) q.running.failAt = q.running.reads + 2;
+    if (fault == 14 || fault == 15) {
+      auto& flash = fault == 14 ? q.f.boot.state_flash : q.f.boot.floor_flash;
+      flash.armFault({Flash::OpKind::Read, Flash::InjectionTiming::Before, flash.readOpCount() + 1});
+    }
+    ::ota::storage::XiaoOtaActiveExtentInfo image;
+    EXPECT_FALSE(q.original.readOriginalSnapshot(image));
+    EXPECT_EQ(0u, image.active_image_extent);
+    EXPECT_EQ(0u, q.f.command_flash.programOpCount());
+    EXPECT_EQ(0u, q.f.command_flash.eraseOpCount());
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, RealGenesisPresenceAndStableWindowsAreRequiredNotNumericBlankZero) {
+  using Floor = ::ota::storage::XiaoOtaFloorReader;
+  for (int fault = 0; fault < 9; ++fault) {
+    SCOPED_TRACE(fault);
+    QualifiedOriginalFixture q;
+    if (fault < 6) {
+      uint8_t record[Floor::kRecordBytes];
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.read(0, record, sizeof(record))));
+      if (fault == 0) LifecycleFixture::le32(record + 8, 2);
+      if (fault == 1) LifecycleFixture::le32(record + 12, 4);
+      if (fault == 2) record[20] = 1;
+      if (fault == 3) LifecycleFixture::le32(record + 16, 9004);
+      LifecycleFixture::le32(record + Floor::kCrcOffset,
+                            ::ota::storage::Crc32::computeFinalized(record, Floor::kCrcOffset));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.program(0, record, sizeof(record))));
+      if (fault == 4) ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.program(4096, record, sizeof(record))));
+      if (fault == 5) {
+        const uint8_t byte = 0;
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.program(8191, &byte, 1)));
+      }
+    }
+    if (fault == 6) {
+      q.running.hookAt = q.running.reads + 2; q.running.hookContext = &q.f.boot.floor;
+      q.running.hook = [](void* context) {
+        ASSERT_TRUE(::ota::platform::isOk(static_cast<::ota::platform::FlashRegion*>(context)->eraseSector(0)));
+      };
+    }
+    if (fault == 7) {
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+      uint32_t numeric_floor = 123;
+      ASSERT_TRUE(Floor::readNewestConfirmedCounterFailClosed(q.f.boot.floor, numeric_floor));
+      ASSERT_EQ(0u, numeric_floor);
+    }
+    if (fault == 8) q.f.qualified = false;
+    ::ota::storage::XiaoOtaActiveExtentInfo image;
+    EXPECT_FALSE(q.original.readOriginalSnapshot(image));
+    EXPECT_EQ(0u, image.active_image_extent);
+    EXPECT_EQ(0u, q.f.command_flash.programOpCount());
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, ExistingImageBoundFactoryAndNonzeroSdkOriginalRemainSupported) {
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (bool nonzero_crc : {false, true}) {
+      QualifiedOriginalFixture q(board, role);
+      q.running.vendorCrcDisabled = !nonzero_crc;
+      q.running.sizeOverride = q.f.boot.accessor.image.size();
+      if (!nonzero_crc) {
+        ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+        q.f.boot.setFloor(0);
+      }
+      OtaBoardOriginalImageSnapshot snapshot;
+      OtaBoardOriginalSnapshotProvider::Context context;
+      ASSERT_TRUE(q.original.read(snapshot, context));
+      ASSERT_NE(0, snapshot.computedCrc);
+      EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::FactoryFloor, context);
+      q.f.stage(1); q.f.commit(); q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+      ASSERT_TRUE(q.original.read(snapshot, context));
+      EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::RestoredOriginal, context);
+    }
+}
+
+TEST(LoraOtaQualifiedOriginal, FactoryConfirmationMustStillBeBlankAfterTheSdkAndMetadataRecheck) {
+  QualifiedOriginalFixture q;
+  ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+  ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+  q.running.hookAt = q.running.reads + 3; q.running.hookContext = &confirm;
+  q.running.hook = [](void* context) {
+    const uint8_t byte = 0;
+    ASSERT_TRUE(::ota::platform::isOk(static_cast<::ota::platform::FlashRegion*>(context)->program(4095, &byte, 1)));
+  };
+  EXPECT_FALSE(q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier, q.f.target, q.f.role));
+}
+
+TEST(LoraOtaQualifiedOriginal, ExactSavedZeroSdkRollbackProvesFailedImageAndAnotherAdminsPrecommitAbortAndReupload) {
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
+    for (auto phase : {::ota::storage::OtaCandidateStore::Phase::Receiving,
+                      ::ota::storage::OtaCandidateStore::Phase::Verifying,
+                      ::ota::storage::OtaCandidateStore::Phase::Ready}) {
+    QualifiedOriginalFixture q(board, role);
+    q.f.stage(1); q.f.commit(); ASSERT_FALSE(HasFatalFailure());
+    q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+    q.attach();
+    q.observer->tick(true);
+    ASSERT_EQ(usb::UsbOtaPhase::Failed, q.f.fx.integration.reportedPhase());
+    q.f.image[12] ^= 1;
+    q.f.manifest(2);
+    auto& receiver = q.f.fx.integration.leanReceiver();
+    ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.begin(q.f.owner.publicKey(), q.f.canonical, q.f.signature, false, false));
+    if (phase != ::ota::storage::OtaCandidateStore::Phase::Receiving) {
+      for (uint16_t block = 0; block < 2; ++block)
+        ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.putBlock(block, q.f.image.data() + block * 84, 84));
+      ASSERT_EQ(usb::UsbOtaResult::Pending, receiver.requestSeal());
+      if (phase == ::ota::storage::OtaCandidateStore::Phase::Ready) receiver.loop();
+    }
+    ASSERT_EQ(phase, receiver.status().phase);
+    const auto before = q.f.fx.integration.leanReceiver().status();
+    uint8_t admin_seed[32] = {0xc3}, message[usb::kAbortSignedBytes], signature[64];
+    ::ota::test::Ed25519TestSigner admin(admin_seed);
+    q.f.fx.admins.add(admin.publicKey());
+    usb::buildAbortSignedMessage(q.f.fx.target_public_key, before.imageHash, message);
+    admin.sign(message, sizeof(message), signature);
+    const auto erases = q.f.command_flash.eraseOpCount();
+    ASSERT_EQ(usb::UsbOtaResult::Ok, q.f.fx.integration.leanReceiver().abort(
+        admin.publicKey(), signature, before.imageHash));
+    EXPECT_EQ(erases, q.f.command_flash.eraseOpCount());
+    EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Aborted, q.f.fx.integration.leanReceiver().status().phase);
+    EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, q.f.fx.integration.leanReceiver().status().ownerPublicKey, 32));
+    uint8_t authorization[kOtaAuthorizationFrameBytes];
+    const auto authorization_size = encodeOtaAuthorizationFrame(
+        q.f.owner.publicKey(), q.f.canonical, q.f.signature, authorization, sizeof(authorization));
+    EXPECT_FALSE(q.f.fx.integration.handleReceivedFrame(authorization, authorization_size, 100));
+    EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Aborted, receiver.status().phase);
+    q.f.image[24] ^= 1;
+    q.f.stage(3, true); ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, q.f.fx.integration.leanReceiver().status().phase);
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, RestoredZeroSdkNeverAcceptsDifferentRawSdkBackupShaOrUnpairedSidecar) {
+  for (int fault = 0; fault < 8; ++fault) {
+    QualifiedOriginalFixture q;
+    q.f.stage(1); q.f.commit(); q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+    if (fault == 0) q.running.bank1 = 0xfe;
+    if (fault == 1) q.running.vendorCrcDisabled = false;
+    if (fault == 2) q.f.boot.accessor.image[100] ^= 1;
+    if (fault == 3) { const uint8_t byte = 0; ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.program(0x100, &byte, 1))); }
+    if (fault == 4) { const uint8_t byte = 0; ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.program(4095, &byte, 1))); }
+    if (fault == 5) q.running.fail = true;
+    if (fault == 6) q.running.unusedSdkByte = 1;
+    if (fault == 7) {
+      uint8_t state[::ota::storage::XiaoOtaStateReader::kRecordBytes], sidecar[88];
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.read(0, state, sizeof(state))));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.read(0x100, sidecar, sizeof(sidecar))));
+      sidecar[76] ^= 1;
+      LifecycleFixture::le32(sidecar + 80, ::ota::storage::Crc32::computeFinalized(sidecar, 80));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.eraseSector(0)));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.program(0, state, sizeof(state))));
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.program(0x100, sidecar, sizeof(sidecar))));
+    }
+    OtaBoardOriginalImageSnapshot snapshot;
+    OtaBoardOriginalSnapshotProvider::Context context;
+    EXPECT_FALSE(q.original.read(snapshot, context));
+    q.attach(); q.observer->tick(true);
+    OtaBootLifecycleEvidence evidence;
+    ASSERT_TRUE(q.observer->read(true, evidence));
+    const uint8_t unknown_hash[32] = {};
+    EXPECT_EQ(0, std::memcmp(unknown_hash, evidence.imageHash, sizeof(unknown_hash)));
+    EXPECT_EQ(usb::UsbOtaResult::TooLate, q.f.abort());
+    EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Committed, q.f.fx.integration.leanReceiver().status().phase);
+  }
+
+}
+
+TEST(LoraOtaQualifiedOriginal, RestoredSdkProofIsIndependentButMalformedOrPendingCurrentIntentStillBlocksWrites) {
+  using Command = ::ota::storage::XiaoOtaCommandRecordV3;
+  using State = ::ota::storage::XiaoOtaStateReader;
+  for (int fault = 0; fault < 3; ++fault) {
+    QualifiedOriginalFixture q;
+    q.f.stage(1); q.f.commit(); q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+    uint8_t command[Command::kRecordBytes];
+    ASSERT_TRUE(Command::readNewest(q.f.command, command));
+    if (fault == 0) command[Command::kSignatureOffset] ^= 1;
+    if (fault == 1) command[12] ^= 1;
+    if (fault == 2) {
+      q.f.manifest(2);
+      std::memcpy(command + 20, q.f.canonical, sizeof(q.f.canonical));
+      std::memcpy(command + Command::kSignatureOffset, q.f.signature, sizeof(q.f.signature));
+    }
+    LifecycleFixture::le32(command + Command::kCrcOffset,
+                          ::ota::storage::Crc32::computeFinalized(command, Command::kCrcOffset));
+    ASSERT_TRUE(::ota::platform::isOk(q.f.command.eraseSector(0)));
+    ASSERT_TRUE(::ota::platform::isOk(q.f.command.program(0, command, sizeof(command))));
+    OtaBoardOriginalImageSnapshot snapshot;
+    OtaBoardOriginalSnapshotProvider::Context context;
+    ASSERT_TRUE(q.original.read(snapshot, context));
+    ASSERT_EQ(OtaBoardOriginalSnapshotProvider::Context::RestoredOriginal, context);
+    ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+    ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+    const bool proven = q.original.ordinaryWritesAllowed(
+        q.f.command, confirm, q.f.fx.sig_verifier, q.f.target, q.f.role);
+    EXPECT_FALSE(proven);
+    const auto decision = resolveOtaBoardOriginalStartupDecision(true, State::ReadStatus::Found,
+                                                                 State::kPhaseFailedMax, proven);
+    Adafruit_LittleFS filesystem;
+    PacketBoundaryRtc clock;
+    DataStore store(filesystem, clock);
+    store.begin(decision.status == OtaBoardStartupDecisionStatus::Normal, false);
+    NodePrefs prefs;
+    EXPECT_FALSE(store.savePrefs(prefs));
+    EXPECT_EQ(0u, filesystem.mounts);
+    EXPECT_EQ(0u, filesystem.writes);
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, ConfirmedCandidateZeroRemainsLiteralAndWrongZeroNeverUsesTheOriginalException) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  using Bridge = ::ota::storage::XiaoOtaActiveExtentBridge;
+  QualifiedOriginalFixture q;
+  auto& image = q.f.boot.accessor.image;
+  const auto crc = Bridge::crc16Compute(image.data(), image.size() - 2);
+  image[image.size() - 2] = crc >> 8; image.back() = crc;
+  ASSERT_EQ(0, Bridge::crc16Compute(image.data(), image.size()));
+  q.running.sizeOverride = image.size();
+  ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+  ::ota::trust::Sha256::hash(image.data(), image.size(), q.f.boot.hash);
+  q.f.boot.setFloor(4); q.f.boot.setState(State::kPhaseConfirmed, 4);
+  OtaBoardOriginalImageSnapshot snapshot;
+  OtaBoardOriginalSnapshotProvider::Context context;
+  ASSERT_TRUE(q.original.read(snapshot, context));
+  EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::Confirmed, context);
+  EXPECT_EQ(0, snapshot.computedCrc);
+  image[100] ^= 1;
+  ASSERT_NE(0, Bridge::crc16Compute(image.data(), image.size()));
+  ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+  ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.eraseSector(0)));
+  ::ota::trust::Sha256::hash(image.data(), image.size(), q.f.boot.hash);
+  q.f.boot.setFloor(4); q.f.boot.setState(State::kPhaseConfirmed, 4);
+  EXPECT_FALSE(q.original.read(snapshot, context));
+  ASSERT_TRUE(::ota::platform::isOk(q.f.boot.state.eraseSector(0)));
+  q.f.boot.setState(State::kPhaseTrialBoot, 5);
+  EXPECT_FALSE(q.original.read(snapshot, context));
+}
+
+TEST(LoraOtaQualifiedOriginal, ProvenFactoryAndRestoredOriginalDriveNormalEarlyDataStoreAndAclWithoutTrialAuthority) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1}) for (bool restored : {false, true}) {
+    QualifiedOriginalFixture q(board, role);
+    if (restored) { q.f.stage(1); q.f.commit(); q.restoredState(); q.attach(); }
+    ASSERT_FALSE(HasFatalFailure());
+    ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+    ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+    uint8_t state[State::kRecordBytes] = {};
+    const auto status = State::readNewestWithStatus(q.f.boot.state, state);
+    const bool proven = q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier, board, role);
+    ASSERT_TRUE(proven);
+    const auto decision = resolveOtaBoardOriginalStartupDecision(true, status,
+        status == State::ReadStatus::Found ? State::phase(state) : 0, proven);
+    ASSERT_EQ(OtaBoardStartupDecisionStatus::Normal, decision.status);
+    Adafruit_LittleFS filesystem;
+    ASSERT_EQ(0u, filesystem.mounts);
+    ASSERT_TRUE(filesystem.begin());
+    PacketBoundaryRtc clock;
+    DataStore store(filesystem, clock);
+    store.begin(decision.status == OtaBoardStartupDecisionStatus::Normal, false);
+    NodePrefs prefs;
+    std::strcpy(prefs.node_name, "qualified-original");
+    ASSERT_TRUE(store.savePrefs(prefs));
+    NodePrefs readback;
+    ASSERT_TRUE(store.loadPrefs(readback, true));
+    EXPECT_STREQ("qualified-original", readback.node_name);
+    stock_acl_test::ClientACL acl;
+    ASSERT_NE(nullptr, acl.putClient(mesh::Identity(q.f.owner.publicKey()), PERM_ACL_ADMIN));
+    acl.save(&filesystem);
+    EXPECT_TRUE(filesystem.exists("/s_contacts"));
+    EXPECT_FALSE(store.formatFileSystem());
+    EXPECT_EQ(0u, filesystem.formats);
+    EXPECT_EQ(0u, confirm_flash.programOpCount());
+    EXPECT_EQ(0u, confirm_flash.eraseOpCount());
+  }
+}
+
+TEST(LoraOtaQualifiedOriginal, PendingMalformedAndUnexplainedHistoryNeverUnlockNormalOriginalWrites) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  for (int fault = 0; fault < 7; ++fault) {
+    QualifiedOriginalFixture q;
+    ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+    ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+    const uint8_t byte = 0;
+    if (fault == 0) { q.f.stage(1); q.f.commit(); }
+    if (fault == 1) ASSERT_TRUE(::ota::platform::isOk(q.f.command.program(0, &byte, 1)));
+    if (fault == 2) ASSERT_TRUE(::ota::platform::isOk(q.f.command.program(4095, &byte, 1)));
+    if (fault == 3) ASSERT_TRUE(::ota::platform::isOk(confirm.program(4095, &byte, 1)));
+    if (fault == 4) q.f.boot.setState(State::kPhaseTrialBoot);
+    if (fault == 5) q.f.boot.setState(4);
+    if (fault == 6) {
+      ASSERT_TRUE(::ota::platform::isOk(q.f.boot.floor.eraseSector(0)));
+      q.f.boot.setFloor(4);
+    }
+    const bool proven = q.original.ordinaryWritesAllowed(
+        q.f.command, confirm, q.f.fx.sig_verifier, q.f.target, q.f.role);
+    EXPECT_FALSE(proven);
+    uint8_t state[State::kRecordBytes] = {};
+    const auto status = State::readNewestWithStatus(q.f.boot.state, state);
+    const auto decision = resolveOtaBoardOriginalStartupDecision(true, status,
+        status == State::ReadStatus::Found ? State::phase(state) : 0, proven);
+    EXPECT_NE(OtaBoardStartupDecisionStatus::Normal, decision.status);
+    Adafruit_LittleFS filesystem;
+    PacketBoundaryRtc clock;
+    DataStore store(filesystem, clock);
+    store.begin(decision.status == OtaBoardStartupDecisionStatus::Normal, false);
+    NodePrefs prefs;
+    EXPECT_FALSE(store.savePrefs(prefs));
+    EXPECT_EQ(0u, filesystem.mounts);
+    EXPECT_EQ(0u, filesystem.writes);
+  }
+}
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

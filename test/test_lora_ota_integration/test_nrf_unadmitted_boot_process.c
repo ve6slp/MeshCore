@@ -58,6 +58,17 @@ static size_t read_remote_fixture(const char *prefix, const char *name, uint8_t 
   return size;
 }
 
+static void save_remote_fixture(const char *prefix, const char *name, const uint8_t *bytes, size_t size) {
+  char path[512];
+  int length = snprintf(path, sizeof(path), "%s-%s.bin", prefix, name);
+  FILE *output;
+  assert(length > 0 && (size_t)length < sizeof(path));
+  output = fopen(path, "wb");
+  assert(output != NULL);
+  assert(fwrite(bytes, 1, size, output) == size);
+  assert(fclose(output) == 0);
+}
+
 static void test_exact_rf_commit_deferred_reset_handoff_installs_and_confirms(const char *prefix) {
   fake_io_state_t s;
   xiao_ota_command_v2_t command;
@@ -390,6 +401,137 @@ static void test_two_real_rollbacks_keep_older_command_safe_only_without_erasing
          (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID);
 }
 
+static void load_original_commit_fixture(fake_io_state_t *s, const char *prefix,
+                                        xiao_ota_command_v2_t *command,
+                                        xiao_ota_wire_descriptor_t *descriptor, uint8_t sdk[28],
+                                        bool vendor_crc_unused) {
+  xiao_ota_floor_t floor;
+  uint8_t digest[32];
+  size_t candidate_size, running_size;
+  fake_io_reset(s);
+  assert(read_remote_fixture(prefix, "original-command", (uint8_t *)command, sizeof(*command)) == sizeof(*command));
+  assert(xiao_ota_command_v2_valid(command));
+  assert(xiao_ota_wire_descriptor_decode(command->wire_descriptor, descriptor));
+  assert((((uint32_t)descriptor->board_family << 16) | descriptor->board_variant) == XIAO_OTA_BOARD_TARGET);
+  assert(descriptor->role == XIAO_OTA_COMPILED_ROLE_ID && descriptor->security_counter == 1);
+  memcpy(s->qspi + XIAO_OTA_COMMAND_A, command, sizeof(*command));
+  candidate_size = read_remote_fixture(prefix, "original-candidate", s->qspi + XIAO_OTA_CANDIDATE_BASE,
+                                       XIAO_OTA_CANDIDATE_SIZE);
+  running_size = read_remote_fixture(prefix, "original-running", s->internal_flash + XIAO_OTA_APP_START,
+                                     XIAO_OTA_APP_MAX_SIZE);
+  assert(candidate_size == descriptor->exact_size_bytes && running_size == command->active_image_extent);
+  assert(read_remote_fixture(prefix, "original-sdk", sdk, 28) == 28);
+  assert(sdk[2] == 0 && sdk[3] == 0);
+  assert(running_size == 9004 && crc16_compute(s->internal_flash + XIAO_OTA_APP_START, 9001, NULL) != 0);
+  if (!vendor_crc_unused) {
+    const uint16_t crc = crc16_compute(s->internal_flash + XIAO_OTA_APP_START, 9001, NULL);
+    sdk[2] = (uint8_t)crc; sdk[3] = (uint8_t)(crc >> 8);
+  }
+  fake_io_write_settings_raw(s, sdk);
+  assert(read_remote_fixture(prefix, "original-floor", s->qspi + XIAO_OTA_FLOOR_A,
+                             2 * XIAO_OTA_QSPI_SECTOR_SIZE) == 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  assert(read_remote_fixture(prefix, "original-state-region", s->qspi + XIAO_OTA_STATE_A,
+                             2 * XIAO_OTA_QSPI_SECTOR_SIZE) == 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  assert(read_floor(s, &floor) && floor.sequence == 1 && floor.confirmed_counter_floor == 0);
+  assert(floor.active_image_extent == 0);
+  sha256_of(s->internal_flash + XIAO_OTA_APP_START, running_size, digest);
+  assert(memcmp(digest, command->active_image_hash_sha256, 32) == 0);
+}
+
+static void test_exact_original_commit_confirmation_rollback_and_controls(const char *prefix,
+                                                                         bool vendor_crc_unused) {
+  fake_io_state_t s;
+  xiao_ota_command_v2_t command;
+  xiao_ota_wire_descriptor_t descriptor;
+  xiao_ota_state_t state;
+  xiao_ota_floor_t floor;
+  uint8_t sdk[28], current_sdk[28], digest[32], before_hash[32], terminal[2 * XIAO_OTA_QSPI_SECTOR_SIZE];
+  unsigned control, attempt;
+
+  for (control = 0; control < 4; ++control) {
+    load_original_commit_fixture(&s, prefix, &command, &descriptor, sdk, vendor_crc_unused);
+    if (control == 0) s.internal_flash[XIAO_OTA_APP_START + 100] ^= 1;
+    if (control == 1) {
+      const uint16_t wrong = crc16_compute(s.internal_flash + XIAO_OTA_APP_START, 9001, NULL) ^ 1;
+      assert(wrong != 0);
+      sdk[2] = (uint8_t)wrong; sdk[3] = (uint8_t)(wrong >> 8);
+      fake_io_write_settings_raw(&s, sdk);
+    }
+    if (control == 2) {
+      assert(read_floor(&s, &floor));
+      floor.confirmed_counter_floor = 4;
+      floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
+      memcpy(s.qspi + XIAO_OTA_FLOOR_A, &floor, sizeof(floor));
+    }
+    if (control == 3) memset(s.qspi + XIAO_OTA_FLOOR_A, 0xff, 2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, command.active_image_extent, before_hash);
+    (void)fake_io_run_boot(&s);
+    assert(!read_state(&s, &state));
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, command.active_image_extent, digest);
+    assert(memcmp(digest, before_hash, 32) == 0);
+    fake_io_read_settings_raw(&s, current_sdk);
+    assert(memcmp(current_sdk, sdk, sizeof(sdk)) == 0);
+  }
+
+  load_original_commit_fixture(&s, prefix, &command, &descriptor, sdk, vendor_crc_unused);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(state.transaction_nonce == command.transaction_nonce && state.active_image_extent == 9004);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, descriptor.exact_size_bytes, digest);
+  assert(memcmp(digest, descriptor.sha256, 32) == 0);
+  write_confirmation(&s, state.transaction_nonce, state.candidate_counter, digest);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_CONFIRMED);
+  assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 1);
+
+  load_original_commit_fixture(&s, prefix, &command, &descriptor, sdk, vendor_crc_unused);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(crc16_compute(s.internal_flash + XIAO_OTA_APP_START, descriptor.exact_size_bytes, NULL) != 0);
+  write_confirmation(&s, state.transaction_nonce, state.candidate_counter, descriptor.sha256);
+  fake_io_read_settings_raw(&s, current_sdk);
+  current_sdk[2] = current_sdk[3] = 0;
+  fake_io_write_settings_raw(&s, current_sdk);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+  fake_io_read_settings_raw(&s, current_sdk);
+  assert(memcmp(current_sdk, sdk, sizeof(sdk)) == 0);
+
+  load_original_commit_fixture(&s, prefix, &command, &descriptor, sdk, vendor_crc_unused);
+  assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  for (attempt = 0; attempt < XIAO_OTA_MAX_TRIAL_BOOTS; ++attempt)
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+  assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+  assert(state.transaction_nonce == command.transaction_nonce && state.active_image_extent == 9004);
+  sha256_of(s.internal_flash + XIAO_OTA_APP_START, command.active_image_extent, digest);
+  assert(memcmp(digest, command.active_image_hash_sha256, 32) == 0);
+  fake_io_read_settings_raw(&s, current_sdk);
+  assert(memcmp(current_sdk, sdk, sizeof(sdk)) == 0);
+  assert(read_floor(&s, &floor) && floor.confirmed_counter_floor == 0);
+  memcpy(terminal, s.qspi + XIAO_OTA_STATE_A, sizeof(terminal));
+  for (attempt = 0; attempt < 3; ++attempt) {
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(memcmp(terminal, s.qspi + XIAO_OTA_STATE_A, sizeof(terminal)) == 0);
+  }
+  char failed_prefix[512];
+  const int prefix_bytes = snprintf(failed_prefix, sizeof(failed_prefix), "%s-original-failed%s", prefix,
+                                    vendor_crc_unused ? "" : "-nonzero");
+  assert(prefix_bytes > 0 && (size_t)prefix_bytes < sizeof(failed_prefix));
+  save_remote_fixture(failed_prefix, "state-region", s.qspi + XIAO_OTA_STATE_A,
+                      2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  save_remote_fixture(failed_prefix, "command-region", s.qspi + XIAO_OTA_COMMAND_A,
+                      2 * XIAO_OTA_QSPI_SECTOR_SIZE);
+  save_remote_fixture(failed_prefix, "running", s.internal_flash + XIAO_OTA_APP_START,
+                      command.active_image_extent);
+  fake_io_read_settings_raw(&s, current_sdk);
+  save_remote_fixture(failed_prefix, "sdk", current_sdk, sizeof(current_sdk));
+  printf("literal app original COMMIT board=%08x role=%u CRC=%s: genesis floor0, Trial->Confirmed, "
+         "Trial->FailedMax exact SDK28/SHA restoration and SHA/CRC/floor/missing-genesis controls passed\n",
+         (unsigned)XIAO_OTA_BOARD_TARGET, (unsigned)XIAO_OTA_COMPILED_ROLE_ID,
+         vendor_crc_unused ? "vendor-zero" : "matching-nonzero");
+}
+
 int main(int argc, char **argv) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
   test_valid_usb_reflash_refuses_original_command_without_admission();
@@ -399,6 +541,8 @@ int main(int argc, char **argv) {
     test_retired_intent_cannot_install_ready_without_new_commit_after_bank_restore(argv[1]);
     test_consumed_failed_command_does_not_install_replacement_after_precommit_abort(argv[1]);
     test_two_real_rollbacks_keep_older_command_safe_only_without_erasing_newest(argv[1]);
+    test_exact_original_commit_confirmation_rollback_and_controls(argv[1], true);
+    test_exact_original_commit_confirmation_rollback_and_controls(argv[1], false);
   }
   return frozen_boot_process_tests_main();
 }

@@ -559,12 +559,16 @@ test-ota-rf-to-boot: tmpdir
 	        multi-rollback-command-a multi-rollback-command-b \
 	        multi-rollback-candidate-a multi-rollback-candidate-b \
 	        multi-rollback-running multi-rollback-sdk multi-rollback-floor \
-	        multi-rollback-command-region multi-rollback-next-candidate multi-rollback-next-canonical; do \
+	        multi-rollback-command-region multi-rollback-next-candidate multi-rollback-next-canonical \
+	        original-command original-candidate original-running original-sdk original-floor original-state-region \
+	        original-failed-command-region original-failed-state-region original-failed-running original-failed-sdk \
+	        original-failed-nonzero-command-region original-failed-nonzero-state-region \
+	        original-failed-nonzero-running original-failed-nonzero-sdk; do \
 	        rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role-$$suffix.bin"; \
 	      done; \
 	    done; \
 	  done
-	env -u GTEST_FILTER \
+	env -u GTEST_FILTER -u OTA_NRF_ORIGINAL_FAILED_PROOF_DIR \
 	  OTA_NRF_REMOTE_BOOT_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
 	  $(MAKE) --no-print-directory test-ota-integration
 	@set -eu; \
@@ -579,6 +583,10 @@ test-ota-rf-to-boot: tmpdir
 	        OTA_NRF_REMOTE_BOOT_PROOF_PREFIX="$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role"; \
 	    done; \
 	  done
+	env -u OTA_NRF_REMOTE_BOOT_PROOF_DIR \
+	  GTEST_FILTER='LoraOtaQualifiedOriginal.FullColdFailedMax*' \
+	  OTA_NRF_ORIGINAL_FAILED_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
+	  $(MAKE) --no-print-directory test-ota-integration
 
 test-xiao-ota-bootloader: tmpdir test-xiao-ota-bootloader-tools test-xiao-ota-boot-process
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
