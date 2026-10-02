@@ -16,8 +16,9 @@ cable. It has three modes:
   capacity for normal traffic. Transfer time depends on image size, radio
   settings, relays and loss; 24–72 hours is a planning window, not a deadline.
 
-The approved lab baseline uses 62.5 kHz bandwidth (62500 Hz). LoRa OTA
-does not replace a deployed network's normal radio settings.
+LoRa OTA does not replace a deployed network's normal radio settings.
+The lab tools default to 62.5 kHz bandwidth; supervised testing on the
+approved bench pair also uses 250 kHz.
 
 ## Current availability: not ready for production use
 
@@ -37,8 +38,9 @@ implementation. The approved bench pair has received immutable applications,
 and its normal settings and administrator permission survived reboot.
 On 2026-10-02, ordinary target-to-client radio reception also passed with
 MeshCore identity verification and unchanged configuration. The target has
-not received its qualified custom OTA bootloader, and application recovery
-integration remains a gate. The 2% airtime policy and ordinary mesh service
+not received its qualified custom OTA bootloader. Corrected application
+recovery integration has passed the software gate, but physical installation
+and rollback remain unqualified. The 2% airtime policy and ordinary mesh service
 must still be verified together during an update. Routed delivery through
 intermediate nodes and fleet contention also need hardware beyond the
 two-node bench.

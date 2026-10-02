@@ -16,8 +16,12 @@ and the separately granted administrator ACL across reboot. Ordinary
 target-to-client radio reception then passed with native MeshCore identity
 acceptance and independently verified advert signing; configuration and the
 full ACL were unchanged afterward. These results do not qualify an update.
-The target's qualified custom loader is not installed, and application
-recovery integration remains open.
+Corrected application recovery integration passed the immutable software
+gate in `e62cf33b`. Fresh outputs from the production-C boot processor
+were accepted by the C++ application under both original SDK CRC policies.
+Newly preserved applications were flashed without changing the pair's
+identities, settings or complete ACL. The target's qualified custom loader
+is not installed; physical installation and rollback remain unqualified.
 
 Keep the uploader on the stock bootloader; only cache staging is available
 after its preflight succeeds. Stock-only compatibility now honours the
@@ -257,8 +261,9 @@ for the full policy model.
   [developer guide](lora_ota_development.md#current-hardware-evidence) for
   specifics and dates.
 - Nothing here yet results in an installed firmware update on a real device.
-  Local power-failure recovery for torn or orphaned cache metadata remains
-  an open risk. Preserve a validated recovery package before bench work;
+  Torn and partially erased cache metadata has native recovery coverage,
+  not physical power-failure qualification. Preserve a validated recovery
+  package before bench work;
   the lost original application and missing public-key baseline cannot be
   reconstructed by capturing new evidence.
 
