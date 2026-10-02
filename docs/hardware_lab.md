@@ -59,6 +59,9 @@ of use makes that a non-event.
 | `make lab-reset-<role>` | Restart the application firmware |
 | `make lab-bootloader-<role>` | Enter the serial DFU bootloader |
 | `make lab-bootloader-uf2-target` | Request vendor UF2 mode from the target's bench USB application |
+| `make inspect-xiao-nrf52-channels` | Read the approved companion's configured channel names and indices, without logging keys |
+| `make inspect-xiao-nrf52-ota-measurements` | Read the approved pair's driver-applied radio and completed airtime observations |
+| `make inspect-xiao-nrf52-ota-client-measurements` | Read those observations from the approved companion only |
 | `make lab-power-cycle-<role>` | Cut and restore USB port power |
 | `make lab-wait-<role>` | Block until the board enumerates |
 | `make upload-xiao-nrf52-<role>` | Build and flash the role's application |
@@ -85,6 +88,23 @@ commissioning uses the separate guarded installer. This flashes only the
 configured client and target without rebuilding concurrently edited source.
 The package check does not identify a firmware role: select each role's
 qualified package explicitly.
+
+Before selecting a background campaign's channel, inventory the uploader's
+existing table:
+
+```sh
+make inspect-xiao-nrf52-channels \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/channels-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Use a new evidence directory. This client-only inspection reads the
+advertised capacity and public names, excludes empty slots from
+`configured_indices`, and redacts channel keys before logging even a
+malformed reply. It never opens the target, changes a channel or grants
+permissions. The repeater has no corresponding channel-index table:
+the chosen sender slot scopes signed OTA flooding, not verified receiver
+membership. An empty table leaves no selectable background channel;
+do not assume index 0 exists.
 
 Extract that package's validated raw application for the signed uploader:
 
@@ -304,7 +324,9 @@ It still collects Installed, hash, floor and preservation evidence in
 to commit the already-installed candidate again.
 
 Select `OTA_SIGNED_LAB_MODE=direct` for 908525 kHz and 60-second leases;
-firmware owns restoration and renewal. Background requires an existing
+firmware restores the normal profile on expiry, then uses a fresh
+authenticated handshake to resume the durable bitmap. This is not
+indefinite lease renewal. Background requires an existing
 configured channel through `OTA_SIGNED_LAB_CHANNEL`. The default share
 is 2%, with a 72-hour host timeout, not a completion guarantee. A
 supervised full-image smoke run requires
@@ -321,10 +343,35 @@ with the companion's lifecycle before and after baseline capture. Only
 then does it explicitly restart the cache. An active conflicting cache,
 missing evidence or a changed snapshot remains a refusal.
 
-The runner does not establish measured airtime, physical multihop, fleet
-contention or power-cut recovery. Its tests and recipes do not close the
-firmware recovery or remote-reboot review gates, or constitute a hardware
-result.
+Stage records baseline, periodic, READY and end/restoration measurements
+between existing STATUS exchanges. Use
+`OTA_SIGNED_LAB_EXTRA='--measurement-interval 5'` for the default five-second
+sampling interval; the accepted range is 0.1 through 5 seconds. Combine it
+with `--supervised-full-image-smoke` for the separately authorized high-duty
+run. Nonzero driver faults, failed radio applications, TX timeouts or lost
+airtime records prevent measurement qualification.
+
+Ordinary peer reception must be bracketed by fresh RECEIVING progress,
+not inferred from transmission totals. Sampled 2% software-budget evidence
+requires a full-window observation, consistent accounting and new completed
+OTA charges as well as independent ordinary service. A short smoke run or
+missing coverage does not pass that gate. The runner does not establish a
+continuous PHY duty guarantee, physical multihop, fleet contention or
+power-cut recovery. Tests and recipes alone are not a hardware result.
+
+The new USB-enabled nRF52 lab firmware exposes `ota radio` and `ota budget`
+on the repeater, and companion selectors `42 00 03` and `42 00 04`.
+These report checked driver-applied radio settings and completed software
+TX timing, not independently measured chip registers or RF airtime.
+The [developer contract](lora_ota_development.md#read-only-radio-and-airtime-evidence)
+defines the fields and failure counters. Hardware acceptance still requires
+fresh RF progress, normal service during on-mesh transfer and observations
+through direct expiry, restoration and a second applied interval. Do not
+substitute stored radio preferences for those observations.
+The current STATUS ABI exposes durable counts, not bitmap bits or the
+fresh handshake token/ACK. Direct interval and progress observations
+therefore remain distinct from a separate wire-handshake witness; the
+runner does not invent missing handshake evidence.
 
 The repeater transport also reads `get acl`, whose output has no closing
 marker. It waits for the echoed reply to a following `get role` command
@@ -498,7 +545,7 @@ role, complete flash load and boot-info marker have been checked. Follow the
 and physical acceptance requirements. Artifact verification alone is not
 installed recovery qualification.
 
-The guarded UF2 path requires a real mass-storage interface and exactly
+UF2 identity inspection requires a real mass-storage interface and exactly
 one mounted UF2 volume belonging to the approved target's USB serial.
 Its `INFO_UF2.TXT` Board-ID must match the supported board. A CDC-only
 serial DFU port does not provide that volume, regardless of its product
@@ -539,8 +586,8 @@ The firmware refuses non-USB requests and active OTA transactions or
 unresolved boot verification, and rechecks those guards before entry.
 The helper neither mounts a volume nor writes firmware. Mount the
 serial-matched volume separately, then read its current `INFO_UF2.TXT`
-and complete the board and artifact checks before using the guarded
-installer. Successful UF2 entry alone proves neither package compatibility
+and complete the board and artifact checks. Do not copy a bootloader
+update to this volume. Successful UF2 entry alone proves neither package compatibility
 nor an installed recovery loader.
 
 The approved target passed this address and UF2-entry sequence on
@@ -552,6 +599,22 @@ cannot establish the current CF2 contents. Keep that distinction:
 current public identity can qualify a matching vendor board profile,
 but an old archive cannot serve as a fresh CF2 readback. No qualified
 loader has been written; the volume remains mounted read-only.
+
+**UF2 self-update is blocked for this layout.** The retained upstream
+0.6.1 and pinned vendor sources stage the bootloader update at
+`0xE0000..0xEA000`, inside protected ExtraFS, before copying it to the
+bootloader slot. Checking only the UF2 destination addresses misses that
+indirect write. This is a source-derived preservation conflict, not an
+attestation of the installed Seeed binary's exact lineage.
+
+Commissioning must instead use the ordinary vendor serial bootloader-only
+workflow with the exact reviewed Sense boot span and proven MBR/UICR
+addresses. That workflow deliberately overwrites application staging but
+does not overlap either filesystem in the verified SINGLEBANK source.
+Restore the immutable qualified application separately, then recheck
+healthy boot, identities, configuration and the complete ACL before
+accepting a genesis floor. A DFU acknowledgement or process exit status
+alone is not installation proof.
 
 The reviewed factory-initialization loader can create the initial durable
 floor only with verified flash, healthy vendor boot evidence and all eight
@@ -586,26 +649,65 @@ and `OTA_LAB_ARCHIVE_FILE` explicitly. This is an offline evidence check,
 not a live comparison or a firmware recovery package; installing the
 read-only diagnostic replaces the application it is meant to inspect.
 
-`make install-xiao-nrf52-target-ota-bootloader` builds the no-SWD package
-for the authorized XIAO repeater, defaulting to firmware role 1. It refuses
-a companion-role or non-XIAO package. Run it only from the frozen,
-qualified source tree after completing the preservation checks above;
-the target rebuilds its package.
-
-For an immutable, already-qualified bootloader package, use:
+Build the genuine Sense no-SWD profile for offline qualification:
 
 ```sh
-make flash-xiao-nrf52-target-ota-bootloader \
-  XIAO_NRF52_TARGET_OTA_BOOTLOADER_PACKAGE=/absolute/path/to/repeater/bootloader.uf2
+make package-xiao-ota-bootloader-noswd \
+  XIAO_OTA_BOARD=xiao_nrf52840_sense XIAO_OTA_ROLE_ID=1
 ```
 
-This target does not rebuild source or enter DFU. Put the authorized target
-in bootloader mode first. Board and repeater-role guards run before the
-artifact-only validation; the package must pass that validation before
-the Make workflow resolves the target's serial port. The physical
-installer checks the package again, validates the approved serial and
-mounted volume, then copies it. Passing these checks does not establish
-installed recovery.
+This selects the vendor's real `xiao_nrf52840_ble_sense` BSP and must fit
+the 38,912-byte bootloader code slot, including the `.data` load image.
+Its UF2 is an artifact-inspection format, not permission to copy it to
+mass storage. `make install-xiao-nrf52-target-ota-bootloader` and
+`make flash-xiao-nrf52-target-ota-bootloader` currently refuse the unsafe
+UF2 write route.
+
+Generate the standard vendor bootloader-only serial package offline:
+
+```sh
+make package-xiao-ota-bootloader-serial \
+  XIAO_OTA_BOARD=xiao_nrf52840_sense XIAO_OTA_ROLE_ID=1 \
+  XIAO_OTA_SERIAL_PACKAGE_DIR="$PWD/.tmp/sense-role1-serial-new"
+```
+
+The output directory must be new. The packager proves byte equality among
+the HEX, UF2 and ELF load image, then emits exactly 40,192 bytes for the
+half-open span `F4000..FDD00`. Its legacy ZIP contains only bootloader
+data, not an application, SoftDevice, MBR or UICR image. The ELF binds the
+compiled vendor version to the pinned release, 0.11.0 (`0x00000B00`);
+a hash-only version of zero is not an acceptable replacement for stock
+0.6.1. ARM fit includes the initialized `.data` load image, not just the
+nominal text size.
+
+Physical commissioning uses the separate, explicit
+`flash-xiao-nrf52-target-ota-bootloader-serial` target only after source,
+product tests, ARM artifacts, package and workflow review are closed.
+Set `XIAO_OTA_ARTIFACTS` and `XIAO_OTA_SERIAL_PACKAGE_DIR` to the immutable
+reviewed files, and `XIAO_OTA_BOOT_ADDRESS_EVIDENCE` to the actual ROOT
+address observation JSON. `XIAO_OTA_SERIAL_INSTALL_FLAGS=--dry-run` checks
+inputs and reports the command without invoking DFU. This is one guarded
+installer around the existing vendor tool, not a second update protocol.
+
+Standard serial bootloader-only DFU intentionally invalidates bank0 and
+can erase application pages `27000..31000` before later checks fail.
+It avoids the verified UF2 staging overlap with ExtraFS, but is not an
+application-preserving operation. Separately restoring the immutable
+qualified application is mandatory; uncertain DFU first requires ROOT
+inspection of enumeration, version and boot evidence, not blind retries
+or automatic restoration. Require positive vendor completion as well as
+a successful process exit. Neither proves installation or a genesis floor.
+After restoration, read back identity, settings, complete ACL, install
+capability, ordinary-write permission and the actual floor described above.
+
+The address reference is an observation, not a new authorization registry.
+Its timestamp must be the real acquisition time, within the installer's
+two-hour limit. If it expires while the board is in UF2 mode, return the
+approved target to its application through an approved reset or recovery
+procedure and read the addresses again. Never re-stamp old evidence.
+The actual installed Seeed stock-source lineage and physical power-failure
+behaviour remain unverified; offline package generation is not installation
+approval.
 
 ## Recovering an unresponsive board
 

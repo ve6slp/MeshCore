@@ -106,16 +106,25 @@ durable individual remote COMMIT, never after READY/rejection/uncertain writes.
 Run directed/direct/background sequentially with increasing explicit counters,
 new artifact directories, and separately qualified commits. Background requires
 an EXISTING configured channel index (0..254); no fleet/multihop claim. Direct
-requests 908525 kHz/60000 ms; production uploader firmware renews bounded leases
-and resumes the bitmap, and the app owns SF5, not this host. Active SF5 and lease
-renewal are NOT measured here. After READY wait a full lease before testing
+requests 908525 kHz/60000 ms; production uploader firmware repeats bounded leases
+only through restored normal service, a fresh handshake and bitmap resume, never
+indefinitely extending an active lease. The app owns SF5, not this host.
+USB-local driver-applied radio/budget samples are collected before caching,
+between remote status polls, at READY and after restoration. These are not PHY
+register readbacks. The status ABI exposes durable bitmap counts, not bitmap
+bits or the direct handshake token/ACK; those limits remain explicit.
+After READY wait a full lease before testing
 ordinary peer advert reception. Default 2000 milli-percent is 2%; explicitly
 passing 95000 or 100000 AND --supervised-full-image-smoke is 95% or 100%
 supervised smoke, NEVER 2% acceptance. The approved normal pair may use
 62.5 kHz or 250 kHz bandwidth at 907.525 MHz/SF7/CR5/path3; both peers must
 agree and retain their actual captured configuration. This runner does not
-configure radio settings. No measured-duty/budget-saturation counters are exposed by
-these status APIs; requested share and peer reception do not prove fairness.
+configure radio settings. Sampled software budgets and completed TX accounting
+do not establish a continuous physical duty guarantee or fairness. A 2% sampled
+window needs complete periodic coverage of at least a full window; before/after
+totals alone are incomplete. Timeouts, lost accounting and driver failures reject
+qualification. Ordinary peer reception during on-mesh transfer is independently
+bracketed by fresh candidate progress, not inferred from TX totals.
 No multihop, fleet, power-cut, rollback or full-configuration-media qualification.
 MAIN must close the current commissioning/recovery gate and use qualified role
 packages before hardware execution; bench application readbacks are not OTA
@@ -675,12 +684,224 @@ def fresh_candidate(uploader, candidate, target_key, deadline):
     raise TimeoutError("existing candidate has no fresh, identity-bound resumable snapshot")
 
 
+def measurement_health(sample):
+    for role, node in sample["nodes"].items():
+        radio, budget = node["radio"], node["budget"]
+        require(radio["v"] == radio["h"] == 1 and radio["x"] == radio["af"] == 0,
+                f"{role}: invalid/unhealthy applied radio or nonzero driver/apply failure count")
+        require(budget["to"] == budget["af"] == 0,
+                f"{role}: TX timeout or lost-accounting counter is nonzero")
+        require(0 < budget["w"] <= 0x7FFFFFFF and 0 <= budget["u"] <= budget["b"] <= budget["w"]
+                and budget["b"] > 0,
+                f"{role}: inconsistent rolling OTA window/budget/used accounting")
+
+
+def ms_delta(later, earlier):
+    return (later - earlier) & 0xFFFFFFFF
+
+
+class TransferMeasurements:
+    """Observe at idle command boundaries; never re-enter an uploader exchange."""
+
+    def __init__(self, pair, candidate, requested, baseline, evidence, deadline, interval):
+        self.pair, self.candidate, self.requested = pair, candidate, requested
+        self.baseline, self.evidence, self.deadline, self.interval = baseline, evidence, deadline, interval
+        self.samples, self.peer = [], None
+        self.record = {"samples": self.samples, "ordinary_peer_during_transfer": None,
+                       "candidate": candidate.metadata, "serials": APPROVED,
+                       "public_keys": {role: baseline[role]["pubkey"] for role in ("client", "target")},
+                       "requested_profile": requested,
+                       "driver_applied_not_phy_readback": True, "duty_guarantee_verified": False,
+                       "bitmap_bits_exposed": False, "fresh_handshake_wire_observed": False}
+        evidence.summary["measurements"]["transfer_measurements"] = self.record
+
+    def observe(self, phase, remote=None, since=None, remote_at=None):
+        if remote is not None:
+            remote_at = time.monotonic() if remote_at is None else remote_at
+            fresh = remote.fresh_since(since, remote_at)
+        remaining = self.deadline - time.monotonic()
+        require(remaining > 0, "measurement deadline expired; progress preserved")
+        sample = lab.read_ota_measurements(self.pair.client, self.pair.target, self.evidence, phase,
+                                           timeout=min(5, remaining))
+        sample["remote"] = None
+        sample["fresh_remote_progress"] = False
+        if remote is not None:
+            sample["remote"] = remote.summary()
+            sample["remote_received_monotonic"] = remote_at
+            sample["remote_snapshot_monotonic"] = (
+                remote_at - remote.age_ms / 1000 if remote.valid and remote.age_ms != ota.AGE_UNKNOWN else None)
+            if fresh:
+                bound_snapshot(remote, self.candidate, bytes.fromhex(self.baseline["target"]["pubkey"]))
+                sample["fresh_remote_progress"] = True
+                previous = next((s for s in reversed(self.samples) if s["fresh_remote_progress"]), None)
+                if previous is not None:
+                    require(remote.received >= previous["remote"]["received"],
+                            "fresh durable bitmap count regressed; preserve progress")
+        self.samples.append(sample)
+        self.evidence.log("transfer_measurement_sample", **sample)
+        measurement_health(sample)
+        for role, values in sample["nodes"].items():
+            radio = values["radio"]
+            normal = tuple(self.baseline[role][key] for key in ("freq_khz", "bw_hz", "sf", "cr"))
+            expected = (self.requested["frequency_khz"], 250000, 5, 5) if radio["a"] else normal
+            require(tuple(radio[key] for key in ("f", "b", "s", "c")) == expected,
+                    f"{role}: applied radio differs from saved baseline normal/direct tuple")
+            if radio["a"]:
+                require(self.requested["mode"] == "direct"
+                        and 0 < ms_delta(radio["e"], radio["n"]) <= self.requested["lease_ms"],
+                        f"{role}: unbounded/expired direct interval or direct active in on-mesh mode")
+            if len(self.samples) > 1:
+                previous = self.samples[-2]["nodes"][role]
+                require(ms_delta(radio["n"], previous["radio"]["n"]) < 0x80000000
+                        and ms_delta(values["budget"]["n"], previous["budget"]["n"]) < 0x80000000,
+                        f"{role}: device clock reset/regressed during transfer measurements")
+                for field in ("d", "r"):
+                    require(ms_delta(radio[field], previous["radio"][field]) < 0x80000000,
+                            f"{role}: applied radio counter regressed")
+        return sample
+
+    def report(self):
+        transfer = [s for s in self.samples if s["phase"] in ("transfer", "ready", "peer-after")]
+        reasons = []
+        if not self.samples or self.samples[0]["phase"] != "baseline":
+            reasons.append("baseline_measurements_missing")
+        if not self.samples or self.samples[-1]["phase"] != "end":
+            reasons.append("end_measurements_missing")
+        direct_sequence = False
+        if self.requested["mode"] == "direct":
+            first = restored = None
+            for sample in transfer:
+                radios = [sample["nodes"][role]["radio"] for role in ("client", "target")]
+                fresh = sample["fresh_remote_progress"]
+                if first is None and all(r["a"] for r in radios) and fresh:
+                    first = sample
+                elif first is not None and all(not r["a"] for r in radios):
+                    if all(ms_delta(sample["nodes"][role]["radio"]["r"],
+                                    first["nodes"][role]["radio"]["r"]) > 0
+                           for role in ("client", "target")):
+                        restored = sample
+                elif restored is not None and all(r["a"] for r in radios) and fresh:
+                    advanced = all(0 < ms_delta(sample["nodes"][role]["radio"]["d"],
+                                                first["nodes"][role]["radio"]["d"]) < 0x80000000
+                                   and ms_delta(sample["nodes"][role]["radio"]["td"],
+                                                restored["nodes"][role]["radio"]["tr"]) < 0x80000000
+                                   for role in ("client", "target"))
+                    direct_sequence = (advanced
+                                       and sample["remote_snapshot_monotonic"] >= restored["finished_monotonic"]
+                                       and sample["remote"]["received"] > first["remote"]["received"])
+                    if direct_sequence:
+                        break
+            if not direct_sequence:
+                reasons.append("two_applied_intervals_restoration_and_bitmap_continuation_not_observed")
+            reasons.append("fresh_direct_handshake_token_ack_not_exposed_by_existing_status_api")
+        else:
+            for sample in transfer:
+                budget = sample["nodes"]["client"]["budget"]
+                require(budget["b"] == budget["w"] * self.requested["duty_milli_percent"] // 100000,
+                        "sender applied budget does not match the requested share")
+            if len(transfer) < 3 or not any(s["fresh_remote_progress"] for s in transfer):
+                reasons.append("periodic_fresh_progress_samples_incomplete")
+            progress = [s["remote"]["received"] for s in transfer if s["fresh_remote_progress"]]
+            if len(progress) < 2 or max(progress) <= min(progress):
+                reasons.append("fresh_durable_bitmap_progress_not_observed")
+            if self.peer is None:
+                reasons.append("ordinary_peer_not_freshly_bracketed_during_transfer")
+            if not any(s["nodes"]["client"]["budget"]["u"] > 0 for s in transfer):
+                reasons.append("completed_on_mesh_ota_airtime_not_observed")
+            used = [s["nodes"]["client"]["budget"]["u"] for s in self.samples]
+            if not used or not any(later > earlier for earlier, later in zip(used, used[1:])):
+                reasons.append("new_completed_on_mesh_ota_charges_not_observed")
+        covered_window = False
+        if self.requested["mode"] != "direct" and transfer:
+            start = transfer[0]
+            previous = start
+            for sample in transfer[1:]:
+                compatible = all(
+                    sample["nodes"][role]["budget"]["w"] == previous["nodes"][role]["budget"]["w"]
+                    and sample["nodes"][role]["budget"]["b"] == previous["nodes"][role]["budget"]["b"]
+                    and ms_delta(sample["nodes"][role]["budget"]["n"],
+                                 previous["nodes"][role]["budget"]["n"]) <= int(self.interval * 2000)
+                    for role in ("client", "target"))
+                if not compatible:
+                    start = sample
+                if all(ms_delta(sample["nodes"][role]["budget"]["n"],
+                                start["nodes"][role]["budget"]["n"]) >= sample["nodes"][role]["budget"]["w"]
+                       for role in ("client", "target")):
+                    covered_window = True
+                previous = sample
+            if self.requested["duty_milli_percent"] == 2000:
+                if not covered_window:
+                    reasons.append("full_rolling_window_periodic_coverage_incomplete")
+                if any(s["nodes"][role]["budget"]["b"] * 100000
+                       > s["nodes"][role]["budget"]["w"] * 2000
+                       for s in transfer for role in ("client", "target")):
+                    reasons.append("observed_budget_exceeds_two_percent")
+        result = {"measurement_outcome": "incomplete" if reasons else "sampled_software_measurements_verified",
+                  "incomplete_reasons": reasons, "measurement_qualified": not reasons,
+                  "two_applied_intervals_restoration_bitmap_continuation_observed": direct_sequence,
+                  "full_window_periodic_coverage_observed": covered_window,
+                  "sampled_two_percent_budget_qualified": not reasons
+                  and self.requested["duty_milli_percent"] == 2000,
+                  "requested_duty_milli_percent": self.requested["duty_milli_percent"],
+                  "duty_guarantee_verified": False, "hardware_phy_readback": False,
+                  "ordinary_peer_during_transfer": self.peer}
+        self.record.update(result)
+        self.evidence.log("transfer_measurement_outcome", **result)
+        return result
+
+
+def wait_observed_ready(pair, uploader, candidate, target_key, since, deadline, observer):
+    peer_attempted = False
+    while time.monotonic() < deadline:
+        remote = uploader.status(target_key, timeout=uploader.remaining(deadline))
+        remote_at = time.monotonic()
+        fresh = remote.fresh_since(since, remote_at)
+        if remote.valid:
+            require(remote.target == target_key and remote.flags & ota.REMOTE,
+                    "OTA transfer status has the wrong remote scope")
+        if fresh:
+            bound_snapshot(remote, candidate, target_key)
+            require(remote.phase not in (ota.Phase.FAILED, ota.Phase.ABORTED),
+                    "OTA candidate failed/ABORTed; preserve progress")
+            require(remote.phase in (ota.Phase.ERASING, ota.Phase.RECEIVING,
+                                     ota.Phase.VERIFYING, ota.Phase.READY),
+                    "unexpected remote phase during transfer observation")
+        observer.observe("ready" if fresh and remote.phase == ota.Phase.READY else "transfer",
+                         remote, since, remote_at)
+        if fresh and remote.phase == ota.Phase.READY:
+            bound_snapshot(remote, candidate, target_key, complete=True)
+            return remote
+        if (not peer_attempted and observer.requested["mode"] != "direct" and fresh
+                and remote.phase == ota.Phase.RECEIVING and remote.received < remote.total):
+            peer_attempted = True
+            peer_since = time.monotonic()
+            witness = ordinary_peer(pair, target_key, observer.evidence, min(deadline, peer_since + 30))
+            after = uploader.status(target_key, timeout=uploader.remaining(deadline))
+            after_at = time.monotonic()
+            observer.observe("peer-after", after, peer_since, after_at)
+            if after.fresh_since(peer_since, after_at):
+                bound_snapshot(after, candidate, target_key)
+                require(after.phase not in (ota.Phase.FAILED, ota.Phase.ABORTED),
+                        "OTA candidate failed/ABORTed during ordinary peer observation")
+                if (after.phase == ota.Phase.RECEIVING and remote.received <= after.received < after.total):
+                    observer.peer = {"witness": witness, "before": remote.summary(), "after": after.summary(),
+                                     "tx_totals_are_not_peer_proof": True}
+            observer.record["ordinary_peer_during_transfer"] = observer.peer
+        time.sleep(min(observer.interval, max(0, deadline - time.monotonic())))
+    raise TimeoutError("no fresh READY before campaign deadline; measurements and progress preserved")
+
+
 def stage(pair, uploader, candidate, args, evidence, deadline):
     body, requested = profile(args)
+    require(math.isfinite(args.measurement_interval) and 0.1 <= args.measurement_interval <= 5,
+            "--measurement-interval must be finite and in 0.1..5 seconds")
     baseline = capture(pair, candidate, evidence, deadline, uploader=uploader)
     if args.baseline_record:
         preserved(read_record(args.baseline_record, "baseline"), baseline)
     write_record(evidence.directory / "baseline.json", baseline)
+    observer = TransferMeasurements(pair, candidate, requested, baseline, evidence, deadline,
+                                    args.measurement_interval)
+    observer.observe("baseline")
     target_key = bytes.fromhex(baseline["target"]["pubkey"])
     since = time.monotonic()
     local = uploader.status(timeout=uploader.remaining(deadline))
@@ -709,20 +930,25 @@ def stage(pair, uploader, candidate, args, evidence, deadline):
     bound_snapshot(cache, candidate, ota.LOCAL_TARGET, complete=True)
     since = time.monotonic()
     uploader.start([target_key], body, args.mode, deadline)
-    ready = uploader.wait_phase(target_key, ota.Phase.READY, candidate.manifest_hash,
-                                candidate.counter, since, deadline)
+    ready = wait_observed_ready(pair, uploader, candidate, target_key, since, deadline, observer)
     bound_snapshot(ready, candidate, target_key, complete=True)
     evidence.log("full_image_ready_without_commit", **ready.summary())
     # READY stops the firmware transfer; allow the last bounded direct lease to expire.
     if args.mode == "direct":
         require(deadline - time.monotonic() > 62, "READY preserved; insufficient deadline for lease restoration")
-        time.sleep(62)
+        restore_until = time.monotonic() + 62
+        while time.monotonic() < restore_until:
+            time.sleep(min(args.measurement_interval, restore_until - time.monotonic()))
+            observer.observe("restoration")
     after = capture(pair, candidate, evidence, deadline)
     preserved(baseline, after)
     require(after["target_status"]["phase"] == "ready", "target no longer READY; no commit attempted")
     ordinary_peer(pair, target_key, evidence, min(deadline, time.monotonic() + 30))
+    observer.observe("end")
+    measurements = observer.report()
     record = {**baseline, "kind": "ready", "profile": requested, "ready": ready.summary(),
-              "ready_observed_at": lab.utc_now(), "auto_commit": False}
+              "ready_observed_at": lab.utc_now(), "auto_commit": False,
+              "transfer_measurements": measurements}
     write_record(evidence.directory / "ready.json", record)
     evidence.summary["measurements"]["outcome"] = "full_image_ready_no_commit"
     return record
@@ -834,6 +1060,14 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
     before = capture(pair, candidate, evidence, deadline)
     preserved(record, before)
     require(before["target_status"]["phase"] == "ready", "explicit commit requires current target READY")
+    measurements = lab.read_ota_measurements(pair.client, pair.target, evidence, "pre-commit")
+    measurement_health(measurements)
+    for role, values in measurements["nodes"].items():
+        radio = values["radio"]
+        normal = tuple(before[role][key] for key in ("freq_khz", "bw_hz", "sf", "cr"))
+        require(not radio["a"] and tuple(radio[key] for key in ("f", "b", "s", "c")) == normal,
+                f"{role}: COMMIT requires healthy driver-applied restored normal service")
+    evidence.summary["measurements"]["pre_commit_measurements"] = measurements
     target_key = bytes.fromhex(before["target"]["pubkey"])
     local = uploader.status(timeout=uploader.remaining(deadline))
     bound_snapshot(local, candidate, ota.LOCAL_TARGET, complete=True)
@@ -849,6 +1083,9 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
             "identity/name/radio/path readbacks changed across installation")
     require(acl == before["acl"], "complete ADMIN ACL did not survive installation reboot")
     ordinary_peer(pair, target_key, evidence, min(deadline, time.monotonic() + 30))
+    measurements = lab.read_ota_measurements(pair.client, pair.target, evidence, "installed-end")
+    measurement_health(measurements)
+    evidence.summary["measurements"]["installed_end_measurements"] = measurements
     trial = evidence.summary["measurements"]["installed"]["remote_trial"]
     qualified = trial is not None
     result = "running_installed_lifecycle_and_peer_verified" if qualified else "remote_trial_not_observed"
@@ -860,6 +1097,9 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
                "trial_observed": qualified, "remote_trial": trial,
                "usb_reset_sent": False, "remote_install_qualified": qualified,
                "measured_duty_evidence_available": False,
+               "transfer_measurements": record.get("transfer_measurements"),
+               "hardware_campaign_qualified": qualified
+               and bool(record.get("transfer_measurements", {}).get("measurement_qualified")),
                "multihop_fleet_powercut_qualified": False}
     write_record(evidence.directory / "installed.json", outcome)
     evidence.summary["measurements"]["outcome"] = result
@@ -892,6 +1132,9 @@ def parser():
             command.add_argument("--duty-milli-percent", type=int, default=2000)
             command.add_argument("--supervised-full-image-smoke", action="store_true")
             command.add_argument("--baseline-record", type=Path)
+            command.add_argument("--measurement-interval", type=float, default=5,
+                                 help="periodic USB measurement/status polling in 0.1..5 seconds; "
+                                      "not a continuous duty guarantee")
         else:
             command.add_argument("--ready-record", required=True, type=Path)
             command.add_argument("--qualified-commit", action="store_true", required=True)
@@ -916,6 +1159,8 @@ def main(argv=None):
     candidate = None if args.command == "probe-peer" else load_candidate(args)
     if args.command == "stage":
         profile(args)
+        require(math.isfinite(args.measurement_interval) and 0.1 <= args.measurement_interval <= 5,
+                "--measurement-interval must be finite and in 0.1..5 seconds")
     elif args.command == "commit":
         record = read_record(args.ready_record, "ready")
         require(record["candidate"] == candidate.metadata, "READY record candidate mismatch")

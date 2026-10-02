@@ -1,8 +1,10 @@
 import contextlib
 import io
+import json
 import pathlib
 import struct
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -29,11 +31,20 @@ def self_info(name="OTA-LAB-CLIENT", public_key=CLIENT_KEY, advert_type=1,
     return bytes(frame) + name.encode("utf-8")
 
 
-def device_info(mode=2, version=13):
+def device_info(mode=2, version=13, capacity=40):
     frame = bytearray(82)
     frame[0:2] = bytes([13, version])
+    frame[3] = capacity
     frame[81] = mode
     return bytes(frame)
+
+
+CHANNEL_SECRET_CANARY = b"SECRET-PSK-12345"
+TEST_SCRATCH = pathlib.Path(__file__).resolve().parents[2] / ".tmp"
+
+
+def channel_info(index=0, name=""):
+    return bytes([18, index]) + name.encode("utf-8").ljust(32, b"\x00") + CHANNEL_SECRET_CANARY
 
 
 def evidence_fixture():
@@ -344,6 +355,25 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--inspect-configuration", "--bandwidth-hz=62500"], "requires --configure-only"),
             (["--inspect-configuration", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--inspect-configuration", "--client-only"], "requires both approved roles"),
+            (["--inspect-channels", "--configure-only"], "not allowed"),
+            (["--inspect-channels", "--grant-client-admin"], "not allowed"),
+            (["--inspect-channels", "--inspect-configuration"], "not allowed"),
+            (["--inspect-channels", "--inspect-ota-preflight"], "not allowed"),
+            (["--inspect-channels", "--monitor-seconds=0"], "not allowed"),
+            (["--inspect-channels", "--monitor-seconds=1"], "not allowed"),
+            (["--inspect-channels", "--bandwidth-hz=62500"], "requires --configure-only"),
+            (["--inspect-channels", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--inspect-channels", "--require-target-genesis-floor"], "requires --inspect-ota-preflight"),
+            (["--inspect-channels", "--require-target-boot-addresses"], "requires --inspect-ota-preflight"),
+            (["--inspect-measurements", "--configure-only"], "not allowed"),
+            (["--inspect-measurements", "--grant-client-admin"], "not allowed"),
+            (["--inspect-measurements", "--inspect-configuration"], "not allowed"),
+            (["--inspect-measurements", "--inspect-ota-preflight"], "not allowed"),
+            (["--inspect-measurements", "--inspect-channels"], "not allowed"),
+            (["--inspect-measurements", "--monitor-seconds=0"], "not allowed"),
+            (["--inspect-measurements", "--bandwidth-hz=250000"], "requires --configure-only"),
+            (["--inspect-measurements", "--require-target-genesis-floor"], "requires --inspect-ota-preflight"),
+            (["--inspect-measurements", "--require-target-boot-addresses"], "requires --inspect-ota-preflight"),
             (["--require-target-genesis-floor"], "requires --inspect-ota-preflight"),
             (["--require-target-genesis-floor", "--configure-only"], "requires --inspect-ota-preflight"),
             (["--require-target-genesis-floor", "--grant-client-admin"], "requires --inspect-ota-preflight"),
@@ -2406,6 +2436,482 @@ class CompanionSigningTests(unittest.TestCase):
             ota_rf_lab.sign_manifest(self.node, self.canonical, self.public_key, deadline=200)
         self.assertEqual([call.kwargs["timeout"] for call in self.node.command.call_args_list],
                          [5, 5, 5])
+
+
+class ChannelResponseRedactionTests(unittest.TestCase):
+    def setUp(self):
+        self.node = ota_rf_lab.FramedSerial.__new__(ota_rf_lab.FramedSerial)
+        self.node.name = "client"
+        self.node.buffer = bytearray()
+        self.node.pending = []
+        self.node.evidence = evidence_fixture()
+
+    def receive(self, payload, split=None):
+        wire = b">" + struct.pack("<H", len(payload)) + payload
+        chunks = [wire] if split is None else [wire[:split], wire[split:]]
+        self.node._read_bytes = mock.Mock(side_effect=chunks)
+        for _ in chunks:
+            self.node.poll()
+        return self.node.pending[-1][1]
+
+    def assert_no_secret(self, value):
+        text = str(value)
+        self.assertNotIn(CHANNEL_SECRET_CANARY.decode(), text)
+        self.assertNotIn(CHANNEL_SECRET_CANARY.hex(), text)
+
+    def test_every_fragment_boundary_redacts_before_logging_and_keeps_protocol_frame_usable(self):
+        payload = channel_info(7, "#ota-lab")
+        for split in range(1, len(payload) + 3):
+            with self.subTest(split=split):
+                self.setUp()
+                self.assertEqual(self.receive(payload, split), payload)
+                self.node.evidence.log.assert_called_once_with(
+                    "serial_rx", node="client", length=50, code=18, redacted=True,
+                    index=7, name="#ota-lab", configured=True)
+                self.assert_no_secret(self.node.evidence.log.call_args_list)
+                self.node._read_bytes = mock.Mock(return_value=b"")
+                self.assertEqual(self.node.wait_frame({18}), payload)
+                self.assertEqual(ota_rf_lab.public_channel_info(payload),
+                                 {"index": 7, "name": "#ota-lab", "configured": True})
+
+    def test_malformed_channel_lengths_never_log_hex_name_index_or_secret(self):
+        for length in (1, 2, 17, 33, 34, 49, 51, 176, 200):
+            with self.subTest(length=length):
+                self.setUp()
+                payload = (b"\x12" + CHANNEL_SECRET_CANARY * 13)[:length]
+                self.assertEqual(self.receive(payload, split=4), payload)
+                self.node.evidence.log.assert_called_once_with(
+                    "serial_rx", node="client", length=length, code=18,
+                    redacted=True, malformed=True)
+                self.assert_no_secret(self.node.evidence.log.call_args_list)
+                with self.assertRaisesRegex(ValueError, "malformed channel response") as error:
+                    ota_rf_lab.public_channel_info(payload)
+                self.assert_no_secret(repr(error.exception))
+
+    def test_invalid_channel_names_and_reserved_index_are_redacted_and_fail_plainly(self):
+        for payload in (
+            bytes([18, 1]) + b"x" * 32 + CHANNEL_SECRET_CANARY,
+            bytes([18, 1]) + b"\xff\x00".ljust(32, b"\x00") + CHANNEL_SECRET_CANARY,
+            channel_info(1, "bad\nname"), channel_info(255, "#invalid"),
+        ):
+            with self.subTest(length=len(payload)):
+                self.setUp()
+                self.receive(payload)
+                self.assertEqual(self.node.evidence.log.call_args.kwargs,
+                                 {"node": "client", "length": 50, "code": 18,
+                                  "redacted": True, "malformed": True})
+                with self.assertRaises(ValueError) as error:
+                    ota_rf_lab.public_channel_info(payload)
+                self.assert_no_secret(repr(error.exception))
+                self.assert_no_secret(self.node.evidence.log.call_args_list)
+
+    def test_stale_bytes_after_name_nul_are_not_logged_or_mistaken_for_padding(self):
+        payload = bytes([18, 9]) + (b"#ok\x00" + CHANNEL_SECRET_CANARY).ljust(32, b"\xff")
+        payload += CHANNEL_SECRET_CANARY
+        self.receive(payload)
+        self.assertEqual(ota_rf_lab.public_channel_info(payload),
+                         {"index": 9, "name": "#ok", "configured": True})
+        self.assert_no_secret(self.node.evidence.log.call_args_list)
+
+    def test_ordinary_frames_remain_byte_for_byte_in_logs_and_pending(self):
+        for payload in (b"\x80" + CLIENT_KEY, b"\x01\x07", b"", self_info(), device_info()):
+            with self.subTest(code=payload[:1]):
+                self.setUp()
+                self.assertEqual(self.receive(payload), payload)
+                self.node.evidence.log.assert_called_once_with(
+                    "serial_rx", node="client", length=len(payload),
+                    code=payload[0] if payload else None, hex=payload.hex())
+
+
+class ChannelInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.node = ota_rf_lab.FramedSerial.__new__(ota_rf_lab.FramedSerial)
+        self.node.name = "client"
+        self.node.fd = None
+        self.node.buffer = bytearray()
+        self.node.pending = []
+        self.requests = []
+        self.chunks = []
+        self.reply_info = self_info()
+        self.reply_device = device_info()
+        self.channel_overrides = {}
+        self.devices = {
+            "client": mock.Mock(serial="4186AE911D94CDB1", by_id="/dev/serial/by-id/client"),
+        }
+
+        def write(wire):
+            request = wire[3:]
+            self.assertEqual(wire[:3], b"<" + struct.pack("<H", len(request)))
+            self.requests.append(request)
+            if request == b"\x01" + bytes(7) + b"ota-rf-lab":
+                response = self.reply_info
+            elif request == b"\x16\x0d":
+                response = self.reply_device
+            elif len(request) == 2 and request[0] == 31:
+                index = request[1]
+                self.assertLess(index, self.reply_device[3])
+                response = self.channel_overrides.get(
+                    index, channel_info(index, "#ota-lab" if index == 7 else ""))
+                if isinstance(response, Exception):
+                    raise response
+            else:
+                raise AssertionError(f"unexpected write command {request[:1].hex()}")
+            framed = b">" + struct.pack("<H", len(response)) + response
+            self.chunks.extend(framed[offset:offset + 7] for offset in range(0, len(framed), 7))
+
+        self.node._write_bytes = write
+        self.node._read_bytes = lambda timeout: self.chunks.pop(0) if self.chunks else b""
+
+    def run_main(self, directory, extra=(), resolver=None):
+        args = ["ota_rf_lab.py", "--artifact-dir", str(directory), "--inspect-channels", *extra]
+        self.output = io.StringIO()
+        with mock.patch.object(sys, "argv", args), \
+                mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
+                mock.patch.object(ota_rf_lab, "FramedSerial", return_value=self.node) as client, \
+                mock.patch.object(ota_rf_lab, "RepeaterSerial") as target, \
+                mock.patch.object(ota_rf_lab.time, "sleep"), \
+                contextlib.redirect_stdout(self.output):
+            self.resolve, self.client_open, self.target_open = resolve, client, target
+            resolve.side_effect = (resolver if resolver is not None
+                                   else lambda role, mode: self.devices[role])
+            def open_client(name, path, evidence):
+                self.node.name = name
+                self.node.evidence = evidence
+                return self.node
+            client.side_effect = open_client
+            ota_rf_lab.main()
+
+    def assert_secret_absent(self, directory, exception=None):
+        text = self.output.getvalue() + repr(exception)
+        text += "".join(path.read_text() for path in directory.iterdir())
+        self.assertNotIn(CHANNEL_SECRET_CANARY.decode(), text)
+        self.assertNotIn(CHANNEL_SECRET_CANARY.hex(), text)
+
+    def record(self, directory):
+        return json.loads((directory / "summary.json").read_text())["measurements"]["channel_inventory"]
+
+    def test_actual_wire_inventory_reads_all_40_slots_only_and_discards_secrets(self):
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            directory = pathlib.Path(parent) / "inventory"
+            self.channel_overrides[39] = channel_info(39, "#last")
+            self.run_main(directory)
+            self.resolve.assert_called_once_with("client", mode=ota_rf_lab.lab_device.MODE_APP)
+            self.client_open.assert_called_once_with("client-4186AE911D94CDB1",
+                                                    "/dev/serial/by-id/client", self.node.evidence)
+            self.target_open.assert_not_called()
+            record = self.record(directory)
+            self.assertEqual(record["capacity"], 40)
+            self.assertEqual(record["configured_indices"], [7, 39])
+            self.assertEqual(len(record["channels"]), 40)
+            self.assertEqual(record["channels"][0], {"index": 0, "name": "", "configured": False})
+            self.assertEqual(record["channels"][7],
+                             {"index": 7, "name": "#ota-lab", "configured": True})
+            self.assertTrue(record["inspection_complete"])
+            self.assertTrue(record["read_only"])
+            self.assertFalse(record["receiver_membership_verified"])
+            self.assertEqual(record["client"]["pubkey"], CLIENT_KEY.hex())
+            self.assertNotIn("pubkey_bytes", record["client"])
+            self.assertEqual(self.requests, [b"\x01" + bytes(7) + b"ota-rf-lab", b"\x16\x0d"]
+                             + [bytes([31, index]) for index in range(40)])
+            self.assertEqual(self.node.pending, [])
+            self.assert_secret_absent(directory)
+
+    def test_advertised_capacity_is_used_instead_of_fixed_40_or_255(self):
+        for capacity in (1, 3, 255):
+            with self.subTest(capacity=capacity), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                self.setUp()
+                self.reply_device = device_info(capacity=capacity)
+                directory = pathlib.Path(parent) / "inventory"
+                self.run_main(directory, ["--client-only"])
+                self.assertEqual(self.requests[2:], [bytes([31, i]) for i in range(capacity)])
+                self.assertEqual(len(self.record(directory)["channels"]), capacity)
+                self.target_open.assert_not_called()
+                self.assert_secret_absent(directory)
+
+    def test_complete_empty_table_has_no_configured_indices_or_receiver_claim(self):
+        self.reply_device = device_info(capacity=2)
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            directory = pathlib.Path(parent) / "inventory"
+            self.run_main(directory)
+            record = self.record(directory)
+            self.assertTrue(record["inspection_complete"])
+            self.assertEqual(record["configured_indices"], [])
+            self.assertFalse(any(row["configured"] for row in record["channels"]))
+            self.assertFalse(record["receiver_membership_verified"])
+
+    def test_existing_artifact_directory_is_refused_before_resolution_or_open(self):
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            directory = pathlib.Path(parent)
+            marker = directory / "preserve.txt"
+            marker.write_text("untouched")
+            with self.assertRaises(FileExistsError):
+                self.run_main(directory)
+            self.resolve.assert_not_called()
+            self.client_open.assert_not_called()
+            self.target_open.assert_not_called()
+            self.assertEqual(marker.read_text(), "untouched")
+            self.assertEqual(list(directory.iterdir()), [marker])
+
+    def test_unapproved_pine_or_target_source_serial_never_opens_any_port(self):
+        for serial in ("49C5BAF21EEF44A1", "3BE94917B92DC5E9", "unapproved"):
+            with self.subTest(serial=serial), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                self.setUp()
+                self.devices["client"].serial = serial
+                directory = pathlib.Path(parent) / "inventory"
+                with self.assertRaises(AssertionError):
+                    self.run_main(directory)
+                self.client_open.assert_not_called()
+                self.target_open.assert_not_called()
+                self.assertEqual(self.requests, [])
+
+    def test_client_role_remapping_is_refused_before_resolution_and_queries(self):
+        for role in ("target", "pine", "alternate"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                with mock.patch.object(ota_rf_lab, "CLIENT_ROLE", role):
+                    with self.assertRaises(AssertionError):
+                        self.run_main(pathlib.Path(parent) / "inventory")
+                self.resolve.assert_not_called()
+                self.client_open.assert_not_called()
+                self.target_open.assert_not_called()
+                self.assertEqual(self.requests, [])
+
+    def test_protected_source_resolver_refusal_is_fatal_before_open(self):
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            directory = pathlib.Path(parent) / "inventory"
+            with mock.patch.object(ota_rf_lab, "resolve_roles",
+                                   side_effect=SystemExit("refusing protected lab device assignment")):
+                with self.assertRaisesRegex(SystemExit, "protected"):
+                    self.run_main(directory)
+            self.client_open.assert_not_called()
+            self.target_open.assert_not_called()
+            self.assertEqual(self.requests, [])
+            self.assertIn("protected", (directory / "summary.json").read_text())
+
+    def test_real_protected_inventory_guard_blocks_override_before_discovery_or_open(self):
+        actual_resolve = ota_rf_lab.lab_device.resolve
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            directory = pathlib.Path(parent) / "inventory"
+            config = pathlib.Path(parent) / "devices.ini"
+            config.write_text("[roles]\nclient = 4186AE911D94CDB1\n"
+                              "[protected]\npine = 49C5BAF21EEF44A1\n")
+            with mock.patch.object(ota_rf_lab.lab_device, "CONFIG_PATH", config), \
+                    mock.patch.dict(ota_rf_lab.os.environ,
+                                    {"MESHCORE_LAB_CLIENT_SERIAL": "49C5BAF21EEF44A1"}), \
+                    mock.patch.object(ota_rf_lab.lab_device, "discover") as discover:
+                with self.assertRaisesRegex(SystemExit, "refusing protected lab device assignment"):
+                    self.run_main(directory, resolver=actual_resolve)
+                discover.assert_not_called()
+            self.client_open.assert_not_called()
+            self.target_open.assert_not_called()
+            self.assertEqual(self.requests, [])
+
+    def test_companion_role_and_identity_are_checked_before_capacity_or_channel_queries(self):
+        for response in (self_info(advert_type=2), self_info(public_key=bytes(32)), self_info()[:57]):
+            with self.subTest(response_length=len(response)), \
+                    tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                self.setUp()
+                self.reply_info = response
+                with self.assertRaises(RuntimeError):
+                    self.run_main(pathlib.Path(parent) / "inventory")
+                self.assertEqual(len(self.requests), 1)
+                self.target_open.assert_not_called()
+
+    def test_capacity_backend_refusals_and_malformed_partial_or_zero_responses_stop_before_reads(self):
+        for response, error in (
+            (b"\x01\x07", RuntimeError), (device_info(capacity=0), RuntimeError),
+            (device_info(version=2), ValueError), (device_info()[:4], ValueError),
+            (device_info()[:79], ValueError), (device_info()[:80], ValueError),
+            (device_info()[:81], ValueError),
+        ):
+            with self.subTest(response_length=len(response)), \
+                    tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                self.setUp()
+                self.reply_device = response
+                directory = pathlib.Path(parent) / "inventory"
+                with self.assertRaises(error):
+                    self.run_main(directory)
+                self.assertEqual(len(self.requests), 2)
+                self.assertFalse(self.record(directory)["inspection_complete"])
+
+    def test_partial_failed_inventory_retains_only_public_progress_and_plain_error(self):
+        for response, error in (
+            (b"\x01\x07", RuntimeError), (b"\x12" + CHANNEL_SECRET_CANARY, ValueError),
+            (channel_info(8, "#wrong"), ValueError), (channel_info(1, "bad\nname"), ValueError),
+            (ConnectionError("client: serial disconnected"), ConnectionError),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                self.setUp()
+                self.channel_overrides[1] = response
+                directory = pathlib.Path(parent) / "inventory"
+                with self.assertRaises(error) as raised:
+                    self.run_main(directory)
+                record = self.record(directory)
+                self.assertFalse(record["inspection_complete"])
+                self.assertEqual(record["channels"], [{"index": 0, "name": "", "configured": False}])
+                self.assertEqual(self.requests[-1], b"\x1f\x01")
+                self.assertEqual(len(self.requests), 4)
+                self.assert_secret_absent(directory, raised.exception)
+                self.target_open.assert_not_called()
+
+
+class OtaMeasurementDiagnosticsTests(unittest.TestCase):
+    RADIO = ("src=driver-applied f=907525 b=250000 s=7 c=5 v=1 a=0 e=00000000 "
+             "d=00000002 r=00000002 td=00010000 tr=00018000 h=1 x=00000000 af=00000000 n=00020000")
+    BUDGET = "n=00020000 w=0036EE80 b=00011940 u=0000002A tx=00000100 to=00000000 af=00000000"
+
+    def test_literal_radio_contract_parses_exact_fields_units_and_initial_normal_application(self):
+        result = ota_rf_lab.parse_ota_radio_measurement(self.RADIO)
+        self.assertEqual(result, {"src": "driver-applied", "f": 907525, "b": 250000, "s": 7, "c": 5,
+            "v": 1, "a": 0, "e": 0, "d": 2, "r": 2, "td": 65536, "tr": 98304,
+            "h": 1, "x": 0, "af": 0, "n": 131072})
+        initial = self.RADIO.replace("d=00000002 r=00000002", "d=00000000 r=00000000")
+        self.assertEqual(ota_rf_lab.parse_ota_radio_measurement(initial)["r"], 0)
+
+    def test_literal_budget_contract_has_actual_completed_ms_and_uint32_counters(self):
+        self.assertEqual(ota_rf_lab.parse_ota_budget_measurement(self.BUDGET),
+                         {"n": 131072, "w": 3600000, "b": 72000, "u": 42, "tx": 256, "to": 0, "af": 0})
+        highest = " ".join(f"{field}=FFFFFFFF" for field in ota_rf_lab.BUDGET_MEASUREMENT_FIELDS)
+        self.assertTrue(all(value == 0xFFFFFFFF
+                            for value in ota_rf_lab.parse_ota_budget_measurement(highest).values()))
+
+    def test_radio_parser_rejects_every_truncation_duplicate_extra_and_out_of_order_key(self):
+        for text in (
+            *(self.RADIO[:i] for i in range(len(self.RADIO))),
+            self.RADIO + " n=00020000", self.RADIO + " extra=1", self.RADIO + "\x00",
+            self.RADIO + "\n", " " + self.RADIO, self.RADIO.replace("src=driver-applied", "src=preferences"),
+            self.RADIO.replace("f=907525 b=250000", "b=250000 f=907525"),
+            self.RADIO.replace("x=00000000", "x=0000000a"),
+            self.RADIO.replace("v=1", "v=2"), self.RADIO.replace("a=0", "a=-1"),
+            self.RADIO.replace("f=907525", "f=907525.0"), self.RADIO.replace("s=7", "s=07"),
+            self.RADIO.replace("n=00020000", "n=100020000"),
+        ):
+            with self.subTest(length=len(text)), self.assertRaises(ValueError):
+                ota_rf_lab.parse_ota_radio_measurement(text)
+
+    def test_radio_range_guards_do_not_accept_unknown_phy_values(self):
+        for field, bad in (("f", "149999"), ("f", "2500001"), ("b", "249999"),
+                           ("s", "4"), ("s", "13"), ("c", "4"), ("c", "9")):
+            old = next(token for token in self.RADIO.split() if token.startswith(field + "="))
+            with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
+                ota_rf_lab.parse_ota_radio_measurement(self.RADIO.replace(old, f"{field}={bad}"))
+
+    def test_budget_parser_rejects_missing_duplicate_reordered_noncanonical_and_extra_fields(self):
+        for text in (
+            *(self.BUDGET[:i] for i in range(len(self.BUDGET))),
+            self.BUDGET + " af=00000000", self.BUDGET + " f=907525", self.BUDGET + "\x00",
+            self.BUDGET.replace("u=0000002A", "u=0000002a"),
+            self.BUDGET.replace("w=0036EE80 b=00011940", "b=00011940 w=0036EE80"),
+            self.BUDGET.replace("tx=00000100", "tx=256"), self.BUDGET + "\n",
+        ):
+            with self.subTest(length=len(text)), self.assertRaises(ValueError):
+                ota_rf_lab.parse_ota_budget_measurement(text)
+
+    def test_read_only_parsers_faithfully_report_unhealthy_and_uninitialized_measurements(self):
+        unhealthy = self.RADIO.replace("v=1", "v=0").replace("h=1", "h=0")
+        unhealthy = unhealthy.replace("af=00000000", "af=00000003").replace("x=00000000", "x=00000002")
+        self.assertEqual(ota_rf_lab.parse_ota_radio_measurement(unhealthy)["af"], 3)
+        uninitialized = unhealthy.replace("f=907525 b=250000 s=7 c=5", "f=0 b=0 s=0 c=0")
+        self.assertEqual(ota_rf_lab.parse_ota_radio_measurement(uninitialized)["v"], 0)
+        counters = self.BUDGET.replace("to=00000000 af=00000000", "to=00000001 af=00000002")
+        self.assertEqual(ota_rf_lab.parse_ota_budget_measurement(counters)["to"], 1)
+
+    def test_exact_existing_companion_requests_and_repeater_commands(self):
+        client, target = mock.Mock(), mock.Mock()
+        client.command.side_effect = [b"\x1d" + self.RADIO.encode(), b"\x1d" + self.BUDGET.encode()]
+        target.command.side_effect = [self.RADIO, self.BUDGET]
+        record = ota_rf_lab.read_ota_measurements(client, target, evidence_fixture(), "test")
+        self.assertEqual(client.command.call_args_list, [
+            mock.call(bytes.fromhex("420003"), expected=(29, 1), timeout=5),
+            mock.call(bytes.fromhex("420004"), expected=(29, 1), timeout=5)])
+        self.assertEqual(target.command.call_args_list,
+                         [mock.call("ota radio", timeout=5), mock.call("ota budget", timeout=5)])
+        self.assertTrue(record["driver_applied_not_phy_readback"])
+        self.assertFalse(record["duty_guarantee_verified"])
+
+    def test_bad_backend_frames_and_text_fail_without_payload_or_secret_repr(self):
+        for role, kind, response in (
+            ("client", "radio", b"\x01\x07"), ("client", "radio", b"\x1d\xff"),
+            ("client", "budget", b"\x1d" + self.BUDGET.encode() + b"\x00"),
+            ("client", "radio", channel_info(1, "#channel")),
+            ("target", "radio", "Err - unavailable"), ("target", "budget", "> " + self.BUDGET),
+        ):
+            with self.subTest(role=role, kind=kind):
+                node = mock.Mock()
+                node.command.return_value = response
+                with self.assertRaises((ValueError, RuntimeError)) as error:
+                    ota_rf_lab.read_ota_measurement(node, role, kind)
+                self.assertNotIn(CHANNEL_SECRET_CANARY.decode(), repr(error.exception))
+                self.assertNotIn(CHANNEL_SECRET_CANARY.hex(), repr(error.exception))
+
+    def test_diagnostic_reader_uses_real_framing_with_interleaved_secret_channel_response(self):
+        node = ota_rf_lab.FramedSerial.__new__(ota_rf_lab.FramedSerial)
+        node.name, node.buffer, node.pending = "client", bytearray(), []
+        node.evidence = evidence_fixture()
+        node._write_bytes = mock.Mock()
+        secret = channel_info(2, "#mesh")
+        diagnostic = b"\x1d" + self.RADIO.encode()
+        wire = b">" + struct.pack("<H", len(secret)) + secret
+        wire += b">" + struct.pack("<H", len(diagnostic)) + diagnostic
+        chunks = iter(wire[i:i + 5] for i in range(0, len(wire), 5))
+        node._read_bytes = lambda timeout: next(chunks, b"")
+        self.assertEqual(ota_rf_lab.read_ota_measurement(node, "client", "radio")["f"], 907525)
+        self.assertEqual(node.pending[-1][1], secret)
+        logs = repr(node.evidence.log.call_args_list)
+        self.assertNotIn(CHANNEL_SECRET_CANARY.decode(), logs)
+        self.assertNotIn(CHANNEL_SECRET_CANARY.hex(), logs)
+
+    def test_standalone_inspection_is_exclusive_approved_and_read_only_even_if_unhealthy(self):
+        for client_only in (False, True):
+            with self.subTest(client_only=client_only), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+                directory = pathlib.Path(parent) / "measurement"
+                client, target = mock.Mock(), mock.Mock()
+                client.command.side_effect = [self_info(), b"\x1d" + self.RADIO.encode(),
+                    b"\x1d" + self.BUDGET.replace("to=00000000", "to=00000001").encode()]
+                target.command.side_effect = ["> repeater", "> " + TARGET_KEY.hex(), self.RADIO, self.BUDGET]
+                devices = {role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{role}")
+                           for role, serial in ota_rf_lab.APPROVED_ADMIN_PAIR.items()}
+                args = ["ota_rf_lab.py", "--artifact-dir", str(directory), "--inspect-measurements"]
+                if client_only:
+                    args.append("--client-only")
+                with mock.patch.object(sys, "argv", args), \
+                        mock.patch.object(ota_rf_lab.lab_device, "resolve",
+                                          side_effect=lambda role, mode: devices[role]) as resolve, \
+                        mock.patch.object(ota_rf_lab, "FramedSerial", return_value=client) as open_client, \
+                        mock.patch.object(ota_rf_lab, "RepeaterSerial", return_value=target) as open_target, \
+                        mock.patch.object(ota_rf_lab.time, "sleep"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    ota_rf_lab.main()
+                    count = 1 if client_only else 2
+                    self.assertEqual(resolve.call_count, count)
+                    if client_only:
+                        open_target.assert_not_called()
+                    record = json.loads((directory / "summary.json").read_text())
+                    record = record["measurements"]["ota_measurement_inspection"]
+                    self.assertTrue(record["inspection_complete"])
+                    self.assertFalse(record["qualification_verified"])
+                    self.assertEqual(record["samples"][0]["nodes"]["client"]["budget"]["to"], 1)
+                    client.get_acl.assert_not_called()
+                    target.get_acl.assert_not_called()
+                    self.assertEqual(len(client.command.call_args_list), 3)
+                    self.assertEqual(target.command.call_count, 0 if client_only else 4)
+                    with self.assertRaises(FileExistsError):
+                        ota_rf_lab.main()
+                    self.assertEqual(open_client.call_count, 1)
+
+    def test_standalone_source_guards_reject_pine_remapping_before_open(self):
+        with tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
+            args = ["ota_rf_lab.py", "--artifact-dir", str(pathlib.Path(parent) / "capture"),
+                    "--inspect-measurements"]
+            device = mock.Mock(serial="49C5BAF21EEF44A1", by_id="/dev/serial/by-id/pine")
+            with mock.patch.object(sys, "argv", args), \
+                    mock.patch.object(ota_rf_lab.lab_device, "resolve", return_value=device), \
+                    mock.patch.object(ota_rf_lab, "FramedSerial") as client, \
+                    mock.patch.object(ota_rf_lab, "RepeaterSerial") as target, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(AssertionError):
+                    ota_rf_lab.main()
+                client.assert_not_called()
+                target.assert_not_called()
 
 
 if __name__ == "__main__":

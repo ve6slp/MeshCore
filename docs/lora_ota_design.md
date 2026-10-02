@@ -179,6 +179,19 @@ arithmetic alone is not enforcement. Qualification must reach the configured
 quota and verify that ordinary traffic still allocates packets and reaches
 its peer under sustained OTA load.
 
+On-mesh accounting uses completed transmission time in milliseconds.
+The default allowance is 72,000 ms per sliding 3,600,000 ms window,
+per transmitter; negotiated off-frequency direct transmissions do not
+consume that on-mesh allowance. Same-category completions may share a
+fixed-memory bucket spanning at most 15 seconds. Each bucket expires only
+after its latest completion leaves the window, so coalescing can delay
+allowance recovery slightly but never forget valid airtime early.
+Admission reserves a conservative completion bound of
+`floor(1.5 * estimatedMs) + 20` against both quota and accounting capacity;
+the completed packet is charged its actual elapsed time. Timeout and
+accounting-failure observations invalidate airtime qualification rather
+than being silently treated as zero usage.
+
 ## Target hardware focus
 
 The first hardware focus should be:

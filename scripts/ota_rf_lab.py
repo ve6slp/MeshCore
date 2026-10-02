@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure, monitor, inspect OTA diagnostics, or grant normal administrator access.
+"""Configure, monitor, inspect normal channels/OTA diagnostics, or grant administrator access.
 
 Configuration preserves existing identities and ACLs. Readbacks describe current
 settings, not active RF, reboot persistence, transfer, install, or trial evidence.
@@ -7,6 +7,10 @@ Repeater settings are preference readbacks; radio application requires a separat
 reboot. This helper never reboots.
 Only --grant-client-admin changes an ACL, using the existing normal text CLI.
 Use ota_uploader.py for the signed USB uploader and its explicit commit operation.
+--inspect-channels only reads the approved companion's advertised channel table.
+Channel response secrets are never logged; inventory contains public names/indices.
+--inspect-measurements reads approved USB-local driver-applied radio and completed
+software airtime diagnostics. It does not qualify PHY registers or a duty guarantee.
 """
 
 import argparse
@@ -38,6 +42,7 @@ CMD_APP_START = 1
 CMD_SET_ADVERT_NAME = 8
 CMD_SET_RADIO_PARAMS = 11
 CMD_DEVICE_QUERY = 22
+CMD_GET_CHANNEL = 31
 CMD_SIGN_START = 33
 CMD_SIGN_DATA = 34
 CMD_SIGN_FINISH = 35
@@ -48,6 +53,7 @@ RESP_OK = 0
 RESP_ERR = 1
 RESP_SELF_INFO = 5
 RESP_DEVICE_INFO = 13
+RESP_CHANNEL_INFO = 18
 RESP_OTA_STATUS = 29
 RESP_SIGN_START = 19
 RESP_SIGNATURE = 20
@@ -61,6 +67,15 @@ SUPPORTED_LORA_BANDWIDTHS_HZ = (
 PATH_HASH_MODE = 2
 CLIENT_NAME = "OTA-LAB-CLIENT"
 TARGET_NAME = "OTA-LAB-TARGET"
+RADIO_MEASUREMENT_FIELDS = ("f", "b", "s", "c", "v", "a", "e", "d", "r", "td", "tr", "h", "x", "af", "n")
+BUDGET_MEASUREMENT_FIELDS = ("n", "w", "b", "u", "tx", "to", "af")
+RADIO_MEASUREMENT_PATTERN = re.compile(
+    r"src=driver-applied f=(0|[1-9][0-9]*) b=(0|[1-9][0-9]*) s=(0|[1-9][0-9]*) "
+    r"c=(0|[1-9][0-9]*) v=([01]) a=([01]) e=([0-9A-F]{8}) d=([0-9A-F]{8}) "
+    r"r=([0-9A-F]{8}) td=([0-9A-F]{8}) tr=([0-9A-F]{8}) h=([01]) x=([0-9A-F]{8}) "
+    r"af=([0-9A-F]{8}) n=([0-9A-F]{8})")
+BUDGET_MEASUREMENT_PATTERN = re.compile(
+    " ".join(field + r"=([0-9A-F]{8})" for field in BUDGET_MEASUREMENT_FIELDS))
 
 
 def utc_now():
@@ -68,9 +83,9 @@ def utc_now():
 
 
 class Evidence:
-    def __init__(self, directory):
+    def __init__(self, directory, *, exclusive=False):
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(parents=True, exist_ok=not exclusive)
         self.events_path = self.directory / "serial-events.jsonl"
         self.summary_path = self.directory / "summary.json"
         self.events = self.events_path.open("a", encoding="utf-8")
@@ -142,6 +157,23 @@ class LabSerial:
         return chunk
 
 
+def public_channel_info(frame):
+    if len(frame) != 50 or frame[0] != RESP_CHANNEL_INFO or frame[1] == 255:
+        raise ValueError("malformed channel response: expected code 18, index 0..254 and 50 bytes")
+    name_field = frame[2:34]
+    terminator = name_field.find(b"\x00")
+    if terminator < 0:
+        raise ValueError("malformed channel response: unterminated name")
+    try:
+        name = name_field[:terminator].decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("malformed channel response: invalid UTF-8 name") from None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError("malformed channel response: control character in name")
+    # The producer uses strcpy, so bytes after the name's NUL are not padding.
+    return {"index": frame[1], "name": name, "configured": bool(name)}
+
+
 class FramedSerial(LabSerial):
     def __init__(self, name, path, evidence):
         super().__init__(name, path, evidence)
@@ -177,8 +209,18 @@ class FramedSerial(LabSerial):
         self.buffer.extend(self._read_bytes(timeout))
         for payload in self._extract():
             self.pending.append((time.monotonic(), payload))
-            self.evidence.log("serial_rx", node=self.name, length=len(payload), code=payload[0] if payload else None,
-                              hex=payload.hex())
+            fields = {"node": self.name, "length": len(payload), "code": payload[0] if payload else None}
+            if payload and payload[0] == RESP_CHANNEL_INFO:
+                fields["redacted"] = True
+                try:
+                    public = public_channel_info(payload)
+                except ValueError:
+                    fields["malformed"] = True
+                else:
+                    fields.update(public)
+            else:
+                fields["hex"] = payload.hex()
+            self.evidence.log("serial_rx", **fields)
 
     def wait_frame(self, codes, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -769,6 +811,119 @@ def run_inspect_configuration(client, target, evidence):
     return record
 
 
+def run_inspect_channels(client, evidence):
+    record = {"read_only": True, "inspection_complete": False, "client": {},
+              "capacity": None, "channels": [], "configured_indices": [],
+              "receiver_membership_verified": False, "serial_events": "serial-events.jsonl"}
+    evidence.summary["measurements"]["channel_inventory"] = record
+    record["client"] = serializable_app_info(app_info(client))
+    frame = client.command(bytes([CMD_DEVICE_QUERY, 13]), expected=(RESP_DEVICE_INFO, RESP_ERR))
+    if frame and frame[0] == RESP_ERR:
+        raise RuntimeError("client: channel capacity query refused by backend")
+    if len(frame) < 80 or frame[0] != RESP_DEVICE_INFO or frame[1] < 3:
+        raise ValueError("client: malformed channel capacity device-info response")
+    minimum_length = 82 if frame[1] >= 10 else 81 if frame[1] >= 9 else 80
+    if len(frame) < minimum_length:
+        raise ValueError("client: truncated channel capacity device-info response")
+    record["capacity"] = frame[3]
+    if record["capacity"] == 0:
+        raise RuntimeError("client: channel table unavailable (advertised capacity is zero)")
+    del frame
+    for index in range(record["capacity"]):
+        frame = client.command(bytes([CMD_GET_CHANNEL, index]), expected=(RESP_CHANNEL_INFO, RESP_ERR))
+        if frame and frame[0] == RESP_ERR:
+            raise RuntimeError(f"client: channel {index} read refused by backend")
+        public = public_channel_info(frame)
+        del frame
+        if public["index"] != index:
+            raise ValueError(f"client: channel response index mismatch (requested {index})")
+        record["channels"].append(public)
+        if public["configured"]:
+            record["configured_indices"].append(index)
+        evidence.log("channel_inventory_entry", **public, read_only=True)
+    record["inspection_complete"] = True
+    evidence.log("channel_inventory_complete", **record)
+    return record
+
+
+def parse_ota_radio_measurement(text):
+    match = RADIO_MEASUREMENT_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError("malformed OTA radio measurement schema")
+    values = dict(zip(RADIO_MEASUREMENT_FIELDS, match.groups()))
+    decimals = {"f", "b", "s", "c", "v", "a", "h"}
+    result = {field: int(value, 10 if field in decimals else 16) for field, value in values.items()}
+    radio = tuple(result[field] for field in ("f", "b", "s", "c"))
+    if radio == (0, 0, 0, 0):
+        valid_tuple = not result["v"] and not result["h"]
+    else:
+        valid_tuple = (150000 <= result["f"] <= 2500000
+                       and result["b"] in SUPPORTED_LORA_BANDWIDTHS_HZ
+                       and 5 <= result["s"] <= 12 and 5 <= result["c"] <= 8)
+    if not valid_tuple or (result["h"] and not result["v"]):
+        raise ValueError("out-of-range or inconsistent OTA radio measurement")
+    return {"src": "driver-applied", **result}
+
+
+def parse_ota_budget_measurement(text):
+    match = BUDGET_MEASUREMENT_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError("malformed OTA budget measurement schema")
+    return dict(zip(BUDGET_MEASUREMENT_FIELDS, (int(value, 16) for value in match.groups())))
+
+
+def read_ota_measurement(node, role, kind, timeout=5):
+    if role not in ("client", "target") or kind not in ("radio", "budget"):
+        raise ValueError("invalid OTA measurement role or kind")
+    if role == "client":
+        selector = 3 if kind == "radio" else 4
+        frame = node.command(bytes([CMD_OTA_CONTROL, 0, selector]),
+                             expected=(RESP_OTA_STATUS, RESP_ERR), timeout=timeout)
+        if frame[:1] != bytes([RESP_OTA_STATUS]):
+            raise RuntimeError(f"client: OTA {kind} measurement unavailable or refused")
+        try:
+            text = frame[1:].decode("ascii")
+        except UnicodeDecodeError:
+            raise ValueError(f"client: non-ASCII OTA {kind} measurement") from None
+    else:
+        text = node.command("ota " + kind, timeout=timeout)
+        if text.startswith("Err"):
+            raise RuntimeError(f"target: OTA {kind} measurement refused by backend")
+    parser = parse_ota_radio_measurement if kind == "radio" else parse_ota_budget_measurement
+    return parser(text)
+
+
+def read_ota_measurements(client, target, evidence, phase, timeout=5):
+    record = {"phase": phase, "started_monotonic": time.monotonic(), "nodes": {},
+              "driver_applied_not_phy_readback": True, "duty_guarantee_verified": False}
+    for role, node in (("client", client), ("target", target)):
+        if node is None:
+            continue
+        record["nodes"][role] = {}
+        for kind in ("radio", "budget"):
+            values = read_ota_measurement(node, role, kind, timeout=timeout)
+            record["nodes"][role][kind] = values
+            evidence.log("ota_measurement", node=role, phase=phase, kind=kind, values=values,
+                         driver_applied_not_phy_readback=True, duty_guarantee_verified=False)
+    record["finished_monotonic"] = time.monotonic()
+    return record
+
+
+def run_inspect_measurements(client, target, evidence):
+    record = {"read_only": True, "inspection_complete": False, "identities": {}, "samples": [],
+              "qualification_verified": False, "hardware_phy_readback": False}
+    evidence.summary["measurements"]["ota_measurement_inspection"] = record
+    record["identities"]["client"] = serializable_app_info(app_info(client))
+    if target is not None:
+        record["identities"]["target"] = repeater_identity(target)
+        evidence.check("measurement-identities-are-distinct",
+                       record["identities"]["client"]["pubkey"] != record["identities"]["target"]["pubkey"])
+    record["samples"].append(read_ota_measurements(client, target, evidence, "inspection"))
+    record["inspection_complete"] = True
+    evidence.log("ota_measurement_inspection_complete", **record)
+    return record
+
+
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
     roles = [CLIENT_ROLE] if client_only else [CLIENT_ROLE, TARGET_ROLE]
@@ -842,6 +997,12 @@ def main():
     scope.add_argument("--inspect-configuration", action="store_true",
                        help="read-only approved pair settings and complete repeater ACL; "
                             "no setters, grants or reboot")
+    scope.add_argument("--inspect-channels", action="store_true",
+                       help="read-only approved companion channel names/indices; implicitly client-only, "
+                            "fresh artifact directory required, no secrets or receiver membership claim")
+    scope.add_argument("--inspect-measurements", action="store_true",
+                       help="read-only approved USB-local applied radio/budget diagnostics; fresh evidence "
+                            "directory, no setters, OTA transfer or PHY/duty qualification")
     args = parser.parse_args()
     if args.require_target_genesis_floor and (not args.inspect_ota_preflight or args.client_only):
         parser.error("--require-target-genesis-floor requires --inspect-ota-preflight "
@@ -858,21 +1019,27 @@ def main():
     if args.bandwidth_hz is not None and not args.configure_only:
         parser.error("--bandwidth-hz requires --configure-only")
     if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin
-            or args.inspect_ota_preflight or args.inspect_configuration):
+            or args.inspect_ota_preflight or args.inspect_configuration or args.inspect_channels
+            or args.inspect_measurements):
         parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
                      "select --configure-only, --grant-client-admin, --inspect-ota-preflight, "
-                     "--inspect-configuration or a positive --monitor-seconds. "
+                     "--inspect-configuration, --inspect-channels, --inspect-measurements "
+                     "or a positive --monitor-seconds. "
                      "Signed transfers use ota_uploader.py with a separate explicit commit")
 
+    if args.inspect_channels:
+        args.client_only = True
     radio = (NORMAL_RADIO if args.bandwidth_hz is None
              else (NORMAL_RADIO[0], args.bandwidth_hz, *NORMAL_RADIO[2:]))
-    evidence = Evidence(args.artifact_dir)
+    evidence = (Evidence(args.artifact_dir, exclusive=True)
+                if args.inspect_channels or args.inspect_measurements
+                else Evidence(args.artifact_dir))
     client = target = None
     error = None
     try:
         if args.grant_client_admin:
             devices = resolve_admin_grant_roles(evidence)
-        elif args.inspect_ota_preflight:
+        elif args.inspect_ota_preflight or args.inspect_channels or args.inspect_measurements:
             devices = resolve_preflight_roles(evidence, client_only=args.client_only)
         elif args.inspect_configuration:
             devices = resolve_configuration_inspection_roles(evidence)
@@ -906,6 +1073,10 @@ def main():
                                      require_target_boot_addresses=args.require_target_boot_addresses)
         elif args.inspect_configuration:
             run_inspect_configuration(client, target, evidence)
+        elif args.inspect_channels:
+            run_inspect_channels(client, evidence)
+        elif args.inspect_measurements:
+            run_inspect_measurements(client, target, evidence)
         else:
             if args.client_only:
                 run_configure_client(client, evidence, radio=radio)

@@ -312,7 +312,19 @@ requires one target and channel 255; background requires a configured group
 channel and accepts up to 32 targets. On-mesh frequency and lease are zero.
 Positive airtime shares are 1..100,000 milli-percent; 2,000 means 2%.
 
-Every reply is exactly 86 bytes: response code 31, ABI version 1, echoed
+`OtaAirtimeLimiter` retains up to 256 same-category accounting buckets,
+not 256 individual packets. A bucket's first completion bounds coalescing
+to 15 seconds, and its latest completion controls conservative expiry.
+The default on-mesh allowance is 72,000 ms per sliding 3,600,000 ms
+window. Dispatcher debits actual completed transmission time; direct
+off-frequency sends are excluded. Retuning preserves history, and a
+genuinely full ring still refuses admission before sending.
+On-mesh admission reserves `floor(1.5 * estimatedMs) + 20` for both the
+quota and available accounting capacity. Recording still charges the actual
+completed duration, not that conservative bound.
+
+Every reply for operations `0x10` through `0x18` is exactly 86 bytes:
+response code 31, ABI version 1, echoed
 operation, result, phase, flags, target PK32, hash32, received16, total16,
 counter32, statusAgeMs32 and retryAfterMs32. Flags are snapshot-valid 1 and
 remote 2. A reply without a snapshot has unknown phase, zero hash, counts
@@ -331,6 +343,65 @@ establish a remote observation made after the wait began, with the expected
 manifest, counter, scope and complete nonzero block counts. A status query
 may honestly report FAILED; a fresh failure for the current candidate ends
 a mutating wait. COMMIT acceptance does not prove a reboot or confirmation.
+
+### Read-only radio and airtime evidence
+
+USB-enabled nRF52 OTA lab builds expose two additional read-only selectors,
+without changing the signed uploader ABI or normal statistics layouts.
+The companion accepts `42 00 03` for radio evidence and `42 00 04` for
+airtime evidence. A successful reply is `1D` followed by ASCII, without a
+trailing NUL. The repeater accepts the USB-local commands `ota radio` and
+`ota budget`; remote commands cannot access these lab measurements.
+
+Radio evidence has this exact field order:
+
+```text
+src=driver-applied f=<decimal> b=<decimal> s=<decimal> c=<decimal> v=<0|1> a=<0|1> e=<HEX8> d=<HEX8> r=<HEX8> td=<HEX8> tr=<HEX8> h=<0|1> x=<HEX8> af=<HEX8> n=<HEX8>
+```
+
+`f` and `b` are frequency in kHz and bandwidth in Hz; `s` and `c` are
+spreading factor and coding-rate denominator. `v` means that the checked
+driver application succeeded. A partial or failed application invalidates
+the previous tuple. `a` and `e` are direct-active state and lease expiry.
+`d` and `r` count successful direct applications and normal restorations;
+initial normal setup is not a restoration. `td`, `tr` and `n` are device
+milliseconds. `h` requires both a valid applied tuple and driver health;
+`x` counts driver faults and `af` counts failed applications. This is
+**driver-applied evidence**, not independent readback of the chip's PHY
+registers. Pair it with actual RF delivery and durable bitmap progress.
+
+Airtime evidence has this exact field order:
+
+```text
+n=<HEX8> w=<HEX8> b=<HEX8> u=<HEX8> tx=<HEX8> to=<HEX8> af=<HEX8>
+```
+
+`n`, `w`, `b`, `u` and `tx` are milliseconds: device clock, sliding
+window, OTA budget, recorded on-mesh OTA usage and completed all-traffic
+TX duration. Direct transmissions do not contribute to `u`. `to` counts
+TX timeouts and `af` counts failed airtime records; neither is cleared by
+normal statistics reset. These durations are completed software timing,
+not external RF measurements. A run with missing accounting or uncertain
+transmissions cannot establish its airtime allowance. A before-and-after
+total alone cannot establish sliding-window compliance or ordinary service.
+
+Direct continuation is expiry, normal restoration, a fresh authenticated
+handshake and resume from the durable bitmap. Qualifying continuation
+requires observations of at least two applied direct intervals, intervening
+restoration and retained progress; it is not indefinite lease renewal.
+These software observation surfaces do not themselves constitute a
+successful hardware campaign.
+
+The lab helper's `--inspect-measurements` reads both approved roles, or
+only the companion with `--client-only`, into a new evidence directory.
+It preserves explicit unhealthy observations without claiming qualification.
+The signed runner samples between existing STATUS transactions; it does
+not re-enter an exchange or require another uploader. Qualification rejects
+nonzero failure counters, inconsistent budgets and regressing clocks,
+counters or fresh candidate-bound progress. Full-window sampled software
+evidence is not a continuous external PHY measurement. The STATUS ABI's
+durable counts also do not expose individual bitmap bits or handshake
+tokens; missing wire-handshake evidence stays incomplete.
 
 ### Boot lifecycle and subsequent updates
 
@@ -692,6 +763,16 @@ does not provide a current CF2 readback. No plaintext firmware was copied,
 and historical CF2 evidence remains historical. A genuine Sense-profile
 package must match the current public board and USB identities before
 installation; a string change or relaxed Board-ID check is not a fix.
+Subsequent retained-source review stopped UF2 self-update commissioning:
+its indirect staging erases `0xE0000..0xEA000`, inside protected ExtraFS.
+The suspected InternalFS overlap was not confirmed. The exact installed
+Seeed binary's source lineage remains unverified, so the footprint is
+reported as a source finding, not physical binary attestation. The normal
+serial bootloader-only alternative stages 40,192 bytes at
+`0x27000..0x30D00`, excluding both filesystems, and requires separate
+immutable application restoration and preservation readbacks. The Make
+UF2 flash target refuses operation while that guarded serial path is
+being qualified.
 The target's qualified custom loader is not installed, and no
 replacement-protocol radio OTA installation has been demonstrated.
 The uploader remains on the stock bootloader. Pine is untouched, and

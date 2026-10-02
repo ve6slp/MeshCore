@@ -61,6 +61,23 @@ def reply(candidate, phase, target=TARGET_KEY, result=ota.Result.OK, age=0,
     return ota.decode_reply(wire)
 
 
+def radio_diagnostic(radio, **overrides):
+    values = {"f": radio[0], "b": radio[1], "s": radio[2], "c": radio[3], "v": 1, "a": 0,
+              "e": 0, "d": 0, "r": 0, "td": 0, "tr": 0, "h": 1, "x": 0, "af": 0,
+              "n": int(signed.time.monotonic() * 1000) & 0xFFFFFFFF}
+    values.update(overrides)
+    decimal = {"f", "b", "s", "c", "v", "a", "h"}
+    return "src=driver-applied " + " ".join(
+        f"{key}={value}" if key in decimal else f"{key}={value:08X}" for key, value in values.items())
+
+
+def budget_diagnostic(**overrides):
+    values = {"n": int(signed.time.monotonic() * 1000) & 0xFFFFFFFF, "w": 3600000, "b": 72000,
+              "u": 0, "tx": 0, "to": 0, "af": 0}
+    values.update(overrides)
+    return " ".join(f"{key}={value:08X}" for key, value in values.items())
+
+
 class Companion:
     """Existing ordinary companion query/sign protocol, not hardware evidence."""
 
@@ -79,6 +96,8 @@ class Companion:
                             "tx_air_secs": 0, "rx_air_secs": 0}
         self.boot = b"boot=unknown phase=unknown floor=unknown counter=0 verified=0 image=unknown"
         self.signed_data = None
+        self.measurement_overrides = {}
+        self.budget_share = 2000
 
     def command(self, payload, **kwargs):
         self.commands.append(payload)
@@ -104,6 +123,13 @@ class Companion:
                 int(values["last_snr"] * 4), values["tx_air_secs"], values["rx_air_secs"])
         if payload == bytes([66, 0]):
             return b"\x1d" + self.boot
+        if payload == bytes([66, 0, 3]):
+            text = self.measurement_overrides.get("radio", radio_diagnostic(self.radio))
+            return b"\x1d" + text.encode("ascii")
+        if payload == bytes([66, 0, 4]):
+            text = self.measurement_overrides.get(
+                "budget", budget_diagnostic(b=3600000 * self.budget_share // 100000))
+            return b"\x1d" + text.encode("ascii")
         if payload == bytes([lab.CMD_SIGN_START]):
             return bytes([lab.RESP_SIGN_START, 0]) + struct.pack("<I", 176)
         if payload[0] == lab.CMD_SIGN_DATA:
@@ -142,6 +168,7 @@ class Target:
         self.packet_stats = dict.fromkeys(signed.PACKET_STATS_FIELDS, 0)
         self.radio_stats = {"noise_floor": -110, "last_rssi": -100, "last_snr": 3.0,
                             "tx_air_secs": 0, "rx_air_secs": 0}
+        self.measurement_overrides = {}
 
     def command(self, command, **kwargs):
         self.commands.append(command)
@@ -160,6 +187,10 @@ class Target:
                 return self.lifecycle.pop(0)
             return (f"boot=unknown phase={self.phase} floor={self.floor} "
                     f"counter={self.counter} verified=0 image=unknown")
+        if command == "ota radio":
+            return self.measurement_overrides.get("radio", radio_diagnostic(self.radio))
+        if command == "ota budget":
+            return self.measurement_overrides.get("budget", budget_diagnostic())
         if command == "advert.zerohop":
             self.peer.pending.append((signed.time.monotonic(), b"\x80" + self.key))
             return "OK - zerohop advert sent"
@@ -191,6 +222,8 @@ class CampaignFixture:
     def status(self, target=ota.LOCAL_TARGET, **kwargs):
         self.ops.append(ota.Op.STATUS)
         if self.local_valid:
+            if target != ota.LOCAL_TARGET and self.pair.target.phase == "ready" and not self.remote_lifecycle:
+                return self.ready_reply
             phase = ota.Phase.CACHE_SEALED if target == ota.LOCAL_TARGET else ota.Phase[self.pair.target.phase.upper()]
             if target != ota.LOCAL_TARGET and self.remote_lifecycle:
                 phase = self.remote_lifecycle[0]
@@ -215,6 +248,7 @@ class CampaignFixture:
         self.ops.extend([ota.Op.ADD_TARGET, ota.Op.START])
         assert targets == [self.pair.target.key]
         self.body, self.mode = body, mode
+        self.pair.client.budget_share = struct.unpack_from(">I", body, 8)[0]
         self.pair.target.phase, self.pair.target.counter = "ready", self.candidate.counter
 
     def wait_phase(self, target, phase, manifest_hash, counter, since, deadline):
@@ -329,6 +363,7 @@ class ProductCompanion(Companion):
             assert self.baseline_path.exists()
             self.target_candidate = self.local
             self.target.phase, self.target.counter = "ready", self.local.counter
+            self.budget_share = struct.unpack_from(">I", body, 8)[0]
         elif op == ota.Op.COMMIT:
             target = body[:32]
             assert target == self.target.key
@@ -385,6 +420,348 @@ class SignedLabTests(unittest.TestCase):
     def run_stage(self):
         return signed.stage(self.pair, self.uploader, self.candidate,
                             self.args, self.evidence, self.deadline)
+
+    def observer(self, mode="directed", duty=2000, interval=5):
+        self.args.mode, self.args.channel = mode, 2 if mode == "background" else 255
+        self.args.duty_milli_percent = duty
+        self.args.supervised_full_image_smoke = duty != 2000
+        _, requested = signed.profile(self.args)
+        baseline = signed.capture(self.pair, self.candidate, self.evidence, self.deadline)
+        observer = signed.TransferMeasurements(self.pair, self.candidate, requested, baseline,
+                                               self.evidence, self.clock.now + 10000, interval)
+        observer.observe("baseline")
+        return observer
+
+    def diagnostic_state(self, direct=False, **fields):
+        profile = (908525, 250000, 5, 5) if direct else lab.NORMAL_RADIO
+        text = radio_diagnostic(profile, a=int(direct), **fields)
+        self.client.measurement_overrides["radio"] = text
+        self.target.measurement_overrides["radio"] = text
+
+    def test_baseline_periodic_end_diagnostics_are_recorded_without_claiming_instant_ready_duty(self):
+        record = self.run_stage()
+        observations = self.evidence.summary["measurements"]["transfer_measurements"]
+        self.assertEqual([sample["phase"] for sample in observations["samples"]], ["baseline", "ready", "end"])
+        self.assertTrue(observations["samples"][1]["fresh_remote_progress"])
+        self.assertEqual(observations["samples"][1]["remote"]["hash"], self.candidate.manifest_hash.hex())
+        self.assertEqual(record["transfer_measurements"]["measurement_outcome"], "incomplete")
+        self.assertFalse(record["transfer_measurements"]["sampled_two_percent_budget_qualified"])
+        self.assertFalse(record["transfer_measurements"]["duty_guarantee_verified"])
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+        self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+
+    def test_qualification_rejects_all_driver_timeout_and_lost_accounting_counters_before_caching(self):
+        for role, kind, field in (
+            ("client", "radio", "x"), ("target", "radio", "af"),
+            ("client", "budget", "to"), ("target", "budget", "af"),
+        ):
+            with self.subTest(role=role, kind=kind, field=field):
+                node = self.client if role == "client" else self.target
+                node.measurement_overrides[kind] = (
+                    radio_diagnostic(lab.NORMAL_RADIO, **{field: 1}) if kind == "radio"
+                    else budget_diagnostic(**{field: 1}))
+                with self.assertRaises(signed.QualificationError):
+                    self.run_stage()
+                self.assertNotIn(ota.Op.CACHE_BEGIN, self.uploader.ops)
+                self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+                node.measurement_overrides.clear()
+                (self.evidence.directory / "baseline.json").unlink()
+
+    def test_timeout_lost_accounting_and_radio_fault_after_start_remain_fatal_with_progress_preserved(self):
+        original = self.uploader.start
+        def start(*args):
+            result = original(*args)
+            self.target.measurement_overrides["budget"] = budget_diagnostic(af=1)
+            return result
+        self.uploader.start = start
+        with self.assertRaisesRegex(signed.QualificationError, "lost-accounting"):
+            self.run_stage()
+        self.assertTrue((self.evidence.directory / "baseline.json").exists())
+        self.assertFalse((self.evidence.directory / "ready.json").exists())
+        self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+
+    def test_measurement_parser_and_real_io_failures_are_not_success_shaped_fallbacks(self):
+        self.client.measurement_overrides["radio"] = "src=preferences f=907525"
+        with self.assertRaises(ValueError):
+            self.run_stage()
+        self.assertNotIn(ota.Op.CACHE_BEGIN, self.uploader.ops)
+        self.client.measurement_overrides.clear()
+        (self.evidence.directory / "baseline.json").unlink()
+        original = self.client.command
+        def command(payload, **kwargs):
+            if payload == bytes.fromhex("420004"):
+                raise ConnectionError("client serial disconnected")
+            return original(payload, **kwargs)
+        self.client.command = command
+        with self.assertRaisesRegex(ConnectionError, "disconnected"):
+            self.run_stage()
+        self.assertNotIn(ota.Op.CACHE_BEGIN, self.uploader.ops)
+
+    def test_two_direct_applied_intervals_restore_and_fresh_bitmap_continuation_are_exposed(self):
+        observer = self.observer("direct")
+        self.diagnostic_state(True, d=1, td=100000, e=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.clock.sleep(60)
+        self.diagnostic_state(False, d=1, r=1, td=100000, tr=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.clock.sleep(15)
+        self.diagnostic_state(True, d=2, r=1, td=175000, tr=160000, e=235000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+        result = observer.report()
+        self.assertTrue(result["two_applied_intervals_restoration_bitmap_continuation_observed"])
+        self.assertFalse(result["measurement_qualified"])
+        self.assertIn("fresh_direct_handshake_token_ack_not_exposed_by_existing_status_api",
+                      result["incomplete_reasons"])
+        self.assertFalse(observer.record["fresh_handshake_wire_observed"])
+        self.assertFalse(result["hardware_phy_readback"])
+
+    def test_literal_production_direct_250khz_restores_captured_normal_62500(self):
+        observer = self.observer("direct")
+        self.assertEqual(observer.baseline["client"]["bw_hz"], 62500)
+        self.assertEqual(observer.baseline["target"]["bw_hz"], 62500)
+        direct = ("src=driver-applied f=908525 b=250000 s=5 c=5 v=1 a=1 e=00027100 "
+                  "d=00000001 r=00000000 td=000186A0 tr=00000000 h=1 x=00000000 af=00000000 n=000186A0")
+        for node in (self.client, self.target):
+            node.measurement_overrides["radio"] = direct
+        sample = observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        for role in ("client", "target"):
+            radio = sample["nodes"][role]["radio"]
+            self.assertEqual(tuple(radio[key] for key in ("f", "b", "s", "c")), (908525, 250000, 5, 5))
+        self.clock.sleep(60)
+        restored = ("src=driver-applied f=907525 b=62500 s=7 c=5 v=1 a=0 e=00000000 "
+                    "d=00000001 r=00000001 td=000186A0 tr=00027100 h=1 x=00000000 af=00000000 n=00027100")
+        for node in (self.client, self.target):
+            node.measurement_overrides["radio"] = restored
+        sample = observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        for role in ("client", "target"):
+            self.assertEqual(sample["nodes"][role]["radio"]["b"], 62500)
+        self.target.measurement_overrides["radio"] = restored.replace("b=62500", "b=250000")
+        with self.assertRaisesRegex(signed.QualificationError, "differs from saved baseline"):
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+
+    def test_direct_frequency_follows_requested_campaign_not_fixed_default(self):
+        observer = self.observer("direct")
+        observer.requested["frequency_khz"] = 915525
+        self.diagnostic_state(True, f=915525, d=1, td=100000, e=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.diagnostic_state(True, f=908525, d=1, td=100000, e=160000)
+        with self.assertRaisesRegex(signed.QualificationError, "differs from saved baseline"):
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+
+    def test_direct_old_bitmap_before_restore_cannot_prove_continuation(self):
+        observer = self.observer("direct")
+        self.diagnostic_state(True, d=1, td=100000, e=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 90)
+        self.clock.sleep(60)
+        self.diagnostic_state(False, d=1, r=1, td=100000, tr=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 90)
+        self.clock.sleep(15)
+        self.diagnostic_state(True, d=2, r=1, td=175000, tr=160000, e=235000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2, age=20000), 90)
+        self.assertFalse(observer.report()["two_applied_intervals_restoration_bitmap_continuation_observed"])
+
+    def test_indefinite_direct_renewal_without_observed_normal_restoration_is_incomplete(self):
+        observer = self.observer("direct")
+        self.diagnostic_state(True, d=1, td=100000, e=160000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.clock.sleep(10)
+        self.diagnostic_state(True, d=2, td=110000, e=170000)
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+        self.assertFalse(observer.report()["two_applied_intervals_restoration_bitmap_continuation_observed"])
+
+    def test_direct_expired_or_overlong_lease_wrong_sf_and_on_mesh_direct_active_are_fatal(self):
+        for mode, expiry, spreading in (("direct", 100000, 5), ("direct", 160001, 5),
+                                       ("direct", 160000, 7), ("directed", 160000, 5)):
+            with self.subTest(mode=mode, expiry=expiry, sf=spreading):
+                observer = self.observer(mode)
+                self.diagnostic_state(True, d=1, td=100000, e=expiry, s=spreading)
+                with self.assertRaises(signed.QualificationError):
+                    observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+                self.client.measurement_overrides.clear()
+                self.target.measurement_overrides.clear()
+
+    def test_device_clock_and_applied_counter_regression_are_refused_but_uint32_wrap_is_valid(self):
+        observer = self.observer()
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.diagnostic_state(False, n=1)
+        with self.assertRaisesRegex(signed.QualificationError, "clock"):
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+        self.assertEqual(signed.ms_delta(4, 0xFFFFFFFC), 8)
+
+    def test_budget_window_used_and_share_consistency_are_required_not_only_totals(self):
+        for values in ({"w": 0}, {"w": 100, "b": 101}, {"u": 72001}, {"b": 3600000}):
+            with self.subTest(values=values):
+                observer = self.observer()
+                self.client.measurement_overrides["budget"] = budget_diagnostic(**values)
+                if values == {"b": 3600000}:
+                    observer.observe("transfer", reply(self.candidate, ota.Phase.READY), 99)
+                    with self.assertRaisesRegex(signed.QualificationError, "requested share"):
+                        observer.report()
+                else:
+                    with self.assertRaisesRegex(signed.QualificationError, "window/budget/used"):
+                        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+                self.client.measurement_overrides.clear()
+
+    def test_95_percent_samples_are_smoke_only_even_with_real_progress_and_independent_peer(self):
+        observer = self.observer(duty=95000)
+        for received in (1, 2, self.candidate.blocks):
+            self.client.measurement_overrides["budget"] = budget_diagnostic(b=3420000, u=100)
+            observer.observe("ready" if received == self.candidate.blocks else "transfer",
+                             reply(self.candidate, ota.Phase.RECEIVING, received=received), 99)
+            self.clock.sleep(5)
+        observer.peer = {"witness": {"source": "companion_advert_push", "target": TARGET_KEY.hex()}}
+        observer.observe("end")
+        result = observer.report()
+        self.assertTrue(result["measurement_qualified"])
+        self.assertFalse(result["sampled_two_percent_budget_qualified"])
+        self.assertFalse(result["duty_guarantee_verified"])
+        self.assertEqual(result["requested_duty_milli_percent"], 95000)
+
+    def test_two_percent_before_after_only_and_sampling_gaps_do_not_qualify(self):
+        observer = self.observer()
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.clock.sleep(3600)
+        self.client.measurement_overrides["budget"] = budget_diagnostic(u=100)
+        observer.observe("ready", reply(self.candidate, ota.Phase.READY), 99)
+        observer.peer = {"witness": {"source": "companion_advert_push"}}
+        observer.observe("end")
+        result = observer.report()
+        self.assertFalse(result["sampled_two_percent_budget_qualified"])
+        self.assertFalse(result["full_window_periodic_coverage_observed"])
+
+    def test_full_window_periodic_two_percent_software_coverage_is_scoped_not_phy_guarantee(self):
+        observer = self.observer()
+        for index in range(721):
+            self.client.measurement_overrides["budget"] = budget_diagnostic(u=100)
+            received = 1 if index < 720 else 2
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=received), 99)
+            if index < 720:
+                self.clock.sleep(5)
+        observer.peer = {"witness": {"source": "companion_advert_push"}}
+        observer.observe("end")
+        result = observer.report()
+        self.assertTrue(result["sampled_two_percent_budget_qualified"])
+        self.assertTrue(result["full_window_periodic_coverage_observed"])
+        self.assertFalse(result["duty_guarantee_verified"])
+
+    def test_real_existing_peer_witness_is_freshly_bracketed_during_on_mesh_receiving(self):
+        observer = self.observer(duty=95000)
+        observer.interval = 0.1
+        self.client.budget_share = 95000
+        self.uploader.local_valid = True
+        self.target.phase, self.target.counter = "receiving", self.candidate.counter
+        replies = iter([reply(self.candidate, ota.Phase.RECEIVING, received=1),
+                        reply(self.candidate, ota.Phase.RECEIVING, received=2),
+                        reply(self.candidate, ota.Phase.READY)])
+        self.uploader.status = mock.Mock(side_effect=lambda *args, **kwargs: next(replies))
+        result = signed.wait_observed_ready(self.pair, self.uploader, self.candidate, TARGET_KEY,
+                                           99, self.deadline, observer)
+        self.assertEqual(result.phase, ota.Phase.READY)
+        self.assertEqual(observer.peer["witness"]["source"], "companion_advert_push")
+        self.assertEqual(observer.peer["before"]["received"], 1)
+        self.assertEqual(observer.peer["after"]["received"], 2)
+        self.assertTrue(observer.peer["tx_totals_are_not_peer_proof"])
+        self.assertNotIn(ota.Op.START, self.uploader.ops)
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+        self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+
+    def test_peer_ack_or_already_ready_after_probe_cannot_prove_peer_during_transfer(self):
+        observer = self.observer(duty=95000)
+        self.client.budget_share = 95000
+        replies = iter([reply(self.candidate, ota.Phase.RECEIVING, received=1),
+                        reply(self.candidate, ota.Phase.READY), reply(self.candidate, ota.Phase.READY)])
+        self.uploader.status = mock.Mock(side_effect=lambda *args, **kwargs: next(replies))
+        signed.wait_observed_ready(self.pair, self.uploader, self.candidate, TARGET_KEY,
+                                   99, self.deadline, observer)
+        self.assertIsNone(observer.peer)
+        self.assertIn("ordinary_peer_not_freshly_bracketed_during_transfer", observer.report()["incomplete_reasons"])
+
+    def test_wrong_peer_timeout_remains_fatal_and_is_not_excused_by_tx_counters(self):
+        observer = self.observer()
+        self.uploader.local_valid = True
+        self.target.phase = "receiving"
+        self.uploader.status = mock.Mock(return_value=reply(self.candidate, ota.Phase.RECEIVING, received=1))
+        self.target.key = bytes([9]) * 32
+        self.client.poll = lambda timeout=0: self.clock.sleep(timeout)
+        with self.assertRaisesRegex(TimeoutError, "ordinary advert"):
+            signed.wait_observed_ready(self.pair, self.uploader, self.candidate, TARGET_KEY,
+                                       99, self.deadline, observer)
+        self.assertIsNone(observer.peer)
+        self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+
+    def test_stale_remote_snapshot_cannot_gain_freshness_during_slow_measurement_reads(self):
+        observer = self.observer()
+        remote = reply(self.candidate, ota.Phase.RECEIVING, received=1, age=1000)
+        original = self.target.command
+        def command(text, **kwargs):
+            if text == "ota radio":
+                self.clock.sleep(2)
+            return original(text, **kwargs)
+        self.target.command = command
+        sample = observer.observe("transfer", remote, 99.5, remote_at=100)
+        self.assertFalse(sample["fresh_remote_progress"])
+        self.assertEqual(sample["remote_snapshot_monotonic"], 99)
+
+    def test_measurement_interval_refusal_is_before_any_hardware_open(self):
+        for value in ("nan", "inf", "-1", "0", "0.01", "5.01"):
+            with self.subTest(value=value), mock.patch.object(signed, "Pair") as pair:
+                with self.assertRaisesRegex(signed.QualificationError, "measurement-interval"):
+                    signed.main(["--artifact-dir", str(self.directory / "unused"), "stage"]
+                                + self.arguments + ["--measurement-interval", value])
+                pair.assert_not_called()
+
+    def test_fresh_durable_bitmap_regression_is_fatal_without_abort_or_restart(self):
+        observer = self.observer()
+        observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=2), 99)
+        self.clock.sleep(5)
+        with self.assertRaisesRegex(signed.QualificationError, "bitmap count regressed"):
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=1), 99)
+        self.assertNotIn(ota.Op.START, self.uploader.ops)
+        self.assertNotIn(ota.Op.ABORT, self.uploader.ops)
+
+    def test_aggregate_tx_and_old_budget_usage_do_not_qualify_new_transfer_or_peer(self):
+        self.client.measurement_overrides["budget"] = budget_diagnostic(b=3420000, u=100, tx=900000)
+        observer = self.observer(duty=95000)
+        for received in (1, 2, self.candidate.blocks):
+            observer.observe("transfer", reply(self.candidate, ota.Phase.RECEIVING, received=received), 99)
+            self.clock.sleep(5)
+        observer.observe("end")
+        result = observer.report()
+        self.assertFalse(result["measurement_qualified"])
+        self.assertIn("new_completed_on_mesh_ota_charges_not_observed", result["incomplete_reasons"])
+        self.assertIn("ordinary_peer_not_freshly_bracketed_during_transfer", result["incomplete_reasons"])
+
+    def test_diagnostics_cannot_authorize_commit_while_driver_is_still_direct_or_unhealthy(self):
+        args, evidence = self.prepare_commit()
+        self.diagnostic_state(True, d=1, td=100000, e=160000)
+        with self.assertRaisesRegex(signed.QualificationError, "restored normal service"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+        self.diagnostic_state(False, x=1)
+        with self.assertRaisesRegex(signed.QualificationError, "driver/apply"):
+            signed.commit(self.pair, self.uploader, self.candidate, args, evidence, self.deadline)
+        self.assertNotIn(ota.Op.COMMIT, self.uploader.ops)
+
+    def test_real_uploader_denied_status_is_fatal_not_measurement_incomplete(self):
+        node, pair, uploader = self.product_pair(counter=7)
+        observer = signed.TransferMeasurements(pair, self.candidate, signed.profile(self.args)[1],
+            {"client": lab.serializable_app_info(lab.companion_info(node)),
+             "target": lab.repeater_info(pair.target)}, self.evidence, self.deadline, 5)
+        original = node.write_frame
+        def write(packet):
+            original(packet)
+            if packet[:2] == bytes([66, ota.Op.STATUS]) and packet[2:] == TARGET_KEY:
+                _, response = node.pending[-1]
+                rejected = bytearray(response)
+                rejected[3] = ota.Result.DENIED
+                node.pending[-1] = (self.clock.now, bytes(rejected))
+        node.write_frame = write
+        with self.assertRaisesRegex(ota.UploaderError, "DENIED"):
+            signed.wait_observed_ready(pair, uploader, self.candidate, TARGET_KEY,
+                                       99, self.deadline, observer)
+        self.assertEqual(observer.samples, [])
+        self.assertNotIn(ota.Op.ABORT, [packet[1] for packet in node.packets])
 
     def prepare_commit(self):
         self.run_stage()
@@ -739,8 +1116,9 @@ class SignedLabTests(unittest.TestCase):
         self.assertTrue((self.evidence.directory / "baseline.json").exists())
         self.assertNotIn(ota.Op.CACHE_BEGIN, self.uploader.ops)
         (self.evidence.directory / "baseline.json").unlink()
-        self.uploader.status = mock.Mock(return_value=reply(
-            self.candidate, ota.Phase.CACHE_SEALED, target=ota.LOCAL_TARGET))
+        self.uploader.status = mock.Mock(side_effect=lambda target=ota.LOCAL_TARGET, **kwargs:
+            reply(self.candidate, ota.Phase.CACHE_SEALED, target=target)
+            if target == ota.LOCAL_TARGET else self.uploader.ready_reply)
         self.uploader.ready_reply = reply(self.candidate, ota.Phase.READY, received=1)
         with self.assertRaisesRegex(signed.QualificationError, "incomplete"):
             self.run_stage()

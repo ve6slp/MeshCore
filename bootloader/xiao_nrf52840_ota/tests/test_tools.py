@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""Behavioural tests for bootloader/xiao_nrf52840_ota/tools/*.py.
-
-Covers two independently-scoped tool behaviours in one file (per the
-Makefile's `unittest discover -p test_tools.py` wiring):
-
-1. verify_boot_info_artifact.py: builds small synthetic Intel HEX and UF2
-   files (never relying on a real compiled build) and checks both real
-   positive marker extraction and specific malformed/adversarial-input
-   rejections (bad checksum, truncated record length, unsupported address
-   record type, oversized UF2 payload, conflicting overlapping UF2 blocks).
-2. prepare_upstream.py's --work-dir path-traversal safety: proves a
-   caller-controlled --work-dir outside ROOT/.tmp (or resolving to .tmp
-   itself, the repo root, the pinned upstream clone, or escaping via a
-   symlink) is rejected before any subprocess/rmtree call, since WORK is
-   unconditionally shutil.rmtree()'d.
+"""Product tests for artifact readers, safe pinned-source preparation and BSP
+binding, vendor UF2 metadata, and the shared canonical descriptor tools.
+Invoked by the existing Makefile's unittest discovery for test_tools.py.
 """
 
 import binascii
 import hashlib
 import importlib.util
 import os
+import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -103,6 +93,152 @@ def _uf2_block(target_addr, payload, block_no=0, num_blocks=1,
     return body + struct.pack("<I", 0x0AB16F30)
 
 
+class SenseProfilePreparationTest(unittest.TestCase):
+    def setUp(self):
+        if not (PREPARE.DEFAULT_SOURCE / "src/boards/xiao_nrf52840_ble_sense/board.h").is_file():
+            self.skipTest("pinned SDK board sources are not present")
+        self.scratch = tempfile.TemporaryDirectory(dir=ROOT / ".tmp")
+        self.addCleanup(self.scratch.cleanup)
+        self.directory = Path(self.scratch.name)
+        self.source = self.directory / "source"
+        (self.source / ".git").mkdir(parents=True)
+        (self.source / "linker").mkdir()
+        for name in ("Makefile", "src/main.c", "src/usb/uf2/ghostfat.c",
+                     "src/usb/uf2/configkeys.h"):
+            destination = self.source / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PREPARE.DEFAULT_SOURCE / name, destination)
+        for board in ("xiao_nrf52840_ble", "xiao_nrf52840_ble_sense"):
+            shutil.copytree(PREPARE.DEFAULT_SOURCE / "src/boards" / board,
+                            self.source / "src/boards" / board)
+
+    def prepare(self, board="xiao_nrf52840_sense", role_id=1, no_ble=True):
+        work = self.directory / "ota-boot-builds" / f"{board}-role{role_id}-{no_ble}"
+        args = ["--board", board, "--role-id", str(role_id),
+                "--source-dir", str(self.source), "--work-dir", str(work)]
+        if no_ble:
+            args.append("--no-ble")
+        with mock.patch.object(PREPARE.subprocess, "check_call") as git, \
+                mock.patch.object(PREPARE, "run", return_value=PREPARE.PIN), \
+                mock.patch("builtins.print"):
+            self.assertEqual(PREPARE.main(args), work)
+        self.assertTrue(all(call.args[0][0] == "git" for call in git.call_args_list))
+        return work
+
+    def test_sense_no_swd_binds_real_vendor_board_and_stock_geometry_for_both_roles(self):
+        for role in (0, 1):
+            with self.subTest(role=role):
+                work = self.prepare(role_id=role)
+                text = (work / "Makefile").read_text()
+                self.assertIn("BOARD ?= xiao_nrf52840_ble_sense", text)
+                self.assertIn("XIAO_OTA_BOARD_TARGET=0x584E3430u", text)
+                self.assertIn(f"XIAO_OTA_COMPILED_ROLE_ID={role}u", text)
+                self.assertIn("BOOTLOADER_REGION_START=0xF4000", text)
+                self.assertIn("LD_FILE = linker/nrf52840_xiao_ota_noswd.ld", text)
+                self.assertNotIn("BOOTLOADER_REGION_START=0xED000", text)
+                self.assertEqual((work / "src/xiao_ota/xiao_ota_boot_io.c").read_bytes(),
+                                 (PREPARE.OVERLAY / "src/xiao_ota_boot_io.c").read_bytes())
+                output = subprocess.check_output(
+                    ["make", "--no-print-directory", "-s", "-C", str(work),
+                     "print-BOARD", "print-LD_FILE", "print-CFLAGS"], text=True)
+                self.assertIn("BOARD = xiao_nrf52840_ble_sense", output)
+                self.assertIn("LD_FILE = linker/nrf52840_xiao_ota_noswd.ld", output)
+                self.assertIn("BOOTLOADER_REGION_START=0xF4000", output)
+                wrong = subprocess.run(
+                    ["make", "--no-print-directory", "-s", "-C", str(work),
+                     "BOARD=xiao_nrf52840_ble", "print-BOARD"],
+                    capture_output=True, text=True)
+                self.assertNotEqual(wrong.returncode, 0)
+                self.assertIn("requires BOARD=xiao_nrf52840_ble_sense", wrong.stderr)
+
+    def test_real_prepared_vendor_version_compiles_and_links_as_verified_release(self):
+        work = self.prepare()
+        output = subprocess.check_output(
+            ["make", "--no-print-directory", "-s", "-C", str(work),
+             "print-CFLAGS", "print-LDFLAGS", "print-GIT_VERSION"], text=True)
+        cflags = next(line.split(" = ", 1)[1] for line in output.splitlines()
+                      if line.startswith("CFLAGS = "))
+        ldflags = next(line.split(" = ", 1)[1] for line in output.splitlines()
+                       if line.startswith("LDFLAGS = "))
+        version_flag = next(flag for flag in shlex.split(cflags)
+                            if flag.startswith("-DMK_BOOTLOADER_VERSION="))
+        symbol_flag = next(flag for flag in shlex.split(ldflags)
+                           if flag.startswith(f"-Wl,--defsym={PREPARE.VERSION_SYMBOL}="))
+        self.assertIn(f"GIT_VERSION = {PREPARE.PIN_RELEASE}-{PREPARE.PIN[:12]}", output)
+        self.assertIn(f"_Static_assert(MK_BOOTLOADER_VERSION == 0x{PREPARE.BOOTLOADER_VERSION:08X}u",
+                      (work / "src/main.c").read_text())
+        source = self.directory / "vendor-version.c"
+        source.write_text(
+            '#include <stdio.h>\n'
+            f'_Static_assert(MK_BOOTLOADER_VERSION == 0x{PREPARE.BOOTLOADER_VERSION:08X}u, "version");\n'
+            'int main(void) { printf("%u\\n", MK_BOOTLOADER_VERSION); }\n')
+        binary = self.directory / "vendor-version"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", version_flag, symbol_flag,
+                        str(source), "-o", str(binary)], check=True, capture_output=True,
+                       env=dict(os.environ, TMPDIR=str(self.directory)))
+        self.assertEqual(int(subprocess.check_output([str(binary)])), PREPARE.BOOTLOADER_VERSION)
+        symbols = subprocess.check_output(["nm", "--defined-only", str(binary)], text=True)
+        line = next(line for line in symbols.splitlines() if line.endswith(PREPARE.VERSION_SYMBOL))
+        value, kind, _ = line.split()
+        self.assertEqual((int(value, 16), kind), (0xB00, "A"))
+        self.assertGreater(PREPARE.BOOTLOADER_VERSION, 0x601)
+
+    def test_wrong_semantic_release_tag_refuses_preparation_before_source_copy(self):
+        work = self.directory / "ota-boot-builds/tag-mismatch"
+        with mock.patch.object(PREPARE.subprocess, "check_call"), \
+                mock.patch.object(PREPARE, "run", side_effect=[PREPARE.PIN, "0" * 40]), \
+                mock.patch.object(PREPARE.shutil, "copytree") as copy:
+            with self.assertRaisesRegex(SystemExit, "semantic release mismatch"):
+                PREPARE.main(["--board", "xiao_nrf52840_sense", "--role-id", "1",
+                              "--source-dir", str(self.source), "--work-dir", str(work), "--no-ble"])
+        copy.assert_not_called()
+
+    def test_real_selected_sense_pinconfig_compiles_to_cf2_45_not_base_44(self):
+        work = self.prepare()
+        harness = self.directory / "cf2"
+        harness.mkdir()
+        (harness / "boards.h").write_text('#include <stdint.h>\n#include "board.h"\n')
+        (harness / "main.c").write_text(
+            '#include <stdint.h>\n#include <stdio.h>\n'
+            'extern const uint32_t bootloaderConfig[];\n'
+            'int main(void) { return fwrite(bootloaderConfig, 4, 14, stdout) == 14 ? 0 : 1; }\n')
+        board = work / "src/boards/xiao_nrf52840_ble_sense"
+        binary = harness / "cf2-test"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                        "-I", str(harness), "-I", str(board), "-I", str(work / "src/usb"),
+                        str(board / "pinconfig.c"), str(harness / "main.c"),
+                        "-o", str(binary)], check=True, capture_output=True,
+                       env=dict(os.environ, TMPDIR=str(harness)))
+        cf2 = subprocess.check_output([str(binary)])
+        artifact = harness / "sense.uf2"
+        artifact.write_bytes(_uf2_block(VBI.CF2_ADDRESS, cf2))
+        self.assertEqual(VBI.read_cf2_bootloader_id(artifact), 0x28860045)
+
+    def test_sense_ble_profile_uses_sense_board_without_changing_existing_ble_geometry(self):
+        work = self.prepare(no_ble=False)
+        text = (work / "Makefile").read_text()
+        self.assertIn("BOARD ?= xiao_nrf52840_ble_sense", text)
+        self.assertIn("BOOTLOADER_REGION_START=0xED000", text)
+        self.assertIn("LD_FILE = linker/nrf52840_xiao_ota.ld", text)
+
+    def test_base_and_sensecap_keep_their_vendor_board_and_distinct_app_families(self):
+        for board, target in (("xiao_nrf52840", "584E3430"),
+                              ("sensecap_solar_p1", "53435031")):
+            with self.subTest(board=board):
+                work = self.prepare(board=board)
+                text = (work / "Makefile").read_text()
+                self.assertIn("BOARD ?= xiao_nrf52840_ble\n", text)
+                self.assertIn(f"XIAO_OTA_BOARD_TARGET=0x{target}u", text)
+                self.assertIn("BOOTLOADER_REGION_START=0xF4000", text)
+
+    def test_missing_sense_board_is_rejected_before_removing_owned_work(self):
+        (self.source / "src/boards/xiao_nrf52840_ble_sense/pinconfig.c").unlink()
+        with mock.patch.object(PREPARE.shutil, "rmtree") as remove, \
+                self.assertRaisesRegex(SystemExit, "pinned vendor board.*lacks pinconfig.c"):
+            self.prepare()
+        remove.assert_not_called()
+
+
 class HexReaderTest(unittest.TestCase):
     def test_valid_hex_extracts_marker(self):
         marker = _build_marker_bytes()
@@ -152,6 +288,42 @@ class HexReaderTest(unittest.TestCase):
 
 
 class Uf2ReaderTest(unittest.TestCase):
+    def test_cf2_reader_skips_unrequested_payloads_including_partial_blocks(self):
+        cf2 = struct.pack("<IIIIIIIIIIIIII", *VBI.CF2_MAGIC, 5, 100,
+                          204, 0x100000, 205, 0x40000, 208, 0x28860045,
+                          209, 0xADA52840, 210, 0x20)
+        blocks = ((0x27000, b"\xA9" * 256),
+                  (VBI.CF2_ADDRESS - 16, b"\xA9" * 16 + cf2[:16]),
+                  (VBI.CF2_ADDRESS + 16, cf2[16:]),
+                  (ADDRESS, b"\xA9" * LENGTH))
+        with tempfile.TemporaryDirectory(dir=ROOT / ".tmp") as td:
+            path = Path(td) / "range-fixture.uf2"
+            path.write_bytes(b"".join(
+                _uf2_block(address, payload, index, len(blocks))
+                for index, (address, payload) in enumerate(blocks)))
+            allowed = [(index * 512, index * 512 + 32) for index in range(len(blocks))]
+            allowed += [(index * 512 + 508, (index + 1) * 512) for index in range(len(blocks))]
+            allowed += [(512 + 48, 512 + 64), (1024 + 32, 1024 + 32 + len(cf2[16:]))]
+            with path.open("rb") as stream:
+                reader = mock.Mock()
+                reader.seek.side_effect = stream.seek
+
+                def read_public_only(size):
+                    start = stream.tell()
+                    self.assertGreater(size, 0)
+                    self.assertTrue(any(lo <= start and start + size <= hi for lo, hi in allowed),
+                                    f"nonpublic payload read at {start} for {size} bytes")
+                    return stream.read(size)
+
+                reader.read.side_effect = read_public_only
+                context = mock.MagicMock()
+                context.__enter__.return_value = reader
+                with mock.patch.object(Path, "open", return_value=context), \
+                        mock.patch.object(Path, "read_bytes",
+                                          side_effect=AssertionError("whole UF2 read")):
+                    self.assertEqual(VBI.read_cf2_bootloader_id(path), 0x28860045)
+                self.assertEqual(reader.read.call_count, 2 * len(blocks) + 2)
+
     def test_valid_uf2_extracts_marker(self):
         marker = _build_marker_bytes()
         with tempfile.TemporaryDirectory(dir=str(ROOT / '.tmp')) as td:
@@ -361,6 +533,26 @@ class PrepareWorkDirSafetyTest(unittest.TestCase):
     """--work-dir is unconditionally shutil.rmtree()'d before use; a
     caller-controlled path here must be rejected before ANY subprocess or
     delete action runs, not just documented as unsafe."""
+
+    def test_default_work_paths_keep_board_role_and_recovery_variant_distinct(self):
+        for board in PREPARE.UPSTREAM_BOARDS:
+            for role in (0, 1):
+                for no_ble in (False, True):
+                    with self.subTest(board=board, role=role, no_ble=no_ble):
+                        args = ["--board", board, "--role-id", str(role)]
+                        if no_ble:
+                            args.append("--no-ble")
+                        suffix = (f"_role{role}" if role else "") + ("_noswd" if no_ble else "")
+                        expected = (ROOT / ".tmp" / PREPARE.WORK_DIR_NAMESPACE
+                                    / f"{board}_ota{suffix}_upstream")
+                        with mock.patch.object(PREPARE, "check_work_dir_ownership",
+                                               side_effect=RuntimeError("stop before checkout")) as ownership, \
+                                mock.patch.object(PREPARE.subprocess, "check_call") as git:
+                            with self.assertRaisesRegex(RuntimeError, "stop before checkout"):
+                                PREPARE.main(args)
+                        self.assertEqual(ownership.call_args.args, (expected.resolve(),
+                                                                    PREPARE.DEFAULT_SOURCE.resolve()))
+                        git.assert_not_called()
 
     def _blocked(self):
         return (
@@ -624,6 +816,10 @@ class PrepareSourceDirSafetyTest(unittest.TestCase):
         relocated = PREPARE.ROOT / ".tmp" / "test_tools_relocated_source_used"
         relocated.mkdir(parents=True, exist_ok=True)
         (relocated / ".git").mkdir(exist_ok=True)
+        board = relocated / "src/boards/xiao_nrf52840_ble"
+        board.mkdir(parents=True, exist_ok=True)
+        for name in ("board.h", "board.mk", "pinconfig.c"):
+            (board / name).touch()
         seen_paths = []
 
         def fake_check_call(cmd, *a, **kw):
@@ -640,22 +836,21 @@ class PrepareSourceDirSafetyTest(unittest.TestCase):
         try:
             with mock.patch.object(PREPARE.subprocess, "check_call", side_effect=fake_check_call), \
                  mock.patch.object(PREPARE, "run", side_effect=fake_run), \
-                 mock.patch.object(PREPARE.shutil, "copytree") as copytree_mock, \
+                 mock.patch.object(PREPARE.shutil, "copytree",
+                                   side_effect=RuntimeError("stop at source copy")) as copytree_mock, \
                  mock.patch.object(PREPARE.shutil, "copy2"), \
                  mock.patch("builtins.open", mock.mock_open(read_data="X" * 512)):
-                try:
+                with self.assertRaisesRegex(RuntimeError, "stop at source copy"):
                     PREPARE.main(["--source-dir", str(relocated), "--work-dir", str(work)])
-                except Exception:
-                    pass
             git_c_calls = [c for c in seen_paths
                            if isinstance(c, list) and "-C" in c]
             self.assertTrue(git_c_calls, "expected at least one 'git -C <SOURCE> ...' call")
             for call in git_c_calls:
                 idx = call.index("-C")
                 self.assertEqual(Path(call[idx + 1]).resolve(), relocated.resolve())
-            if copytree_mock.called:
-                src_arg = copytree_mock.call_args[0][0]
-                self.assertEqual(Path(src_arg).resolve(), relocated.resolve())
+            copytree_mock.assert_called_once()
+            src_arg = copytree_mock.call_args[0][0]
+            self.assertEqual(Path(src_arg).resolve(), relocated.resolve())
         finally:
             shutil = PREPARE.shutil
             if relocated.exists():
@@ -676,6 +871,7 @@ class SignImageActiveExtentBoundTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(dir=str(ROOT / ".tmp")))
+        cls.addClassCleanup(shutil.rmtree, cls.tmp)
         cls.private_key = cls.tmp / "private.pem"
         subprocess.check_call(
             ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(cls.private_key)],
@@ -1019,6 +1215,7 @@ class BuildManifestToolTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(dir=str(ROOT / ".tmp")))
+        cls.addClassCleanup(shutil.rmtree, cls.tmp)
         cls.private_key = cls.tmp / "private.pem"
         subprocess.check_call(
             ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(cls.private_key)],
@@ -1058,6 +1255,21 @@ class BuildManifestToolTest(unittest.TestCase):
         output = self.tmp / "manifest_match.bin"
         self._build_manifest(output, role_id=1, counter=7)
         self.assertEqual(output.read_bytes(), (out_dir / "descriptor.bin").read_bytes())
+
+    def test_sense_keeps_xiao_family_manifest_and_signed_command_bytes_for_both_roles(self):
+        for role in (0, 1):
+            with self.subTest(role=role), \
+                    mock.patch.object(SIGN.secrets, "randbits", return_value=0x0123456789ABCDEF):
+                base = self.tmp / f"base-role{role}"
+                sense = self.tmp / f"sense-role{role}"
+                self._sign(base, role_id=role, counter=7)
+                self._sign(sense, board="xiao_nrf52840_sense", role_id=role, counter=7)
+                manifest = self.tmp / f"sense-role{role}.manifest"
+                self._build_manifest(manifest, board="xiao_nrf52840_sense",
+                                     role_id=role, counter=7)
+                self.assertEqual(manifest.read_bytes(), (base / "descriptor.bin").read_bytes())
+                for name in ("descriptor.bin", "descriptor.sig", "install-command.bin"):
+                    self.assertEqual((base / name).read_bytes(), (sense / name).read_bytes())
 
     def test_output_is_exactly_59_bytes(self):
         output = self.tmp / "manifest_59.bin"

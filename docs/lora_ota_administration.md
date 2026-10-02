@@ -232,6 +232,14 @@ repeater profile is unchanged; USB recovery remains separate.
   implemented enforcement mechanism today.
 - Unused OTA allowance expires at the end of its window; it does not carry
   over into a later burst.
+- The default on-mesh allowance is 72 seconds of completed transmission
+  time per sliding one-hour window, per transmitter. Short accounting
+  buckets retain their latest completion for the full window; allowance
+  recovery may therefore be delayed by up to 15 seconds, never advanced.
+- Lab observations report completed on-mesh OTA usage separately from
+  all-traffic transmission time. Timeout or failed-accounting observations
+  prevent airtime qualification. Check ordinary peer delivery during the
+  transfer as well; a budget reading alone does not prove usable service.
 - An earlier 2026-09-30 pressure run reached 71,851 of 72,000 ms without
   overshoot but failed ordinary advert allocation with `ERR_TABLE_FULL`.
   A later full run at 12:26:14 UTC reached 71,822 ms and delivered an

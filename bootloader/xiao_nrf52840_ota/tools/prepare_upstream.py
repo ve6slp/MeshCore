@@ -11,8 +11,16 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
 PIN = "c67f0bcf0fa8e841426335b1bbde91cda6ca1f50"
+PIN_RELEASE = "0.11.0"
+BOOTLOADER_VERSION = 0x00000B00
+VERSION_SYMBOL = "__meshcore_vendor_bootloader_version"
 DEFAULT_SOURCE = ROOT / ".tmp" / "Adafruit_nRF52_Bootloader"
 OVERLAY = ROOT / "bootloader" / "xiao_nrf52840_ota"
+UPSTREAM_BOARDS = {
+    "xiao_nrf52840": "xiao_nrf52840_ble",
+    "xiao_nrf52840_sense": "xiao_nrf52840_ble_sense",
+    "sensecap_solar_p1": "xiao_nrf52840_ble",
+}
 
 # ghostfat.c infoUf2File flash-cost patch: named module-level constants (not
 # inline literals in main()) so tests can import this module and reuse the
@@ -208,10 +216,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-ble", action="store_true",
                         help="build the stock-address UF2/CDC recovery variant")
-    parser.add_argument("--board", choices=("xiao_nrf52840", "sensecap_solar_p1"),
+    parser.add_argument("--board", choices=tuple(UPSTREAM_BOARDS),
                         default="xiao_nrf52840",
-                        help="board profile to compile the boot-info marker and install "
-                             "policy target check for. sensecap_solar_p1 is a real, "
+                        help="select the pinned vendor BSP, boot-info marker and install "
+                             "policy target. xiao_nrf52840_sense uses the genuine Sense "
+                             "BSP with the existing Xiao application family. "
+                             "sensecap_solar_p1 is a real, "
                              "distinct target id sharing the same P25Q16H QSPI pinout "
                              "family, but has NOT been physically qualified on hardware "
                              "-- treat any such build as build-only until a real board "
@@ -228,8 +238,8 @@ def main(argv=None):
     parser.add_argument("--work-dir", default=None,
                         help="disposable build tree to copy the pinned upstream into "
                              "and compile from. Defaults to "
-                             ".tmp/ota-boot-builds/xiao_nrf52840_ota_{noswd_,}upstream "
-                             "(selected by --no-ble). Pass a distinct --work-dir per "
+                             ".tmp/ota-boot-builds/<board>_ota{_roleN}_{_noswd}_upstream "
+                             "(selected by --board, --role-id and --no-ble). Pass a distinct --work-dir per "
                              "profile when building more than one --board in one "
                              "invocation, or they will clobber each other's "
                              "tree/artifacts. Must be a strict descendant of "
@@ -259,6 +269,7 @@ def main(argv=None):
     SOURCE = validate_tmp_scratch_path(SOURCE, "source-dir")
     BOARD_TARGET_MACRO = {
         "xiao_nrf52840": "XIAO_OTA_TARGET_XIAO_NRF52840",
+        "xiao_nrf52840_sense": "XIAO_OTA_TARGET_XIAO_NRF52840",
         "sensecap_solar_p1": "XIAO_OTA_TARGET_SENSECAP_SOLAR_P1",
     }[args.board]
     # Must stay byte-for-byte identical to the same-named constants in
@@ -267,12 +278,14 @@ def main(argv=None):
     # authenticates against.
     BOARD_TARGET_VALUE = {
         "xiao_nrf52840": 0x584E3430,
+        "xiao_nrf52840_sense": 0x584E3430,
         "sensecap_solar_p1": 0x53435031,
     }[args.board]
+    upstream_board = UPSTREAM_BOARDS[args.board]
     ROLE_SUFFIX = "" if args.role_id == 0 else f"_role{args.role_id}"
     WORK = Path(args.work_dir) if args.work_dir else ROOT / ".tmp" / WORK_DIR_NAMESPACE / (
-        f"xiao_nrf52840_ota{ROLE_SUFFIX}_noswd_upstream" if args.no_ble
-        else f"xiao_nrf52840_ota{ROLE_SUFFIX}_upstream"
+        f"{args.board}_ota{ROLE_SUFFIX}_noswd_upstream" if args.no_ble
+        else f"{args.board}_ota{ROLE_SUFFIX}_upstream"
     )
     if not WORK.is_absolute():
         WORK = ROOT / WORK
@@ -291,6 +304,8 @@ def main(argv=None):
     subprocess.check_call(["git", "-C", str(SOURCE), "checkout", "--detach", PIN])
     if run("git", "-C", str(SOURCE), "rev-parse", "HEAD") != PIN:
         raise SystemExit("pinned upstream checkout mismatch")
+    if run("git", "-C", str(SOURCE), "rev-parse", f"{PIN_RELEASE}^{{commit}}") != PIN:
+        raise SystemExit("pinned upstream semantic release mismatch")
     # Idempotently re-asserted here (cheap no-op if the Makefile's fetch
     # target already did it) so this script is self-sufficient even on a
     # fresh non-recursive clone, where submodules like lib/nrfx (nrf.h)
@@ -298,6 +313,9 @@ def main(argv=None):
     subprocess.check_call([
         "git", "-C", str(SOURCE), "submodule", "update", "--init", "--recursive", "--quiet",
     ])
+    for name in ("board.h", "board.mk", "pinconfig.c"):
+        if not (SOURCE / "src" / "boards" / upstream_board / name).is_file():
+            raise SystemExit(f"pinned vendor board {upstream_board} lacks {name}")
 
     if WORK.exists():
         shutil.rmtree(WORK)
@@ -472,6 +490,16 @@ def main(argv=None):
     main = WORK / "src" / "main.c"
     text = main.read_text()
     text = text.replace('#include "boards.h"\n', '#include "boards.h"\n#include "xiao_ota_boot.h"\n')
+    version_store = '  BOOTLOADER_VERSION_REGISTER = (MK_BOOTLOADER_VERSION);\n'
+    if text.count(version_store) != 1:
+        raise SystemExit("pinned vendor version assignment changed")
+    text = text.replace(
+        version_store,
+        f'  _Static_assert(MK_BOOTLOADER_VERSION == 0x{BOOTLOADER_VERSION:08X}u,\n'
+        '                 "vendor version must match the pinned release");\n'
+        + version_store,
+        1,
+    )
     needle = '  led_state(STATE_BOOTLOADER_STARTED);\n'
     text = text.replace(needle, needle + "\n  xiao_ota_boot_process();\n", 1)
     main.write_text(text)
@@ -546,9 +574,11 @@ def main(argv=None):
 
     makefile = WORK / "Makefile"
     text = makefile.read_text()
+    if "-include src/boards/$(BOARD)/board.mk\n" not in text:
+        raise SystemExit("pinned Makefile board include not found; refusing unbound board preparation")
     text = text.replace(
         "GIT_VERSION := $(shell git describe --dirty --always --tags)",
-        f"GIT_VERSION := {PIN[:12]}",
+        f"GIT_VERSION := {PIN_RELEASE}-{PIN[:12]}",
         1,
     )
     needle = "# all files in boards\n"
@@ -576,13 +606,18 @@ def main(argv=None):
     # policy (xiao_ota_record.c / xiao_ota_boot_io.c), and baked into the
     # immutable boot-info marker's role_id field above by this same script.
     CFLAGS += -DXIAO_OTA_COMPILED_ROLE_ID={args.role_id}u
+    LDFLAGS += -Wl,--defsym={VERSION_SYMBOL}=0x{BOOTLOADER_VERSION:08X}
 
     """
     text = text.replace(needle, addition + needle, 1)
     text = text.replace(
         "-include src/boards/$(BOARD)/board.mk\n",
+        f"BOARD ?= {upstream_board}\n"
+        f"ifneq ($(BOARD),{upstream_board})\n"
+        f"$(error prepared --board {args.board} requires BOARD={upstream_board})\n"
+        "endif\n"
         "-include src/boards/$(BOARD)/board.mk\n\n"
-        "ifeq ($(BOARD),xiao_nrf52840_ble)\n"
+        f"ifeq ($(BOARD),{upstream_board})\n"
         "CFLAGS += -DBOOTLOADER_REGION_START=0xED000\n"
         "endif\n",
         1,
@@ -590,7 +625,7 @@ def main(argv=None):
     text = text.replace(
         "else\n  LD_FILE = linker/$(MCU_SUB_VARIANT).ld\nendif\n",
         "else\n  LD_FILE = linker/$(MCU_SUB_VARIANT).ld\nendif\n"
-        "ifeq ($(BOARD),xiao_nrf52840_ble)\n"
+        f"ifeq ($(BOARD),{upstream_board})\n"
         "LD_FILE = linker/nrf52840_xiao_ota.ld\n"
         "endif\n",
         1,

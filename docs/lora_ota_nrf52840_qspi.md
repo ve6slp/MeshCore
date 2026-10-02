@@ -71,6 +71,16 @@ and [CustomLFS implementation](https://github.com/oltaco/CustomLFS/blob/0.2.3/sr
 
 The OTA application limit is **708,608 bytes**, not the stock linker's
 larger `0x27000..0xED000` span. OTA must preserve MeshCore's ExtraFS.
+
+Bootloader commissioning must preserve these filesystems too. The retained
+vendor UF2 self-update implementation stages its payload at
+`0xE0000..0xEA000`, inside ExtraFS; a destination-address whitelist does
+not protect against that indirect erase. Do not use mass-storage UF2
+self-update for this layout. The ordinary serial bootloader-only workflow
+uses application staging instead and requires a separate qualified
+application restore before healthy boot and genesis-floor acceptance.
+See the [hardware workflow](hardware_lab.md#bootloader-commissioning)
+for the current commissioning gate and evidence limits.
 The source contracts are `boards/nrf52840_s140_v7_extrafs.ld` and
 `src/ota/platform/Nrf52FlashLayoutContract.h`.
 

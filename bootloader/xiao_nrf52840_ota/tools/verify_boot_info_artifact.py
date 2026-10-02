@@ -65,8 +65,13 @@ ALGORITHM_ED25519 = 1
 
 BOARD_TARGET_VALUE = {
     "xiao_nrf52840": 0x584E3430,
+    "xiao_nrf52840_sense": 0x584E3430,
     "sensecap_solar_p1": 0x53435031,
 }
+CF2_ADDRESS = 0xFD800
+CF2_BYTES = BOOT_INFO_ADDRESS - CF2_ADDRESS
+CF2_MAGIC = (0x1E9E10F1, 0x20227A79)
+CF2_BOOTLOADER_BOARD_ID = 208
 
 # UF2 block flags (offset 8; see https://github.com/microsoft/uf2). Every
 # block a real build of this artifact emits sets exactly
@@ -101,6 +106,7 @@ def read_intel_hex_bytes(path: Path, address: int, length: int) -> bytes:
     silently-skipped address record could otherwise misplace every
     following byte without any error."""
     out = bytearray(b"\xff" * length)
+    seen = {}
     found_any = False
     upper = 0
     with path.open("r", encoding="ascii") as fh:
@@ -156,6 +162,9 @@ def read_intel_hex_bytes(path: Path, address: int, length: int) -> bytes:
             for i, b in enumerate(payload):
                 a = abs_addr + i
                 if address <= a < address + length:
+                    if a in seen and seen[a] != b:
+                        raise SystemExit(f"{path}:{lineno}: conflicting HEX bytes at 0x{a:X}")
+                    seen[a] = b
                     out[a - address] = b
                     found_any = True
     if not found_any:
@@ -175,57 +184,70 @@ def read_uf2_bytes(path: Path, address: int, length: int) -> bytes:
     actually writes it to flash), payload_size <= 476 (the maximum a
     512-byte block can carry: 512 - 32-byte header - 4-byte trailing
     magic), and rejects (rather than silently overwrites) two blocks that
-    disagree about the same address inside our target range."""
-    data = path.read_bytes()
-    if len(data) % 512 != 0:
+    disagree about the same address inside our target range. Only headers,
+    trailers and the requested payload range are read, never other payloads."""
+    size = path.stat().st_size
+    if size % 512 != 0:
         raise SystemExit(f"{path}: not a whole number of 512-byte UF2 blocks")
     out = bytearray(b"\xff" * length)
     written_from = {}
-    for off in range(0, len(data), 512):
-        block = data[off:off + 512]
-        magic0, magic1 = struct.unpack_from("<II", block, 0)
-        magic_end, = struct.unpack_from("<I", block, 508)
-        if magic0 != 0x0A324655 or magic1 != 0x9E5D5157:
-            raise SystemExit(f"{path}: bad UF2 start magic at offset {off}")
-        if magic_end != 0x0AB16F30:
-            raise SystemExit(f"{path}: bad UF2 trailing magic at offset {off}")
-        flags, = struct.unpack_from("<I", block, 8)
-        # Checked independently of whether the payload bytes below happen
-        # to look like a correct marker: a real UF2 bootloader skips any
-        # block with "not main flash" set (never writes it to flash) and
-        # treats "file container" blocks as a virtual filesystem entry, not
-        # a flash write -- either flag would mean this verifier is reading
-        # bytes that would never actually reach the device.
-        if flags & UF2_FLAG_NOT_MAIN_FLASH:
-            raise SystemExit(
-                f"{path}: block at offset {off} sets UF2 flag "
-                f"0x{UF2_FLAG_NOT_MAIN_FLASH:08X} (not main flash) -- a real UF2 "
-                "bootloader never writes this block to flash, so its payload "
-                "bytes cannot be trusted as what the device will actually hold"
-            )
-        if flags & UF2_FLAG_FILE_CONTAINER:
-            raise SystemExit(
-                f"{path}: block at offset {off} sets UF2 flag "
-                f"0x{UF2_FLAG_FILE_CONTAINER:08X} (file container), not a flash "
-                "write"
-            )
-        if not (flags & UF2_FLAG_FAMILY_ID_PRESENT):
-            raise SystemExit(
-                f"{path}: block at offset {off} does not set UF2 flag "
-                f"0x{UF2_FLAG_FAMILY_ID_PRESENT:08X} (familyID present) -- a "
-                "genuine artifact from this project's packaging step always "
-                "sets it"
-            )
-        target_addr, payload_size = struct.unpack_from("<II", block, 12)
-        if payload_size > 476:
-            raise SystemExit(
-                f"{path}: block at offset {off} declares payload_size "
-                f"{payload_size} > 476 (max for a 512-byte UF2 block)"
-            )
-        payload = block[32:32 + payload_size]
-        for i, b in enumerate(payload):
-            a = target_addr + i
-            if address <= a < address + length:
+    with path.open("rb") as stream:
+        for off in range(0, size, 512):
+            stream.seek(off)
+            header = stream.read(32)
+            stream.seek(off + 508)
+            trailer = stream.read(4)
+            if len(header) != 32 or len(trailer) != 4:
+                raise SystemExit(f"{path}: truncated UF2 block at offset {off}")
+            magic0, magic1 = struct.unpack_from("<II", header, 0)
+            magic_end, = struct.unpack("<I", trailer)
+            if magic0 != 0x0A324655 or magic1 != 0x9E5D5157:
+                raise SystemExit(f"{path}: bad UF2 start magic at offset {off}")
+            if magic_end != 0x0AB16F30:
+                raise SystemExit(f"{path}: bad UF2 trailing magic at offset {off}")
+            flags, = struct.unpack_from("<I", header, 8)
+            # Checked independently of whether the payload bytes below happen
+            # to look like a correct marker: a real UF2 bootloader skips any
+            # block with "not main flash" set (never writes it to flash) and
+            # treats "file container" blocks as a virtual filesystem entry, not
+            # a flash write -- either flag would mean this verifier is reading
+            # bytes that would never actually reach the device.
+            if flags & UF2_FLAG_NOT_MAIN_FLASH:
+                raise SystemExit(
+                    f"{path}: block at offset {off} sets UF2 flag "
+                    f"0x{UF2_FLAG_NOT_MAIN_FLASH:08X} (not main flash) -- a real UF2 "
+                    "bootloader never writes this block to flash, so its payload "
+                    "bytes cannot be trusted as what the device will actually hold"
+                )
+            if flags & UF2_FLAG_FILE_CONTAINER:
+                raise SystemExit(
+                    f"{path}: block at offset {off} sets UF2 flag "
+                    f"0x{UF2_FLAG_FILE_CONTAINER:08X} (file container), not a flash "
+                    "write"
+                )
+            if not (flags & UF2_FLAG_FAMILY_ID_PRESENT):
+                raise SystemExit(
+                    f"{path}: block at offset {off} does not set UF2 flag "
+                    f"0x{UF2_FLAG_FAMILY_ID_PRESENT:08X} (familyID present) -- a "
+                    "genuine artifact from this project's packaging step always "
+                    "sets it"
+                )
+            target_addr, payload_size = struct.unpack_from("<II", header, 12)
+            if payload_size > 476:
+                raise SystemExit(
+                    f"{path}: block at offset {off} declares payload_size "
+                    f"{payload_size} > 476 (max for a 512-byte UF2 block)"
+                )
+            start = max(address, target_addr)
+            stop = min(address + length, target_addr + payload_size)
+            if start >= stop:
+                continue
+            stream.seek(off + 32 + start - target_addr)
+            payload = stream.read(stop - start)
+            if len(payload) != stop - start:
+                raise SystemExit(f"{path}: truncated UF2 payload at offset {off}")
+            for i, b in enumerate(payload):
+                a = start + i
                 rel = a - address
                 if rel in written_from and out[rel] != b:
                     raise SystemExit(
@@ -241,6 +263,26 @@ def read_uf2_bytes(path: Path, address: int, length: int) -> bytes:
             f"0x{address + length:X} in {path}"
         )
     return bytes(out)
+
+
+def read_cf2_bootloader_id(path: Path) -> int:
+    """Extract an artifact's public CF2 ID, reading only the requested UF2 payloads."""
+    if path.suffix.lower() == ".uf2":
+        raw = read_uf2_bytes(path, CF2_ADDRESS, CF2_BYTES)
+    elif path.suffix.lower() == ".hex":
+        raw = read_intel_hex_bytes(path, CF2_ADDRESS, CF2_BYTES)
+    else:
+        raise ValueError(f"unrecognized CF2 artifact extension: {path}")
+    magic0, magic1, used, capacity = struct.unpack_from("<IIII", raw)
+    if (magic0, magic1) != CF2_MAGIC:
+        raise ValueError(f"invalid CF2 magic in {path}")
+    if not 0 < used <= capacity <= (CF2_BYTES - 16) // 8:
+        raise ValueError(f"invalid CF2 entry count/capacity in {path}")
+    boot_ids = [value for key, value in struct.iter_unpack("<II", raw[16:16 + used * 8])
+                if key == CF2_BOOTLOADER_BOARD_ID]
+    if len(boot_ids) != 1:
+        raise ValueError(f"CF2 must contain exactly one bootloader board ID in {path}")
+    return boot_ids[0]
 
 
 def parse_public_key_header(path: Path) -> bytes:

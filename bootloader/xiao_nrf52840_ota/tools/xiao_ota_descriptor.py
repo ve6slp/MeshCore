@@ -30,6 +30,7 @@ CANONICAL_LAYOUT_CONTRACT = ROOT / "src" / "ota" / "platform" / "Nrf52FlashLayou
 # table and its cross-check against xiao_ota_record.h).
 BOARD_TARGETS = {
     "xiao_nrf52840": 0x584E3430,
+    "xiao_nrf52840_sense": 0x584E3430,
     # A real, distinct target id sharing the same P25Q16H QSPI pinout family
     # as the XIAO profile, but NOT physically qualified on hardware -- any
     # descriptor built with this profile is build-only until a real board
