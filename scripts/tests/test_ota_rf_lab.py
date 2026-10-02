@@ -330,6 +330,12 @@ class LabRoleTransportTests(unittest.TestCase):
             (["--grant-client-admin", "--monitor-seconds=1"], "not allowed"),
             (["--grant-client-admin", "--monitor-seconds=0"], "not allowed"),
             (["--grant-client-admin", "--client-only"], "requires both approved roles"),
+            (["--inspect-ota-preflight", "--configure-only"], "not allowed"),
+            (["--inspect-ota-preflight", "--grant-client-admin"], "not allowed"),
+            (["--inspect-ota-preflight", "--monitor-seconds=0"], "not allowed"),
+            (["--inspect-ota-preflight", "--monitor-seconds=1"], "not allowed"),
+            (["--inspect-ota-preflight", "--bandwidth-hz=62500"], "requires --configure-only"),
+            (["--inspect-ota-preflight", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--monitor-seconds=1", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--grant-client-admin", "--bandwidth-hz=250000"], "requires --configure-only"),
             (["--bandwidth-hz=250000"], "requires --configure-only"),
@@ -1432,6 +1438,202 @@ class AdminGrantModeTests(unittest.TestCase):
                 message = f"{type(error).__name__}: {error}"
                 self.evidence.log.assert_called_with("fatal", error=message)
                 self.evidence.finish.assert_called_once_with(message)
+
+
+class OtaPreflightInspectionTests(unittest.TestCase):
+    EARLY = "writes=blocked marker=blank proof=sdk-read sdk=unread"
+    CAPABILITY = "writes=blocked CACHE_UNAVAILABLE: SDK bank0 read failed"
+
+    def setUp(self):
+        self.evidence = evidence_fixture()
+        self.evidence.finish = mock.Mock()
+        self.client = mock.Mock()
+        self.client.name = "client"
+        self.client.command.side_effect = [
+            self_info(), b"\x1d" + self.EARLY.encode("ascii"),
+            b"\x1d" + self.CAPABILITY.encode("ascii"),
+        ]
+        self.target = mock.Mock()
+        self.target.name = "target"
+        self.target.command.side_effect = [
+            "> repeater", "> " + TARGET_KEY.hex(), self.EARLY, self.CAPABILITY,
+        ]
+        self.devices = {
+            role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{role}")
+            for role, serial in ota_rf_lab.APPROVED_ADMIN_PAIR.items()
+        }
+
+    def run_main(self, options=()):
+        arguments = ["ota_rf_lab.py", "--artifact-dir", "unused",
+                     "--inspect-ota-preflight", *options]
+        with mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(ota_rf_lab, "Evidence", return_value=self.evidence), \
+                mock.patch.object(ota_rf_lab.lab_device, "resolve") as resolve, \
+                mock.patch.object(ota_rf_lab, "FramedSerial", return_value=self.client) as client_open, \
+                mock.patch.object(ota_rf_lab, "RepeaterSerial", return_value=self.target) as target_open, \
+                mock.patch.object(ota_rf_lab.time, "sleep"):
+            self.resolve, self.client_open, self.target_open = resolve, client_open, target_open
+            resolve.side_effect = lambda role, mode: self.devices[role]
+            ota_rf_lab.main()
+
+    def test_parser_consumes_frozen_early_formatter_shapes_without_interpreting_proof(self):
+        for detail in (
+            "proof=not-run", "proof=backend-unavailable", "proof=qspi-layout", "proof=qspi-read",
+            "proof=jedec observed=856015", "marker=blank proof=sdk-read sdk=unread",
+            "marker=blank proof=crc off=000FE000 bank0=1 bank1=0 size=1024 crc=ABCD/1234 tail=1",
+            "marker=corrupt proof=marker off=? bank0=FF bank1=FF size=0 crc=FFFF/? tail=0",
+            "marker=qualified proof=qualified-state",
+            "marker=qualified proof=qualified-state state=2 phase=3 decision=4",
+        ):
+            with self.subTest(detail=detail):
+                text = f"writes=blocked {detail}"
+                parsed = ota_rf_lab.parse_ota_preflight_diagnostic(text, "preflight")
+                self.assertEqual(parsed["text"], text)
+                self.assertFalse(parsed["writes_allowed"])
+                self.assertIn("proof", parsed["early_proof"])
+                self.assertNotIn("install_authority", parsed)
+
+    def test_capability_and_actual_latch_are_independent_live_readbacks(self):
+        for writes in ("allowed", "blocked"):
+            for capability in ("CACHE_ONLY", "CACHE_UNAVAILABLE", "STAGING_ONLY", "INSTALL_CAPABLE"):
+                with self.subTest(writes=writes, capability=capability):
+                    parsed = ota_rf_lab.parse_ota_preflight_diagnostic(
+                        f"writes={writes} {capability}: verified stock boot", "capability")
+                    self.assertEqual(parsed["writes_allowed"], writes == "allowed")
+                    self.assertEqual(parsed["capability"], capability)
+                    self.assertEqual(parsed["reason"], "verified stock boot")
+
+    def test_unknown_lifecycle_missing_reason_and_incomplete_formats_are_refused(self):
+        for kind, text in (
+            ("preflight", "mode=direct state=0 phase=0 floor=0"),
+            ("preflight", "writes=allowed"),
+            ("preflight", "writes=maybe proof=qspi-read"),
+            ("preflight", "writes=blocked unknown"),
+            ("preflight", "writes=blocked proof=unknown"),
+            ("preflight", "writes=blocked marker=blank proof=crc off=?"),
+            ("preflight", "writes=blocked marker=blank sdk=unread"),
+            ("preflight", self.EARLY + "\x00"),
+            ("preflight", self.EARLY + "\n"),
+            ("preflight", self.EARLY.replace("sdk-read", "sdk-r\u00e9ad")),
+            ("capability", "writes=blocked CACHE_UNAVAILABLE: "),
+            ("capability", "writes=allowed CACHE_ONLY"),
+            ("capability", "writes=allowed UNKNOWN: reason"),
+            ("capability", "writes=blocked CACHE_ONLY: " + "x" * 176),
+            ("capability", self.EARLY),
+            ("unknown", self.CAPABILITY),
+        ):
+            with self.subTest(kind=kind, text=text):
+                with self.assertRaises(ValueError):
+                    ota_rf_lab.parse_ota_preflight_diagnostic(text, kind)
+
+    def test_opt_in_pair_probe_is_exact_read_only_and_persists_backend_refusal_without_failing(self):
+        self.run_main()
+        self.assertEqual(self.resolve.call_args_list, [
+            mock.call("client", mode=ota_rf_lab.lab_device.MODE_APP),
+            mock.call("target", mode=ota_rf_lab.lab_device.MODE_APP),
+        ])
+        self.assertEqual(self.client.command.call_args_list, [
+            mock.call(b"\x01" + bytes(7) + b"ota-rf-lab", expected=(5,)),
+            mock.call(bytes.fromhex("420001"), expected=(29, 1)),
+            mock.call(bytes.fromhex("420002"), expected=(29, 1)),
+        ])
+        self.assertEqual(self.target.command.call_args_list, [
+            mock.call("get role"), mock.call("get public.key"),
+            mock.call("ota preflight"), mock.call("ota capability"),
+        ])
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertTrue(record["read_only"])
+        self.assertTrue(record["inspection_complete"])
+        self.assertEqual(record["identities"]["client"]["pubkey"], CLIENT_KEY.hex())
+        self.assertEqual(record["identities"]["target"]["pubkey"], TARGET_KEY.hex())
+        for role in ("client", "target"):
+            early, later = record["nodes"][role]["preflight"], record["nodes"][role]["capability"]
+            self.assertEqual(early["text"], self.EARLY)
+            self.assertEqual(early["early_proof"], {"marker": "blank", "proof": "sdk-read", "sdk": "unread"})
+            self.assertFalse(early["writes_allowed"])
+            self.assertEqual(later["capability"], "CACHE_UNAVAILABLE")
+            self.assertEqual(later["reason"], "SDK bank0 read failed")
+            self.assertFalse(later["writes_allowed"])
+        self.assertEqual(record["nodes"]["client"]["preflight"]["request_hex"], "420001")
+        self.assertEqual(record["nodes"]["client"]["capability"]["request_hex"], "420002")
+        self.assertEqual(record["nodes"]["client"]["preflight"]["response_hex"],
+                         (b"\x1d" + self.EARLY.encode("ascii")).hex())
+        self.client.get_acl.assert_not_called()
+        self.target.get_acl.assert_not_called()
+        self.client.close.assert_called_once()
+        self.target.close.assert_called_once()
+        self.evidence.finish.assert_called_once_with(None)
+        self.assertEqual(self.evidence.log.call_args.kwargs["qualification_verified"], False)
+
+    def test_client_only_probe_never_resolves_or_opens_target(self):
+        self.run_main(["--client-only"])
+        self.resolve.assert_called_once_with("client", mode=ota_rf_lab.lab_device.MODE_APP)
+        self.target_open.assert_not_called()
+        self.target.command.assert_not_called()
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertEqual(set(record["nodes"]), {"client"})
+        self.assertTrue(record["inspection_complete"])
+
+    def test_legacy_selector_fallback_is_fatal_with_all_raw_readbacks_retained(self):
+        legacy = b"\x1dmode=direct state=0 phase=0 floor=0"
+        self.client.command.side_effect = [self_info(), legacy, legacy]
+        with self.assertRaisesRegex(ValueError, "legacy lifecycle"):
+            self.run_main()
+        record = self.evidence.summary["measurements"]["ota_preflight"]
+        self.assertFalse(record["inspection_complete"])
+        self.assertEqual(record["nodes"]["client"]["preflight"]["response_hex"], legacy.hex())
+        self.assertEqual(record["nodes"]["client"]["capability"]["response_hex"], legacy.hex())
+        self.assertEqual(record["nodes"]["target"]["capability"]["text"], self.CAPABILITY)
+        self.assertIn("error", record["nodes"]["client"]["preflight"])
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+        self.assertIn("legacy lifecycle", self.evidence.finish.call_args.args[0])
+        self.client.close.assert_called_once()
+        self.target.close.assert_called_once()
+
+    def test_usb_error_wrong_response_nonascii_or_truncated_diagnostic_is_not_success(self):
+        for frame, error in ((b"\x01\x03", RuntimeError), (b"\x56" + self.EARLY.encode(), RuntimeError),
+                             (b"", RuntimeError), (b"\x1d", ValueError),
+                             (b"\x1d\xff", UnicodeDecodeError),
+                             (b"\x1dwrites=blocked marker=blank proof=crc off=?", ValueError)):
+            with self.subTest(frame=frame):
+                self.setUp()
+                self.client.command.side_effect = [self_info(), frame, b"\x1d" + self.CAPABILITY.encode()]
+                with self.assertRaises(error):
+                    self.run_main()
+                record = self.evidence.summary["measurements"]["ota_preflight"]
+                self.assertFalse(record["inspection_complete"])
+                self.assertEqual(record["nodes"]["client"]["preflight"]["response_hex"], frame.hex())
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_unapproved_or_pine_serial_refuses_before_either_port_opens(self):
+        for role in ("client", "target"):
+            for serial in ("unapproved", "49C5BAF21EEF44A1"):
+                with self.subTest(role=role, serial=serial):
+                    self.setUp()
+                    self.devices[role].serial = serial
+                    with self.assertRaisesRegex(AssertionError, f"approved-ota-preflight-{role}"):
+                        self.run_main()
+                    self.client_open.assert_not_called()
+                    self.target_open.assert_not_called()
+                    self.client.command.assert_not_called()
+                    self.target.command.assert_not_called()
+
+    def test_actual_wrong_role_or_duplicate_identity_refuses_before_diagnostic_reads(self):
+        for client_frame, target_role, target_key in (
+            (self_info(advert_type=2), "> repeater", TARGET_KEY),
+            (self_info(), "> room", TARGET_KEY),
+            (self_info(), "> repeater", CLIENT_KEY),
+        ):
+            with self.subTest(target_role=target_role, target_key=target_key):
+                self.setUp()
+                self.client.command.side_effect = [client_frame]
+                self.target.command.side_effect = [target_role, "> " + target_key.hex()]
+                with self.assertRaises((RuntimeError, AssertionError)):
+                    self.run_main()
+                self.assertEqual(self.client.command.call_count, 1)
+                self.assertFalse(any(call.args[0].startswith("ota ")
+                                     for call in self.target.command.call_args_list))
 
 
 class CompanionSigningTests(unittest.TestCase):

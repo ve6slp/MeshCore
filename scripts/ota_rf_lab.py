@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure, monitor, or explicitly grant normal MeshCore administrator access.
+"""Configure, monitor, inspect OTA diagnostics, or grant normal administrator access.
 
 Configuration preserves existing identities and ACLs. Readbacks describe current
 settings, not active RF, reboot persistence, transfer, install, or trial evidence.
@@ -48,6 +48,7 @@ RESP_OK = 0
 RESP_ERR = 1
 RESP_SELF_INFO = 5
 RESP_DEVICE_INFO = 13
+RESP_OTA_STATUS = 29
 RESP_SIGN_START = 19
 RESP_SIGNATURE = 20
 MAX_SERIAL_FRAME_SIZE = 176
@@ -581,6 +582,85 @@ def run_grant_client_admin(client, target, evidence):
     return record
 
 
+def parse_ota_preflight_diagnostic(text, kind):
+    if not re.fullmatch(rf"[\x20-\x7e]{{1,{MAX_SERIAL_FRAME_SIZE - 1}}}", text):
+        raise ValueError("OTA diagnostic must be bounded printable ASCII")
+    match = re.fullmatch(r"writes=(allowed|blocked) (.+)", text)
+    if not match:
+        raise ValueError("missing OTA write-latch diagnostic; legacy lifecycle status is not supported")
+    writes, detail = match.groups()
+    result = {"text": text, "writes_allowed": writes == "allowed"}
+    if kind == "preflight":
+        marker = r"marker=(?:blank|corrupt|qualified|mismatch) proof=[a-z][a-z0-9-]*"
+        # Consume the frozen formatter's shapes, not the firmware's proof logic.
+        formats = (
+            r"proof=(?:not-run|backend-unavailable|qspi-layout|qspi-read)",
+            r"proof=jedec observed=[0-9A-F]{6}",
+            marker + r" sdk=unread",
+            marker + r" off=(?:[0-9A-F]{8}|\?) bank0=[0-9A-F]+ bank1=[0-9A-F]+ "
+                     r"size=[0-9]+ crc=[0-9A-F]{4}/(?:[0-9A-F]{4}|\?) tail=[01]",
+            r"marker=qualified proof=qualified-state"
+            r"(?: state=[0-9]+ phase=[0-9]+ decision=[0-9]+)?",
+        )
+        if not any(re.fullmatch(pattern, detail) for pattern in formats):
+            raise ValueError("unrecognized or incomplete OTA early-preflight diagnostic")
+        result["early_proof"] = dict(field.split("=", 1) for field in detail.split(" "))
+    elif kind == "capability":
+        capability = re.fullmatch(
+            r"(CACHE_ONLY|CACHE_UNAVAILABLE|STAGING_ONLY|INSTALL_CAPABLE): (\S(?:.*\S)?)", detail)
+        if not capability:
+            raise ValueError("unrecognized or incomplete OTA capability diagnostic")
+        result["capability"], result["reason"] = capability.groups()
+    else:
+        raise ValueError(f"unknown OTA diagnostic kind: {kind!r}")
+    return result
+
+
+def run_inspect_ota_preflight(client, target, evidence):
+    record = {"read_only": True, "inspection_complete": False, "nodes": {}}
+    evidence.summary["measurements"]["ota_preflight"] = record
+    identities = {"client": serializable_app_info(app_info(client))}
+    if target is not None:
+        identities["target"] = repeater_identity(target)
+        evidence.check("node-identities-are-distinct",
+                       identities["client"]["pubkey"] != identities["target"]["pubkey"],
+                       client=identities["client"]["pubkey"], target=identities["target"]["pubkey"])
+    record["identities"] = identities
+    # Retain all raw readbacks before validation, including old firmware fallback.
+    for role, node in (("client", client), ("target", target)):
+        if node is None:
+            continue
+        diagnostics = record["nodes"][role] = {}
+        for selector, kind in ((1, "preflight"), (2, "capability")):
+            row = diagnostics[kind] = {}
+            if role == "client":
+                request = bytes([CMD_OTA_CONTROL, 0, selector])
+                row["request_hex"] = request.hex()
+                frame = node.command(request, expected=(RESP_OTA_STATUS, RESP_ERR))
+                row["response_hex"] = frame.hex()
+            else:
+                row["command"] = f"ota {kind}"
+                row["text"] = node.command(row["command"])
+            evidence.log("ota_preflight_raw_readback", node=role, kind=kind, **row)
+    for role, diagnostics in record["nodes"].items():
+        for kind, row in diagnostics.items():
+            try:
+                if role == "client":
+                    frame = bytes.fromhex(row["response_hex"])
+                    if not frame or frame[0] != RESP_OTA_STATUS:
+                        raise RuntimeError(f"companion OTA diagnostic refused: {frame.hex()}")
+                    row["text"] = frame[1:].decode("ascii")
+                row.update(parse_ota_preflight_diagnostic(row["text"], kind))
+            except (ValueError, RuntimeError) as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                raise
+            evidence.log("ota_preflight_diagnostic", node=role, kind=kind, **row)
+    record["inspection_complete"] = True
+    evidence.log("ota_preflight_inspection_complete", read_only=True,
+                 qualification_verified=False, install_authority_verified=False)
+    return record
+
+
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
     roles = [CLIENT_ROLE] if client_only else [CLIENT_ROLE, TARGET_ROLE]
@@ -607,6 +687,17 @@ def resolve_admin_grant_roles(evidence):
     return devices
 
 
+def resolve_preflight_roles(evidence, client_only=False):
+    evidence.check("approved-ota-preflight-roles",
+                   CLIENT_ROLE == "client" and (client_only or TARGET_ROLE == "target"),
+                   client_role=CLIENT_ROLE, target_role=TARGET_ROLE, client_only=client_only)
+    devices = resolve_roles(evidence, client_only=client_only)
+    for role, device in devices.items():
+        evidence.check(f"approved-ota-preflight-{role}", device.serial == APPROVED_ADMIN_PAIR[role],
+                       expected_serial=APPROVED_ADMIN_PAIR[role], observed_serial=device.serial)
+    return devices
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--artifact-dir", required=True)
@@ -621,6 +712,8 @@ def main():
     scope.add_argument("--grant-client-admin", action="store_true",
                        help="explicit normal CLI grant of permission 03 to the approved companion; "
                             "live ACL verification only, no reboot or OTA")
+    scope.add_argument("--inspect-ota-preflight", action="store_true",
+                       help="read-only early preflight, write-latch and capability diagnostics")
     args = parser.parse_args()
     if not math.isfinite(args.monitor_seconds) or args.monitor_seconds < 0:
         parser.error("--monitor-seconds must be finite and non-negative")
@@ -628,9 +721,11 @@ def main():
         parser.error("--grant-client-admin requires both approved roles; not --client-only")
     if args.bandwidth_hz is not None and not args.configure_only:
         parser.error("--bandwidth-hz requires --configure-only")
-    if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin):
+    if not (args.configure_only or args.monitor_seconds > 0 or args.grant_client_admin
+            or args.inspect_ota_preflight):
         parser.error("RF/OTA qualification is not supported by this configuration/monitor helper; "
-                     "select --configure-only, --grant-client-admin or a positive --monitor-seconds. "
+                     "select --configure-only, --grant-client-admin, --inspect-ota-preflight "
+                     "or a positive --monitor-seconds. "
                      "Signed transfers use ota_uploader.py with a separate explicit commit")
 
     radio = (NORMAL_RADIO if args.bandwidth_hz is None
@@ -641,6 +736,8 @@ def main():
     try:
         if args.grant_client_admin:
             devices = resolve_admin_grant_roles(evidence)
+        elif args.inspect_ota_preflight:
+            devices = resolve_preflight_roles(evidence, client_only=args.client_only)
         else:
             devices = resolve_roles(evidence, client_only=args.client_only)
         client_device = devices[CLIENT_ROLE]
@@ -665,6 +762,8 @@ def main():
                     target.pending.clear()
         elif args.grant_client_admin:
             run_grant_client_admin(client, target, evidence)
+        elif args.inspect_ota_preflight:
+            run_inspect_ota_preflight(client, target, evidence)
         else:
             if args.client_only:
                 run_configure_client(client, evidence, radio=radio)

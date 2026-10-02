@@ -116,6 +116,22 @@ administrator ACL readbacks. It does not grant administrator permissions,
 transfer an image, commit an update or reboot either board. Client-only
 configuration remains available.
 
+Read the actual stock-boot refusal before retrying a blocked setter:
+
+```sh
+make inspect-xiao-nrf52-ota-preflight \
+  OTA_LAB_ARTIFACT_DIR="$PWD/.tmp/ota-rf-lab/stock-preflight-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Use a new evidence directory. This opt-in inspection reads both approved
+roles, identities, the captured early proof, the actual latched write
+permission and later cache capability. It never changes settings,
+permissions, candidates or journals, and never resets a board. A recognized
+blocked diagnostic is a valid observation, not permission to proceed.
+The helper rejects lifecycle-only, missing or malformed readbacks.
+These diagnostics require the corrected application: `bda99d13` ignores
+the companion selector and cannot report the captured early refusal.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
