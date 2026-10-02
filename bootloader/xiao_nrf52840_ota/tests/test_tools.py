@@ -238,6 +238,313 @@ class SenseProfilePreparationTest(unittest.TestCase):
             self.prepare()
         remove.assert_not_called()
 
+    def test_prepared_main_orders_pending_updates_escape_hook_and_application_gate(self):
+        for board in PREPARE.UPSTREAM_BOARDS:
+            for role in (0, 1):
+                for no_ble in (False, True):
+                    with self.subTest(board=board, role=role, no_ble=no_ble):
+                        work = self.prepare(board=board, role_id=role, no_ble=no_ble)
+                        main = (work / "src/main.c").read_text()
+                        self.assertLess(main.index("bootloader_dfu_sd_update_finalize();"),
+                                        main.index("ota_prior_reset_marker ="))
+                        self.assertLess(main.index("ota_physical_dfu ="),
+                                        main.index("    xiao_ota_boot_process();"))
+                        self.assertLess(main.index("    xiao_ota_boot_process();"),
+                                        main.index("  check_dfu_mode();"))
+                        self.assertIn('#include "xiao_ota_record.h"', main)
+                        self.assertIn("!xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET)", main)
+                        self.assertIn("if (ota_hook_ran && vendor_app_ready)", main)
+                        self.assertEqual(main.count("bool const vendor_app_ready ="), 1)
+                        self.assertIn("GPREGRET = vendor_app_ready ? 0 : DFU_MAGIC_OTA_RESET;", main)
+                        self.assertEqual(main.count("xiao_ota_boot_process();"), 1)
+                        self.assertNotIn("start_trial_watchdog", main)
+                        self.assertEqual((work / "src/xiao_ota/xiao_ota_boot_io.c").read_bytes(),
+                                         (PREPARE.OVERLAY / "src/xiao_ota_boot_io.c").read_bytes())
+
+    def test_vendor_main_sequencing_anchor_drift_refuses_preparation(self):
+        source = self.source / "src/main.c"
+        original = source.read_text()
+        for needle, error in (
+                ('#include "boards.h"\n', "board include"),
+                ("  // Check all inputs and enter DFU if needed\n", "pending-update boundary"),
+                ("  if (!bootloader_must_be_reentered && \n", "application-jump gate"),
+                ("  if (_ota_was_connected) {\n", "BLE-reentry gate"),
+                ("                   (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin);\n",
+                 "double-reset detection"),
+                ("    if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {\n",
+                 "DFU-timeout gate")):
+            with self.subTest(anchor=needle):
+                self.assertEqual(original.count(needle), 1)
+                source.write_text(original.replace(needle, "", 1))
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.prepare()
+        source.write_text(original)
+
+    def main_harness(self, text):
+        extract = GhostFatSoftDeviceMetadataTest._extract_balanced_body
+        entry = "int main(void) {"
+        mode = "static void check_dfu_mode(void) {"
+        functions = ("static int bootloader_main(void) {" + extract(text, entry) + "}\n"
+                     + mode + extract(text, mode) + "}\n")
+        constants = text[text.index("#define DFU_MAGIC_OTA_APPJUM"):
+                         text.index("#define BLEGAP_EVENT_LENGTH")]
+        return r"""
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <setjmp.h>
+#include "xiao_ota_record.h"
+#define CHECK(condition) do { if (!(condition)) { \
+  fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #condition); exit(1); \
+} } while (0)
+#define MK_BOOTLOADER_VERSION 0x00000B00u
+#define BOOTLOADER_DFU_START XIAO_OTA_DFU_MAGIC_OTA_APPJUM
+#define POWER_RESETREAS_RESETPIN_Msk 1u
+#define PRINTF(...) ((void)0)
+#define BUTTON_DFU 18u
+#define BUTTON_DFU_OTA 3u
+#define STATE_BOOTLOADER_STARTED 1
+#define STATE_WRITING_STARTED 2
+#define STATE_WRITING_FINISHED 3
+#define STATE_USB_UNMOUNTED 4
+#define STATE_BLE_DISCONNECTED 5
+static struct { uint32_t GPREGRET, RESETREAS; } power;
+static struct { uint32_t CC[1]; } timer;
+#define NRF_POWER (&power)
+#define NRF_TIMER2 (&timer)
+""" + constants + r"""
+#undef APP_ASKS_FOR_SINGLE_TAP_RESET
+#define APP_ASKS_FOR_SINGLE_TAP_RESET() single_tap
+static uint32_t reset_marker, prior_marker;
+uint32_t *dbl_reset_mem = &reset_marker;
+bool _ota_dfu, _sd_inited, _ota_was_connected;
+static bool app_valid, pending, single_tap, receive_app, reset_during_swap, must_reenter;
+static bool ble_connect, pending_after_dfu;
+static bool cdc_only, dfu_ota, cancel_timeout;
+static unsigned hooks, swaps, finalizes, usb_calls, dfu_calls, delays, app_queries;
+static uint32_t hook_marker, dfu_timeout;
+enum { APP = 1, RESET, STALLED };
+static jmp_buf escape;
+static int hook_action;
+static void check_dfu_mode(void);
+void board_init(void) {}
+void bootloader_init(void) {}
+void led_state(int state) { (void)state; }
+_Noreturn void NVIC_SystemReset(void) { longjmp(escape, RESET); }
+bool bootloader_dfu_sd_in_progress(void) { return pending; }
+void bootloader_dfu_sd_update_continue(void) {
+  CHECK(hooks == 0 && pending && reset_marker == prior_marker);
+  ++swaps;
+  if (reset_during_swap) NVIC_SystemReset();
+}
+void bootloader_dfu_sd_update_finalize(void) {
+  CHECK(hooks == 0 && pending && swaps == 1);
+  ++finalizes;
+  pending = false;
+}
+void xiao_ota_boot_process(void) {
+  CHECK(!pending && !xiao_ota_explicit_dfu_requested(power.GPREGRET));
+  ++hooks;
+  hook_marker = reset_marker;
+  if (hook_action == STALLED) longjmp(escape, STALLED);
+  if (hook_action == RESET) {
+    power.GPREGRET = XIAO_OTA_DFU_MAGIC_UF2;
+    NVIC_SystemReset();
+  }
+}
+bool bootloader_must_reset_to_self(void) { return must_reenter; }
+void board_teardown(void) {}
+bool bootloader_app_is_valid(void) {
+  if (hooks && app_queries == 0) CHECK(reset_marker == prior_marker);
+  ++app_queries;
+  return app_valid;
+}
+bool is_sd_existed(void) { return false; }
+void mbr_init_sd(void) {}
+void disable_softdevice(void) {}
+_Noreturn void bootloader_app_start(void) { longjmp(escape, APP); }
+bool button_pressed(uint32_t pin) { (void)pin; return false; }
+void NRFX_DELAY_MS(unsigned delay) {
+  CHECK(delay == DFU_DBL_RESET_DELAY && reset_marker == DFU_DBL_RESET_MAGIC);
+  ++delays;
+}
+void ble_stack_init(void) {}
+void usb_init(bool serial_only) { ++usb_calls; cdc_only = serial_only; }
+void bootloader_dfu_start(bool ota, uint32_t timeout, bool cancel) {
+  ++dfu_calls;
+  dfu_ota = ota;
+  dfu_timeout = timeout;
+  cancel_timeout = cancel;
+  if (receive_app) app_valid = true;
+  if (ota && ble_connect) _ota_was_connected = true;
+  if (pending_after_dfu) pending = true;
+}
+void usb_teardown(void) {}
+""" + functions + r"""
+static void setup(uint32_t reason, uint32_t marker, uint32_t gpregret, bool valid) {
+  power.RESETREAS = reason;
+  power.GPREGRET = gpregret;
+  reset_marker = prior_marker = marker;
+  _ota_dfu = _sd_inited = _ota_was_connected = false;
+  app_valid = valid;
+  pending = single_tap = receive_app = reset_during_swap = must_reenter = false;
+  ble_connect = pending_after_dfu = false;
+  hooks = swaps = finalizes = usb_calls = dfu_calls = delays = app_queries = 0;
+  cdc_only = dfu_ota = cancel_timeout = false;
+  hook_marker = dfu_timeout = 0;
+  hook_action = 0;
+}
+static int boot(void) {
+  int outcome = setjmp(escape);
+  if (!outcome) bootloader_main();
+  return outcome;
+}
+int main(void) {
+  setup(0, 0, 0, true);
+  CHECK(boot() == APP && hooks == 1 && dfu_calls == 0);
+  setup(0, DFU_DBL_RESET_MAGIC, 0, true);
+  CHECK(boot() == APP && hooks == 1 && hook_marker == DFU_DBL_RESET_MAGIC);
+  setup(1, 0x11223344u, 0, true);
+  CHECK(boot() == APP && hooks == 1 && hook_marker == DFU_DBL_RESET_MAGIC && delays == 1);
+  setup(1, DFU_DBL_RESET_APP, 0, true);
+  single_tap = true;
+  CHECK(boot() == APP && hooks == 1 && delays == 0);
+  setup(1, 0, 0, true);
+  single_tap = true;
+  CHECK(boot() == APP && hooks == 1 && dfu_calls == 1 && dfu_timeout == 3000);
+  setup(0, 0, 0, true);
+  must_reenter = true;
+  CHECK(boot() == RESET && hooks == 1);
+
+  setup(1, 0, 0, false);
+  pending = true;
+  CHECK(boot() == RESET && swaps == 1 && finalizes == 1 && hooks == 1);
+  CHECK(hook_marker == DFU_DBL_RESET_MAGIC && dfu_calls == 1 && dfu_timeout == 0);
+  setup(1, 0, 0, false);
+  pending = reset_during_swap = true;
+  CHECK(boot() == RESET && swaps == 1 && finalizes == 0 && hooks == 0 && reset_marker == 0);
+  setup(1, DFU_DBL_RESET_MAGIC, XIAO_OTA_DFU_MAGIC_UF2, true);
+  pending = true;
+  CHECK(boot() == RESET && swaps == 1 && finalizes == 1 && hooks == 0);
+  CHECK(dfu_calls == 1 && dfu_timeout == 0);
+
+  setup(1, 0, 0, false);
+  hook_action = STALLED;
+  CHECK(boot() == STALLED && reset_marker == DFU_DBL_RESET_MAGIC && hooks == 1);
+  uint32_t armed = reset_marker;
+  setup(1, armed, 0, false);
+  receive_app = true;
+  CHECK(boot() == RESET && hooks == 0 && dfu_calls == 1 && usb_calls == 1);
+  CHECK(dfu_timeout == 0 && !cancel_timeout && !cdc_only);
+
+  setup(1, 0, 0, true);
+  hook_action = RESET;
+  CHECK(boot() == RESET && reset_marker == DFU_DBL_RESET_MAGIC);
+  CHECK(power.GPREGRET == XIAO_OTA_DFU_MAGIC_UF2);
+  setup(1, reset_marker, power.GPREGRET, true);
+  single_tap = true;
+  CHECK(boot() == RESET && hooks == 0 && dfu_calls == 1 && dfu_timeout == 0);
+
+  uint32_t const requests[] = { XIAO_OTA_DFU_MAGIC_UF2, XIAO_OTA_DFU_MAGIC_SERIAL,
+                               XIAO_OTA_DFU_MAGIC_OTA_RESET, XIAO_OTA_DFU_MAGIC_OTA_APPJUM };
+  for (unsigned i = 0; i < sizeof(requests) / sizeof(requests[0]); ++i) {
+    for (unsigned pin = 0; pin < 2; ++pin) {
+      setup(pin, 0, requests[i], true);
+      CHECK(boot() == RESET && hooks == 0 && dfu_calls == 1);
+      if (requests[i] == XIAO_OTA_DFU_MAGIC_UF2 ||
+          requests[i] == XIAO_OTA_DFU_MAGIC_SERIAL || NO_BLE) {
+        CHECK(usb_calls == 1 && dfu_timeout == 3000 && cancel_timeout);
+        CHECK(cdc_only == (requests[i] != XIAO_OTA_DFU_MAGIC_UF2));
+      } else {
+        CHECK(dfu_ota && usb_calls == 0 && dfu_timeout == 0);
+      }
+    }
+    setup(1, DFU_DBL_RESET_MAGIC, requests[i], true);
+    single_tap = receive_app = true;
+    CHECK(boot() == RESET && hooks == 0 && dfu_calls == 1 && dfu_timeout == 0);
+  }
+  setup(0, 0, DFU_MAGIC_SKIP, true);
+  CHECK(boot() == APP && hooks == 1 && dfu_calls == 0);
+  uint32_t const ble_requests[] = { XIAO_OTA_DFU_MAGIC_OTA_RESET, XIAO_OTA_DFU_MAGIC_OTA_APPJUM };
+  for (unsigned i = 0; i < sizeof(ble_requests) / sizeof(ble_requests[0]); ++i) {
+    setup(0, 0, ble_requests[i], false);
+    ble_connect = receive_app = true;
+    CHECK(boot() == RESET && hooks == 0 && app_valid && power.GPREGRET == 0);
+    CHECK(_ota_was_connected == !NO_BLE);
+    if (NO_BLE) CHECK(dfu_timeout == 3000);
+    uint32_t next_request = power.GPREGRET;
+    bool next_valid = app_valid;
+    setup(0, 0, next_request, next_valid);
+    CHECK(boot() == APP && hooks == 1 && dfu_calls == 0);
+
+    if (!NO_BLE) {
+      setup(0, 0, ble_requests[i], false);
+      ble_connect = true;
+      CHECK(boot() == RESET && hooks == 0 && _ota_was_connected);
+      CHECK(power.GPREGRET == XIAO_OTA_DFU_MAGIC_OTA_RESET);
+      setup(0, 0, ble_requests[i], true);
+      ble_connect = must_reenter = true;
+      CHECK(boot() == RESET && hooks == 0 && app_valid && _ota_was_connected);
+      CHECK(power.GPREGRET == XIAO_OTA_DFU_MAGIC_OTA_RESET);
+      setup(0, 0, ble_requests[i], true);
+      ble_connect = pending_after_dfu = true;
+      CHECK(boot() == RESET && hooks == 0 && pending && _ota_was_connected);
+      CHECK(power.GPREGRET == XIAO_OTA_DFU_MAGIC_OTA_RESET);
+    }
+  }
+  puts("PASS");
+  return 0;
+}
+"""
+
+    def run_main_harness(self, text, no_ble):
+        source = self.directory / "main-sequencing.c"
+        source.write_text(self.main_harness(text))
+        binary = self.directory / "main-sequencing"
+        compiled = subprocess.run(
+            ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+             f"-DNO_BLE={int(no_ble)}", "-I", str(PREPARE.OVERLAY / "include"),
+             str(source), str(PREPARE.OVERLAY / "src/xiao_ota_record.c"),
+             "-o", str(binary)], capture_output=True, text=True,
+            env=dict(os.environ, TMPDIR=str(self.directory)))
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        return subprocess.run([str(binary)], capture_output=True, text=True)
+
+    def test_prepared_main_executes_escape_and_bypass_gate_for_ble_and_no_ble(self):
+        for no_ble in (False, True):
+            with self.subTest(no_ble=no_ble):
+                text = (self.prepare(no_ble=no_ble) / "src/main.c").read_text()
+                result = self.run_main_harness(text, no_ble)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), "PASS")
+
+    def test_native_main_negative_controls_detect_unsafe_jump_and_lost_escape(self):
+        text = (self.prepare() / "src/main.c").read_text()
+        for before, after in (
+                ("if (ota_hook_ran && vendor_app_ready)",
+                 "if ((ota_hook_ran || true) && vendor_app_ready)"),
+                ("    if (ota_reset_pin) *dbl_reset_mem = DFU_DBL_RESET_MAGIC;",
+                 "    if (ota_reset_pin) *dbl_reset_mem = ota_prior_reset_marker;"),
+                ("!xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET)", "true"),
+                ("if (!double_reset &&", "if (double_reset ||")):
+            with self.subTest(mutation=before):
+                self.assertEqual(text.count(before), 1)
+                result = self.run_main_harness(text.replace(before, after, 1), True)
+                self.assertNotEqual(result.returncode, 0, "unsafe generated-main mutation passed")
+                self.assertIn("check failed", result.stderr)
+
+    def test_native_ble_negative_controls_detect_endless_reentry_and_lost_recovery(self):
+        text = (self.prepare(no_ble=False) / "src/main.c").read_text()
+        before = "vendor_app_ready ? 0 : DFU_MAGIC_OTA_RESET"
+        for after in ("DFU_MAGIC_OTA_RESET", "ota_hook_ran ? DFU_MAGIC_OTA_RESET : 0"):
+            with self.subTest(mutation=after):
+                self.assertEqual(text.count(before), 1)
+                result = self.run_main_harness(text.replace(before, after, 1), False)
+                self.assertNotEqual(result.returncode, 0, "unsafe BLE-reentry mutation passed")
+                self.assertIn("check failed", result.stderr)
+
 
 class HexReaderTest(unittest.TestCase):
     def test_valid_hex_extracts_marker(self):

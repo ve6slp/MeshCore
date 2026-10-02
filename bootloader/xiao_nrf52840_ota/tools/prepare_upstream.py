@@ -489,7 +489,13 @@ def main(argv=None):
 
     main = WORK / "src" / "main.c"
     text = main.read_text()
-    text = text.replace('#include "boards.h"\n', '#include "boards.h"\n#include "xiao_ota_boot.h"\n')
+    if text.count('#include "boards.h"\n') != 1:
+        raise SystemExit("pinned vendor board include changed")
+    text = text.replace(
+        '#include "boards.h"\n',
+        '#include "boards.h"\n#include "xiao_ota_boot.h"\n#include "xiao_ota_record.h"\n',
+        1,
+    )
     version_store = '  BOOTLOADER_VERSION_REGISTER = (MK_BOOTLOADER_VERSION);\n'
     if text.count(version_store) != 1:
         raise SystemExit("pinned vendor version assignment changed")
@@ -500,8 +506,86 @@ def main(argv=None):
         + version_store,
         1,
     )
-    needle = '  led_state(STATE_BOOTLOADER_STARTED);\n'
-    text = text.replace(needle, needle + "\n  xiao_ota_boot_process();\n", 1)
+    needle = (
+        '    led_state(STATE_WRITING_FINISHED);\n'
+        '  }\n\n'
+        '  // Check all inputs and enter DFU if needed\n'
+    )
+    if text.count(needle) != 1:
+        raise SystemExit("pinned vendor pending-update boundary changed")
+    text = text.replace(
+        needle,
+        '    led_state(STATE_WRITING_FINISHED);\n'
+        '  }\n\n'
+        '  uint32_t const ota_prior_reset_marker = *dbl_reset_mem;\n'
+        '  bool const ota_reset_pin =\n'
+        '      (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) != 0;\n'
+        '  bool const ota_physical_dfu =\n'
+        '      ota_reset_pin && ota_prior_reset_marker == DFU_DBL_RESET_MAGIC;\n'
+        '  bool ota_hook_ran = false;\n'
+        '  if (!ota_physical_dfu &&\n'
+        '      !xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET)) {\n'
+        '    // A second pin reset can escape even while the OTA hook is stalled.\n'
+        '    if (ota_reset_pin) *dbl_reset_mem = DFU_DBL_RESET_MAGIC;\n'
+        '    xiao_ota_boot_process();\n'
+        '    *dbl_reset_mem = ota_prior_reset_marker;\n'
+        '    ota_hook_ran = true;\n'
+        '  }\n\n'
+        '  // Check all inputs and enter DFU if needed\n',
+        1,
+    )
+    app_gate = (
+        '  if (!bootloader_must_be_reentered && \n'
+        '       bootloader_app_is_valid() && \n'
+        '      !bootloader_dfu_sd_in_progress()) {\n'
+    )
+    if text.count(app_gate) != 1:
+        raise SystemExit("pinned vendor application-jump gate changed")
+    text = text.replace(
+        app_gate,
+        '  bool const vendor_app_ready =\n'
+        '      !bootloader_must_be_reentered &&\n'
+        '      bootloader_app_is_valid() &&\n'
+        '      !bootloader_dfu_sd_in_progress();\n'
+        '  if (ota_hook_ran && vendor_app_ready) {\n',
+        1,
+    )
+    ble_reentry = (
+        '  if (_ota_was_connected) {\n'
+        '    NRF_POWER->GPREGRET = DFU_MAGIC_OTA_RESET;\n'
+        '  }\n'
+    )
+    if text.count(ble_reentry) != 1:
+        raise SystemExit("pinned vendor BLE-reentry gate changed")
+    text = text.replace(
+        ble_reentry,
+        '  if (_ota_was_connected) {\n'
+        '    NRF_POWER->GPREGRET = vendor_app_ready ? 0 : DFU_MAGIC_OTA_RESET;\n'
+        '  }\n',
+        1,
+    )
+    double_reset = (
+        '  bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu ||\n'
+        '                   (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin);\n'
+    )
+    if text.count(double_reset) != 1:
+        raise SystemExit("pinned vendor double-reset detection changed")
+    text = text.replace(
+        double_reset,
+        '  bool const double_reset =\n'
+        '      ((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin;\n'
+        '  bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu || double_reset;\n',
+        1,
+    )
+    timeout_gate = '    if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {\n'
+    if text.count(timeout_gate) != 1:
+        raise SystemExit("pinned vendor DFU-timeout gate changed")
+    text = text.replace(
+        timeout_gate,
+        '    if (!double_reset &&\n'
+        '        (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu)) {\n',
+        1,
+    )
     main.write_text(text)
 
     if args.no_ble:

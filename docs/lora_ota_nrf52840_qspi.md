@@ -252,6 +252,26 @@ injection must drive the actual `xiao_ota_boot_process_io()` processor and
 compare real application bytes and all 28 SDK settings bytes after cuts,
 not merely assert an outcome enum. Physical recovery is still unverified.
 
+### Startup escape and application integrity
+
+The overlay completes the vendor's pending bootloader or SoftDevice update
+handling before starting OTA checks. A reset-pin boot arms the existing
+double-reset marker throughout those checks and restores its previous value
+when they return. A second pin reset can therefore select vendor DFU without
+entering a stalled OTA hook. Physical double-reset DFU has no startup timeout.
+
+Explicit local DFU requests also bypass the OTA hook. A boot that bypasses
+the hook must reset rather than jump into the application when DFU ends or
+times out; the next ordinary boot must run the recovery checks first.
+Otherwise, the vendor's optional-CRC application policy could accept an
+incomplete copy. These guards do not add a startup watchdog, journal format
+or separate authorization system.
+
+This escape point follows vendor initialization and pending-update handling;
+it cannot bypass a fault before that point. These are replacement-software
+requirements, not a capability readback or recovery result from the target
+that stopped re-enumerating after commissioning.
+
 ## Reproducible qualification and installation gates
 
 The overlay is pinned to Adafruit_nRF52_Bootloader commit
@@ -309,9 +329,12 @@ the authorized candidate-owned windows above and preserve boot metadata.
 
 An early test exhausted the task stack, and a subsequent sysfs USB
 `authorized` toggle wedged enumeration. The target later returned to service.
-Current recovery uses the guarded `make lab-power-cycle-target` path;
-it must not bypass protected-device checks. The other authorized board is
-client serial `4186AE911D94CDB1`; the unrelated Pine device is excluded.
+Those incidents do not explain the later bootloader-commissioning failure
+on Oct. 2, 2026. The target remains inaccessible pending non-erasing SWD
+diagnosis; do not repeat historical power-cycle or flashing procedures.
+See the [current commissioning record](hardware_lab.md#bootloader-commissioning).
+The other authorized board is client serial `4186AE911D94CDB1`; the unrelated
+Pine device is excluded.
 
 The historical binary journal reader and floor-cleanup helper have been
 removed. They do not match the replacement's text repeater or candidate
