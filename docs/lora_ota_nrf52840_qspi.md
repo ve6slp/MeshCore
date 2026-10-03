@@ -72,19 +72,52 @@ remain. This is baseline arithmetic, not fit proof for either correction.
 | Two complete loader slots plus a selector | Two 40 KiB slots cannot fit the existing 40 KiB boot area. An example 80 KiB APP reservation lowers its limit to 626,688 bytes, before any additional selector cost. A second valid image does not itself detect a running loader hang |
 | Frozen OTAFIX recovery primary plus one fixed internal installer | A proposed 64 KiB reservation at `0xC4000..0xD4000` lowers APP capacity to 643,072 bytes. Primary-owned USB/BLE recovery can avoid QSPI and installer execution after an explicit reset escape. Target/client images of 538,360/548,772 bytes leave 104,712/94,300 bytes respectively |
 
-The immediate decision is to correct the two invariants on the current map
-and measure the integrated load. A fixed internal secondary is the preferred
-isolation option to evaluate if a separate recovery boundary is selected;
-whole-loader A/B, QSPI execution and an APP-resident shim are not substitutes
-for safe application-copy ordering.
+The integrated single-loader result now makes the capacity constraint
+concrete: all four board/role profiles need **39,436 bytes** (39,188 code plus
+248 initialized data), exceeding the 38,912-byte region by **524 bytes**.
+No valid ELF/HEX/UF2 was produced. Checks, cryptography and layout were not
+weakened to obtain a fit. The flash-completion/wake correction is source-reviewed
+at `c67d30db`; its separate pre-F2 build leaves 52 bytes, not integrated headroom.
 
-**No secondary reservation or handoff is approved or implemented.** It needs
-explicit approval of the reduced APP limit and a separately qualified
-primary/secondary ABI. Moving a binary is not sufficient: both existing
-runtimes use overlapping RAM, and a returning installer call is not the
-vendor's non-returning reset-vector jump. Every USB/BLE/LoRa writing path must
-exclude the reserved secondary and frozen primary. The vendor UF2 APP upper
-bound currently does not protect such a secondary.
+**The user approved the fixed OTAFIX-primary/internal-installer architecture
+for source implementation and qualification.** This is not authorization to
+flash a device. Both components are initially frozen, with no remote bootloader
+update path. The approved reservation is:
+
+| Range | Owner and limit |
+| --- | --- |
+| `0x27000..0xC4000` | APP, 643,072 bytes (628 KiB) |
+| `0xC4000..0xD4000` | fixed internal installer, 65,536 bytes |
+| `0xD4000..0xF4000` | both existing filesystems, unchanged |
+| `0xF4000..0xFE000` | minimally modified OTAFIX primary/configuration, unchanged start |
+| `0xFE000..0x100000` | MBR parameters and SDK settings, unchanged |
+
+The reservation is not yet wired into the live application/boot contracts.
+Moving a binary is not sufficient: both existing runtimes use overlapping RAM,
+and a returning installer call is not the vendor's non-returning reset-vector
+jump. A source prototype must establish a small typed ABI, disjoint runtime
+storage, retained reset escape and actual paired-artifact fit. Every
+USB/BLE/LoRa writing path must exclude the secondary, filesystems and primary.
+The vendor UF2 APP upper bound currently does not protect the new reservation.
+
+The F2 kernel's native cut model covers SDK invalidation and validity-last
+publication, but **vendor recovery writers are a coupled open dependency**.
+Pinned SDK11 `dfu_single_bank.c` starts APP erasure before the completed-erase
+callback invalidates bank0. That invalidates a global CRC0-fallback claim.
+Every destructive APP/staging writer needs a verified pre-erase barrier;
+compare the exact OTAFIX 2.3 implementation rather than assuming vendor-source
+versions are interchangeable. A valid image or recovery gate alone does not
+close that erase window. Whole-loader A/B, QSPI execution and an APP-resident
+shim are not substitutes for these copy/write invariants.
+
+The retained F2 review also found a recovery regression in the proposed strict
+SDK execution check: stock UF2 completion publishes VALID with CRC0 and **size0**,
+which that check correctly refuses as an unbounded extent. Preserving UF2
+recovery therefore requires fixing its actual writer to invalidate before the
+first APP write and publish the real bounded written extent with VALID last.
+Do not weaken the extent check or call native kernel cuts a UF2 recovery proof.
+The existing serial DFU path also publishes CRC0; simply rejecting CRC0
+fallback would disable it without closing interrupted UF2 writes.
 
 Neither A/B nor chaining protects the first replacement of the working
 primary. Keep the replacement's official OTAFIX unchanged until recovery
@@ -123,6 +156,10 @@ in the [Adafruit linker](https://github.com/adafruit/Adafruit_nRF52_Bootloader/b
 and [CustomLFS implementation](https://github.com/oltaco/CustomLFS/blob/0.2.3/src/CustomLFS_QSPIFlash.cpp).
 
 ## Fixed memory map
+
+This is the existing live contract, before integration of the approved
+primary/installer reservation above. Neither table is evidence of an installed
+custom loader; the replacement still runs the official vendor loader.
 
 ### Internal nRF52840 flash
 

@@ -147,7 +147,14 @@ compares same-map corrections, whole-loader A/B and a frozen OTAFIX primary
 with a fixed internal installer. A separate stage can isolate installer
 failure from recovery after commissioning, but cannot preserve the old
 primary during its first replacement or recreate a lost QSPI backup.
-No repartition or new hardware operation follows from this review.
+That assessment itself did not repartition storage or operate hardware.
+
+The later integrated source exceeds the current boot region by 524 bytes in
+all four board/role profiles. The user approved source work on the frozen
+OTAFIX-primary/internal-installer direction, not a new device flash. Vendor
+APP erasure before SDK invalidation is also a coupled recovery-write gap;
+it must be closed before claiming global zero-CRC fallback safety. None of
+these source results establishes what ran on the failed board.
 
 ## First SWD capture
 
