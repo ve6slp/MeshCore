@@ -128,6 +128,27 @@ gating. They neither establish this target's cause nor remove the vendor USB
 waits, and were not delivered to the inaccessible board. The 60-second
 watchdog is a trial-path mechanism, not protection for initial QSPI startup.
 
+## Later source review is not an incident diagnosis
+
+The code-only review of baseline `ccc0a77b` established two separate
+reliability defects: the QSPI adapter did not await physical erase/program
+completion or cancel pending buffer access on timeout, and destructive APP
+copies could keep the SDK bank VALID while QSPI failure handling forced
+recovery even for an intact APP. Corrections require bounded physical flash
+completion and a durable invalid-before-copy/valid-last boundary.
+
+Those error paths request vendor recovery; neither finding by itself
+explains persistent absence of USB on `3BE...`. The failed board has not
+received the later changes, and source fixes cannot establish its installed
+bytes, PC or fault state.
+
+The [recovery architecture assessment](lora_ota_nrf52840_qspi.md#bootloader-reliability-review-and-isolation-options)
+compares same-map corrections, whole-loader A/B and a frozen OTAFIX primary
+with a fixed internal installer. A separate stage can isolate installer
+failure from recovery after commissioning, but cannot preserve the old
+primary during its first replacement or recreate a lost QSPI backup.
+No repartition or new hardware operation follows from this review.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does

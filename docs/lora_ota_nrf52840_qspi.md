@@ -32,6 +32,66 @@ image using the admitted administrator's public key, not a second registry.
 See the [design](lora_ota_design.md), [administrator guide](lora_ota_administration.md)
 and [developer guide](lora_ota_development.md) for the common update policy.
 
+## Bootloader reliability review and isolation options
+
+The code-only review of baseline `ccc0a77b` found two mandatory reliability
+defects. They are not diagnoses of the original board's missing USB:
+
+| Finding | Required safety boundary |
+| --- | --- |
+| QSPI command completion was treated as physical erase/program completion | Wait for flash WIP to clear with bounded operation-specific deadlines. Stop peripheral/DMA access before returning an error so a queued transfer cannot outlive its buffer. Wake and wait for flash idle before startup admission |
+| QSPI failure forced recovery, while interrupted APP copies could retain SDK bank VALID | Durably invalidate the existing SDK bank before every destructive install/rollback entry or resume. Publish bank/CRC validity last, only after complete image verification and the other settings. Permit unavailable-QSPI fallback only when intact-bank evidence is sufficient; erased/torn/pending settings are not evidence |
+
+The existing SDK settings and original-settings sidecar are sufficient for
+this boundary; another authority, journal or replay ledger is not needed.
+An SDK page erase/rewrite can use the named INVALID value without relying on
+an uncertain number of repeated per-word programming pulses. Every successful
+barrier must be read back before the first APP erase. Restoration must retain
+the original 28 settings bytes, including an original zero CRC; a zero CRC
+alone is never integrity evidence.
+
+If QSPI is unavailable after a complete candidate has been published, an
+otherwise admissible internal image may be an **unconfirmed trial candidate**,
+not the previous healthy firmware. Such fallback must not count trials,
+confirm the candidate or advance the version floor. No bootloader arrangement
+can restore an application from a physically unavailable external backup.
+
+The current custom overlay is pinned to Adafruit
+`c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`. It is **not** the official
+OTAFIX 2.3 source `a62825be4733f500271c89b5ec489fd609748e97`, whose unmodified
+release has returned USB and booted ordinary/OTA applications on replacement
+`77CD...`. That vendor result does not qualify our custom installer.
+
+The reviewed baseline's four board/role ELF snapshots consume **38,460 of
+38,912 code-region bytes**, including initialized data: only **452 bytes**
+remain. This is baseline arithmetic, not fit proof for either correction.
+
+| Architecture | Capacity and recovery tradeoff |
+| --- | --- |
+| Correct the current single loader | No repartition, but corrected artifacts must fit. Recovery and installer remain in the same replacement image |
+| Two complete loader slots plus a selector | Two 40 KiB slots cannot fit the existing 40 KiB boot area. An example 80 KiB APP reservation lowers its limit to 626,688 bytes, before any additional selector cost. A second valid image does not itself detect a running loader hang |
+| Frozen OTAFIX recovery primary plus one fixed internal installer | A proposed 64 KiB reservation at `0xC4000..0xD4000` lowers APP capacity to 643,072 bytes. Primary-owned USB/BLE recovery can avoid QSPI and installer execution after an explicit reset escape. Target/client images of 538,360/548,772 bytes leave 104,712/94,300 bytes respectively |
+
+The immediate decision is to correct the two invariants on the current map
+and measure the integrated load. A fixed internal secondary is the preferred
+isolation option to evaluate if a separate recovery boundary is selected;
+whole-loader A/B, QSPI execution and an APP-resident shim are not substitutes
+for safe application-copy ordering.
+
+**No secondary reservation or handoff is approved or implemented.** It needs
+explicit approval of the reduced APP limit and a separately qualified
+primary/secondary ABI. Moving a binary is not sufficient: both existing
+runtimes use overlapping RAM, and a returning installer call is not the
+vendor's non-returning reset-vector jump. Every USB/BLE/LoRa writing path must
+exclude the reserved secondary and frozen primary. The vendor UF2 APP upper
+bound currently does not protect such a secondary.
+
+Neither A/B nor chaining protects the first replacement of the working
+primary. Keep the replacement's official OTAFIX unchanged until recovery
+access and commissioning are qualified. See the
+[incident notes](lora_ota_bootloader_failure_notes.md) for the distinction
+between source findings and the unresolved original activation failure.
+
 ## Hardware and existing storage
 
 The P25Q16H QSPI device has a 2 MiB capacity, 4 KiB erase sectors and
