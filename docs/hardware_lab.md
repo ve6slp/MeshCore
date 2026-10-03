@@ -782,6 +782,11 @@ genesis-floor and radio-installation acceptance therefore remain
 **blocked**, not passed. Do not repeat commissioning or bypass its guards
 to recover an inaccessible board.
 
+The [incident analysis and SWD arrival notes](lora_ota_bootloader_failure_notes.md)
+separate transfer acknowledgement from activation, record the exact failed
+artifact and recovery input, and describe how the first capture will
+guide triage of startup stalls, faults and MBR/loader-selection problems.
+
 ## Non-erasing SWD diagnosis
 
 **Target recovery and physical SWD diagnosis remain paused.**
@@ -883,6 +888,13 @@ make diagnose-xiao-nrf52-target-swd \
 ```
 
 Use `SWD_DIAGNOSE_PYTHON=/path/to/python` for a separate dependency environment.
+In the current lab, `.tmp/swd-venv` is not present. The already retained
+`.tmp/swd-pyocd` prefix was imported offline successfully as pyOCD 0.43.1 with
+the builtin NRF52840 target, without probe enumeration or a Session.
+It needs no reinstall: use `PYTHONPATH="$PWD/.tmp/swd-pyocd"` on the Make
+invocation and `SWD_DIAGNOSE_PYTHON=python3` instead. This dependency check is
+not physical probe/target qualification; all arrival and authorization gates
+above still apply.
 `make test-ota-lab-host` also discovers the product safety tests.
 The JSON and process exit must both be checked: `ok: false`, acquisition or
 state-restoration/teardown errors, or a nonzero exit are **not** a completed
