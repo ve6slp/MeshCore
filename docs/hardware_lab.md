@@ -145,6 +145,52 @@ proven recoverable commissioning; do not bypass the current refusal.
 Corrected source/artifacts and actual migration evidence are retained privately
 in `review-candidates/replacement-77-prefs-migration-04705d6a/`.
 
+**User-authorized vendor OTAFIX sequence completed, Oct. 3:** replacement
+`77CD44653A967172` now has the official XIAO nRF52840 **Sense** OTAFIX
+`0.9.2-OTAFIX2.3-BP1.4`, followed by the qualified ordinary MeshCore
+389,768-byte bench APP and then the corrected 538,360-byte OTA APP above.
+The SenseCAP Solar P1 and ThinkNode M6 files in Downloads were not used:
+their board identities are different, and a UF2 board rejection can happen
+after scratch writes have started.
+
+The digest-verified Sense NOSD UF2 supplied the boot bytes; its sparse erased
+gap was corroborated against the official combined ZIP's bootloader slice.
+The private, reviewed Make workflow generated a **bootloader-only serial**
+package, not a UF2 copy or combined SoftDevice update. Its 39,168-byte BIN
+SHA256 is `0cff4f0a0e95c017def050bc03a6898b6970316c0c5934ce36e4de949b34aa9e`;
+ZIP SHA256 is `54307f53efb36390ff4bb6b5c8e8d56466d8a0f2198040826c2f12a680a8ea24`.
+This route stages/erases APP bank0 through `0x31000` and writes the loader
+through `0xFD900`, page-rounded to `0xFE000`. ExtraFS and InternalFS are
+outside those ranges. Normal MBR-parameter/SDK-setting mutations are expected;
+no MBR, UICR or SoftDevice image was sent. Source inspection, 13 causal offline
+tests and scoped Opus 5.5 review closed before the single physical attempt.
+
+After transport acknowledgement, the user double-reset only 77 to select
+USB recovery: OTAFIX defaults to BLE DFU when the APP is invalid, so USB
+absence at that point alone is not a failed-loader diagnosis. Bounded,
+ancestry-matched read-only INFO then reported OTAFIX 2.3,
+`nRF52840-SeeedXiaoSense-v1` and S140 `7.3.0`. This is vendor metadata,
+not cryptographic installed-loader readback. Ordinary and corrected OTA
+APP-only restores returned to USB and preserved every captured public setting,
+both identities and the complete ADMIN ACL without setters or grants.
+
+A final physical single RESET retained application service, all settings/ACL,
+healthy stock proof `0000/B968`, and the same live boot/parameter addresses
+`0xF4000` / `0xFE000`. The `11:24:04Z` ordinary peer probe received a
+host-verified signed target advert (RSSI -18 dBm, SNR 12.25 dB); native
+companion acceptance and emission freshness were not established. Final
+driver-reported health had no faults, timeouts or accounting failures and
+zero OTA airtime. The unchanged client cache remained ABORTED generation 6
+with all 6,403 blocks.
+
+The target remains **CACHE_ONLY** with no confirmed version floor. Vendor
+OTAFIX improves USB/BLE DFU; it does not supply our LoRa install/rollback
+authority. Full three-mode image delivery, installation, trial/rollback and
+duty qualification remain incomplete. Pine and the failed 3BE were not
+operated. Reviewed helpers, vendor inputs, restoration packages and actual
+evidence are retained privately in
+`review-candidates/replacement-77-vendor-otafix-2.3-evidence/`.
+
 An inventory listing can override a role for one run without editing the file:
 
 ```sh
@@ -188,6 +234,11 @@ read-only whole-volume mount, and bounded stock `0.6.1` / S140 `7.3.0` INFO.
 Its JSON explicitly distinguishes vendor metadata from installed-byte proof
 and custom-loader qualification. Missing or mismatched evidence is a refusal,
 not permission to retry a flash.
+
+That inspector deliberately remains **0.6.1-only**. It must refuse the current
+replacement's newer OTAFIX metadata; do not loosen the old commissioning gate
+or relabel newer observations as passing it. The separately reviewed vendor
+operation retained its own bounded read-only post-update INFO evidence.
 
 The client uses `Xiao_nrf52_companion_radio_usb`; the remotely upgraded
 target uses `Xiao_nrf52_repeater_ota_usb` (`simple_repeater`). Override

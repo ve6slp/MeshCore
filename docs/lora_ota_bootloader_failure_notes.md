@@ -6,6 +6,14 @@ The replacement radio target is `77CD44653A967172`. This incident and its
 paused SWD diagnosis still concern only the original failed `3BE...` unit,
 bound by `[recovery] target` in the lab inventory, not the active OTA role.
 
+On Oct. 3 the replacement successfully completed a separately reviewed
+official Sense OTAFIX 2.3 bootloader-only serial update, documented in
+[the hardware lab results](hardware_lab.md). USB recovery returned after
+the user's double reset, and ordinary then corrected OTA applications retained
+settings/identity/ACL through a final physical reset. That positive vendor-route
+result on a different unit does not establish the original target's installed
+bytes or explain its failed custom-loader activation.
+
 ## Assessment
 
 The observed failure is **no USB return after the activation request**, not a
