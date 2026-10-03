@@ -65,14 +65,99 @@ RAM pointer to `qspi_write()`; the readback compare now checks against the
 same RAM buffer instead of re-reading flash through EasyDMA rules that don't
 apply to it. `tests/test_source.py` adds a source-level regression check that
 `copy_internal_to_qspi()`'s `qspi_write()` call is never given a
-`XIAO_OTA_APP_START`-based pointer. A genuine behavioural test (mocking the
-`NRF_QSPI` peripheral itself) is not included: `xiao_ota_boot.c` depends on
-the vendored Adafruit bootloader's hardware headers and isn't host-buildable
-without a much larger register-mock harness, and building a partial one that
-only covers this call site risked more confidence than it earns. The
-source-level check is what's actually shipped; treat this fix as verified by
-code review and the corrected size/behaviour above, not by an executed test,
-until real QSPI hardware confirms it.
+`XIAO_OTA_APP_START`-based pointer. That backup-staging check remains
+source-level; the adapter-only register model below does not execute the
+transaction processor or establish physical EasyDMA behavior.
+
+## Fixed: QSPI READY was not flash-write completion
+
+The production adapter formerly returned from erase/program on `EVENTS_READY`
+alone. An immediate journal write could then wait for the preceding erase
+inside its own 20 ms budget and time out with a queued EasyDMA source still
+owned by the peripheral. Erase and program now poll RDSR1 WIP after READY.
+Command/DMA transfer and WIP polling share one deadline: the existing 3000 ms
+erase budget or conservative 20 ms program budget; each status transfer also
+retains its 10 ms cap. Status-register setup uses the same completion helper.
+Timeouts deactivate/disable QSPI, clear stale events/DMA descriptors, and
+refuse subsequent data operations until reinitialization. Already accepted
+flash commands cannot be undone, so failure does **not** imply unchanged flash.
+DWT remains the timebase; 1024 consecutive unchanged counter samples fail
+closed even if the counter never starts/stops. This is a liveness guard, not
+a calibrated delay. NVMC and physical double-reset escape policy are unchanged.
+
+Pinned references (not measured timings):
+
+- [Nordic nrfx QSPI API, commit `7a4c9d946cf1801771fc180acdbf7b878f270093`,
+  lines 189–198 and 217–226](https://github.com/NordicSemiconductor/nrfx/blob/7a4c9d946cf1801771fc180acdbf7b878f270093/drivers/include/nrfx_qspi.h#L189-L226):
+  READY reports data sent, not flash completion.
+- [Same pinned driver's uninit, lines 324–343](https://github.com/NordicSemiconductor/nrfx/blob/7a4c9d946cf1801771fc180acdbf7b878f270093/drivers/src/nrfx_qspi.c#L324-L343)
+  supplies the deactivate/disable sequence;
+  [HAL lines 551–557](https://github.com/NordicSemiconductor/nrfx/blob/7a4c9d946cf1801771fc180acdbf7b878f270093/hal/nrf_qspi.h#L551-L557)
+  includes anomaly 122's workaround. The adapter adds a disable readback/DSB
+  before releasing caller buffers.
+- [P25Q16H datasheet, July 20, 2020](https://www.mantech.co.za/datasheets/products/102010448-241119a.pdf),
+  SHA256 `30814706719bdbe45237126abc605e083a02417aa6846d037e04d9396367fe24`:
+  table 5-4 (p11) specifies tPP max 3 ms per 256-byte page; table 5-3
+  (p10) specifies tW max 12 ms; §10.5 (p21–22) permits RDSR while busy
+  and defines WIP completion. The retained 3000 ms budget is conservative,
+  **not** a claim of measured erase time.
+- [Pinned nrfx finite-attempt wait pattern](https://github.com/NordicSemiconductor/nrfx/blob/7a4c9d946cf1801771fc180acdbf7b878f270093/drivers/nrfx_common.h#L180-L202)
+  motivates the independent bounded liveness escape.
+
+With the existing pinned upstream sources present:
+
+```sh
+make test-xiao-ota-qspi-adapter XIAO_OTA_ROLE_ID=1
+make qualify-xiao-ota-qspi-adapter XIAO_OTA_ROLE_ID=1
+```
+
+`test_qspi_adapter.c` compiles the actual production C adapter/vtable against
+minimal QSPI/DWT register emulation and the pinned SDK bitfields. Synthetic
+delayed erase (>20 ms), program WIP, shared deadline, lost/stale READY,
+returned-buffer reuse, error propagation, stopped clocks, and wraparound
+are exercised. Qualification builds baseline `ccc0a77b1813a3999dadb2ca465e42261f2f68ac`
+and guard-removed fixtures via Make, requires executed assertion failures
+(not compile failures), then requires all fixed cases to pass. Commands,
+source hashes and logs are retained in `.tmp/xiao-ota-qspi-qualification/`.
+This host model does not qualify silicon cancellation, electrical behavior,
+or custom bootloader hardware operation, and does not explain the old USB
+absence. No device actions are performed.
+
+### Follow-up: wake and wait for idle before identification
+
+Startup now sends single-byte `0xAB` (without WIPWAIT), permits flash wake
+recovery, and polls WIP idle **before** JEDEC/QE checks. Activation, wake, and
+initial idle share one 3000 ms budget: a reset does not cancel an external
+chip's erase. JEDEC/QE keep their existing per-command bounds and identity
+policy. Timeout disables the peripheral and refuses subsequent data operations.
+
+The same pinned P25Q16H PDF, §10.31 / figures 10-31–10-32 (p44–45), documents
+`0xAB`, its availability in deep power-down, and that it does not affect an
+in-progress program/erase. Table 5-3 gives tRES1/2 max 8 µs. A conservative
+10 µs delay uses the actual pinned
+[Adafruit nrfx glue](https://github.com/adafruit/Adafruit_nRF52_Bootloader/blob/c67f0bcf0fa8e841426335b1bbde91cda6ca1f50/src/nrfx_glue.h#L185-L202),
+which selects `NRFX_DELAY_DWT_BASED=0`, and Nordic's
+[finite instruction-loop implementation](https://github.com/NordicSemiconductor/nrfx/blob/7a4c9d946cf1801771fc180acdbf7b878f270093/soc/nrfx_coredep.h#L131-L174).
+A compile-time guard rejects a DWT-dependent delay configuration. Shared,
+non-inlined deadline/transfer helpers avoid duplicated code; none of the
+timeouts, status checks, crypto, layout, or transaction gates are removed.
+
+`test_qspi_startup.c` adds actual-adapter deep-powerdown, wake recovery,
+mid-erase (including activation waiting for idle), startup deadline,
+refusal/quiescence, and stopped-clock cases. `qualify_qspi_startup.py` requires
+the retained F1 source hash, executes assertion-failing before-wake and
+guard-removed controls, then passes the fixed cases:
+
+```sh
+make test-xiao-ota-qspi-startup XIAO_OTA_ROLE_ID=1
+make qualify-xiao-ota-qspi-startup XIAO_OTA_ROLE_ID=1 \
+  XIAO_OTA_QSPI_WAKE_BASELINE_SOURCE=.tmp/boot-f1-qualification/frozen-qualified-source/bootloader/xiao_nrf52840_ota/src/xiao_ota_boot.c
+```
+
+F1's qualified snapshot/records remain separate from this follow-up.
+ARM qualification must use an exact frozen overlay and account for both
+code/rodata **and initialized-data load**, including any marker overlap.
+These host cases and source-bound builds make no runtime hardware claims.
 
 ## Fixed: OTA permanently disabled after any rollback
 

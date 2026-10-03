@@ -6,19 +6,25 @@
 #include <string.h>
 
 #include "nrf.h"
+#include "nrfx.h"
+#include "nrf_qspi.h"
 #include "xiao_ota_layout.h"
 #include "xiao_ota_record.h"
 
+#if NRFX_DELAY_DWT_BASED
+#error "QSPI wake requires the pinned finite non-DWT nrfx delay"
+#endif
+
 /*
  * Real nRF52840 QSPI/NVMC/WDT/FICR/GPREGRET register access. Thin,
- * unchanged register-level adapters implementing the xiao_ota_io_t
+ * register-level adapters implementing the xiao_ota_io_t
  * contract (xiao_ota_boot_io.h) -- all actual OTA transaction decision
  * logic lives in xiao_ota_boot_io.c's xiao_ota_boot_process_io(), which
  * this file only wires up to real hardware and calls unmodified. A
  * native host test builds the exact same xiao_ota_boot_process_io()
  * against a fake, in-memory xiao_ota_io_t instead (tests/fake_io.c) --
- * this file is never part of that build, since it has no SDK-independent
- * host build target of its own.
+ * tests/test_qspi_adapter.c also builds this production adapter against
+ * a minimal QSPI/DWT register model (not the transaction processor).
  */
 
 /*
@@ -57,21 +63,23 @@ static void hw_ensure_cycle_counter_enabled(void) {
 }
 
 static inline uint32_t hw_deadline_cycles(uint32_t timeout_ms) {
-  return (uint32_t)(((uint64_t)timeout_ms * XIAO_OTA_HW_CPU_HZ) / 1000u);
+  /* All private callers use <= 3000 ms; 64 MHz is divisible by 1000.
+   * The product fits uint32_t, without a runtime 64-bit division. */
+  return timeout_ms * (XIAO_OTA_HW_CPU_HZ / 1000u);
 }
 
-/* QSPI peripheral bring-up (PSEL/IFCONFIG/ENABLE/ACTIVATE): sub-millisecond
- * in practice; bounded generously at 10 ms. */
-#define XIAO_OTA_HW_QSPI_ACTIVATE_TIMEOUT_MS (10u)
+/* Activation, wake, and initial flash-idle polling share the erase budget:
+ * the MCU may have reset while the external chip was still erasing. */
+#define XIAO_OTA_HW_QSPI_STARTUP_TIMEOUT_MS (3000u)
 /* P25Q16H custom single-byte status-register read/write instructions:
  * bounded generously at 10 ms (far above any real SPI-NOR status-register
  * command turnaround). */
 #define XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS (10u)
-/* P25Q16H page-program worst case (datasheet tPP, up to a 256-byte page):
- * a few milliseconds typical; bounded at 20 ms. */
+/* P25Q16H datasheet July 20, 2020, table 5-4: tPP max 3 ms for
+ * up to 256 bytes. Allow 20 ms for transfer plus final WIP completion. */
 #define XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS (20u)
-/* P25Q16H 4 KiB sector-erase worst case (datasheet tSE): hundreds of ms
- * typical; bounded generously at 3000 ms. */
+/* Retain the conservative 3000 ms sector-erase budget; it covers both
+ * command transfer and flash WIP completion, not just EVENTS_READY. */
 #define XIAO_OTA_HW_QSPI_ERASE_TIMEOUT_MS (3000u)
 /* nRF52840 NVMC page-erase worst case (product specification tERASEPAGE):
  * bounded generously at 200 ms. */
@@ -80,15 +88,78 @@ static inline uint32_t hw_deadline_cycles(uint32_t timeout_ms) {
  * specification tWRITE): bounded generously at 5 ms per word. */
 #define XIAO_OTA_HW_NVMC_WRITE_TIMEOUT_MS (5u)
 
-static bool qspi_wait_for(uint32_t timeout_ms) {
+/* DWT remains the timebase. Like nrfx's finite-attempt waits, this
+ * independent liveness guard also terminates if CYCCNT never starts or
+ * stops. It is NOT a wall-clock timeout or a calibrated iteration delay. */
+#define XIAO_OTA_HW_DWT_STAGNANT_READ_LIMIT (1024u)
+
+typedef struct {
+  uint32_t start;
+  uint32_t last;
+  uint32_t cycles;
+  uint32_t stagnant_reads;
+} qspi_deadline_t;
+
+/* Share this initializer in the size-constrained boot image; inlining it
+ * duplicates DWT bring-up at every transfer/status-poll call site. */
+static __attribute__((noinline)) void qspi_deadline_start(
+    qspi_deadline_t *deadline, uint32_t timeout_ms) {
   hw_ensure_cycle_counter_enabled();
-  const uint32_t start = DWT->CYCCNT;
-  const uint32_t deadline_cycles = hw_deadline_cycles(timeout_ms);
-  while (NRF_QSPI->EVENTS_READY == 0) {
-    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
+  const uint32_t now = DWT->CYCCNT;
+  deadline->start = deadline->last = now;
+  deadline->cycles = hw_deadline_cycles(timeout_ms);
+  deadline->stagnant_reads = 0;
+}
+
+static bool qspi_deadline_expired(qspi_deadline_t *deadline) {
+  const uint32_t now = DWT->CYCCNT;
+  if (now == deadline->last) {
+    if (++deadline->stagnant_reads >= XIAO_OTA_HW_DWT_STAGNANT_READ_LIMIT) {
+      return true;
+    }
+  } else {
+    deadline->last = now;
+    deadline->stagnant_reads = 0;
+  }
+  return (uint32_t)(now - deadline->start) >= deadline->cycles;
+}
+
+static void qspi_quiesce(void) {
+  /* Match pinned nrfx_qspi_uninit(): deactivate, then disable using the
+   * HAL (including anomaly 122's workaround). Do not wait for READY:
+   * it may be the event that never arrives. Disable/readback + DSB
+   * precede returning ownership of any EasyDMA buffer to the caller.
+   * This cannot undo a command already accepted by the flash chip. */
+  NRF_QSPI->INTENCLR = QSPI_INTENCLR_READY_Msk;
+  NRF_QSPI->TASKS_DEACTIVATE = 1;
+  nrf_qspi_disable(NRF_QSPI);
+  (void)NRF_QSPI->ENABLE;
+  __DSB();
+  NRF_QSPI->EVENTS_READY = 0;
+  NRF_QSPI->READ.CNT = 0;
+  NRF_QSPI->READ.DST = 0;
+  NRF_QSPI->WRITE.CNT = 0;
+  NRF_QSPI->WRITE.SRC = 0;
+}
+
+static bool qspi_wait_ready(qspi_deadline_t *deadline,
+                            qspi_deadline_t *operation_deadline) {
+  for (;;) {
+    if (qspi_deadline_expired(deadline) ||
+        (operation_deadline && qspi_deadline_expired(operation_deadline))) {
+      qspi_quiesce();
+      return false;
+    }
+    if (NRF_QSPI->EVENTS_READY != 0) break;
   }
   NRF_QSPI->EVENTS_READY = 0;
   return true;
+}
+
+static bool qspi_wait_for(uint32_t timeout_ms) {
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, timeout_ms);
+  return qspi_wait_ready(&deadline, NULL);
 }
 
 static bool nvmc_wait_for(uint32_t timeout_ms) {
@@ -132,20 +203,37 @@ static bool nvmc_wait_for(uint32_t timeout_ms) {
 #define XIAO_OTA_P25Q16H_OPCODE_RDSR2 (0x35u)
 #define XIAO_OTA_P25Q16H_OPCODE_WREN (0x06u)
 #define XIAO_OTA_P25Q16H_OPCODE_WRSR2 (0x31u)
+#define XIAO_OTA_P25Q16H_OPCODE_RELEASE_DPD (0xABu)
 #define XIAO_OTA_P25Q16H_SR2_QE_BIT (0x02u)
 #define XIAO_OTA_P25Q16H_SR1_WIP_BIT (0x01u)
 #define XIAO_OTA_HW_QSPI_CINSTR_LEVELS \
   (QSPI_CINSTRCONF_LIO2_Msk | QSPI_CINSTRCONF_LIO3_Msk)
 
-static bool qspi_cinstr_read_byte(uint8_t opcode, uint8_t *out_byte) {
+static __attribute__((noinline)) bool qspi_cinstr_transfer(
+    uint32_t configuration, qspi_deadline_t *operation_deadline) {
   NRF_QSPI->EVENTS_READY = 0;
-  NRF_QSPI->CINSTRCONF =
-      ((uint32_t)opcode << QSPI_CINSTRCONF_OPCODE_Pos) |
-      (QSPI_CINSTRCONF_LENGTH_2B << QSPI_CINSTRCONF_LENGTH_Pos) |
-      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
-  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS)) return false;
+  NRF_QSPI->CINSTRCONF = configuration | XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
+  qspi_deadline_t transfer;
+  qspi_deadline_start(&transfer, XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS);
+  return qspi_wait_ready(&transfer, operation_deadline);
+}
+
+static bool qspi_cinstr_read_byte_until(uint8_t opcode, uint8_t *out_byte,
+                                       qspi_deadline_t *operation_deadline) {
+  if (operation_deadline && qspi_deadline_expired(operation_deadline)) {
+    qspi_quiesce();
+    return false;
+  }
+  if (!qspi_cinstr_transfer(
+          ((uint32_t)opcode << QSPI_CINSTRCONF_OPCODE_Pos) |
+          (QSPI_CINSTRCONF_LENGTH_2B << QSPI_CINSTRCONF_LENGTH_Pos),
+          operation_deadline)) return false;
   *out_byte = (uint8_t)(NRF_QSPI->CINSTRDAT0 & 0xFFu);
   return true;
+}
+
+static bool qspi_cinstr_read_byte(uint8_t opcode, uint8_t *out_byte) {
+  return qspi_cinstr_read_byte_until(opcode, out_byte, NULL);
 }
 
 /* Polls the flash's OWN Write-In-Progress bit (status register 1, bit 0)
@@ -156,46 +244,47 @@ static bool qspi_cinstr_read_byte(uint8_t opcode, uint8_t *out_byte) {
  * instruction started -- neither proves the write this function just
  * issued has itself finished committing inside the flash part. This is
  * the only way to actually confirm that. */
-static bool qspi_wait_flash_write_complete(void) {
-  hw_ensure_cycle_counter_enabled();
-  const uint32_t start = DWT->CYCCNT;
-  const uint32_t deadline_cycles =
-      hw_deadline_cycles(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS);
+static bool qspi_wait_flash_write_complete(qspi_deadline_t *deadline) {
   for (;;) {
     uint8_t status = 0;
-    if (!qspi_cinstr_read_byte(XIAO_OTA_P25Q16H_OPCODE_RDSR1, &status)) {
+    if (!qspi_cinstr_read_byte_until(XIAO_OTA_P25Q16H_OPCODE_RDSR1,
+                                    &status, deadline)) {
       return false;
     }
     if ((status & XIAO_OTA_P25Q16H_SR1_WIP_BIT) == 0) return true;
-    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
   }
 }
 
+static bool qspi_cinstr_command(
+    uint8_t opcode, qspi_deadline_t *operation_deadline) {
+  return qspi_cinstr_transfer(
+      ((uint32_t)opcode << QSPI_CINSTRCONF_OPCODE_Pos) |
+      (QSPI_CINSTRCONF_LENGTH_1B << QSPI_CINSTRCONF_LENGTH_Pos),
+      operation_deadline);
+}
+
 static bool qspi_cinstr_write_enable(void) {
-  NRF_QSPI->EVENTS_READY = 0;
-  NRF_QSPI->CINSTRCONF =
-      ((uint32_t)XIAO_OTA_P25Q16H_OPCODE_WREN << QSPI_CINSTRCONF_OPCODE_Pos) |
-      (QSPI_CINSTRCONF_LENGTH_1B << QSPI_CINSTRCONF_LENGTH_Pos) |
-      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
-  return qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS);
+  return qspi_cinstr_command(XIAO_OTA_P25Q16H_OPCODE_WREN, NULL);
 }
 
 static bool qspi_cinstr_write_sr2(uint8_t value) {
+  /* tW max 12 ms (P25Q16H table 5-3); share the conservative 20 ms
+   * program budget across WREN, transfer, and WIP polling. */
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
   if (!qspi_cinstr_write_enable()) return false;
   NRF_QSPI->CINSTRDAT0 = value;
-  NRF_QSPI->EVENTS_READY = 0;
-  NRF_QSPI->CINSTRCONF =
+  if (!qspi_cinstr_transfer(
       ((uint32_t)XIAO_OTA_P25Q16H_OPCODE_WRSR2 << QSPI_CINSTRCONF_OPCODE_Pos) |
       (QSPI_CINSTRCONF_LENGTH_2B << QSPI_CINSTRCONF_LENGTH_Pos) |
       (QSPI_CINSTRCONF_WIPWAIT_Enable << QSPI_CINSTRCONF_WIPWAIT_Pos) |
-      XIAO_OTA_HW_QSPI_CINSTR_LEVELS;
-  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_CINSTR_TIMEOUT_MS)) return false;
+      XIAO_OTA_HW_QSPI_CINSTR_LEVELS, &deadline)) return false;
   /* WIPWAIT above only guaranteed the flash was idle BEFORE this WRSR2
    * instruction was issued (see the comment on
    * qspi_wait_flash_write_complete()); explicitly poll WIP now to prove
    * this status-register write itself has actually committed before any
    * caller trusts a subsequent QE readback. */
-  return qspi_wait_flash_write_complete();
+  return qspi_wait_flash_write_complete(&deadline);
 }
 
 /* Confirms the external flash's Quad Enable bit is set, setting it if
@@ -214,6 +303,17 @@ static bool qspi_confirm_quad_enable(void) {
   return (status & XIAO_OTA_P25Q16H_SR2_QE_BIT) != 0;
 }
 
+static bool qspi_wake_and_wait_idle(qspi_deadline_t *deadline) {
+  if (!qspi_cinstr_command(XIAO_OTA_P25Q16H_OPCODE_RELEASE_DPD, deadline)) {
+    return false;
+  }
+  /* P25Q16H table 5-3 / section 10.31: tRES1/2 max 8 us.
+   * Use the SDK's finite instruction-loop delay, not DWT-dependent wait.
+   * No WIPWAIT on AB: a sleeping chip cannot answer status polls. */
+  NRFX_DELAY_US(10u);
+  return qspi_wait_flash_write_complete(deadline);
+}
+
 /* Both supported board profiles use P25Q16H (JEDEC 85:60:15).
  * READY/QE alone can succeed with floating or wrong-part read data. */
 static bool qspi_confirm_jedec(void) {
@@ -228,6 +328,8 @@ static bool qspi_confirm_jedec(void) {
 
 static bool hw_qspi_init(void *ctx) {
   (void)ctx;
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, XIAO_OTA_HW_QSPI_STARTUP_TIMEOUT_MS);
   NRF_QSPI->PSEL.SCK = XIAO_OTA_QSPI_SCK_PIN;
   NRF_QSPI->PSEL.CSN = XIAO_OTA_QSPI_CS_PIN;
   NRF_QSPI->PSEL.IO0 = XIAO_OTA_QSPI_IO0_PIN;
@@ -244,7 +346,8 @@ static bool hw_qspi_init(void *ctx) {
   NRF_QSPI->ENABLE = QSPI_ENABLE_ENABLE_Enabled;
   NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->TASKS_ACTIVATE = 1;
-  if (!qspi_wait_for(XIAO_OTA_HW_QSPI_ACTIVATE_TIMEOUT_MS)) return false;
+  if (!qspi_wait_ready(&deadline, NULL) ||
+      !qspi_wake_and_wait_idle(&deadline)) return false;
   /* IFCONFIG0 above already programs the NRF QSPI PERIPHERAL for quad
    * read/program, but that says nothing about the FLASH CHIP's own Quad
    * Enable bit -- confirm/set it explicitly rather than assuming a prior
@@ -255,29 +358,43 @@ static bool hw_qspi_init(void *ctx) {
 static bool hw_qspi_read(void *ctx, uint32_t address, void *destination,
                          size_t length) {
   (void)ctx;
+  if (NRF_QSPI->ENABLE != QSPI_ENABLE_ENABLE_Enabled) return false;
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
+  NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->READ.SRC = address;
   NRF_QSPI->READ.DST = (uint32_t)destination;
   NRF_QSPI->READ.CNT = length;
   NRF_QSPI->TASKS_READSTART = 1;
-  return qspi_wait_for(XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
+  return qspi_wait_ready(&deadline, NULL);
 }
 
 static bool hw_qspi_write(void *ctx, uint32_t address, const void *source,
                           size_t length) {
   (void)ctx;
+  if (NRF_QSPI->ENABLE != QSPI_ENABLE_ENABLE_Enabled) return false;
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
+  NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->WRITE.SRC = (uint32_t)source;
   NRF_QSPI->WRITE.DST = address;
   NRF_QSPI->WRITE.CNT = length;
   NRF_QSPI->TASKS_WRITESTART = 1;
-  return qspi_wait_for(XIAO_OTA_HW_QSPI_PROGRAM_TIMEOUT_MS);
+  return qspi_wait_ready(&deadline, NULL) &&
+         qspi_wait_flash_write_complete(&deadline);
 }
 
 static bool hw_qspi_erase_sector(void *ctx, uint32_t address) {
   (void)ctx;
+  if (NRF_QSPI->ENABLE != QSPI_ENABLE_ENABLE_Enabled) return false;
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, XIAO_OTA_HW_QSPI_ERASE_TIMEOUT_MS);
+  NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->ERASE.PTR = address;
   NRF_QSPI->ERASE.LEN = QSPI_ERASE_LEN_LEN_4KB;
   NRF_QSPI->TASKS_ERASESTART = 1;
-  return qspi_wait_for(XIAO_OTA_HW_QSPI_ERASE_TIMEOUT_MS);
+  return qspi_wait_ready(&deadline, NULL) &&
+         qspi_wait_flash_write_complete(&deadline);
 }
 
 static bool hw_internal_erase_page(void *ctx, uint32_t address) {

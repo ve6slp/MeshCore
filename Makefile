@@ -589,6 +589,51 @@ qualify-xiao-ota-bootloader: tmpdir
 	    done; \
 	  done
 
+.PHONY: test-xiao-ota-qspi-adapter test-xiao-ota-qspi-startup qualify-xiao-ota-qspi-adapter qualify-xiao-ota-qspi-startup build-xiao-ota-qspi-frozen
+build-xiao-ota-qspi-frozen: tmpdir
+	@test -n "$(XIAO_OTA_QSPI_FROZEN_WORK)" && test -r "$(XIAO_OTA_QSPI_FROZEN_WORK)/Makefile"
+	@$(MAKE) -C "$(XIAO_OTA_QSPI_FROZEN_WORK)" BOARD="$(XIAO_OTA_VENDOR_BOARD)" clean
+	@out="$$( $(MAKE) -s --no-print-directory -C "$(XIAO_OTA_QSPI_FROZEN_WORK)" BOARD="$(XIAO_OTA_VENDOR_BOARD)" print-OUT_NAME | sed 's/^OUT_NAME = //' )"; \
+	  SOURCE_DATE_EPOCH="$(XIAO_OTA_SOURCE_DATE_EPOCH)" $(MAKE) -C "$(XIAO_OTA_QSPI_FROZEN_WORK)" BOARD="$(XIAO_OTA_VENDOR_BOARD)" \
+	    "$(XIAO_OTA_VENDOR_BUILD_DIR)/$${out}.out" \
+	    "$(XIAO_OTA_VENDOR_BUILD_DIR)/$${out}_nosd.hex" \
+	    "$(XIAO_OTA_VENDOR_BUILD_DIR)/update-$${out}_nosd.uf2"
+	@python3 bootloader/xiao_nrf52840_ota/tools/report_size.py \
+	  "$$(find "$(XIAO_OTA_QSPI_FROZEN_WORK)/$(XIAO_OTA_VENDOR_BUILD_DIR)" -maxdepth 1 -name '*.out' | head -1)" \
+	  --slot-bytes 38912
+
+qualify-xiao-ota-qspi-startup: tmpdir
+	python3 bootloader/xiao_nrf52840_ota/tests/qualify_qspi_startup.py \
+	  --work-dir "$(TMPDIR)/xiao-ota-qspi-startup-qualification" \
+	  --baseline-source "$(XIAO_OTA_QSPI_WAKE_BASELINE_SOURCE)" \
+	  --upstream "$(XIAO_OTA_UPSTREAM)" --cc "$(CC)" --role-id "$(XIAO_OTA_ROLE_ID)"
+
+test-xiao-ota-qspi-startup:
+	$(MAKE) --no-print-directory test-xiao-ota-qspi-adapter \
+	  XIAO_OTA_QSPI_TEST_SOURCE=bootloader/xiao_nrf52840_ota/tests/test_qspi_startup.c
+
+qualify-xiao-ota-qspi-adapter: tmpdir
+	python3 bootloader/xiao_nrf52840_ota/tests/qualify_qspi_adapter.py \
+	  --work-dir "$(TMPDIR)/xiao-ota-qspi-qualification" \
+	  --upstream "$(XIAO_OTA_UPSTREAM)" --cc "$(CC)" \
+	  --role-id "$(XIAO_OTA_ROLE_ID)" --board-target "$(XIAO_OTA_TEST_BOARD_TARGET)" \
+	  $(if $(XIAO_OTA_QSPI_BASELINE_REF),--baseline-ref "$(XIAO_OTA_QSPI_BASELINE_REF)")
+
+test-xiao-ota-qspi-adapter: tmpdir
+	@mkdir -p "$(TMPDIR)/xiao-ota-qspi-host"
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fno-pie -no-pie \
+	  -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast \
+	  -Ibootloader/xiao_nrf52840_ota/tests/qspi_mock \
+	  -I"$(XIAO_OTA_UPSTREAM)/lib/nrfx/mdk" \
+	  -Ibootloader/xiao_nrf52840_ota/include \
+	  -Ibootloader/xiao_nrf52840_ota/src \
+	  -DXIAO_OTA_COMPILED_ROLE_ID="$(XIAO_OTA_ROLE_ID)" \
+	  -DXIAO_OTA_BOARD_TARGET="$(XIAO_OTA_TEST_BOARD_TARGET)" \
+	  $(if $(XIAO_OTA_QSPI_ADAPTER_SOURCE),$(XIAO_OTA_QSPI_ADAPTER_SOURCE),bootloader/xiao_nrf52840_ota/src/xiao_ota_boot.c) \
+	  $(if $(XIAO_OTA_QSPI_TEST_SOURCE),$(XIAO_OTA_QSPI_TEST_SOURCE),bootloader/xiao_nrf52840_ota/tests/test_qspi_adapter.c) \
+	  -o "$(TMPDIR)/xiao-ota-qspi-host/test_qspi_adapter"
+	"$(TMPDIR)/xiao-ota-qspi-host/test_qspi_adapter" $(XIAO_OTA_QSPI_TEST_CASE)
+
 test-xiao-ota-boot-process: tmpdir
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"
 	$(CC) $(XIAO_OTA_BOOT_PROCESS_CFLAGS) \
