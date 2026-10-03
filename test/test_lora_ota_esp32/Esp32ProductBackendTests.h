@@ -4,9 +4,46 @@
 #include <helpers/ota/OtaFirmwareBackend.h>
 #include <helpers/ota/OtaFirmwareIntegration.h>
 #include <helpers/ota/OtaEsp32RollbackGuard.h>
+#include <helpers/ota/OtaMeshTrialHealthTick.h>
 #include <ota/trust/Ed25519SignatureVerifier.h>
 #include "../test_lora_ota_trust/Ed25519TestSigner.h"
 #include "Esp32SdkModel.h"
+
+namespace {
+mesh::ota::Esp32TrialController* shared_health_controller = nullptr;
+mesh::ota::OtaBoardTrialHealthOutcome shared_health_outcome = mesh::ota::OtaBoardTrialHealthOutcome::Pending;
+uint32_t shared_health_queries = 0;
+
+bool sharedUnknownServiceHeld() {
+  ++shared_health_queries;
+  return shared_health_controller == nullptr || shared_health_controller->unknownServiceHeld();
+}
+bool sharedUnknownServiceNotHeld() { return false; }
+
+class SharedHealthBridge {
+public:
+  explicit SharedHealthBridge(mesh::ota::Esp32TrialController* controller = nullptr) {
+    shared_health_controller = controller;
+    shared_health_queries = 0;
+  }
+  ~SharedHealthBridge() {
+    shared_health_controller = nullptr;
+    shared_health_outcome = mesh::ota::OtaBoardTrialHealthOutcome::Pending;
+  }
+};
+}
+
+mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(
+    uint32_t now_ms, bool radio_ready, bool filesystem_ready, bool loop_healthy) {
+  if (shared_health_controller == nullptr) return shared_health_outcome;
+  switch (shared_health_controller->tick(now_ms, radio_ready, filesystem_ready, loop_healthy)) {
+    case mesh::ota::Esp32TrialHealthOutcome::Confirmed: return mesh::ota::OtaBoardTrialHealthOutcome::Confirmed;
+    case mesh::ota::Esp32TrialHealthOutcome::DeadlineExpired: return mesh::ota::OtaBoardTrialHealthOutcome::DeadlineExpired;
+    case mesh::ota::Esp32TrialHealthOutcome::ConfirmationUncertain: return mesh::ota::OtaBoardTrialHealthOutcome::ConfirmationUncertain;
+    case mesh::ota::Esp32TrialHealthOutcome::StateUnreadable: return mesh::ota::OtaBoardTrialHealthOutcome::StateUnreadable;
+    default: return mesh::ota::OtaBoardTrialHealthOutcome::Pending;
+  }
+}
 
 namespace {
 
@@ -96,6 +133,132 @@ Esp32RunningProof InstallModel::runningProof(uint32_t& counter) {
   ReadOnlyAppModel reader(sdk, sdk.snapshot.running);
   return readEsp32RunningProof(sdk, reader, policy, signatures, counter);
 }
+
+class CausalNvsModel {
+public:
+  explicit CausalNvsModel(Esp32PartitionModel& sdk, uint32_t floor) : sdk(sdk) { storeFloor(floor); }
+  Esp32PartitionModel& sdk;
+  Esp32SdkError initError = kEsp32Ok;
+  bool initialized = true, floorKnown = true, failVerification = false, failNextRead = false, readFault = false;
+  uint32_t erases = 0;
+  uint32_t storedFloor() const {
+    const auto* bytes = sdk.bytes.data() + Esp32S3PartitionLayout::entry(0).address + 64;
+    return usb::getBE32(bytes);
+  }
+  void storeFloor(uint32_t floor) {
+    auto* bytes = sdk.bytes.data() + Esp32S3PartitionLayout::entry(0).address + 64;
+    for (uint32_t i = 0; i < 4; ++i) bytes[i] = static_cast<uint8_t>(floor >> (24 - 8 * i));
+    floorKnown = true;
+  }
+  bool readFloor(uint32_t& floor, bool& found) {
+    floor = 0;
+    found = false;
+    if (!initialized || failNextRead || readFault) { failNextRead = false; return false; }
+    found = floorKnown;
+    if (found) floor = storedFloor();
+    return true;
+  }
+  bool saveFloor(uint32_t counter) {
+    uint32_t floor;
+    bool found;
+    if (!readFloor(floor, found)) return false;
+    if (counter > floor) storeFloor(counter);
+    failNextRead = failVerification;
+    return readFloor(floor, found) && found && floor >= counter;
+  }
+  void eraseExplicitly() {
+    const auto partition = Esp32S3PartitionLayout::entry(0);
+    std::fill(sdk.bytes.begin() + partition.address, sdk.bytes.begin() + partition.address + partition.size, 0xff);
+    ++erases;
+    floorKnown = false;
+    initError = kEsp32Ok;
+  }
+  Esp32SdkError initArduinoNvs(bool ota_enabled = true) {
+    // The pinned core calls init, formats on these two errors, then retries.
+    auto result = ota_enabled ? esp32NvsStartupInitResult(initError) : initError;
+    if (result == kEsp32NvsNoFreePages || result == kEsp32NvsNewVersionFound) {
+      eraseExplicitly();
+      result = ota_enabled ? esp32NvsStartupInitResult(initError) : initError;
+    }
+    initialized = result == kEsp32Ok;
+    return result;
+  }
+};
+
+class CausalInstallModel final : public Esp32OtaInstallApi {
+public:
+  CausalInstallModel(InstallModel& install, CausalNvsModel& nvs) : install(install), nvs(nvs) {}
+  InstallModel& install;
+  CausalNvsModel& nvs;
+  bool validateImage(const Esp32PartitionIdentity& p, uint32_t bytes) override {
+    return install.validateImage(p, bytes);
+  }
+  bool selectBoot(const Esp32PartitionIdentity& p) override { return install.selectBoot(p); }
+  Esp32RunningProof runningProof(uint32_t& counter) override { return install.runningProof(counter); }
+  bool readConfirmedFloor(uint32_t& counter, bool& found) override { return nvs.readFloor(counter, found); }
+  bool saveConfirmedFloor(uint32_t counter) override { return nvs.saveFloor(counter); }
+};
+
+class CausalTrialModel final : public Esp32TrialPlatform {
+public:
+  CausalTrialModel(Esp32PartitionModel& sdk, CausalNvsModel& nvs, const Esp32OtaPolicy& policy,
+                   const ::ota::trust::SignatureVerifier& signatures)
+      : sdk(sdk), nvs(nvs), policy(policy), signatures(signatures) {}
+  Esp32PartitionModel& sdk;
+  CausalNvsModel& nvs;
+  const Esp32OtaPolicy& policy;
+  const ::ota::trust::SignatureVerifier& signatures;
+  bool markValidFails = false;
+  uint32_t arms = 0, disarms = 0, resets = 0, rollbacks = 0, fallbacks = 0, unknownReports = 0;
+  bool runningState(Esp32ImageState& out) override { return readEsp32EarlyRunningState(sdk, out); }
+  bool unknownTopologyHoldAllowed() override { return readEsp32UnknownStartupTopology(sdk); }
+  bool armWatchdog(uint32_t) override { ++arms; return true; }
+  void disarmWatchdog() override { ++disarms; }
+  void reportUnknownService() override { ++unknownReports; }
+  Esp32TrialConfirmation confirmHealthy() override {
+    return confirmEsp32TrialImage(
+        [&](uint32_t& counter, bool& have_candidate) {
+          ReadOnlyAppModel reader(sdk, sdk.snapshot.running);
+          FlashRegion image(reader, 0, Esp32OtaPolicy::kCandidateBytes);
+          FlashRegion metadata(reader, Esp32OtaPolicy::kCandidateBytes, 8192);
+          OtaCandidateStore provenance(metadata);
+          OtaCandidateStore::Snapshot snapshot;
+          meshcore::ota::protocol::OtaDescriptor descriptor;
+          have_candidate = verifyEsp32RunningCandidate(provenance, image, policy, signatures, snapshot, descriptor);
+          if (have_candidate) counter = descriptor.securityCounter;
+          return have_candidate;
+        },
+        [&]() {
+          if (markValidFails) return false;
+          sdk.snapshot.appStates[sdk.snapshot.running.subtype - 0x10] = Esp32ImageState::Valid;
+          return true;
+        },
+        [&](uint32_t counter) { return nvs.saveFloor(counter); });
+  }
+  void restartWithoutRollback() override {
+    ++resets;
+    auto& current = sdk.snapshot.appStates[sdk.snapshot.running.subtype - 0x10];
+    if (esp32PartitionEquals(sdk.snapshot.boot, sdk.snapshot.running) && current == Esp32ImageState::PendingVerify) {
+      current = Esp32ImageState::Aborted;
+      sdk.snapshot.boot = sdk.snapshot.next;
+    }
+    sdk.snapshot.running = sdk.snapshot.boot;
+    if (sdk.bytes[sdk.snapshot.boot.address] != 0xe9) {
+      sdk.snapshot.running = Esp32S3PartitionLayout::entry(sdk.snapshot.boot.subtype == 0x10 ? 3 : 2);
+      ++fallbacks;
+    }
+    sdk.snapshot.next = Esp32S3PartitionLayout::entry(sdk.snapshot.running.subtype == 0x10 ? 3 : 2);
+  }
+  void rollbackAndRestart() override {
+    Esp32ImageState state;
+    if (runningState(state) && state == Esp32ImageState::PendingVerify) {
+      ++rollbacks;
+      sdk.snapshot.appStates[sdk.snapshot.boot.subtype - 0x10] = Esp32ImageState::Invalid;
+      sdk.snapshot.boot = sdk.snapshot.next;
+    }
+    restartWithoutRollback();
+  }
+};
 
 class Esp32Product : public ::testing::Test {
 protected:
@@ -251,6 +414,19 @@ protected:
     ASSERT_EQ(0x10000u, sdk.snapshot.running.address);
     ASSERT_EQ(FlashStatus::Ok, flash.bind(Esp32OtaPolicy::kSlotBytes));
   }
+  void thirdTrial() {
+    twoSuccessfulInstalls();
+    ASSERT_FALSE(HasFatalFailure());
+    image[1] = 3;
+    descriptor.securityCounter = 3;
+    ::ota::trust::Sha256::hash(image.data(), image.size(), descriptor.sha256);
+    signDescriptor();
+    ready();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(Result::Ok, commit());
+    ASSERT_EQ(InstallOutcome::Selected, sink.activateDurableCommit());
+    rebootIntoCandidate(Esp32ImageState::PendingVerify);
+  }
   void usbReflash(const Esp32PartitionIdentity& running, bool blank_tail) {
     sdk.snapshot.running = running;
     sdk.snapshot.boot = running;
@@ -383,6 +559,399 @@ protected:
     });
   }
 };
+
+class Esp32SharedHealth : public Esp32Product, public ::testing::WithParamInterface<uint8_t> {
+protected:
+  void SetUp() override {
+    policy.role = GetParam();
+    Esp32Product::SetUp();
+  }
+  static OtaMeshTrialHealthTickInputs inputs(uint32_t now) {
+    return {now, true, true, false, true, true, 0, 0, true};
+  }
+};
+
+TEST_P(Esp32SharedHealth, DefaultNullAndFalseGetterPreserveGenericRebootsAndHeldOnlySuppressesUnknown) {
+  SharedHealthBridge bridge;
+  for (const auto outcome : {OtaBoardTrialHealthOutcome::Pending, OtaBoardTrialHealthOutcome::Confirmed,
+                            OtaBoardTrialHealthOutcome::DeadlineExpired,
+                            OtaBoardTrialHealthOutcome::ConfirmationUncertain,
+                            OtaBoardTrialHealthOutcome::StateUnreadable}) {
+    shared_health_outcome = outcome;
+    uint32_t faults = 0;
+    const auto legacy = evaluateOtaMeshTrialHealthTick(inputs(0), faults);
+    const auto explicit_null = evaluateOtaMeshTrialHealthTick(inputs(0), faults, nullptr);
+    const auto not_held = evaluateOtaMeshTrialHealthTick(inputs(0), faults, sharedUnknownServiceNotHeld);
+    EXPECT_EQ(outcome, legacy.outcome);
+    EXPECT_EQ(outcome != OtaBoardTrialHealthOutcome::Pending, legacy.should_reboot);
+    EXPECT_EQ(legacy.should_reboot, explicit_null.should_reboot);
+    EXPECT_EQ(legacy.should_reboot, not_held.should_reboot);
+    shared_health_queries = 0;
+    const auto held = evaluateOtaMeshTrialHealthTick(inputs(0), faults, sharedUnknownServiceHeld);
+    EXPECT_EQ(outcome, held.outcome);
+    EXPECT_EQ(outcome != OtaBoardTrialHealthOutcome::Pending &&
+              outcome != OtaBoardTrialHealthOutcome::StateUnreadable, held.should_reboot);
+    EXPECT_EQ(outcome == OtaBoardTrialHealthOutcome::StateUnreadable ? 1u : 0u, shared_health_queries);
+  }
+}
+
+TEST_P(Esp32SharedHealth, GenuineSdkReadFailureNeverBecomesHeldWithExhaustedTopologyBudget) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  Esp32StartupRestartState retained = {kEsp32StartupRestartMagic, kEsp32StartupRestartLimit};
+  sdk.inspectError = -1;
+  Esp32TrialController controller(platform, &retained);
+  EXPECT_FALSE(controller.begin(0));
+  EXPECT_FALSE(controller.unknownServiceHeld());
+  EXPECT_EQ(1u, platform.resets);
+  SharedHealthBridge bridge(&controller);
+  uint32_t faults = 0;
+  const auto result = evaluateOtaMeshTrialHealthTick(inputs(0), faults, sharedUnknownServiceHeld);
+  EXPECT_EQ(OtaBoardTrialHealthOutcome::StateUnreadable, result.outcome);
+  EXPECT_TRUE(result.should_reboot);
+}
+
+TEST_P(Esp32SharedHealth, HeldQueryRunsAfterBoardTickEstablishesBoundedUnknownService) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  sdk.snapshot.appStates[sdk.snapshot.boot.subtype - 0x10] = Esp32ImageState::Valid;
+  sdk.snapshot.running = sdk.snapshot.next;
+  sdk.snapshot.next = sdk.snapshot.boot;
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  Esp32StartupRestartState retained = {kEsp32StartupRestartMagic, kEsp32StartupRestartLimit};
+  Esp32TrialController controller(platform, &retained);
+  EXPECT_FALSE(controller.unknownServiceHeld());
+  SharedHealthBridge bridge(&controller);
+  uint32_t faults = 0;
+  const auto result = evaluateOtaMeshTrialHealthTick(inputs(0), faults, sharedUnknownServiceHeld);
+  EXPECT_EQ(OtaBoardTrialHealthOutcome::StateUnreadable, result.outcome);
+  EXPECT_FALSE(result.should_reboot);
+  EXPECT_TRUE(controller.unknownServiceHeld());
+  EXPECT_EQ(1u, shared_health_queries);
+  EXPECT_EQ(0u, platform.resets);
+  EXPECT_EQ(0u, platform.arms);
+}
+
+INSTANTIATE_TEST_SUITE_P(BothProductionRoles, Esp32SharedHealth, ::testing::Values(uint8_t{0}, uint8_t{1}),
+    [](const ::testing::TestParamInfo<uint8_t>& info) { return info.param == 0 ? "Companion" : "Repeater"; });
+
+TEST_F(Esp32Product, ValidCounterThreeWithDurableFloorAndLostReadbackRestartsForwardAndRecoversAdmission) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto candidate_app = sdk.snapshot.running;
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  Esp32TrialController controller(platform);
+  ASSERT_TRUE(controller.begin(0));
+  for (uint32_t now = 0; now < 10000; now += 500) controller.tick(now, true, true, true);
+  nvs.failVerification = true;
+  EXPECT_EQ(Esp32TrialHealthOutcome::ConfirmationUncertain, controller.tick(10000, true, true, true));
+  EXPECT_EQ(3u, nvs.storedFloor());
+  EXPECT_TRUE(esp32PartitionEquals(candidate_app, sdk.snapshot.running));
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[candidate_app.subtype - 0x10]);
+  EXPECT_EQ(0u, platform.rollbacks);
+  EXPECT_EQ(1u, platform.resets);
+  EXPECT_EQ(0u, platform.disarms);
+  nvs.failVerification = false;
+  CausalInstallModel cold_install(install, nvs);
+  Esp32OtaStagingSink cold_sink(flash, lease, candidate, metadata, store, trust, policy, signatures, cold_install);
+  OtaFirmwareIntegration cold;
+  const char* capability = nullptr;
+  EXPECT_EQ(Esp32ConfigureOutcome::Configured,
+      configureEsp32OtaBackend(cold, false, cold_install, policy, flash, lease, store, cold_sink, trust,
+                               signatures, capability));
+  EXPECT_EQ(3u, policy.confirmedCounter);
+  OtaBootLifecycleEvidence boot;
+  ASSERT_TRUE(lifecycle(true, nvs.storedFloor(), boot));
+  EXPECT_EQ(usb::UsbOtaPhase::Installed, boot.phase);
+  EXPECT_EQ(3u, boot.counter);
+  setIdentity(cold);
+  const auto before = sdk.bytes;
+  EXPECT_EQ(Result::Denied, cold.leanReceiver().begin(owner.publicKey(), canonical, signature, false, false));
+  EXPECT_EQ(before, sdk.bytes);
+  image[1] = 4;
+  descriptor.securityCounter = 4;
+  ::ota::trust::Sha256::hash(image.data(), image.size(), descriptor.sha256);
+  signDescriptor();
+  EXPECT_EQ(Result::Ok, cold.leanReceiver().begin(owner.publicKey(), canonical, signature, false, false));
+}
+
+TEST_F(Esp32Product, FailedBeforeValidKeepsFloorAndRollsBackOnlyPendingCandidate) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto candidate_app = sdk.snapshot.running;
+  const auto previous = sdk.snapshot.next;
+  CausalNvsModel nvs(sdk, 2);
+  const auto before = sdk.bytes;
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  platform.markValidFails = true;
+  Esp32TrialController controller(platform);
+  ASSERT_TRUE(controller.begin(0));
+  for (uint32_t now = 0; now < 10000; now += 500) controller.tick(now, true, true, true);
+  EXPECT_EQ(Esp32TrialHealthOutcome::ConfirmationUncertain, controller.tick(10000, true, true, true));
+  EXPECT_EQ(2u, nvs.storedFloor());
+  EXPECT_TRUE(esp32PartitionEquals(previous, sdk.snapshot.running));
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[previous.subtype - 0x10]);
+  EXPECT_EQ(Esp32ImageState::Invalid, sdk.snapshot.appStates[candidate_app.subtype - 0x10]);
+  EXPECT_EQ(1u, platform.rollbacks);
+  EXPECT_EQ(1u, platform.resets);
+  EXPECT_EQ(0u, platform.disarms);
+  EXPECT_EQ(before, sdk.bytes);
+}
+
+TEST_F(Esp32Product, PersistentConfirmedFloorFaultDisablesOtaWithoutFurtherResetsOrWrites) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel trial(sdk, nvs, policy, signatures);
+  Esp32TrialController confirmation(trial);
+  ASSERT_TRUE(confirmation.begin(0));
+  for (uint32_t now = 0; now < 10000; now += 500) confirmation.tick(now, true, true, true);
+  nvs.failVerification = true;
+  ASSERT_EQ(Esp32TrialHealthOutcome::ConfirmationUncertain, confirmation.tick(10000, true, true, true));
+  ASSERT_EQ(3u, nvs.storedFloor());
+  ASSERT_EQ(1u, trial.resets);
+  const auto before = sdk.bytes;
+  nvs.failVerification = false;
+  nvs.readFault = true;
+  Esp32StartupRestartState retained = {0, 0};
+  for (uint32_t boot = 0; boot < 6; ++boot) {
+    CausalTrialModel service(sdk, nvs, policy, signatures);
+    Esp32TrialController controller(service, &retained);
+    ASSERT_TRUE(controller.begin(0));
+    EXPECT_FALSE(controller.activeOrUnknown());
+    nvs.initError = boot % 3 == 0 ? kEsp32NvsNoFreePages :
+                    boot % 3 == 1 ? kEsp32NvsNewVersionFound : kEsp32Ok;
+    EXPECT_EQ(boot % 3 == 2 ? kEsp32Ok : kEsp32InvalidState, nvs.initArduinoNvs());
+    CausalInstallModel cold_install(install, nvs);
+    Esp32OtaStagingSink cold_sink(flash, lease, candidate, metadata, store, trust, policy, signatures, cold_install);
+    OtaFirmwareIntegration cold;
+    const char* capability = nullptr;
+    EXPECT_EQ(Esp32ConfigureOutcome::IoError,
+        configureEsp32OtaBackend(cold, controller.activeOrUnknown(), cold_install, policy, flash, lease,
+                                 store, cold_sink, trust, signatures, capability));
+    EXPECT_STREQ("OTA_DISABLED: ESP confirmed floor unreadable", capability);
+    for (uint32_t now = 0; now <= 120000; now += 500)
+      EXPECT_EQ(Esp32TrialHealthOutcome::Pending, controller.tick(now, true, false, true));
+    EXPECT_EQ(0u, service.arms);
+    EXPECT_EQ(0u, service.resets);
+    EXPECT_EQ(0u, service.rollbacks);
+    EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[sdk.snapshot.running.subtype - 0x10]);
+    EXPECT_EQ(3u, nvs.storedFloor());
+    EXPECT_EQ(0u, nvs.erases);
+    EXPECT_EQ(before, sdk.bytes);
+  }
+}
+
+TEST_F(Esp32Product, RollbackRequiresFreshRunningPendingProofAndNeverInvalidatesValidOrAnotherSelectedApp) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto candidate_app = sdk.snapshot.running;
+  const auto previous = sdk.snapshot.next;
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  const auto before = sdk.bytes;
+  sdk.snapshot.appStates[candidate_app.subtype - 0x10] = Esp32ImageState::Valid;
+  platform.rollbackAndRestart();
+  EXPECT_EQ(0u, platform.rollbacks);
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[candidate_app.subtype - 0x10]);
+  EXPECT_TRUE(esp32PartitionEquals(candidate_app, sdk.snapshot.running));
+  sdk.snapshot.boot = previous;
+  platform.rollbackAndRestart();
+  EXPECT_EQ(0u, platform.rollbacks);
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[previous.subtype - 0x10]);
+  EXPECT_TRUE(esp32PartitionEquals(previous, sdk.snapshot.running));
+  sdk.snapshot.running = sdk.snapshot.boot = candidate_app;
+  sdk.snapshot.next = previous;
+  sdk.snapshot.appStates[candidate_app.subtype - 0x10] = Esp32ImageState::PendingVerify;
+  platform.rollbackAndRestart();
+  EXPECT_EQ(1u, platform.rollbacks);
+  EXPECT_EQ(Esp32ImageState::Invalid, sdk.snapshot.appStates[candidate_app.subtype - 0x10]);
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[previous.subtype - 0x10]);
+  EXPECT_TRUE(esp32PartitionEquals(previous, sdk.snapshot.running));
+  EXPECT_EQ(before, sdk.bytes);
+}
+
+TEST_P(Esp32SharedHealth, InvalidSelectedImageRepeatedlyFallsBackButUnknownStartupRestartsAreRetainedAndBounded) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto selected = sdk.snapshot.boot;
+  const auto fallback = sdk.snapshot.next;
+  sdk.snapshot.appStates[selected.subtype - 0x10] = Esp32ImageState::Valid;
+  sdk.bytes[selected.address] = 0;  // SDK retains VALID otadata after image validation falls back.
+  sdk.snapshot.running = fallback;
+  sdk.snapshot.next = selected;
+  CausalNvsModel nvs(sdk, 2);
+  CausalInstallModel cold_install(install, nvs);
+  const auto before = sdk.bytes;
+  Esp32StartupRestartState retained = {0, 0};
+  uint32_t resets = 0;
+  for (uint32_t boot = 0; boot < kEsp32StartupRestartLimit + 3; ++boot) {
+    CausalTrialModel platform(sdk, nvs, policy, signatures);
+    Esp32TrialController controller(platform, &retained);
+    EXPECT_FALSE(controller.begin(0));
+    EXPECT_TRUE(controller.activeOrUnknown());
+    EXPECT_EQ(boot >= kEsp32StartupRestartLimit, controller.unknownServiceHeld());
+    EXPECT_EQ(boot < kEsp32StartupRestartLimit ? 1u : 0u, platform.resets);
+    EXPECT_EQ(Esp32TrialHealthOutcome::StateUnreadable, controller.tick(0, false, false, false));
+    EXPECT_EQ(0u, platform.rollbacks);
+    EXPECT_TRUE(esp32PartitionEquals(fallback, sdk.snapshot.running));
+    EXPECT_TRUE(esp32PartitionEquals(selected, sdk.snapshot.boot));
+    if (boot >= kEsp32StartupRestartLimit) {
+      EXPECT_EQ(0u, platform.arms);
+      EXPECT_EQ(1u, platform.unknownReports);
+      SharedHealthBridge bridge(&controller);
+      uint32_t faults = 0;
+      uint32_t radio_service_ticks = 0;
+      for (uint32_t now = 500; now <= 120000; now += 500) {
+        const auto result = evaluateOtaMeshTrialHealthTick(inputs(now), faults, sharedUnknownServiceHeld);
+        EXPECT_EQ(OtaBoardTrialHealthOutcome::StateUnreadable, result.outcome);
+        EXPECT_FALSE(result.should_reboot);
+        if (result.should_reboot) {
+          platform.restartWithoutRollback();
+          break;
+        }
+        ++radio_service_ticks;
+      }
+      EXPECT_EQ(240u, radio_service_ticks);
+      EXPECT_EQ(0u, platform.resets);
+      EXPECT_EQ(kEsp32Ok, nvs.initArduinoNvs());
+      OtaFirmwareIntegration cold;
+      const char* capability = nullptr;
+      EXPECT_EQ(Esp32ConfigureOutcome::Refused,
+          configureEsp32OtaBackend(cold, controller.activeOrUnknown(), cold_install, policy, flash, lease,
+                                   store, sink, trust, signatures, capability));
+      EXPECT_STREQ("OTA_DISABLED: ESP trial or unknown", capability);
+      EXPECT_FALSE(cold.backendAvailable());
+      EXPECT_FALSE(cold.leanReceiver().hasStore());
+      sdk.inspectError = -1;
+      EXPECT_FALSE(controller.unknownServiceHeld());
+      EXPECT_TRUE(evaluateOtaMeshTrialHealthTick(inputs(120500), faults, sharedUnknownServiceHeld).should_reboot);
+      sdk.inspectError = kEsp32Ok;
+      EXPECT_TRUE(controller.unknownServiceHeld());
+      sdk.snapshot.appStates[fallback.subtype - 0x10] = Esp32ImageState::PendingVerify;
+      EXPECT_FALSE(controller.unknownServiceHeld());
+      sdk.snapshot.appStates[fallback.subtype - 0x10] = Esp32ImageState::Valid;
+      EXPECT_TRUE(controller.unknownServiceHeld());
+      const auto saved_count = sdk.snapshot.count;
+      --sdk.snapshot.count;
+      EXPECT_FALSE(controller.unknownServiceHeld());
+      sdk.snapshot.count = saved_count;
+    }
+    resets += platform.resets;
+    EXPECT_EQ(before, sdk.bytes);
+  }
+  EXPECT_EQ(kEsp32StartupRestartLimit, resets);
+  EXPECT_EQ(kEsp32StartupRestartLimit, retained.attempts);
+  sdk.snapshot.boot = fallback;
+  CausalTrialModel recovered(sdk, nvs, policy, signatures);
+  Esp32TrialController healthy(recovered, &retained);
+  EXPECT_TRUE(healthy.begin(0));
+  EXPECT_FALSE(healthy.activeOrUnknown());
+  EXPECT_EQ(0u, retained.attempts);
+  EXPECT_EQ(0u, recovered.arms);
+  EXPECT_EQ(0u, recovered.resets);
+  sdk.snapshot.appStates[fallback.subtype - 0x10] = Esp32ImageState::Undefined;
+  CausalTrialModel stock(sdk, nvs, policy, signatures);
+  Esp32TrialController usb_stock(stock, &retained);
+  EXPECT_TRUE(usb_stock.begin(0));
+  EXPECT_FALSE(usb_stock.activeOrUnknown());
+  EXPECT_EQ(0u, stock.arms);
+  EXPECT_EQ(0u, stock.resets);
+  EXPECT_EQ(before, sdk.bytes);
+}
+
+TEST_F(Esp32Product, ArduinoNvsStartupErrorsPreserveFloorAndBytesInTrialValidAndUsbStockBoots) {
+  for (const auto state : {Esp32ImageState::PendingVerify, Esp32ImageState::Valid, Esp32ImageState::Undefined}) {
+    sdk.snapshot.appStates[0] = state;
+    for (const auto error : {kEsp32NvsNoFreePages, kEsp32NvsNewVersionFound}) {
+      CausalNvsModel nvs(sdk, 3);
+      nvs.initialized = false;
+      nvs.initError = error;
+      CausalTrialModel platform(sdk, nvs, policy, signatures);
+      Esp32TrialController controller(platform);
+      ASSERT_TRUE(controller.begin(0));  // verifyRollbackLater runs before nvs_flash_init.
+      const auto before = sdk.bytes;
+      EXPECT_EQ(kEsp32InvalidState, nvs.initArduinoNvs());
+      EXPECT_FALSE(nvs.initialized);
+      EXPECT_EQ(0u, nvs.erases);
+      EXPECT_EQ(3u, nvs.storedFloor());
+      EXPECT_EQ(before, sdk.bytes);
+      EXPECT_EQ(error, nvs.initError);
+    }
+  }
+}
+
+TEST_F(Esp32Product, ExplicitFactoryNvsEraseRemainsSeparateFromStartupErrorProtection) {
+  CausalNvsModel nvs(sdk, 3);
+  nvs.eraseExplicitly();
+  EXPECT_EQ(kEsp32Ok, nvs.initArduinoNvs());
+  EXPECT_EQ(1u, nvs.erases);
+  uint32_t floor;
+  bool found;
+  ASSERT_TRUE(nvs.readFloor(floor, found));
+  EXPECT_FALSE(found);
+  EXPECT_EQ(0u, floor);
+  EXPECT_EQ(kEsp32Ok, esp32NvsStartupInitResult(kEsp32Ok));
+  EXPECT_EQ(-1, esp32NvsStartupInitResult(-1));
+}
+
+TEST_F(Esp32Product, OtaOffWrapperForwardsOriginalNvsResultsAndPreservesArduinoStartupPolicy) {
+  for (const auto error : {kEsp32NvsNoFreePages, kEsp32NvsNewVersionFound, kEsp32Ok, -1}) {
+    CausalNvsModel nvs(sdk, 3);
+    nvs.initError = error;
+    const auto before = sdk.bytes;
+    const bool formats = error == kEsp32NvsNoFreePages || error == kEsp32NvsNewVersionFound;
+    EXPECT_EQ(formats ? kEsp32Ok : error, nvs.initArduinoNvs(false));
+    EXPECT_EQ(formats ? 1u : 0u, nvs.erases);
+    EXPECT_EQ(!formats, nvs.floorKnown);
+    if (formats) {
+      const auto partition = Esp32S3PartitionLayout::entry(0);
+      EXPECT_TRUE(std::equal(before.begin(), before.begin() + partition.address, sdk.bytes.begin()));
+      EXPECT_TRUE(std::equal(before.begin() + partition.address + partition.size, before.end(),
+                            sdk.bytes.begin() + partition.address + partition.size));
+    } else {
+      EXPECT_EQ(before, sdk.bytes);
+    }
+  }
+}
+
+TEST_F(Esp32Product, MissingTrialStateWithDifferentSelectedAppBlocksWritesAndRestartsToExistingAppOnce) {
+  thirdTrial();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto previous = sdk.snapshot.next;
+  const auto failed_trial = sdk.snapshot.running;
+  sdk.snapshot.boot = previous;
+  sdk.snapshot.appStates[failed_trial.subtype - 0x10] = Esp32ImageState::Undefined;
+  CausalNvsModel nvs(sdk, 2);
+  CausalTrialModel platform(sdk, nvs, policy, signatures);
+  const auto before = sdk.bytes;
+  Esp32TrialController controller(platform);
+  EXPECT_FALSE(controller.begin(0));
+  EXPECT_TRUE(controller.activeOrUnknown());
+  EXPECT_EQ(Esp32TrialHealthOutcome::StateUnreadable, controller.tick(0, false, false, false));
+  EXPECT_EQ(0u, platform.rollbacks);
+  EXPECT_EQ(1u, platform.resets);
+  EXPECT_TRUE(esp32PartitionEquals(previous, sdk.snapshot.running));
+  EXPECT_EQ(Esp32ImageState::Valid, sdk.snapshot.appStates[previous.subtype - 0x10]);
+  EXPECT_EQ(before, sdk.bytes);
+  CausalTrialModel recovered(sdk, nvs, policy, signatures);
+  Esp32TrialController next(recovered);
+  EXPECT_TRUE(next.begin(0));
+  EXPECT_FALSE(next.activeOrUnknown());
+  EXPECT_EQ(Esp32TrialHealthOutcome::Pending, next.tick(60000, true, true, true));
+  EXPECT_EQ(0u, recovered.resets);
+  sdk.snapshot.appStates[previous.subtype - 0x10] = Esp32ImageState::Undefined;
+  CausalTrialModel stock(sdk, nvs, policy, signatures);
+  Esp32TrialController usb_stock(stock);
+  EXPECT_TRUE(usb_stock.begin(0));
+  EXPECT_FALSE(usb_stock.activeOrUnknown());
+  EXPECT_EQ(0u, stock.arms);
+  EXPECT_EQ(before, sdk.bytes);
+}
 
 TEST_F(Esp32Product, UsbBootApp0ReflashWithBlankTailPreservesFloorAndConfiguresNewerAuthenticatedOta) {
   successiveInstall(1);
@@ -1853,18 +2422,21 @@ class TrialModel final : public Esp32TrialPlatform {
 public:
   Esp32ImageState state = Esp32ImageState::PendingVerify;
   bool readable = true, watchdogOk = true, confirmOk = true, persistValid = true;
-  uint32_t arms = 0, remaining = 0, disarms = 0, confirmations = 0, resets = 0;
+  uint32_t arms = 0, remaining = 0, disarms = 0, confirmations = 0, resets = 0, unknownReports = 0;
   bool watchdog = false;
   bool runningState(Esp32ImageState& out) override { out = state; return readable; }
+  bool unknownTopologyHoldAllowed() override { return false; }
   bool armWatchdog(uint32_t ms) override {
     ++arms; remaining = ms; watchdog = watchdogOk; return watchdogOk;
   }
   void disarmWatchdog() override { ++disarms; watchdog = false; }
-  bool confirmHealthy() override {
+  void reportUnknownService() override { ++unknownReports; }
+  Esp32TrialConfirmation confirmHealthy() override {
     ++confirmations;
     if (confirmOk && persistValid) state = Esp32ImageState::Valid;
-    return confirmOk;
+    return confirmOk ? Esp32TrialConfirmation::Confirmed : Esp32TrialConfirmation::Unconfirmed;
   }
+  void restartWithoutRollback() override { ++resets; }
   void rollbackAndRestart() override { ++resets; }
   void hardwareTimeExpires() {
     if (watchdog) {

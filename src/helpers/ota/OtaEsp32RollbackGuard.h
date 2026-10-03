@@ -15,6 +15,53 @@
 namespace mesh {
 namespace ota {
 
+constexpr ::ota::storage::Esp32SdkError kEsp32NvsNoFreePages = 0x110d;
+constexpr ::ota::storage::Esp32SdkError kEsp32NvsNewVersionFound = 0x1110;
+constexpr ::ota::storage::Esp32SdkError kEsp32InvalidState = 0x103;
+
+inline ::ota::storage::Esp32SdkError esp32NvsStartupInitResult(::ota::storage::Esp32SdkError result) {
+  // Arduino 2.0.17 otherwise turns these failed reads into a full NVS erase.
+  return result == kEsp32NvsNoFreePages || result == kEsp32NvsNewVersionFound ? kEsp32InvalidState : result;
+}
+
+inline bool readEsp32EarlyRunningState(::ota::storage::Esp32PartitionApi& sdk,
+                                      ::ota::storage::Esp32ImageState& out) {
+  ::ota::storage::Esp32PartitionSnapshot context;
+  if (sdk.inspect(context) != ::ota::storage::kEsp32Ok) return false;
+  using namespace ::ota::storage;
+  if (!Esp32S3PartitionLayout::matches(context)) return false;
+  const bool running0 = esp32PartitionEquals(context.running, Esp32S3PartitionLayout::entry(2));
+  if ((!running0 && !esp32PartitionEquals(context.running, Esp32S3PartitionLayout::entry(3))) ||
+      !esp32PartitionEquals(context.boot, context.running) ||
+      !esp32PartitionEquals(context.next, Esp32S3PartitionLayout::entry(running0 ? 3 : 2))) return false;
+  const auto inactive = context.appStates[running0 ? 1 : 0];
+  if (inactive != Esp32ImageState::Valid && inactive != Esp32ImageState::Undefined &&
+      inactive != Esp32ImageState::Aborted && inactive != Esp32ImageState::Invalid) return false;
+  out = context.appStates[context.running.subtype - 0x10];
+  return true;
+}
+
+inline bool readEsp32UnknownStartupTopology(::ota::storage::Esp32PartitionApi& sdk) {
+  using namespace ::ota::storage;
+  Esp32PartitionSnapshot before;
+  if (sdk.inspect(before) != kEsp32Ok || !Esp32S3PartitionLayout::matches(before)) return false;
+  const bool running0 = esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(2));
+  if ((!running0 && !esp32PartitionEquals(before.running, Esp32S3PartitionLayout::entry(3))) ||
+      !esp32PartitionEquals(before.boot, Esp32S3PartitionLayout::entry(running0 ? 3 : 2)) ||
+      !esp32PartitionEquals(before.next, before.boot)) return false;
+  const auto current = before.appStates[running0 ? 0 : 1];
+  if (current != Esp32ImageState::Valid && current != Esp32ImageState::Undefined) return false;
+  for (const auto state : before.appStates)
+    if (state != Esp32ImageState::New && state != Esp32ImageState::PendingVerify &&
+        state != Esp32ImageState::Valid && state != Esp32ImageState::Undefined &&
+        state != Esp32ImageState::Aborted && state != Esp32ImageState::Invalid) return false;
+  Esp32PartitionSnapshot after;
+  return sdk.inspect(after) == kEsp32Ok && Esp32S3PartitionLayout::matches(after) &&
+         esp32PartitionEquals(after.running, before.running) && esp32PartitionEquals(after.boot, before.boot) &&
+         esp32PartitionEquals(after.next, before.next) && after.appStates[0] == before.appStates[0] &&
+         after.appStates[1] == before.appStates[1];
+}
+
 inline Esp32RunningProof readEsp32RunningProof(
     ::ota::storage::Esp32PartitionApi& sdk, ::ota::platform::FlashDevice& reader,
     const Esp32OtaPolicy& policy, const ::ota::trust::SignatureVerifier& signatures, uint32_t& out) {
@@ -328,13 +375,46 @@ private:
   Esp32TrialHealthOutcome outcome_ = Esp32TrialHealthOutcome::Pending;
 };
 
+enum class Esp32TrialConfirmation : uint8_t { Unconfirmed, ValidNeedsFloorReconciliation, Confirmed };
+
+template <typename RunningProof, typename MarkValid, typename SaveFloor>
+Esp32TrialConfirmation confirmEsp32TrialImage(RunningProof running_proof, MarkValid mark_valid,
+                                             SaveFloor save_floor) {
+  uint32_t counter = 0;
+  bool have_candidate = false;
+  if (!running_proof(counter, have_candidate) || !mark_valid()) return Esp32TrialConfirmation::Unconfirmed;
+  if (have_candidate && !save_floor(counter)) return Esp32TrialConfirmation::ValidNeedsFloorReconciliation;
+  return Esp32TrialConfirmation::Confirmed;
+}
+
+struct Esp32StartupRestartState {
+  uint32_t magic;
+  uint32_t attempts;
+};
+
+constexpr uint32_t kEsp32StartupRestartMagic = 0x45535231;
+constexpr uint32_t kEsp32StartupRestartLimit = 2;
+
+inline bool reserveEsp32StartupRestart(Esp32StartupRestartState& state) {
+  if (state.magic != kEsp32StartupRestartMagic) {
+    state.attempts = 0;
+    state.magic = kEsp32StartupRestartMagic;
+  }
+  if (state.attempts >= kEsp32StartupRestartLimit) return false;
+  ++state.attempts;
+  return true;
+}
+
 class Esp32TrialPlatform {
 public:
   virtual ~Esp32TrialPlatform() = default;
   virtual bool runningState(::ota::storage::Esp32ImageState& out) = 0;
+  virtual bool unknownTopologyHoldAllowed() = 0;
   virtual bool armWatchdog(uint32_t remaining_ms) = 0;
   virtual void disarmWatchdog() = 0;
-  virtual bool confirmHealthy() = 0;
+  virtual Esp32TrialConfirmation confirmHealthy() = 0;
+  virtual void reportUnknownService() = 0;
+  virtual void restartWithoutRollback() = 0;
   virtual void rollbackAndRestart() = 0;
 };
 
@@ -342,7 +422,8 @@ public:
 // Never feeds/extends the watchdog: setup time and stalled loops count.
 class Esp32TrialController {
 public:
-  explicit Esp32TrialController(Esp32TrialPlatform& platform) : platform_(platform), gate_(0, true) {}
+  explicit Esp32TrialController(Esp32TrialPlatform& platform, Esp32StartupRestartState* retained = nullptr)
+      : platform_(platform), restart_state_(retained ? *retained : local_restarts_), gate_(0, true) {}
   bool begin(uint32_t now_ms) {
     if (begun_) return !unknown_;
     begun_ = true;
@@ -353,19 +434,35 @@ public:
       unknown_ = state != ::ota::storage::Esp32ImageState::Valid &&
                  state != ::ota::storage::Esp32ImageState::Undefined && !trial_;
     }
-    if (trial_ || unknown_) {
-      const uint32_t remaining = now_ms < Esp32TrialHealthGate::kOverallDeadlineMs
-          ? Esp32TrialHealthGate::kOverallDeadlineMs - now_ms : 1;
+    const uint32_t remaining = now_ms < Esp32TrialHealthGate::kOverallDeadlineMs
+        ? Esp32TrialHealthGate::kOverallDeadlineMs - now_ms : 1;
+    if (unknown_) {
+      outcome_ = Esp32TrialHealthOutcome::StateUnreadable;
+      action_taken_ = true;
+      if (!platform_.unknownTopologyHoldAllowed() || reserveEsp32StartupRestart(restart_state_)) {
+        if (!platform_.armWatchdog(remaining)) platform_.reportUnknownService();
+        platform_.restartWithoutRollback();
+      } else {
+        unknown_service_ = true;
+        platform_.disarmWatchdog();
+        platform_.reportUnknownService();
+      }
+      return false;
+    }
+    restart_state_.attempts = 0;
+    restart_state_.magic = kEsp32StartupRestartMagic;
+    if (trial_) {
       if (!platform_.armWatchdog(remaining)) {
         unknown_ = true;
         outcome_ = Esp32TrialHealthOutcome::StateUnreadable;
         action_taken_ = true;
-        platform_.rollbackAndRestart();
+        platform_.restartWithoutRollback();
       }
     }
     return !unknown_;
   }
   bool activeOrUnknown() const { return !begun_ || unknown_ || trial_; }
+  bool unknownServiceHeld() const { return unknown_service_ && platform_.unknownTopologyHoldAllowed(); }
   Esp32TrialHealthOutcome tick(uint32_t now_ms, bool radio, bool storage, bool loop) {
     if (!begun_) begin(now_ms);
     if (action_taken_) return outcome_;
@@ -378,27 +475,39 @@ public:
       if (outcome_ == Esp32TrialHealthOutcome::Pending) return outcome_;
       if (outcome_ == Esp32TrialHealthOutcome::Confirmed) {
         ::ota::storage::Esp32ImageState state;
-        if (platform_.runningState(state) &&
-            state == ::ota::storage::Esp32ImageState::PendingVerify &&
-            platform_.confirmHealthy() && platform_.runningState(state) &&
-            state == ::ota::storage::Esp32ImageState::Valid) {
-          platform_.disarmWatchdog();
-          trial_ = false;
-          action_taken_ = true;
-          return outcome_;
+        bool restart_forward = true;
+        if (platform_.runningState(state) && state == ::ota::storage::Esp32ImageState::PendingVerify) {
+          const auto confirmation = platform_.confirmHealthy();
+          if (confirmation == Esp32TrialConfirmation::Confirmed && platform_.runningState(state) &&
+              state == ::ota::storage::Esp32ImageState::Valid) {
+            platform_.disarmWatchdog();
+            trial_ = false;
+            action_taken_ = true;
+            return outcome_;
+          }
+          restart_forward = confirmation != Esp32TrialConfirmation::Unconfirmed;
         }
         outcome_ = Esp32TrialHealthOutcome::ConfirmationUncertain;
+        if (restart_forward) {
+          action_taken_ = true;
+          platform_.restartWithoutRollback();
+          return outcome_;
+        }
       }
     }
     action_taken_ = true;
-    platform_.rollbackAndRestart();
+    if (unknown_) platform_.restartWithoutRollback();
+    else platform_.rollbackAndRestart();
     return outcome_;
   }
 private:
   Esp32TrialPlatform& platform_;
+  Esp32StartupRestartState local_restarts_ = {0, 0};
+  Esp32StartupRestartState& restart_state_;
   Esp32TrialHealthGate gate_;
   Esp32TrialHealthOutcome outcome_ = Esp32TrialHealthOutcome::Pending;
   bool begun_ = false, unknown_ = false, trial_ = false, action_taken_ = false;
+  bool unknown_service_ = false;
 };
 
 }  // namespace ota

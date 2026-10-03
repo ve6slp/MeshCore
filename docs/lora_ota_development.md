@@ -166,6 +166,33 @@ repeater 1. The experimental OTA repeater also disables the ordinary Wi-Fi
 updater with `DISABLE_WIFI_OTA`, preventing two updaters from owning the same
 inactive slot. The ordinary repeater profile retains its existing updater.
 
+The qualified ESP OTA-on images intercept Arduino 2.0.17's NVS initialization
+through a build-local linker wrapper. `NO_FREE_PAGES` and
+`NEW_VERSION_FOUND` remain visible initialization failures, but cannot trigger
+Arduino's automatic whole-NVS erase. Explicit factory-reset erase remains
+available. OTA-off builds forward the original SDK result unchanged; old,
+stock and foreign/unwrapped images can still perform the legacy automatic
+erase. Protection is an image property, not a bootloader-wide guarantee.
+
+After the SDK marks an image VALID, uncertain floor persistence does not
+invalidate it. A plain restart lets the existing signed running-image proof
+reconcile the floor forward; a persistent floor fault disables OTA rather than
+repeatedly restarting a VALID image. Invalidation is reserved for a freshly
+checked, coherent running/selected partition in PENDING_VERIFY.
+
+A coherent Undefined SDK state, including blank otadata selecting the default
+slot after USB programming, retains stock behavior. A validated running /
+selected partition disagreement blocks destructive userdata writes before
+ordinary startup and attempts two RTC-retained plain restarts. If the selected
+image stays invalid and the bootloader repeatedly falls back, the device holds
+reported Unknown state, read-only userdata and disabled OTA while servicing
+normal radio through the shared health tick. Only that positively qualified
+hold suppresses the StateUnreadable reboot; genuine SDK I/O failures and
+confirmation/deadline failures retain the existing reboot behavior.
+Arbitrary permanent SDK I/O recovery and BLE startup with uninitialized NVS
+are not qualified. These source, native and linked-framework checks do not
+establish physical ESP installation, rollback or power-failure acceptance.
+
 ### nRF52840 bootloader qualification
 
 `make qualify-xiao-ota-bootloader` builds and packages both nRF board
@@ -391,6 +418,32 @@ requires observations of at least two applied direct intervals, intervening
 restoration and retained progress; it is not indefinite lease renewal.
 These software observation surfaces do not themselves constitute a
 successful hardware campaign.
+
+Legacy temporary-profile commands are separate from signed direct leases.
+Their shared C++11 helper tracks timer presence independently of the deadline,
+including a deadline of zero after clock rollover. On nRF OTA profiles,
+normal-profile restoration remains pending until the checked backend apply
+succeeds; failed restores retry only while idle, at most once per second.
+Repeated cancellation cannot reset that backoff. Ordinary profiles retain
+their existing unchecked apply interface; compilation is not proof of
+successful physical restoration.
+
+Initial on-mesh DATA sweeps re-offer the existing 164-byte Authorization,
+which occupies one OTA packet. Successful re-offers require both 32 accepted
+DATA frames and a 15-second interval. A quota refusal retains the selected
+target until credit is available, but 32 accepted DATA frames during refusals
+rotate that target so an unavailable peer cannot monopolize later offers.
+Multicast DATA does not wait for admission acknowledgements.
+
+Native full-image regressions drop the initial Authorization and deliver
+537,816 bytes (6,403 blocks) under a shared 72,000 ms / 3,600,000 ms budget,
+ordinary-ready priority and clock rollover. With modeled DATA estimate /
+completed duration of 200 / 300 ms and Authorization of 300 / 400 ms, both
+on-mesh modes renew admission after 32 blocks and finish byte-exact without
+COMMIT. Directed/background simulated completion is 28.03 / 28.04 hours,
+with control traffic accounting for 4.01 / 4.03% of sender OTA airtime.
+These are conditional software-model results, not measured PHY airtime,
+hardware delivery or field completion guarantees.
 
 The lab helper's `--inspect-measurements` reads both approved roles, or
 only the companion with `--client-only`, into a new evidence directory.

@@ -5,8 +5,13 @@
 #include <esp_flash.h>
 #include <esp_image_format.h>
 #include <esp_ota_ops.h>
+#include <esp_attr.h>
 #include <esp_partition.h>
 #include <nvs.h>
+#include <nvs_flash.h>
+#include <esp_log.h>
+#include <esp_arduino_version.h>
+#include <esp_idf_version.h>
 #include <esp_private/esp_clk.h>
 #include <hal/wdt_hal.h>
 #include <soc/rtc.h>
@@ -20,6 +25,13 @@
 #endif
 #if !CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE || !CONFIG_APP_ROLLBACK_ENABLE
 #error "ESP LoRa OTA requires vendor bootloader and app rollback support"
+#endif
+#if !defined(MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD) || !MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD
+#error "ESP LoRa OTA requires the build-local nvs_flash_init startup wrapper"
+#endif
+#if ESP_ARDUINO_VERSION != ESP_ARDUINO_VERSION_VAL(2, 0, 17) || \
+    ESP_IDF_VERSION != ESP_IDF_VERSION_VAL(4, 4, 7)
+#error "ESP LoRa OTA startup interception must be qualified for this Arduino/IDF version"
 #endif
 #if defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA) && !defined(MESHCORE_ESP32_OTA_UPDATER_LEASE)
 #error "ESP LoRa OTA must exclude the ordinary updater or wire its shared lease before server startup"
@@ -130,6 +142,8 @@ const char* capability = "OTA_DISABLED: not configured";
 bool storage_fault = false;
 bool commit_waiting = false;
 uint32_t commit_observed_ms = 0;
+// Image-check fallback can leave boot != running across every warm reset.
+RTC_NOINIT_ATTR Esp32StartupRestartState startup_restarts;
 
 bool readFloor(uint32_t& out, bool* found = nullptr) {
   out = 0;
@@ -191,14 +205,12 @@ bool runningCandidateCounter(uint32_t& counter, bool& have_candidate) {
 class VendorTrialPlatform final : public Esp32TrialPlatform {
 public:
   bool runningState(Esp32ImageState& out) override {
-    const auto* running = esp_ota_get_running_partition();
-    if (running == nullptr) return false;
-    esp_ota_img_states_t state;
-    const esp_err_t err = esp_ota_get_state_partition(running, &state);
-    if (err == ESP_ERR_NOT_FOUND) { out = Esp32ImageState::Undefined; return true; }
-    if (err != ESP_OK) return false;
-    out = static_cast<Esp32ImageState>(state);
-    return true;
+    ::ota::storage::Esp32IdfPartitionApi sdk;
+    return readEsp32EarlyRunningState(sdk, out);
+  }
+  bool unknownTopologyHoldAllowed() override {
+    ::ota::storage::Esp32IdfPartitionApi sdk;
+    return readEsp32UnknownStartupTopology(sdk);
   }
   bool armWatchdog(uint32_t remaining_ms) override {
     // The pinned IDF4.4 S3 SDK's legacy soc/rtc_wdt.h is ESP32-only.
@@ -230,21 +242,34 @@ public:
     wdt_hal_write_protect_enable(&watchdog_);
     armed_ = false;
   }
-  bool confirmHealthy() override {
+  Esp32TrialConfirmation confirmHealthy() override {
     // Never advance the numeric floor during a failed trial. If reset cuts
     // the valid->floor window, next startup reconciles the signed RUNNING
     // candidate before permitting another transfer.
-    uint32_t counter = 0;
-    bool have_candidate = false;
-    if (!runningCandidateCounter(counter, have_candidate)) { storage_fault = true; return false; }
-    if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) return false;
-    if (have_candidate && !saveFloor(counter)) { storage_fault = true; return false; }
-    return true;
+    return confirmEsp32TrialImage(
+        [](uint32_t& counter, bool& have_candidate) {
+          const bool ok = runningCandidateCounter(counter, have_candidate);
+          if (!ok) storage_fault = true;
+          return ok;
+        },
+        []() { return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK; },
+        [](uint32_t counter) {
+          const bool ok = saveFloor(counter);
+          if (!ok) storage_fault = true;
+          return ok;
+        });
+  }
+  void restartWithoutRollback() override { esp_restart(); }
+  void reportUnknownService() override {
+    ESP_LOGE("meshota", "ESP startup context unknown; restart attempts=%u; OTA and destructive writes disabled",
+             static_cast<unsigned>(startup_restarts.attempts));
   }
   void rollbackAndRestart() override {
-    // IDF refuses rollback if no previous valid app exists. Still RESET:
-    // an unconfirmed PENDING_VERIFY image must not run indefinitely.
-    esp_ota_mark_app_invalid_rollback_and_reboot();
+    // An uncertain VALID publication must reconcile forward; a different
+    // selected app must never be invalidated on behalf of this running app.
+    Esp32ImageState state;
+    if (runningState(state) && state == Esp32ImageState::PendingVerify)
+      esp_ota_mark_app_invalid_rollback_and_reboot();
     esp_restart();
   }
 private:
@@ -253,13 +278,17 @@ private:
 };
 
 VendorTrialPlatform trial_platform;
-Esp32TrialController trial(trial_platform);
+Esp32TrialController trial(trial_platform, &startup_restarts);
 
 void earlyTrialGuard() {
   trial.begin(static_cast<uint32_t>(millis()));
 }
 
 }  // namespace
+
+static_assert(ESP_ERR_NVS_NO_FREE_PAGES == mesh::ota::kEsp32NvsNoFreePages, "NVS error ABI changed");
+static_assert(ESP_ERR_NVS_NEW_VERSION_FOUND == mesh::ota::kEsp32NvsNewVersionFound, "NVS error ABI changed");
+static_assert(ESP_ERR_INVALID_STATE == mesh::ota::kEsp32InvalidState, "NVS error ABI changed");
 
 // This strong symbol must appear as T (not W) in BOTH linked firmware ELFs.
 extern "C" bool verifyRollbackLater() {
@@ -273,6 +302,7 @@ bool otaBoardEarlyBootTrialOrUnknown() {
 }
 
 bool otaBoardTrialHealthWindowActive() { return trial.activeOrUnknown(); }
+bool otaBoardUnknownStartupRecoveryHeld() { return trial.unknownServiceHeld(); }
 bool otaBoardStorageIoFaultObserved() { return storage_fault || sink.storageIoFaultObserved(); }
 const char* otaBoardInstallCapabilityStatus() { return capability; }
 
@@ -475,4 +505,25 @@ OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(
   }
 }
 
+#endif
+
+#if defined(ESP32_PLATFORM) && defined(MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD) && MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD
+#include <nvs_flash.h>
+
+extern "C" esp_err_t __real_nvs_flash_init();
+extern "C" esp_err_t __wrap_nvs_flash_init() {
+  const esp_err_t result = __real_nvs_flash_init();
+#if defined(MESHCORE_LORA_OTA) && MESHCORE_LORA_OTA
+  const esp_err_t guarded = mesh::ota::esp32NvsStartupInitResult(result);
+  if (result != ESP_OK) {
+    storage_fault = true;
+    ESP_LOGE("meshota", "NVS initialization failed (0x%x); startup erase is not authorized",
+             static_cast<unsigned>(result));
+  }
+  return guarded;
+#else
+  // OTA-off builds retain Arduino's ordinary initialization/error policy.
+  return result;
+#endif
+}
 #endif

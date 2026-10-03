@@ -13,6 +13,12 @@
 mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(uint32_t now_ms, bool radio_ready,
                                                                         bool filesystem_ready, bool loop_healthy);
 
+#if defined(ESP32_PLATFORM) && defined(MESHCORE_LORA_OTA) && MESHCORE_LORA_OTA && \
+    defined(MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD) && MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD
+// Unqualified ESP profiles retain the generic null-query behavior.
+bool otaBoardUnknownStartupRecoveryHeld();
+#endif
+
 /**
  * \brief  Role-agnostic, board-agnostic trial-boot-health TICK decision,
  *         shared verbatim by every MyMesh that enables MESHCORE_LORA_OTA
@@ -45,7 +51,7 @@ struct OtaMeshTrialHealthTickInputs {
 
 struct OtaMeshTrialHealthTickResult {
   OtaBoardTrialHealthOutcome outcome;
-  bool should_reboot;  // Confirmed / DeadlineExpired / ConfirmationUncertain / StateUnreadable.
+  bool should_reboot;  // Terminal outcomes reboot, except a qualified held StateUnreadable.
 };
 
 // `last_radio_fault_count` is read (compared against the two fresh
@@ -53,7 +59,13 @@ struct OtaMeshTrialHealthTickResult {
 // -- callers must persist it across ticks themselves (it is genuinely
 // per-instance state, not something this stateless function can own).
 inline OtaMeshTrialHealthTickResult evaluateOtaMeshTrialHealthTick(const OtaMeshTrialHealthTickInputs& in,
-                                                                    uint32_t& last_radio_fault_count) {
+                                                                    uint32_t& last_radio_fault_count,
+#if defined(ESP32_PLATFORM) && defined(MESHCORE_LORA_OTA) && MESHCORE_LORA_OTA && \
+    defined(MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD) && MESHCORE_ESP32_OTA_STARTUP_NVS_GUARD
+                                                                    bool (*unknown_service_held)() = ::otaBoardUnknownStartupRecoveryHeld) {
+#else
+                                                                    bool (*unknown_service_held)() = nullptr) {
+#endif
   const bool radio_ready_now = evaluateOtaTrialRadioReadyThisPass(
       in.radio_present, in.base_radio_ready, in.radio_stuck_non_recv, in.radio_driver_healthy,
       in.radio_genuinely_servicing, in.radio_fault_count_before_probe, in.radio_fault_count_after_probe,
@@ -66,7 +78,8 @@ inline OtaMeshTrialHealthTickResult evaluateOtaMeshTrialHealthTick(const OtaMesh
   const bool should_reboot = (outcome == OtaBoardTrialHealthOutcome::Confirmed ||
                               outcome == OtaBoardTrialHealthOutcome::DeadlineExpired ||
                               outcome == OtaBoardTrialHealthOutcome::ConfirmationUncertain ||
-                              outcome == OtaBoardTrialHealthOutcome::StateUnreadable);
+                              (outcome == OtaBoardTrialHealthOutcome::StateUnreadable &&
+                               !(unknown_service_held && unknown_service_held())));
   return OtaMeshTrialHealthTickResult{outcome, should_reboot};
 }
 

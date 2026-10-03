@@ -221,6 +221,12 @@ repeater profile is unchanged; USB recovery remains separate.
   the OTA allowance is exhausted.
 - Routed mode may be given a higher temporary budget for an explicitly
   scheduled maintenance window.
+- Routed and background transfers periodically re-offer the existing signed
+  authorization during the initial DATA sweep. A successful re-offer requires
+  at least 32 accepted DATA frames and 15 seconds since the previous offer.
+  This lets a receiver recover a lost initial authorization before the whole
+  image has been sent; ordinary-traffic priority and the airtime budget still
+  apply. It does not restart an aborted candidate or authorize installation.
 - Direct mode is a short, supervised session and is expected to be bounded
   by the same radio and regulatory limits as any other transmission.
 - A supervised 95% or 100% full-image smoke run is not measured 2%
