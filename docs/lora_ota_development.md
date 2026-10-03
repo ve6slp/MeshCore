@@ -45,15 +45,16 @@ public key is accepted only through the device's administrator policy.
 Each device retains one candidate image and its original administrator.
 Duplicate durable blocks do not write flash again. Invalid frames preserve
 valid progress, and installed or older versions do not acquire the candidate
-slot. A competing image or administrator receives a busy refusal. Any trusted
-administrator may abort reception and suppress that image's multicast until
-an explicit restart.
+slot. A competing image or administrator receives a busy refusal. Any currently
+trusted administrator may abort before commit and suppress reception of that
+image until an explicit restart.
 
 All three transfer modes converge on the same image validation. Complete
-reception leaves durable `READY` state, not an install command. Only an
-explicit per-device commit for the validated image publishes the bootloader
-handoff. The current image remains operational during reception and while
-waiting for commit. These are migration requirements, not hardware results.
+reception leaves durable `READY` state, not an install command. Only an explicit,
+target-bound commit by the original owner, still trusted as an administrator,
+publishes the bootloader handoff. The current image remains operational during
+reception and while waiting for commit. These are software contracts, not
+physical hardware results.
 
 ## Building and testing
 
@@ -204,13 +205,14 @@ gate, not an installation result. Package validation must include every
 file-backed flash load segment, including initialized `.data`, and preserve
 the fixed configuration and boot-info addresses.
 
-Independent qualification of all four current no-SWD packages found
+An earlier four-profile no-SWD qualification found
 37,812 bytes of code, unwind metadata and initialized data within the
 38,912-byte load slot. The final file-backed load ends at `0xFD3B4`,
 leaving 1,100 bytes before configuration at `0xFD800`. Each package
 retains its ELF and section report alongside HEX, UF2 and linker map.
-These are build-artifact and simulated-recovery results, not physical
-installation or power-cut results.
+These historical build-artifact and simulated-recovery measurements do not
+describe current packages or installed bytes. Qualify each new artifact's
+complete load; physical installation and power-cut recovery remain unverified.
 
 The running app checks the manifest signer against its administrator policy
 before committing. Its install record snapshots that accepted public key
@@ -544,6 +546,12 @@ The client is a USB companion; the target must run `simple_repeater`.
 A third board, listed under `[protected]`, belongs to an unrelated project
 and must never be reset, flashed, or power-cycled by any MeshCore command.
 
+The target no longer enumerates after its bootloader activation request.
+The commands below are reference entry points, not authorization to retry
+that board. Recovery is paused pending the physical gates and explicit
+authorization in the [incident notes](lora_ota_bootloader_failure_notes.md).
+Offline package checks cannot replace fresh installed-state evidence.
+
 Relevant targets:
 
 ```sh
@@ -614,8 +622,9 @@ role and counter before writing. It emits exactly 59 bytes, with no
 signature, private key or boot command. Select `xiao_s3_wio` for the
 ESP32 descriptor policy described above.
 
-The other Make entry points are `ota-lab-upload`, `ota-lab-status`,
-`ota-lab-commit`, `ota-lab-abort` and `ota-lab-admin`. Supply a raw image
+The other Make entry points are `ota-lab-cache`, `ota-lab-upload`,
+`ota-lab-status`, `ota-lab-commit`, `ota-lab-abort`, `ota-lab-abort-cache`
+and `ota-lab-admin`. Supply a raw image
 with `OTA_UPLOAD_IMAGE`, its exact canonical 59-byte descriptor with
 `OTA_UPLOAD_MANIFEST`, and the full target public key with
 `OTA_UPLOAD_TARGET`. Upload signs the descriptor using the companion,
@@ -624,6 +633,14 @@ Set `OTA_UPLOAD_WAIT_READY=1` to wait for fresh, complete target snapshots;
 the default returns the campaign request result without claiming target
 completion. `OTA_UPLOAD_DUTY_MILLI_PERCENT=2000` selects 2% airtime; the
 host also accepts lower positive shares.
+
+`ota-lab-cache` signs and stages only the local cache, then requires fresh,
+complete, image-bound `CACHE_SEALED`. It sends no ADD_TARGET, START, COMMIT or
+administrator operation. A same-image BEGIN already in VERIFYING or
+CACHE_SEALED waits for matching local STATUS rather than sending PUT or SEAL
+again. This is local storage evidence, not remote READY, radio delivery or
+installation. See the [working-client workflow](hardware_lab.md#one-client-application-and-local-cache-validation)
+for the separately scoped hardware checks.
 
 **Implementation boundary:** host commands and native tests are not a
 hardware qualification result. The firmware implements autonomous
@@ -721,119 +738,39 @@ application and verify identity and configuration across the role change.
 
 ## Current hardware evidence
 
-This reflects the most recent lab runs and should be re-checked against
-`docs/lora_ota_design.md` and `docs/lora_ota_nrf52840_qspi.md` before relying
-on it, since hardware qualification is ongoing.
+The [hardware lab guide](hardware_lab.md) owns the detailed operation and
+evidence record; the [incident notes](lora_ota_bootloader_failure_notes.md)
+own failed-target analysis and first-capture restrictions. This summary
+does not authorize hardware access.
 
 ### Current preservation evidence
 
-On 2026-10-01, both approved boards passed the existing Make targets for
-live, read-only comparison with their authenticated encrypted archives.
-Each comparison covered all 1 MiB of internal flash and 2 MiB of QSPI,
-with an exact byte-for-byte match. Those comparisons issued no flash, reset,
-power cycle or installation command, and the protected board was not opened.
-Neither result establishes production mesh service.
-Immutable `bda99d13` companion and repeater applications
-were subsequently flashed to the approved pair, but the first companion
-NAME setter returned `0104 BAD_STATE` before mutation. Radio settings
-and administrator commissioning were blocked at that revision.
-Reviewed and gated `7e3066b9` diagnostic applications
-were then flashed. Both captured early readbacks identify the stored SDK
-CRC `0000` sentinel as the refusal: calculated image CRCs are `19D3`
-(companion) and `F59D` (repeater). The stock vendor loader deliberately
-disables its optional CRC check at zero, and its normal serial DFU writer
-sets that sentinel. Qualified loader, installation and rollback integrity
-must not gain a blanket zero bypass.
+Earlier paired checks preserved normal identities, settings and the complete
+administrator ACL across reboot and established ordinary target-to-client
+radio reception. They did not establish OTA delivery.
 
-On 2026-10-02, reviewed and gated `6e0b63be` applications restored ordinary
-stock-loader writes on both boards. Their actual preflight readbacks were
-healthy, writes allowed and cache-only. Normal commissioning set
-`OTA-LAB-CLIENT`/`OTA-LAB-TARGET`, 907.525 MHz, 250 kHz, SF7, CR5 and
-three-byte path preferences, preserving both public keys. A separate
-normal administrator grant added only client permission 3.
-After the six-second save opportunity and normal protocol reboots,
-read-only inspection at `06:25:47Z` confirmed both identities, names and
-radio preferences, client path mode 2 and the complete target ACL.
-The inspection used no setters or fallback grant. Its evidence retains
-`reboot_persistence_verified: false` because the inspection does not itself
-reboot a device; persistence follows from comparison with the separately
-recorded commissioning and reboot operations.
-At `07:27:09Z`, the bounded ordinary-peer probe passed on this profile:
-two advert requests produced a native companion notification for the actual
-target in 4.194 seconds, with an independently signature-verified raw
-MeshCore advert. Complete before/after reads preserved both identities,
-names, radio preferences, both observed path modes and the target ACL.
-Packet/radio counters were diagnostics, not the success witness. This
-establishes only target-to-client ordinary reception; the two earlier
-timeouts remain failures, and neither bidirectional nor OTA operation is
-implied.
+The target stopped returning on USB after the Oct. 2, 2026, `13:46:21Z`
+loader activation request. Positive transport acknowledgement does not prove
+the installed loader, completed MBR copy or USB startup. The cause remains
+unproven. Do not retry commissioning, reset, unlock or erase it. The first
+SWD capture requires explicit authorization, verified target/probe identity,
+fixture continuity and a resolved RESET-contact decision. It captures bounded
+public metadata, not a full loader hash, RAM or encrypted-media archive.
 
-Reviewed recovery changes in `e62cf33b` passed the immutable software gate
-for tree `0aec89d94991625f31aa620646470e438005daee`. The gate generated fresh
-application fixtures, ran all four production-C board/role boot drivers
-and imported their actual FailedMax rollback outputs into the C++ application.
-Both vendor-unused CRC 0 and matching nonzero CRC policies passed, including
-restored ordinary configuration writes and subsequent update admission.
-Cache cut-and-retry coverage, 345 host tests and all six OTA firmware profiles
-also passed. This closes the software recovery defects, not physical
-rollback qualification.
+The working client runs the immutable `18ca2dcc` companion application,
+548,276 bytes, with healthy stock proof and `CACHE_ONLY`, not installation
+capability. Its full 537,816-byte, 6,403-block local cache sealed and survived
+an ordinary reboot. Same-image sealed retries sent no PUT or SEAL, and an
+explicit image-bound local ABORT was independently confirmed. Captured public
+settings remained unchanged; no ADD_TARGET, START, COMMIT, administrator or
+radio-setting request was made. The failed target and Pine were not accessed.
 
-The immutable, role-specific `e62cf33b` applications were then flashed to
-the approved pair. Read-only inspection at `09:15:35Z` confirmed both
-identities, names, 907.525 MHz/250 kHz/SF7/CR5 preferences, both path modes
-and the complete target ACL without setters or replacement grants.
-Both reported healthy stock boot, ordinary writes allowed and cache-only
-OTA. The subsequent target-only loader installer passed artifact validation
-but refused the vendor's actual stable boot-port product name before writing.
-The host guard was corrected to use the existing lab identity resolver,
-without relaxing serial, vendor, bootloader mode, stable by-id, volume
-ancestry, Board-ID or artifact checks. Read-only inspection showed CDC
-without mass storage in the mode selected by the 1200-baud helper.
-Vendor and Arduino source inspection established that the helper requests
-serial-only DFU; the loader deliberately hides MSC in that mode. The
-separate vendor UF2 API and physical double-reset entry must not be
-confused with that application-flash path. Historical archive metadata
-cannot substitute for fresh observations.
-The bench-only USB adapter and `make lab-bootloader-uf2-target` use the
-existing vendor API rather than a parallel updater. The paired read-only
-address gate and host application-to-bootloader mass-storage check qualify
-only those observed conditions, not an installed recovery loader.
-The reviewed `47b40e59` bench application was subsequently flashed to
-the target only. At `10:33:47Z`, fresh metadata showed erased flash
-address words, UICR boot address `000F4000`, parameter address `000FE000`
-and matching effective addresses, with healthy stock boot and ordinary
-writes allowed. At `10:33:49Z`, read-only configuration inspection
-confirmed both identities, names, 907.525 MHz/250 kHz/SF7/CR5 preferences,
-path modes and the complete target ACL unchanged, without setters.
-The guarded vendor UF2 entry then passed on the actual target, including
-USB disappearance and bootloader re-enumeration with mass storage.
-The serial-matched volume reported current Board-ID
-`Seeed_XIAO_nRF52840_Sense` and USB identity `2886:0045`; it was mounted
-read-only. These observations rule out commissioning the preserved
-base-board package with CF2 USB identity `2886:0044`.
-The volume's virtual `CURRENT.UF2` excludes the bootloader region, so it
-does not provide a current CF2 readback. No plaintext firmware was copied,
-and historical CF2 evidence remains historical. A genuine Sense-profile
-package must match the current public board and USB identities before
-installation; a string change or relaxed Board-ID check is not a fix.
-Subsequent retained-source review stopped UF2 self-update commissioning:
-its indirect staging erases `0xE0000..0xEA000`, inside protected ExtraFS.
-The suspected InternalFS overlap was not confirmed. The exact installed
-Seeed binary's source lineage remains unverified, so the footprint is
-reported as a source finding, not physical binary attestation. The normal
-serial bootloader-only alternative stages 40,192 bytes at
-`0x27000..0x30D00`, excluding both filesystems, and requires separate
-immutable application restoration and preservation readbacks. The Make
-UF2 flash target refuses operation while that guarded serial path is
-being qualified.
-The target's qualified custom loader is not installed, and no
-replacement-protocol radio OTA installation has been demonstrated.
-The uploader remains on the stock bootloader. Pine is untouched, and
-destructive shared-domain power-cut qualification remains deferred.
-
-Destructive power cuts are deferred while the target shares the protected
-power domain. Simulated recovery and offline artifact qualification do
-not close that physical acceptance gap.
+These are application and local-cache results only. Current three-mode radio
+READY/COMMIT, trial/install/floor and normal-service qualification, physical
+power-loss rollback, full-window 2% operation, ESP/P1 hardware, fleet contention
+and multihop remain unverified. Shared-domain power cuts remain prohibited.
+New preservation evidence cannot recover the lost original 502,300-byte
+application or establish its missing public-key baseline.
 
 ### Historical radio and flash evidence
 
@@ -912,9 +849,9 @@ Previously verified:
   both `XIAO_OTA_BOARD=xiao_nrf52840` default and
   `XIAO_OTA_BOARD=sensecap_solar_p1`): cached HEX/UF2 marker and key
   checks, and full no-SWD UF2 family/address admissibility, have passed.
-  These are offline artifact checks — they do **not** exercise a custom
-  bootloader install on physical hardware, and no such install has
-  happened. Do not describe this gate as bootloader-install evidence.
+  These are offline artifact checks — they do **not** establish installed
+  loader bytes or usable recovery on physical hardware. Do not describe this
+  historical gate as proof of the later target activation.
 - Those historical transfers used 128-byte chunks. The signed receiver
   uses at most 84 data bytes per block, preserving Nordic four-byte
   alignment. Packet sizing must include the actual outer transport and
@@ -967,14 +904,14 @@ confirmation rather than the Nordic register and copy/restore sequence.
 Not verified, and not to be represented as done in any documentation or
 release notes:
 - Full three-mode signed firmware transfer and install on real hardware.
-  Signed staging and the full stock-only RF harness have passed, but
+  Historical signed staging and the full stock-only RF harness passed, but
   neither transfers and installs a bootable firmware through all three
   autonomous modes. No actual device install has passed.
 - Routed (directed, mesh-relayed) image delivery to an out-of-reach target
   has not been attempted yet; only direct-mode application-layer traffic and
   fleet-mode state probes have been run over real RF so far.
 - Sustained multi-node and multihop fairness during a real background
-  campaign remains unverified. The latest two-board pressure run does
+  campaign remains unverified. The historical two-board pressure run does
   pass both the quota and ordinary-service witness, but it does not model
   fleet contention, autonomous byte repair or a 24-72-hour campaign.
 - Turning a staged image into a running update is not proven end to end,
@@ -984,13 +921,10 @@ release notes:
     native tests**. Packaged HEX and UF2 build artifacts with marker
     verification now build separately for both the XIAO and SenseCAP
     profiles, in their own board/role-specific output directories. All
-    four reviewed factory-initialization no-SWD packages use 38,324 of
-    38,912 bytes, including initialized-data load bytes, leaving 588 bytes
-    free. Their source fingerprint is `23384fd9…`; the earlier
-    `7861fdc0` packages lack initialization and must not commission a
-    blank target. App-side integration and actual floor readback are
-    still required before claiming commissioning.
-    Historical footprints do not describe this build.
+    board/role artifacts must pass complete flash-load and marker checks;
+    earlier package footprints do not describe a new build. Actual installed
+    bytes and first-boot floor readback remain hardware gates, not deductions
+    from package validation.
   - The candidate and backup regions each hold at most 708,608 bytes,
     preserving the extra-filesystem range `0xD4000`–`0xED000`.
     The 811,008-byte staging stride includes receiver metadata; it is
@@ -998,19 +932,19 @@ release notes:
     flag, size and CRC16 is required before destructive installation.
     A stale floor value or a guessed extent is not sufficient.
   - The application-to-bootloader hand-off, and commissioning/installing
-    that bootloader on physical hardware, are **not qualified** — no
-    device has gone through commissioning, a real install, or a confirmed
-    boot from an image delivered this way. Native tests exercise all three
-    transfer modes, but no mode has completed a firmware installation on
-    physical hardware with the replacement.
+    that bootloader on physical hardware, are **not qualified**. The target's
+    activation attempt did not return usable USB and does not establish its
+    installed state. Native tests exercise all three transfer modes, but no
+    mode has completed a firmware installation on physical hardware with the
+    replacement.
   Do not describe the marker or SenseCAP profile as "not implemented" —
   they exist and are tested; the gap is specifically the hand-off and
   physical hardware qualification.
 - Anti-rollback has durable implementations: Nordic uses confirmed A/B
   floor records, and ESP32 stores its confirmed numeric floor in NVS.
   Neither has been qualified through a real install/confirmation cycle.
-  The approved lab pair currently runs read-only diagnostics, not the
-  retired RAM-counter backend or the new production receiver.
+  The working client has current application/local-cache evidence; the target
+  remains unavailable. Neither supplies a physical install/floor proof.
 - Fleet-state probes and raw QSPI read/write results are evidence of
   protocol and flash-driver correctness — they are **not** evidence of a
   completed firmware installation. Do not conflate the two when reporting
@@ -1049,5 +983,7 @@ a companion app or CLI, not the removed lab controls.
 - Never target the `[protected]` board in `lab/devices.ini`.
 - Keep `src/ota/` changes covered by the matching native test suite before
   touching firmware integration.
-- Update `docs/lora_ota_design.md`'s hardware-evidence sections when you add
-  a new verified result, and keep unproven claims explicitly marked as such.
+- Keep these guides' contracts and status aligned with verified results.
+  Record detailed hardware chronology in `docs/hardware_lab.md` and incident
+  analysis in `docs/lora_ota_bootloader_failure_notes.md`; link rather than
+  duplicate it, and keep unproven claims explicit.

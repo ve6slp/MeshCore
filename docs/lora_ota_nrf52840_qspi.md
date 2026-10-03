@@ -9,12 +9,20 @@ QSPI, and backs up the working application before an install changes it.
 A QSPI-aware bootloader copies or restores the image through a durable
 journal. This is not execute-in-place or the stock Adafruit dual-bank mode.
 
-**The signed, single-candidate implementation is undergoing migration.**
+**The signed, single-candidate implementation remains experimental.**
 Earlier native tests, ARM packages and raw-QSPI lab results do not qualify
 the replacement. No physical board has completed a LoRa-delivered install,
 trial confirmation or rollback. No SenseCAP board has been physically
 qualified. Do not install an artifact solely because an earlier revision
 fit or passed a native suite.
+
+The approved target stopped returning on USB after a bootloader activation
+request. Transfer acknowledgement does not establish installed bytes or a
+working loader. Recovery remains paused pending the bounded, non-erasing
+diagnosis gates in the [incident notes](lora_ota_bootloader_failure_notes.md).
+Do not retry commissioning, unlock, erase or reset it to test a hypothesis.
+The working companion remains stock `CACHE_ONLY`; its local staging proof
+does not qualify this target's installation or recovery.
 
 The duplicate authority, commissioning receipts, lifetime-role proofs and
 transport-key ledgers are removed from the accepted design. MeshCore's
@@ -90,13 +98,15 @@ initialized `.data`, and must not overlap the fixed configuration at
 `0xFD800`. A `.text` size or linker percentage alone is not proof of fit.
 The boot-info marker remains at `0xFDC00`.
 
-The current build qualification covers XIAO nRF52840 and SenseCAP Solar P1,
-each in companion and repeater roles. All four packages use **37,812 of
+An earlier build qualification covered XIAO nRF52840 and SenseCAP Solar P1,
+each in companion and repeater roles. Those four packages used **37,812 of
 38,912 bytes**, leaving 1,100 bytes free. Independent ELF section inspection
 includes `.text`, `.ARM.exidx` and initialized `.data`: their flash loads
 end at `0xFD3B4`, below the `0xFD800` configuration boundary. Configuration,
 boot-info and UICR records occupy their separately reserved locations.
 Uninitialized sections do not carry flash payloads.
+These are historical footprints, not current package limits or installed
+byte evidence; qualify the complete load of each new artifact.
 
 `make qualify-xiao-ota-bootloader` retains each actual ELF, HEX, UF2, linker
 map and section report, and checks package board, role, capabilities and
@@ -119,7 +129,8 @@ All boundaries are erase-sector aligned. The physical placement stride
 `0xC6000` is not installable image capacity. Both image banks expose only
 708,608 bytes. The former `securityA` and `securityB` names do not imply a
 continuing authority or global security store; that system has been deleted.
-The replacement's progress-record implementation is being migrated.
+The receiver uses `OtaCandidateStore` for durable candidate metadata and
+receipt bits inside its reserved view, separate from the boot journal.
 
 `SenseCapQspiLayout.h` and `Nrf52FlashLayoutContract.h` define the boundaries.
 Partition accessors must reject writes and erases outside their own view.
@@ -192,7 +203,7 @@ mesh while waiting.
 
 Only the original owner, still trusted as an administrator, may commit the
 validated image to that individual target. Any trusted administrator may
-abort before commit and suppress the image's multicast until an explicit
+abort before commit and suppress reception of that image until an explicit
 restart. Once boot installation begins, recovery is local; it cannot wait
 for another radio packet or an abort command.
 
@@ -287,8 +298,10 @@ The four-profile gate covers XIAO and SenseCAP for companion role 0 and
 repeater role 1. It must validate actual flash loads, board/role markers and
 UF2 packages. Offline success is not hardware qualification.
 
-Only after those gates pass may an authorized lab operator use the guarded
-local installer. Keep a validated stock recovery artifact and preserve
+Offline gates alone do not authorize installation. The failed target first
+requires current diagnosis and a separately approved recovery boundary; do not
+use the generic installer to retry it. For subsequent authorized commissioning,
+keep a validated stock recovery artifact and preserve
 identity and configuration first. Hardware targets resolve stable serial
 identities from `lab/devices.ini`; they must not select a transient tty or
 power-cycle a protected shared hub domain.
@@ -332,7 +345,11 @@ An early test exhausted the task stack, and a subsequent sysfs USB
 Those incidents do not explain the later bootloader-commissioning failure
 on Oct. 2, 2026. The target remains inaccessible pending non-erasing SWD
 diagnosis; do not repeat historical power-cycle or flashing procedures.
-See the [current commissioning record](hardware_lab.md#bootloader-commissioning).
+See the [current commissioning record](hardware_lab.md#bootloader-commissioning)
+and [incident analysis](lora_ota_bootloader_failure_notes.md). A first SWD
+capture is bounded public metadata, not a full-media archive or loader hash;
+fixture continuity, probe identity, the RESET-contact decision and explicit
+authorization remain physical prerequisites.
 The other authorized board is client serial `4186AE911D94CDB1`; the unrelated
 Pine device is excluded.
 

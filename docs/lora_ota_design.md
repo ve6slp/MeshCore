@@ -17,10 +17,13 @@ delivery and routed/flood traffic. LoRa OTA reuses those facilities; it does
 not add a second identity or authorization system. Normal radio service and
 recovery from local power failure take priority over update completion.
 
-**Status:** the signed, single-candidate implementation is replacing the
-earlier experimental lab path. Historical results below do not qualify the
-replacement. No LoRa-delivered firmware installation, trial confirmation or
-rollback has been verified on physical hardware.
+**Status:** the signed, single-candidate software implements all three modes,
+but remains experimental. Historical results below do not qualify it.
+No LoRa-delivered firmware installation, trial confirmation or rollback has
+been verified on physical hardware. The working companion has local cache
+evidence only; the failed target is unavailable pending authorized diagnosis.
+See the [hardware lab guide](hardware_lab.md) and
+[incident notes](lora_ota_bootloader_failure_notes.md) for current restrictions.
 
 The design uses three operating modes:
 
@@ -82,7 +85,7 @@ owner, still authorized as an administrator, must issue a commit bound to
 that image and that individual target.
 
 Any currently trusted administrator may abort before commit and suppress
-further multicast for that image until an explicit administrator-directed
+further reception of that image until an explicit administrator-directed
 restart. Once installation has begun, boot recovery completes the operation
 or restores the backup; it does not depend on another radio packet.
 
@@ -124,10 +127,12 @@ This keeps background updates from overwhelming the mesh while still allowing br
 ### Direct mode
 This is the fast path for a technician or installer who has direct radio reach to a node.
 
-- Use the target’s active channel settings or a negotiated direct OTA channel.
-- Use the uploader's negotiated high-speed profile, such as SF5, coding
-  rate 4/5 and higher bandwidth where the hardware and local rules permit.
-- Transfer uses the same trusted owner and signed blocks as the on-mesh modes.
+- Use an authenticated, bounded off-frequency lease for the uploader's
+  direct profile; do not permanently replace either peer's normal settings.
+- A high-speed profile may use SF5, coding rate 4/5 and higher bandwidth
+  where the hardware and local rules permit.
+- Transfer uses the same administrator-signed image manifest and validated
+  block geometry as the on-mesh modes.
 - The node stages and validates the image, then waits for explicit commit.
 - The temporary radio lease restores the normal profile on completion,
   abort or timeout; losing a packet must not leave the node off-channel.
@@ -140,14 +145,18 @@ This uses the mesh as an infrastructure transport.
 
 - The source sends the manifest to the target using the standard mesh packet structure.
 - Route selection uses the existing direct path or known mesh path if available.
-- OTA data is transmitted in bounded blocks using explicit retry and acknowledgements.
+- Image blocks use durable-progress census and selective repair rather than
+  requiring an acknowledgement for every block.
 - Directed control messages identify the individual target. The shared
   image descriptor need not be re-signed for each fleet member.
 
 This enables remote software updates without physical access to the device.
 
 ### Background fleet mode
-This is a scheduled, low-priority mode designed for 24-72 hour update cycles.
+This is a scheduled, low-priority mode on an existing MeshCore channel.
+The default is 2% airtime; 24-72 hours is an acceptable planning window,
+not a delivery deadline. On-mesh delivery retains the network's normal radio
+profile.
 
 Phases:
 
@@ -164,7 +173,7 @@ as a strict OTA share inside the radio's stricter regulatory budget.
 
 ## Duty-cycle behaviour
 
-The policy has two nested limits:
+The required policy has two nested limits:
 
 - default background mode target is 2% airtime budget
 - routed mode can use 5-10% if a maintenance window is explicitly scheduled
@@ -172,6 +181,10 @@ The policy has two nested limits:
 - a rolling per-sub-band regulatory limiter always takes precedence
 - unused OTA allowance expires instead of accumulating into a later burst
 - normal MeshCore traffic is served before background OTA traffic
+
+The implementation shares MeshCore's radio admission control and adds the
+OTA budget. A dedicated per-region or per-sub-band legal limiter remains a
+design requirement, not a separately implemented enforcement mechanism.
 
 The production path must debit measured packet airtime from the shared radio
 admission policy and a separate OTA budget at every forwarding node. Planning
@@ -202,7 +215,7 @@ The first hardware focus should be:
 
 These are the most practical targets for the first production-grade OTA pattern. They are already represented in the repo and match the real-world deployment model we need to support.
 
-Heltec v3/v4 support should come second as a future upgrade path after the protocol and bootloader model is proven on the initial hardware set.
+Heltec v3/v4 are outside the initial scope; no support or qualification is claimed.
 
 The XIAO nRF52840 + SX1262 lab boards use the same nRF52840 class, P25Q16H
 2 MiB QSPI device, and SX1262 radio family as the first target hardware. The
@@ -294,6 +307,20 @@ default. OTA integration must defer that confirmation through the core's
 Vendor bootloader support does not, by itself, make the application safe
 to install.
 
+Once the SDK marks an image VALID, uncertain version-floor persistence must
+not invalidate it. An ordinary restart can repair the floor from signed
+running-image proof; a persistent floor fault disables OTA. Rollback requires
+a fresh coherent selected/running partition check and PENDING_VERIFY.
+
+OTA-on images intercept Arduino's NVS initialization to prevent automatic
+whole-NVS erase on `NO_FREE_PAGES` or `NEW_VERSION_FOUND`; explicit authorized
+factory erase remains available. OTA-off images retain original SDK behaviour.
+A positively verified selected/running topology mismatch gets two RTC-retained
+restarts, then may hold reported Unknown state with read-only userdata and OTA
+disabled while servicing normal radio. Only that qualified hold suppresses
+the shared health tick's state-error reboot; general SDK I/O, confirmation and
+deadline failures do not gain this exception.
+
 Earlier inactive-partition and NVS tests are evidence for those primitives,
 not for the replacement's receiver, explicit commit or trial recovery.
 No ESP32 hardware qualification is claimed.
@@ -310,22 +337,24 @@ acceptance gates and are deliberately not claimed as done:
   confirmation or installation
 - the selected ESP32 vendor artifact contains rollback handling, but late
   application confirmation and actual installed recovery remain unqualified
-- stock nRF RF staging and airtime fairness have hardware evidence (see
-  [the lab guide](hardware_lab.md)); actual installation, trial confirmation
-  and power-loss rollback remain unqualified
+- current stock nRF local-cache staging and reboot persistence have hardware
+  evidence; historical RF staging and airtime checks used the retired
+  transport. Neither qualifies current radio delivery, installation, trial
+  confirmation, full-window 2% operation or power-loss rollback
 
-## Follow-up execution plan
+## Remaining qualification sequence
 
-The implementation sequence is:
+The software paths exist; source findings must be closed before release, and
+the remaining hardware gates require actual device evidence:
 
-1. implement and bench-validate the target-specific staging and rollback
-   contract
-2. add the signed OTA envelope and durable receiver state
-3. implement one-hop direct transfer with a timed high-speed profile lease
-4. add routed transfer with relay-side OTA airtime accounting
-5. add multicast announcement, census, cohort resolution, and repair
-6. validate success, interrupted transfer, corrupt image, failed trial boot,
-   rollback, and traffic fairness on both target boards
+1. Diagnose the failed target under the non-erasing recovery restrictions,
+   then separately authorize and qualify any required local recovery.
+2. Validate signed direct, routed and background transfer into durable READY,
+   explicit per-target commit, late confirmation and unchanged normal service.
+3. Qualify interrupted installation, failed trials and power-loss rollback
+   without bypassing protected power domains.
+4. Measure full-window 2% service and repeat target-specific recovery on P1
+   and ESP32 hardware; use additional nodes for multihop and fleet contention.
 
 The gate for each stage is a measurable hardware outcome, not completion of a
 code task.

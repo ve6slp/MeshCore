@@ -11,20 +11,19 @@ results do not qualify the replacement. No physical node has completed a
 LoRa-delivered firmware install, confirmation or rollback. Do not use these
 controls to manage a deployed network.
 
-On 2026-10-02, the approved bench pair preserved normal settings, identities
-and the separately granted administrator ACL across reboot. Ordinary
-target-to-client radio reception then passed with native MeshCore identity
-acceptance and independently verified advert signing; configuration and the
-full ACL were unchanged afterward. These results do not qualify an update.
-Corrected application recovery integration passed the immutable software
-gate in `e62cf33b`. Fresh outputs from the production-C boot processor
-were accepted by the C++ application under both original SDK CRC policies.
-Newly preserved applications were flashed without changing the pair's
-identities, settings or complete ACL. The target's qualified custom loader
-is not installed; physical installation and rollback remain unqualified.
+Earlier bench checks preserved identities, settings and administrator
+permissions and verified ordinary target-to-client reception. The target
+subsequently stopped returning on USB after a bootloader activation request;
+neither its installed bytes nor the cause is known. Recovery is paused:
+do not retry bootloader installation, reset, unlock or erase it. First
+diagnosis requires the physical checks and explicit authorization in the
+[incident notes](lora_ota_bootloader_failure_notes.md#arrival-checklist).
 
-Keep the uploader on the stock bootloader; only cache staging is available
-after its preflight succeeds. Stock-only compatibility now honours the
+The working companion has verified full local cache staging, ordinary-reboot
+persistence, sealed retries and an explicit image-bound abort while preserving
+its captured settings. It remains stock `CACHE_ONLY`, not `INSTALL_CAPABLE`;
+no campaign START or COMMIT was sent. Keep the uploader on the stock bootloader.
+Stock-only compatibility honours the
 vendor's documented unused-CRC-zero convention without relaxing candidate
 or trial integrity. Installing a custom uploader loader is not a workaround.
 
@@ -167,6 +166,13 @@ Abort the remote target separately when that is intended. A denied,
 mismatched or unavailable local abort is an error, not permission to
 overwrite the cache.
 
+For cache-only staging without selecting a target or starting radio traffic,
+use `make ota-lab-cache` as documented in the
+[working-client workflow](hardware_lab.md#one-client-application-and-local-cache-validation).
+`CACHE_SEALED` is local validated storage, not a remote READY or installation.
+Retrying the same sealed image signs the manifest and sends BEGIN, then
+requires fresh, matching local STATUS without sending PUT or SEAL again.
+
 An nRF command refused before installation is not an active copy or
 trial. If the device can prove that refusal against the original signed
 command and its current valid running bank, a currently trusted
@@ -174,6 +180,13 @@ administrator may explicitly abort it. Firmware durably records the
 abort and cancels the old intent before allowing replacement. Missing,
 corrupt or unbound commands, inconsistent boot evidence and I/O faults
 remain protected; an unknown status alone is not permission to erase.
+
+On ESP32, uncertain version-floor persistence must not invalidate an image
+already marked VALID. An ordinary restart can reconcile the floor from
+signed running-image proof; a persistent fault disables OTA. The OTA-on
+application prevents Arduino's automatic whole-NVS erase on initialization
+failure, not an explicitly authorized factory reset. Neither behaviour is
+physical recovery qualification; do not erase state to clear an OTA refusal.
 
 ## Build-time requirement
 
