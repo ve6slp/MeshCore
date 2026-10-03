@@ -68,6 +68,47 @@ The OTA profile intentionally refuses fresh identity creation and blank-storage
 formatting; do not bypass those guards or clone the failed target's identity.
 Keep stock recovery intact during these application and ordinary-radio checks.
 
+**Actual replacement commissioning, Oct. 3, 2026 UTC:** application-only stock
+DFU of the qualified ordinary bench image returned to APP USB. Its 389,768-byte
+application SHA256 is
+`54ad8251ce53610b0195ba018895020fbe1e264209a82c4ae290d401497b8713`;
+ZIP SHA256 is `b71a5e90c410b28ed5d5069740575f31ef003dfd2a9b0ebcb820d31678ad0fae`.
+Compiled initial/preference defaults were independently qualified as
+907.525 MHz / BW250 kHz / SF7 / CR5; inherited TX power remained 22 dBm.
+The ordinary profile's existing append/unflag mechanism selected those defaults:
+
+```sh
+PLATFORMIO_BUILD_FLAGS='-D LORA_FREQ=907.525 -D LORA_BW=250 -D LORA_SF=7 -D LORA_CR=5' \
+PLATFORMIO_BUILD_UNFLAGS='-D LORA_FREQ=869.618 -D LORA_BW=62.5 -D LORA_SF=8' \
+make build-xiao-nrf52-lab XIAO_NRF52_LAB_ENVS=Xiao_nrf52_repeater
+```
+
+It generated its own public identity `11e41e0d...ad3bd507`, retained after an
+ordinary reboot. Explicit bench name/radio/path settings and normal companion
+ADMIN permission were then saved and independently retained after another
+ordinary reboot, including the complete ACL. The `03:47:08Z` zero-hop advert
+probe received that exact target at the client: native companion acceptance and
+host Ed25519 verification of the raw advert were both observed, RSSI -24 dBm /
+SNR 11.75 dB. All captured settings and the complete ACL were unchanged.
+
+**Blocking migration finding:** APP-only migration to the qualified `73da40aa`
+OTA repeater preserved identity and complete ACL, but reset visible target
+preferences to the compiled defaults: name `Xiao_nrf52 Repeater`, BW62.5 kHz
+and path-hash mode 0 instead of the saved bench name/BW250 kHz/mode 2.
+Stock proof was healthy, size 538328, CRC `0000/E87C`, marker blank, CACHE_ONLY.
+No settings were replayed to hide this failure. Restoring the exact ordinary
+APP recovered every original captured setting and the complete ACL without
+setters; the tested migration did not erase those stored preferences.
+Further OTA migration is held for a causally verified preference-read/startup
+correction. The replacement is back on its ordinary bench APP with stock
+recovery intact. The final `03:55:01Z` probe again observed a host-verified signed
+target advert; native companion acceptance was not observed in that final
+probe. Neither probe qualifies bidirectional, routed, multicast or OTA delivery.
+No custom loader, SoftDevice, MBR or UICR update, power cut, OTA START or COMMIT
+was requested; Pine and the failed recovery target were not opened.
+Source-bound first-provision and regression evidence is retained privately in
+`review-candidates/replacement-77-stock-first-provision-evidence/`.
+
 An inventory listing can override a role for one run without editing the file:
 
 ```sh
