@@ -1426,7 +1426,7 @@ class AdminGrantModeTests(unittest.TestCase):
         ])
         self.client.assert_called_once_with("client-4186AE911D94CDB1",
                                            "/dev/serial/by-id/client", self.evidence)
-        self.target.assert_called_once_with("target-3BE94917B92DC5E9",
+        self.target.assert_called_once_with("target-77CD44653A967172",
                                            "/dev/serial/by-id/target", self.evidence)
         self.grant.assert_called_once_with(self.client.return_value, self.target.return_value,
                                           self.evidence)
@@ -1438,7 +1438,8 @@ class AdminGrantModeTests(unittest.TestCase):
 
     def test_unapproved_swapped_duplicate_or_pine_serials_fail_before_either_port_opens(self):
         for role, serial in (("client", "unapproved"), ("target", "unapproved"),
-                             ("client", "3BE94917B92DC5E9"), ("target", "4186AE911D94CDB1"),
+                             ("client", "77CD44653A967172"), ("target", "4186AE911D94CDB1"),
+                             ("target", "3BE94917B92DC5E9"),
                              ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
             with self.subTest(role=role, serial=serial):
                 self.setUp()
@@ -1669,6 +1670,7 @@ class OtaPreflightInspectionTests(unittest.TestCase):
 
     def test_boot_address_requirement_cannot_bypass_approved_pair_or_role_name_guards(self):
         for role, serial in (("client", "unapproved"), ("target", "unapproved"),
+                             ("target", "3BE94917B92DC5E9"),
                              ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
             with self.subTest(role=role, serial=serial):
                 self.setUp()
@@ -1941,7 +1943,7 @@ class OtaPreflightInspectionTests(unittest.TestCase):
 
     def test_genesis_requirement_cannot_bypass_existing_approved_roles_and_actual_identity_checks(self):
         for serial, key in (("49C5BAF21EEF44A1", TARGET_KEY), ("unapproved", TARGET_KEY),
-                            ("3BE94917B92DC5E9", CLIENT_KEY)):
+                            ("3BE94917B92DC5E9", TARGET_KEY), ("77CD44653A967172", CLIENT_KEY)):
             with self.subTest(serial=serial, key=key):
                 self.setUp()
                 self.genesis_fixture()
@@ -1950,7 +1952,7 @@ class OtaPreflightInspectionTests(unittest.TestCase):
                     self.target.command.side_effect = ["> repeater", "> " + key.hex()]
                 with self.assertRaises(AssertionError):
                     self.run_main(["--require-target-genesis-floor"])
-                if serial != "3BE94917B92DC5E9":
+                if serial != "77CD44653A967172":
                     self.client_open.assert_not_called()
                     self.target_open.assert_not_called()
                 self.assertFalse(any(call.args[0].startswith("ota ")
@@ -2100,11 +2102,11 @@ class OtaPreflightInspectionTests(unittest.TestCase):
 
     def test_unapproved_or_pine_serial_refuses_before_either_port_opens(self):
         for role in ("client", "target"):
-            for serial in ("unapproved", "49C5BAF21EEF44A1"):
+            for serial in ("unapproved", "49C5BAF21EEF44A1", "3BE94917B92DC5E9"):
                 with self.subTest(role=role, serial=serial):
                     self.setUp()
                     self.devices[role].serial = serial
-                    with self.assertRaisesRegex(AssertionError, f"approved-ota-preflight-{role}"):
+                    with self.assertRaisesRegex(AssertionError, f"approved-active-lab-{role}"):
                         self.run_main()
                     self.client_open.assert_not_called()
                     self.target_open.assert_not_called()
@@ -2323,7 +2325,8 @@ class ConfigurationInspectionTests(unittest.TestCase):
 
     def test_unapproved_swapped_or_pine_usb_serial_refuses_before_either_port_opens(self):
         for role, serial in (("client", "unapproved"), ("target", "unapproved"),
-                             ("client", "3BE94917B92DC5E9"), ("target", "4186AE911D94CDB1"),
+                             ("client", "77CD44653A967172"), ("target", "4186AE911D94CDB1"),
+                             ("target", "3BE94917B92DC5E9"),
                              ("client", "49C5BAF21EEF44A1"), ("target", "49C5BAF21EEF44A1")):
             with self.subTest(role=role, serial=serial):
                 self.setUp()
@@ -2381,7 +2384,7 @@ class ConfigurationInspectionTests(unittest.TestCase):
         self.evidence.finish.assert_called_once_with(None)
 
     def test_client_only_configuration_refuses_other_usb_sources_and_role_overrides_before_open(self):
-        for serial in ("49C5BAF21EEF44A1", "3BE94917B92DC5E9", "unapproved"):
+        for serial in ("49C5BAF21EEF44A1", "77CD44653A967172", "3BE94917B92DC5E9", "unapproved"):
             with self.subTest(serial=serial):
                 self.setUp()
                 self.devices["client"].serial = serial
@@ -2432,6 +2435,52 @@ class ConfigurationInspectionTests(unittest.TestCase):
                     target_open.assert_not_called()
                 self.assertEqual(marker.read_text(), "untouched")
                 self.assertEqual(list(pathlib.Path(parent).iterdir()), [marker])
+
+
+class ActivePairResolverTests(unittest.TestCase):
+    def test_all_operational_pair_resolvers_use_literal_replacement_contract(self):
+        expected = {"client": "4186AE911D94CDB1", "target": "77CD44653A967172"}
+        self.assertEqual(ota_rf_lab.APPROVED_ADMIN_PAIR, expected)
+        devices = {role: mock.Mock(serial=serial, by_id=f"/dev/serial/by-id/{serial}")
+                   for role, serial in expected.items()}
+        for resolver in (ota_rf_lab.resolve_roles, ota_rf_lab.resolve_admin_grant_roles,
+                         ota_rf_lab.resolve_preflight_roles, ota_rf_lab.resolve_configuration_inspection_roles):
+            with self.subTest(resolver=resolver.__name__), \
+                    mock.patch.object(ota_rf_lab.lab_device, "resolve",
+                                      side_effect=lambda role, mode: devices[role]) as resolve:
+                self.assertEqual(resolver(evidence_fixture()), devices)
+                self.assertEqual(resolve.call_args_list, [
+                    mock.call("client", mode=ota_rf_lab.lab_device.MODE_APP),
+                    mock.call("target", mode=ota_rf_lab.lab_device.MODE_APP),
+                ])
+
+    def test_failed_target_and_pine_are_refused_by_every_operational_resolver(self):
+        for serial in ("3BE94917B92DC5E9", "49C5BAF21EEF44A1"):
+            for resolver in (ota_rf_lab.resolve_roles, ota_rf_lab.resolve_admin_grant_roles,
+                             ota_rf_lab.resolve_preflight_roles, ota_rf_lab.resolve_configuration_inspection_roles):
+                with self.subTest(serial=serial, resolver=resolver.__name__):
+                    devices = {
+                        "client": mock.Mock(serial="4186AE911D94CDB1", by_id="/dev/serial/by-id/client"),
+                        "target": mock.Mock(serial=serial, by_id="/dev/serial/by-id/denied"),
+                    }
+                    with mock.patch.object(ota_rf_lab.lab_device, "resolve",
+                                           side_effect=lambda role, mode: devices[role]), \
+                            mock.patch.object(ota_rf_lab, "FramedSerial") as client, \
+                            mock.patch.object(ota_rf_lab, "RepeaterSerial") as target:
+                        with self.assertRaises(AssertionError):
+                            resolver(evidence_fixture())
+                        client.assert_not_called()
+                        target.assert_not_called()
+
+    def test_client_only_resolution_never_resolves_replacement_recovery_or_pine_roles(self):
+        device = mock.Mock(serial="4186AE911D94CDB1", by_id="/dev/serial/by-id/client")
+        for resolver in (ota_rf_lab.resolve_roles, ota_rf_lab.resolve_preflight_roles):
+            for target_role in ("target", "recovery", "pine"):
+                with self.subTest(resolver=resolver.__name__, target_role=target_role), \
+                        mock.patch.object(ota_rf_lab, "TARGET_ROLE", target_role), \
+                        mock.patch.object(ota_rf_lab.lab_device, "resolve", return_value=device) as resolve:
+                    self.assertEqual(resolver(evidence_fixture(), client_only=True), {"client": device})
+                    resolve.assert_called_once_with("client", mode=ota_rf_lab.lab_device.MODE_APP)
 
 
 class CompanionSigningTests(unittest.TestCase):
@@ -2753,7 +2802,7 @@ class ChannelInventoryTests(unittest.TestCase):
             self.assertEqual(list(directory.iterdir()), [marker])
 
     def test_unapproved_pine_or_target_source_serial_never_opens_any_port(self):
-        for serial in ("49C5BAF21EEF44A1", "3BE94917B92DC5E9", "unapproved"):
+        for serial in ("49C5BAF21EEF44A1", "77CD44653A967172", "3BE94917B92DC5E9", "unapproved"):
             with self.subTest(serial=serial), tempfile.TemporaryDirectory(dir=TEST_SCRATCH) as parent:
                 self.setUp()
                 self.devices["client"].serial = serial

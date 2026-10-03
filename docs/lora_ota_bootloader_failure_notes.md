@@ -2,6 +2,10 @@
 
 Target: `3BE94917B92DC5E9`. Incident: Oct. 2, 2026, `13:46:21Z`.
 
+The replacement radio target is `77CD44653A967172`. This incident and its
+paused SWD diagnosis still concern only the original failed `3BE...` unit,
+bound by `[recovery] target` in the lab inventory, not the active OTA role.
+
 ## Assessment
 
 The observed failure is **no USB return after the activation request**, not a

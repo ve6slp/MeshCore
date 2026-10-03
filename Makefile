@@ -136,7 +136,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         test-ota-image-layout-index test-ota-storage \
         test-ota-trust test-ota-boot test-ota-integration test-ota-rf-to-boot test-ota-lab-host test-ota-lab-archive clean-ota-targets \
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
-        lab-bootloader-client lab-bootloader-target lab-bootloader-uf2-target \
+        lab-bootloader-client lab-bootloader-target lab-bootloader-uf2-target lab-inspect-stock-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
         lab-wait-client lab-wait-target \
         test-xiao-nrf52-swd-diagnosis diagnose-xiao-nrf52-target-swd \
@@ -301,6 +301,10 @@ lab-bootloader-target:
 ## Enter vendor UF2 mode through the approved target's bench USB application.
 lab-bootloader-uf2-target:
 	@$(LAB_DEVICE) bootloader-uf2 target --timeout 30
+
+## Read public stock Sense boot INFO from the operator's already read-only mounted target volume.
+lab-inspect-stock-bootloader-target:
+	@$(LAB_DEVICE) inspect-stock-bootloader target
 
 ## Cut and restore USB port power. Use this to recover an unresponsive board.
 lab-power-cycle-client:

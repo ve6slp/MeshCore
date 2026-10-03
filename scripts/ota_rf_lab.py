@@ -34,7 +34,7 @@ import lab_device  # noqa: E402
 # serial or ttyACMn, so the lab survives re-cabling and board swaps.
 CLIENT_ROLE = os.environ.get("MESHCORE_LAB_CLIENT_ROLE", "client")
 TARGET_ROLE = os.environ.get("MESHCORE_LAB_TARGET_ROLE", "target")
-APPROVED_ADMIN_PAIR = {"client": "4186AE911D94CDB1", "target": "3BE94917B92DC5E9"}
+APPROVED_ADMIN_PAIR = lab_device.APPROVED_ADMIN_PAIR
 CLIENT_ACL_ADMIN = 3
 ACL_LAZY_SAVE_WAIT_SECONDS = 6.0
 
@@ -934,10 +934,15 @@ def run_inspect_measurements(client, target, evidence):
 
 def resolve_roles(evidence, client_only=False):
     """Resolve each lab role to a live board and record the evidence."""
+    evidence.check("approved-active-lab-roles",
+                   CLIENT_ROLE == "client" and (client_only or TARGET_ROLE == "target"),
+                   client_role=CLIENT_ROLE, target_role=TARGET_ROLE, client_only=client_only)
     roles = [CLIENT_ROLE] if client_only else [CLIENT_ROLE, TARGET_ROLE]
     resolved = {}
     for role in roles:
         device = lab_device.resolve(role, mode=lab_device.MODE_APP)
+        evidence.check(f"approved-active-lab-{role}", device.serial == APPROVED_ADMIN_PAIR[role],
+                       expected_serial=APPROVED_ADMIN_PAIR[role], observed_serial=device.serial)
         resolved[role] = device
         evidence.check(f"device-{role}", True, role=role, serial=device.serial,
                        path=str(device.by_id), resolved=os.path.realpath(device.by_id))

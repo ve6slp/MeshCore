@@ -195,6 +195,15 @@ class DiagnosisTests(unittest.TestCase):
             role="target", target_serial=swd.APPROVED_SERIAL, probe_uid=self.probe.unique_id,
             config=swd.ROOT / "lab" / "devices.ini",
         )
+        self.inventory = """[roles]
+client = 4186AE911D94CDB1
+target = 77CD44653A967172
+[recovery]
+target = 3BE94917B92DC5E9
+[protected]
+pine = 49C5BAF21EEF44A1
+"""
+        mock.patch.object(Path, "open", side_effect=lambda: io.StringIO(self.inventory)).start()
         self.session = None
         outer = self
 
@@ -368,7 +377,7 @@ class DiagnosisTests(unittest.TestCase):
         self.assertTrue(all(not 0x12000000 <= a < 0x16000000 for a in addresses))
 
     def test_mismatched_protected_or_healthy_identity_never_halts_or_creates_cores(self):
-        for serial in ("49C5BAF21EEF44A1", "4186AE911D94CDB1"):
+        for serial in ("49C5BAF21EEF44A1", "4186AE911D94CDB1", "77CD44653A967172"):
             with self.subTest(serial=serial):
                 self.events.clear()
                 self.target = FakeTarget(self.events, serial=serial)
@@ -586,15 +595,81 @@ class DiagnosisTests(unittest.TestCase):
 
     def test_request_refuses_healthy_protected_or_empty_explicit_identity_before_dependency(self):
         for serial, uid in (("4186AE911D94CDB1", "full-probe-uid"),
+                            ("77CD44653A967172", "full-probe-uid"),
                             ("49C5BAF21EEF44A1", "full-probe-uid"), (swd.APPROVED_SERIAL, "")):
             with self.subTest(serial=serial):
                 self.args.target_serial, self.args.probe_uid = serial, uid
-                self.assertFalse(self.run_diagnosis()["ok"])
+                result = self.run_diagnosis()
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["errors"][0]["phase"], "request")
+                self.assertEqual(self.events, [])
+                self.assertIsNone(self.session)
         self.loader.assert_not_called()
         self.select.assert_not_called()
 
+    def test_recovery_selects_original_target_despite_active_pair_and_environment_overrides(self):
+        with mock.patch.dict("os.environ", {"MESHCORE_LAB_TARGET_SERIAL": "77CD44653A967172",
+                                           "MESHCORE_LAB_RECOVERY_TARGET_SERIAL": "77CD44653A967172"}):
+            result = self.run_diagnosis()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["identity"]["approved_serial"], "3BE94917B92DC5E9")
+        self.assertEqual(result["identity"]["observed_serial"], "3BE94917B92DC5E9")
+        self.assertEqual(result["identity"]["role"], "target")
+        self.loader.assert_called_once()
+        self.select.assert_called_once_with(unique_id="full-probe-uid", is_explicit=True)
+
+    def test_legacy_inventory_without_recovery_accepts_only_original_target(self):
+        self.inventory = """[roles]
+client = 4186AE911D94CDB1
+target = 3BE94917B92DC5E9
+[protected]
+pine = 49C5BAF21EEF44A1
+"""
+        result = self.run_diagnosis()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["identity"]["observed_serial"], "3BE94917B92DC5E9")
+
+    def test_missing_or_malformed_recovery_target_never_falls_back_to_legacy_role(self):
+        base = self.inventory.replace("target = 77CD44653A967172", "target = 3BE94917B92DC5E9")
+        for recovery in ("", "other = 3BE94917B92DC5E9", "target =",
+                         "target = 77CD44653A967172", "target = 49C5BAF21EEF44A1",
+                         "target = 3be94917b92dc5e9", "target = 3BE94917B92DC5E9-extra",
+                         "target = 3BE94917B92DC5E9\ntarget = 77CD44653A967172"):
+            with self.subTest(recovery=recovery):
+                self.inventory = base.replace("[recovery]\ntarget = 3BE94917B92DC5E9",
+                                              "[recovery]\n" + recovery)
+                result = self.run_diagnosis()
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["errors"][0]["phase"], "request")
+                self.loader.assert_not_called()
+                self.select.assert_not_called()
+                self.assertEqual(self.events, [])
+                self.assertIsNone(self.session)
+
+    def test_recovery_collisions_and_inherited_default_target_refuse_before_dependency(self):
+        canonical = self.inventory
+        inventories = (
+            canonical.replace("target = 77CD44653A967172", "target = 3BE94917B92DC5E9"),
+            canonical.replace("client = 4186AE911D94CDB1", "client = 3BE94917B92DC5E9"),
+            canonical.replace("pine = 49C5BAF21EEF44A1", "pine = 3BE94917B92DC5E9"),
+            canonical.replace("[recovery]", "[recovery]\nother = 3BE94917B92DC5E9"),
+            "[DEFAULT]\ntarget = 3BE94917B92DC5E9\n"
+            + canonical.replace("[recovery]\ntarget = 3BE94917B92DC5E9", "[recovery]"),
+        )
+        for inventory in inventories:
+            with self.subTest(inventory=inventory):
+                self.inventory = inventory
+                result = self.run_diagnosis()
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["errors"][0]["phase"], "request")
+                self.loader.assert_not_called()
+                self.select.assert_not_called()
+                self.assertEqual(self.events, [])
+                self.assertIsNone(self.session)
+
     def test_inventory_reassignment_or_protected_alias_refuses_before_dependency(self):
         for inventory in ("[roles]\ntarget = 4186AE911D94CDB1\n",
+                          "[roles]\ntarget = 77CD44653A967172\n",
                           f"[roles]\ntarget = {swd.APPROVED_SERIAL}\n[protected]\npine = {swd.APPROVED_SERIAL}\n",
                           f"[roles]\ntarget = {swd.APPROVED_SERIAL}\nclient = {swd.APPROVED_SERIAL}\n"):
             with self.subTest(inventory=inventory), mock.patch.object(Path, "open", return_value=io.StringIO(inventory)):

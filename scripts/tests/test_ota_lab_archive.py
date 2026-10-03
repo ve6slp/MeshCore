@@ -1029,11 +1029,21 @@ class ArchiveAndVerifyCommandTests(ScratchDirMixin, unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(lab_device, "resolve") as resolve_mock, \
                 mock.patch.object(ota_lab_archive, "open_serial_port") as open_mock, \
+                mock.patch.object(lab_device, "load_roles",
+                                  return_value={"client": CLIENT_SERIAL, "target": TARGET_SERIAL}), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(0, ota_lab_archive.cmd_verify(args))
         resolve_mock.assert_not_called()
         open_mock.assert_not_called()
         self.assertIn("no live device comparison", output.getvalue())
+        with mock.patch.object(lab_device, "resolve") as resolve_mock, \
+                mock.patch.object(ota_lab_archive, "open_serial_port") as open_mock, \
+                mock.patch.object(lab_device, "load_roles",
+                                  return_value={"client": CLIENT_SERIAL, "target": "77CD44653A967172"}):
+            with self.assertRaisesRegex(ota_lab_archive.DeviceRefused, "does not match"):
+                ota_lab_archive.cmd_verify(args)
+            resolve_mock.assert_not_called()
+            open_mock.assert_not_called()
 
     def test_offline_validation_refuses_wrong_role_serial_or_uid(self):
         key_path = self.make_key_file()

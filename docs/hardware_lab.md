@@ -30,17 +30,52 @@ serial:
 ```ini
 [roles]
 client = 4186AE911D94CDB1
-target = 3BE94917B92DC5E9
+target = 77CD44653A967172
 
 [protected]
 pine = 49C5BAF21EEF44A1
+
+[recovery]
+target = 3BE94917B92DC5E9
 ```
 
-Override a role for one run without editing the file:
+The replacement `77CD44653A967172` is the active radio target. The failed
+former target remains separately bound in `[recovery]`; it is not an active
+OTA role. SWD's explicit `--role target` still selects only that original
+failed device, not whichever board is now the radio target.
+
+Initial replacement discovery found `239a:810b`, manufacturer Seeed Studio,
+product `XIAO-BOOT`, with CDC interfaces. That is public USB evidence, not
+proof of application mode, board variant, SoftDevice or a compatible recovery
+loader. Do not infer mode from the high PID bit or bypass USB/profile guards
+to flash it. Its firmware baseline must be established first.
+
+After the user's replacement-only physical double-reset on Oct. 3, 2026 UTC,
+the same serial enumerated as `2886:0045`, XIAO nRF52840 Sense, with its own
+MSC interface. The ancestry-matched, read-only `XIAO-SENSE` volume reported
+Board-ID `Seeed_XIAO_nRF52840_Sense`, stock UF2 loader `0.6.1` and S140 `7.3.0`.
+This is compatible vendor metadata, not cryptographic installed-byte proof or
+custom-loader qualification. No software reset, serial open or firmware write
+was made to establish that baseline.
+
+The user identifies the replacement as a fresh factory board that has never
+run MeshCore. Its first application must therefore be the ordinary
+`Xiao_nrf52_repeater` profile, with separately qualified bench radio defaults.
+Ordinary healthy first boot generates and saves its own MeshCore identity.
+Only after capturing that new identity/settings and verifying persistence
+should it be upgraded application-only to the OTA repeater profile.
+The OTA profile intentionally refuses fresh identity creation and blank-storage
+formatting; do not bypass those guards or clone the failed target's identity.
+Keep stock recovery intact during these application and ordinary-radio checks.
+
+An inventory listing can override a role for one run without editing the file:
 
 ```sh
 MESHCORE_LAB_TARGET_SERIAL=ABC123 make lab-devices
 ```
+
+Operational commands still require the exact approved client/replacement pair;
+an inventory override does not authorize a different device.
 
 Serials in `[protected]` cannot be assigned to a lab role, including through
 an environment override. This prevents the Pine project board from being
@@ -59,6 +94,7 @@ of use makes that a non-event.
 | `make lab-reset-<role>` | Restart the application firmware |
 | `make lab-bootloader-<role>` | Enter the serial DFU bootloader |
 | `make lab-bootloader-uf2-target` | Request vendor UF2 mode from the target's bench USB application |
+| `make lab-inspect-stock-bootloader-target` | Read public stock Sense boot metadata from its already-mounted read-only MSC volume |
 | `make inspect-xiao-nrf52-channels` | Read the approved companion's configured channel names and indices, without logging keys |
 | `make inspect-xiao-nrf52-ota-measurements` | Read the approved pair's driver-applied radio and completed airtime observations |
 | `make inspect-xiao-nrf52-ota-client-measurements` | Read those observations from the approved companion only |
@@ -66,6 +102,15 @@ of use makes that a non-event.
 | `make lab-wait-<role>` | Block until the board enumerates |
 | `make upload-xiao-nrf52-<role>` | Build and flash the role's application |
 | `make flash-xiao-nrf52-<role>` | Flash the role's existing package without rebuilding |
+
+`lab-inspect-stock-bootloader-target` never enters a bootloader, opens serial,
+mounts a volume or writes firmware. After target-only physical UF2 entry and
+host read-only mounting, it requires the approved replacement's stable USB
+identity, exact Sense USB/Board-ID, its own MSC interface, one ancestry-matched
+read-only whole-volume mount, and bounded stock `0.6.1` / S140 `7.3.0` INFO.
+Its JSON explicitly distinguishes vendor metadata from installed-byte proof
+and custom-loader qualification. Missing or mismatched evidence is a refusal,
+not permission to retry a flash.
 
 The client uses `Xiao_nrf52_companion_radio_usb`; the remotely upgraded
 target uses `Xiao_nrf52_repeater_ota_usb` (`simple_repeater`). Override
@@ -162,7 +207,8 @@ not authorize target/SWD recovery, bootloader/SoftDevice/MBR/UICR writes,
 raw code-region writes or a radio campaign.
 
 When only companion `4186AE911D94CDB1` is available, these routes never
-resolve or open target `3BE94917B92DC5E9` or protected Pine `49C5BAF21EEF44A1`.
+resolve or open active target `77CD44653A967172`, failed recovery target
+`3BE94917B92DC5E9` or protected Pine `49C5BAF21EEF44A1`.
 Use a **new artifact directory for every inspection and cache invocation**;
 existing directories are refused before any port opens.
 
@@ -319,9 +365,43 @@ actual application/local-cache evidence to the refined tree, **not** remote
 OTA, installation, rollback, physical RF-register readback or duty acceptance.
 
 That physical firmware and its recorded uploader used ABI1. The current
-generation-bound cancellation protocol uses ABI2/90-byte replies and has not
-been qualified on this client. The new host refuses ABI1; do not bypass its
-version guard or relabel the earlier cache evidence as ABI2 acceptance.
+generation-bound cancellation protocol uses ABI2/90-byte replies. The new host
+refuses ABI1; do not bypass its version guard or relabel earlier cache evidence
+as ABI2 acceptance.
+
+**ABI2 application/local-cache validation, Oct. 3, 2026 UTC:** an application-only stock DFU of
+the qualified `6d73c110` / `73da40aa` companion package returned to APP USB.
+The ZIP SHA256 is `f5129bc90c1134b79b5348d5250d31bdea24456788622950c489192cb636de41`;
+the 548,772-byte application SHA256 is
+`a0bc5bd9e59166678dffa9d3433d6495bcd21e949f67c2e3e206e2049cea58cd`.
+Fresh `03:10:20Z` configuration matched the pre-flash capture. Stock proof
+remained healthy, writes allowed, blank marker, SDK size 548772 and CRC
+`0000/45B7`, still CACHE_ONLY. Actual 90-byte ABI2 local STATUS at `03:10:25Z`
+reported the retained aborted candidate, generation 4, counter 1 and all
+6,403 blocks with canonical hash `8eeecabd...`.
+
+Explicit reupload of the same 537,816-byte signed candidate sealed all 6,403
+blocks at `03:13:55Z`, generation 5. An ordinary application reboot retained
+the exact sealed candidate/generation at `03:17:52Z`. Both sealed retries sent
+signing/BEGIN/STATUS, with zero PUT or SEAL. Actual 70-byte local ABORT bound to
+generation 5 produced durable ABORTED generation 6 at `03:19:22Z`, independently
+confirmed at `03:19:24Z`. An explicit retry using generation 6 remained at 6:
+it did not advance the generation again.
+
+Final `03:20:27–32Z` readbacks matched every captured public setting and retained
+healthy stock proof / CACHE_ONLY / CRC `0000/45B7`. Driver-reported radio faults,
+apply failures, OTA airtime, all-TX time, timeouts and accounting failures were
+zero. ROOT's recorded-evidence audit verified all three normal-identity manifest
+signatures, byte-exact 6,403-block transfer, 6,419 valid local 90-byte ABI2 replies
+and all 17 recorded serial opens against the approved client. The separate
+application flash and ordinary reboot logs also identify only that client.
+No ADD_TARGET, START, COMMIT, administrator or radio-setting request was sent;
+no bootloader, SoftDevice, MBR or UICR update was requested. Private source-bound
+evidence is retained in `review-candidates/working-client-abi2-final-evidence/`.
+This qualifies the actual ABI2 application/local-cache cancellation outcome,
+**not** remote radio delivery, installation, rollback, physical PHY readback
+or full-window duty acceptance. Retained ABORTED block counts are not erasure
+proof.
 
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
@@ -334,7 +414,7 @@ Use a new evidence path for each invocation; the Make wrapper refuses any
 already-existing artifact directory. It invokes
 `scripts/ota_rf_lab.py --artifact-dir "$OTA_LAB_ARTIFACT_DIR" --grant-client-admin`
 and only opens approved client
-`4186AE911D94CDB1` and target `3BE94917B92DC5E9`, never Pine
+`4186AE911D94CDB1` and target `77CD44653A967172`, never Pine
 `49C5BAF21EEF44A1`. After checking actual companion/repeater roles, distinct
 normal full public keys and the complete ACL, it sends exactly
 `setperm <64-hex-normal-companion-pk> 3` through the existing repeater text CLI
@@ -866,7 +946,11 @@ and [Sense V1.1 KiCad design](https://files.seeedstudio.com/wiki/XIAO-BLE/Seeed-
 
 `scripts/swd_diagnose.py` is independent of USB application/serial discovery.
 It requires the explicit full probe UID and approved target serial/role in
-`lab/devices.ini`, ignores role environment overrides, and has no first-probe
+`lab/devices.ini`'s authoritative `[recovery] target`, not the replacement
+radio `[roles] target`. A present malformed/missing recovery target is refused;
+it never falls back to the active radio target. Legacy inventories without a
+recovery section still require the original hard-approved failed serial.
+The helper ignores role environment overrides and has no first-probe
 fallback. CMSIS-DAP discovery occurs **only** in the physical `diagnose`
 command; native tests never import pyOCD or open probes.
 

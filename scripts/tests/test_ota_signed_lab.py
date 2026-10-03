@@ -1433,13 +1433,49 @@ class SignedLabTests(unittest.TestCase):
         self.assertFalse(self.evidence.summary["measurements"]["installed"]["trial_observed"])
 
     def test_role_resolution_refuses_pine_before_opening_either_port(self):
-        with mock.patch.object(signed.lab_device, "resolve", side_effect=[
-                SimpleNamespace(serial=signed.APPROVED["client"], by_id="/dev/serial/by-id/client"),
-                SimpleNamespace(serial="49C5BAF21EEF44A1", by_id="/dev/serial/by-id/pine")]), \
-                mock.patch.object(lab, "FramedSerial") as opened:
-            with self.assertRaisesRegex(signed.QualificationError, "unapproved target"):
-                signed.Pair(self.evidence, self.deadline)
-        opened.assert_not_called()
+        for serial in ("49C5BAF21EEF44A1", "3BE94917B92DC5E9"):
+            with self.subTest(serial=serial), \
+                    mock.patch.object(signed.lab_device, "resolve", side_effect=[
+                        SimpleNamespace(serial=signed.APPROVED["client"], by_id="/dev/serial/by-id/client"),
+                        SimpleNamespace(serial=serial, by_id="/dev/serial/by-id/denied")]), \
+                    mock.patch.object(lab, "FramedSerial") as client_open, \
+                    mock.patch.object(lab, "RepeaterSerial") as target_open:
+                with self.assertRaisesRegex(signed.QualificationError, "unapproved target"):
+                    signed.Pair(self.evidence, self.deadline)
+                client_open.assert_not_called()
+                target_open.assert_not_called()
+
+    def test_active_pair_contract_is_literal_and_resolves_both_before_opening_ports(self):
+        self.assertEqual(signed.APPROVED,
+                         {"client": "4186AE911D94CDB1", "target": "77CD44653A967172"})
+        self.assertIs(signed.APPROVED, lab.APPROVED_ADMIN_PAIR)
+        devices = {role: SimpleNamespace(serial=serial, by_id=f"/dev/serial/by-id/{serial}")
+                   for role, serial in (("client", "4186AE911D94CDB1"), ("target", "77CD44653A967172"))}
+        resolved = []
+
+        def resolve(role, mode):
+            resolved.append(role)
+            return devices[role]
+
+        def open_node(*args):
+            self.assertEqual(resolved, ["client", "target"])
+            return mock.Mock()
+
+        with mock.patch.object(signed.lab_device, "resolve", side_effect=resolve), \
+                mock.patch.object(lab, "FramedSerial", side_effect=open_node) as client_open, \
+                mock.patch.object(lab, "RepeaterSerial", side_effect=open_node) as target_open:
+            pair = signed.Pair(self.evidence, self.deadline)
+            client_open.assert_called_once_with("client", devices["client"].by_id, self.evidence)
+            target_open.assert_called_once_with("target", devices["target"].by_id, self.evidence)
+            pair.close()
+
+    def test_previous_target_baseline_cannot_qualify_replacement_pair(self):
+        path = self.directory / "old-pair-baseline.json"
+        signed.write_record(path, {"version": signed.RECORD_VERSION, "kind": "baseline",
+                                  "serials": {"client": "4186AE911D94CDB1",
+                                              "target": "3BE94917B92DC5E9"}})
+        with self.assertRaisesRegex(signed.QualificationError, "approved pair"):
+            signed.read_record(path, "baseline")
 
     def test_reenumeration_requires_real_absence_and_resolves_new_stable_path(self):
         pair = object.__new__(signed.Pair)

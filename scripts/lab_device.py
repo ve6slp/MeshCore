@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import argparse
 import configparser
+from datetime import datetime, timezone
 import glob
 import hashlib
 import json
 import math
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -38,18 +40,25 @@ CONFIG_PATH = Path(os.environ.get("MESHCORE_LAB_CONFIG", REPO_ROOT / "lab" / "de
 
 BY_ID_DIR = Path("/dev/serial/by-id")
 USB_DEVICES = Path("/sys/bus/usb/devices")
+MOUNTINFO = Path("/proc/self/mountinfo")
+SYS_DEV_CHAR = Path("/sys/dev/char")
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+STOCK_INFO_MAX_BYTES = 4096
 
-# Seeed's USB vendor ID. Both XIAO nRF52840 variants enumerate under it.
+# Existing guarded Seeed USB vendor ID; other VIDs are diagnostic-only.
 SEEED_VID = 0x2886
 
 # Adafruit nRF52 convention: the running application sets bit 15 of the
 # product ID, the serial-DFU bootloader clears it (e.g. app 0x8044 vs
 # bootloader 0x0044). Matching on the bit works across board variants,
-# unlike the USB product strings, which differ per unit.
+# unlike the USB product strings, which differ per unit. This convention is
+# not applied to diagnostic-only USB profiles.
 APP_PID_BIT = 0x8000
 
 MODE_APP = "app"
 MODE_BOOT = "bootloader"
+
+APPROVED_ADMIN_PAIR = {"client": "4186AE911D94CDB1", "target": "77CD44653A967172"}
 
 # uhubctl can wedge when the USB stack is busy; never block the lab on it.
 UHUBCTL_TIMEOUT = 25.0
@@ -118,7 +127,7 @@ def sysfs_for_serial(serial: str) -> Path | None:
 
 
 def discover() -> list[Device]:
-    """Every attached XIAO nRF52840 that udev has finished setting up.
+    """Every guarded Seeed-VID XIAO nRF52840 that udev has finished setting up.
 
     A board is only reported once its stable by-id symlink exists. Reporting it
     earlier races udev: the raw /dev/ttyACMn node briefly exists with default
@@ -138,6 +147,25 @@ def discover() -> list[Device]:
         devices.append(Device(serial=serial, mode=mode, tty=tty, sysfs=node,
                               product=_read(node / "product"), by_id=by_id[tty]))
     return devices
+
+
+def _attached_usb_diagnostics(serial: str) -> list[str]:
+    """Presence-only diagnostics, never an operational device or power-control path."""
+    if serial not in APPROVED_ADMIN_PAIR.values():
+        return []
+    details = []
+    for node in sorted(USB_DEVICES.glob("*")):
+        if ":" in node.name or not (node / "idVendor").exists():
+            continue
+        if _read(node / "serial") != serial:
+            continue
+        vendor = _read(node / "idVendor").lower()
+        product_id = _read(node / "idProduct").lower()
+        reason = ("unsupported USB profile" if vendor != f"{SEEED_VID:04x}"
+                  else "not ready for guarded discovery")
+        details.append(f"{node.name}: VID={vendor or 'unknown'} PID={product_id or 'unknown'} "
+                       f"product={_read(node / 'product')!r}; {reason}; mode/firmware unproven")
+    return details
 
 
 def load_roles() -> dict[str, str]:
@@ -181,9 +209,16 @@ def resolve(role: str, mode: str = "any") -> Device:
         raise SystemExit(f"unknown lab role '{role}'; configured roles: {known}\n"
                          f"edit {CONFIG_PATH} or export MESHCORE_LAB_{role.upper()}_SERIAL")
     serial = roles[role]
+    if role not in APPROVED_ADMIN_PAIR or serial != APPROVED_ADMIN_PAIR[role]:
+        raise SystemExit(f"refusing unapproved active lab role '{role}' (serial {serial}); "
+                         "only the approved client and replacement target are operational")
     attached = discover()
     matches = [d for d in attached if d.serial == serial]
     if not matches:
+        diagnostics = _attached_usb_diagnostics(serial)
+        if diagnostics:
+            raise SystemExit(f"lab role '{role}' (serial {serial}) is attached but unavailable "
+                             "for guarded lab operations:\n  " + "\n  ".join(diagnostics))
         listing = "\n".join(f"  {d.serial}  {d.mode:<10} {d.tty}" for d in attached) or "  (none)"
         raise SystemExit(f"lab role '{role}' (serial {serial}) is not attached.\n"
                          f"attached XIAO nRF52840 boards:\n{listing}")
@@ -259,17 +294,26 @@ def cmd_list(args: argparse.Namespace) -> int:
     protected_by_serial = {serial: f"protected:{name}"
                            for name, serial in load_protected().items()}
     devices = discover()
+    missing = [r for r, s in roles.items() if not any(d.serial == s for d in devices)]
+    unavailable = {role: details for role in missing
+                   if (details := _attached_usb_diagnostics(roles[role]))}
     if not devices:
-        print("no XIAO nRF52840 boards attached")
+        print("no operationally discoverable XIAO nRF52840 boards" if unavailable
+              else "no XIAO nRF52840 boards attached")
     else:
         print(f"{'ROLE':<14} {'SERIAL':<18} {'MODE':<11} {'TTY':<10} {'USB':<10} PRODUCT")
         labels = {**protected_by_serial, **by_serial}
         for d in sorted(devices, key=lambda d: (labels.get(d.serial, "~"), d.serial)):
             print(f"{labels.get(d.serial, '-'):<14} {d.serial:<18} {d.mode:<11} "
                   f"{d.tty:<10} {d.sysfs.name:<10} {d.product}")
-    missing = [r for r, s in roles.items() if not any(d.serial == s for d in devices)]
+    if unavailable:
+        print("\nconfigured and attached but unavailable for guarded lab operations:", file=sys.stderr)
+        for role, details in sorted(unavailable.items()):
+            print(f"  {role} (serial {roles[role]}):\n    " + "\n    ".join(details), file=sys.stderr)
+    absent = [role for role in missing if role not in unavailable]
+    if absent:
+        print(f"\nconfigured but not attached: {', '.join(sorted(absent))}", file=sys.stderr)
     if missing:
-        print(f"\nconfigured but not attached: {', '.join(sorted(missing))}", file=sys.stderr)
         return 1
     return 0
 
@@ -350,8 +394,6 @@ def _uf2_target(args: argparse.Namespace) -> Device:
         raise SystemExit("UF2 commissioning is authorized for the target role only")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise SystemExit("UF2 commissioning timeout must be finite and positive")
-    from ota_rf_lab import APPROVED_ADMIN_PAIR
-
     device = resolve(args.role, MODE_APP)
     _validate_uf2_identity(device, APPROVED_ADMIN_PAIR["target"])
     return device
@@ -384,6 +426,111 @@ def _has_msc_interface(device: Device) -> bool:
         if interface_class.lower() == "08":
             return True
     return False
+
+
+@dataclass(frozen=True)
+class _StockInfoSnapshot:
+    """Give existing Path-based validators the same single bounded INFO read."""
+    text: str
+
+    def __truediv__(self, name: str) -> _StockInfoSnapshot:
+        if name != "INFO_UF2.TXT":
+            raise ValueError("only INFO_UF2.TXT is available in the stock INFO snapshot")
+        return self
+
+    def is_file(self) -> bool:
+        return True
+
+    def read_text(self, *, encoding: str) -> str:
+        return self.text
+
+    def __str__(self) -> str:
+        return "bounded INFO_UF2.TXT snapshot"
+
+
+def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
+    """Read public stock Sense boot metadata; never enter or install a loader."""
+    if args.role != "target":
+        raise SystemExit("stock bootloader inspection is authorized for the target role only")
+    tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
+    sys.path.insert(0, str(tools))
+    import install_uf2
+
+    try:
+        device = resolve("target", MODE_BOOT)
+        serial = APPROVED_ADMIN_PAIR["target"]
+        _validate_uf2_identity(device, serial)
+        matches = [candidate for candidate in discover() if candidate.serial == serial]
+        if len(matches) != 1 or matches[0] != device:
+            raise ValueError("stock bootloader requires one unique unchanged discovered target identity")
+        tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
+        if (not tty_link.exists() or install_uf2.usb_serial_ancestor(tty_link) != serial
+                or device.sysfs.resolve() not in tty_link.resolve().parents):
+            raise ValueError("stock bootloader tty ancestry does not match the approved target USB node")
+        vendor = (device.sysfs / "idVendor").read_text().strip().lower()
+        product_id = (device.sysfs / "idProduct").read_text().strip().lower()
+        board = "xiao_nrf52840_sense"
+        if (int(vendor, 16) << 16 | int(product_id, 16)) != install_uf2.USB_BOARD_IDS[board]:
+            raise ValueError("stock bootloader inspection requires exact Sense USB 2886:0045")
+        if not _has_msc_interface(device):
+            raise ValueError("approved stock bootloader must expose its own MSC class08 interface")
+        volumes = install_uf2.matching_mounts(serial, MOUNTINFO, SYS_DEV_BLOCK)
+        if len(volumes) != 1:
+            raise ValueError(f"expected exactly one ancestry-matched mounted target volume, found {len(volumes)}")
+        volume = volumes[0]
+        mount_text = MOUNTINFO.read_text(encoding="utf-8")
+        rows = [fields for line in mount_text.splitlines()
+                if len(fields := line.split()) >= 10 and "-" in fields
+                and Path(install_uf2.decode_mount_field(fields[4])) == volume]
+        if len(rows) != 1:
+            raise ValueError("target volume must have exactly one unambiguous mount record")
+        fields = rows[0]
+        separator = fields.index("-")
+        if separator < 6 or len(fields) != separator + 4:
+            raise ValueError("malformed target mount record")
+        options, super_options = fields[5].split(","), fields[separator + 3].split(",")
+        if (fields[3] != "/" or "ro" not in options or "rw" in options
+                or "ro" not in super_options or "rw" in super_options):
+            raise ValueError("target INFO requires a whole-volume read-only mount and read-only superblock")
+        block_link = SYS_DEV_BLOCK / fields[2]
+        if (install_uf2.usb_serial_ancestor(block_link) != serial
+                or device.sysfs.resolve() not in block_link.resolve().parents):
+            raise ValueError("mounted target volume ancestry does not match the approved target USB node")
+        info_path = volume / "INFO_UF2.TXT"
+        descriptor = os.open(info_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("INFO_UF2.TXT must be a regular file")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                data = stream.read(STOCK_INFO_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(data) > STOCK_INFO_MAX_BYTES:
+            raise ValueError(f"INFO_UF2.TXT exceeds {STOCK_INFO_MAX_BYTES} bytes")
+        text = data.decode("utf-8")
+        if "\x00" in text:
+            raise ValueError("INFO_UF2.TXT contains NUL bytes")
+        snapshot = _StockInfoSnapshot(text)
+        actual_board_id = install_uf2.board_id(snapshot)
+        if actual_board_id not in install_uf2.BOARD_IDS[board]:
+            raise ValueError("stock INFO Board-ID does not match the Sense profile")
+        install_uf2.validate_stock_info(snapshot)
+        if MOUNTINFO.read_text(encoding="utf-8") != mount_text:
+            raise ValueError("mount records changed during stock INFO inspection")
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"refusing read-only stock bootloader inspection: {exc}") from exc
+    print(json.dumps({
+        "schema": "meshcore.lab.stock-bootloader-info.v1",
+        "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "role": "target", "serial": serial, "by_id": str(device.by_id),
+        "sysfs": str(device.sysfs), "usb_vid": vendor, "usb_pid": product_id,
+        "product": device.product, "board_id": actual_board_id, "vendor_info": text,
+        "mountpoint": str(volume), "mount_options": options, "superblock_options": super_options,
+        "stock_bootloader_version": "0.6.1", "softdevice": "S140", "softdevice_version": "7.3.0",
+        "read_only": True, "public_only": True, "serial_opened": False, "writes": False,
+        "cryptographic_installed_bytes_proof": False, "custom_loader_qualified": False,
+    }, sort_keys=True))
+    return 0
 
 
 def _wait_for_uf2(source: Device, timeout: float) -> Device:
@@ -553,8 +700,15 @@ def cmd_power_cycle(args: argparse.Namespace) -> int:
     roles = load_roles()
     if args.role not in roles:
         raise SystemExit(f"unknown lab role '{args.role}'; edit {CONFIG_PATH}")
+    if args.role not in APPROVED_ADMIN_PAIR or roles[args.role] != APPROVED_ADMIN_PAIR[args.role]:
+        raise SystemExit(f"refusing unapproved active lab role '{args.role}' "
+                         f"(serial {roles[args.role]})")
     sysfs = sysfs_for_serial(roles[args.role])
     if sysfs is None:
+        diagnostics = _attached_usb_diagnostics(roles[args.role])
+        if diagnostics:
+            raise SystemExit(f"role '{args.role}' is attached but unavailable for guarded power "
+                             "control:\n  " + "\n  ".join(diagnostics))
         raise SystemExit(f"role '{args.role}' (serial {roles[args.role]}) is not on the USB bus "
                          f"at all; re-seat the cable")
     location = sysfs.name  # e.g. "8-4.4.3" or "1-10"
@@ -656,6 +810,10 @@ def main() -> int:
     uf2.add_argument("role", choices=["target"])
     uf2.add_argument("--timeout", type=float, default=30.0)
     uf2.set_defaults(func=cmd_bootloader_uf2)
+    stock = sub.add_parser("inspect-stock-bootloader",
+                           help="read approved target stock Sense INFO from an already read-only mounted MSC; no serial or writes")
+    stock.add_argument("role", choices=["target"])
+    stock.set_defaults(func=cmd_inspect_stock_bootloader)
     flash = add_role_command("flash", cmd_flash, mode_default=MODE_APP,
                              help_text="flash a DFU package and return to the application")
     flash.add_argument("--package", required=True, help="path to firmware.zip")

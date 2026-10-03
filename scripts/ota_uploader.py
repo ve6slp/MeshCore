@@ -367,6 +367,8 @@ def main():
     args = arguments.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         arguments.error("--timeout must be finite and positive")
+    if args.client_role != "client":
+        arguments.error("uploader requires the approved client role; no role override")
     canonical = args.manifest.read_bytes() if hasattr(args, "manifest") else None
     image = args.image.read_bytes() if hasattr(args, "image") else None
     if canonical is not None and len(canonical) != 59:
@@ -374,8 +376,6 @@ def main():
     body = None
     if args.command in ("upload", "cache"):
         validate_image(canonical, image)
-    if args.command == "cache" and args.client_role != "client":
-        arguments.error("cache requires the approved client role; no role override")
     if args.command == "upload":
         body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent)
         if len(set(args.target)) != len(args.target) or len(args.target) > 32:
@@ -390,9 +390,8 @@ def main():
     error = None
     try:
         device = lab_device.resolve(args.client_role, mode=lab_device.MODE_APP)
-        if args.command == "cache":
-            evidence.check("approved-cache-client", device.serial == lab.APPROVED_ADMIN_PAIR["client"],
-                           expected_serial=lab.APPROVED_ADMIN_PAIR["client"], observed_serial=device.serial)
+        evidence.check("approved-uploader-client", device.serial == lab.APPROVED_ADMIN_PAIR["client"],
+                       expected_serial=lab.APPROVED_ADMIN_PAIR["client"], observed_serial=device.serial)
         node = lab.FramedSerial(f"{args.client_role}-{device.serial}", str(device.by_id), evidence)
         time.sleep(2)
         uploader = Uploader(node, evidence, command_timeout=min(10, args.timeout))
@@ -431,7 +430,7 @@ def main():
         else:
             reply = uploader.status(args.target)
         evidence.log("ota_command_result", command=args.command, **reply.summary())
-    except (Exception, KeyboardInterrupt) as exc:
+    except (Exception, SystemExit, KeyboardInterrupt) as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence.log("fatal", error=error)
         raise

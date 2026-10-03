@@ -104,11 +104,19 @@ def validate_request(args):
     config = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
     with args.config.open() as stream:
         config.read_file(stream)
-    if config.get("roles", "target", fallback="").strip() != args.target_serial:
-        raise Refusal("approved target serial does not match lab inventory; environment overrides ignored")
-    other_serials = [v.strip() for k, v in config.items("roles") if k != "target"]
-    if config.has_section("protected"):
-        other_serials.extend(v.strip() for _, v in config.items("protected"))
+    # A present recovery section is authoritative, even when its target is missing.
+    target_section = "recovery" if config.has_section("recovery") else "roles"
+    if "target" in config.defaults():
+        raise Refusal("inventory target must be explicit, not inherited from DEFAULT")
+    if config.get(target_section, "target", fallback="").strip() != args.target_serial:
+        raise Refusal(f"approved target serial does not match lab [{target_section}] inventory; "
+                      "environment overrides ignored")
+    other_serials = [
+        value.strip()
+        for section in ("roles", "recovery", "protected") if config.has_section(section)
+        for key, value in config.items(section)
+        if (section, key) != (target_section, "target")
+    ]
     if args.target_serial in other_serials:
         raise Refusal("target is also assigned to a protected or other role")
     if not re.fullmatch(r"[0-9A-F]{16}", args.target_serial):

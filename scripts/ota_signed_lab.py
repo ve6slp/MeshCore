@@ -156,7 +156,7 @@ import ota_rf_lab as lab
 import ota_uploader as ota
 
 
-APPROVED = {"client": "4186AE911D94CDB1", "target": "3BE94917B92DC5E9"}
+APPROVED = lab.APPROVED_ADMIN_PAIR
 APPROVED_RADIOS = ((907525, 62500, 7, 5), (907525, 250000, 7, 5))
 RECORD_VERSION = 1
 ACTIVE_PHASES = {"erasing", "receiving", "verifying", "ready"}

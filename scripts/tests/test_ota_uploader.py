@@ -799,13 +799,50 @@ class CliLifecycleTests(unittest.TestCase):
                 self.node.command.assert_not_called()
 
     def test_cache_refuses_unapproved_target_or_pine_source_before_open(self):
-        for serial in ("3BE94917B92DC5E9", "49C5BAF21EEF44A1", "unapproved"):
+        for serial in ("77CD44653A967172", "3BE94917B92DC5E9", "49C5BAF21EEF44A1", "unapproved"):
             with self.subTest(serial=serial):
-                with self.assertRaisesRegex(AssertionError, "approved-cache-client"):
+                with self.assertRaisesRegex(AssertionError, "approved-uploader-client"):
                     self.run_cli(self.cache_arguments(), serial=serial)
                 self.client_open.assert_not_called()
                 self.node.command.assert_not_called()
                 self.node.write_frame.assert_not_called()
+
+    def test_every_uploader_command_is_companion_only_and_rejects_new_target_failed_target_or_pine_before_open(self):
+        commands = (
+            self.cache_arguments(), self.upload_arguments(), ["status"],
+            ["abort-cache", "--image", str(self.image_path)],
+            ["abort", "--target", TARGET.hex(), "--image", str(self.image_path)],
+            ["commit", "--target", TARGET.hex(), "--manifest", str(self.manifest_path)],
+            ["admin", "--target", TARGET.hex(), "--enabled", "1"],
+        )
+        for serial in ("77CD44653A967172", "3BE94917B92DC5E9", "49C5BAF21EEF44A1"):
+            for arguments in commands:
+                with self.subTest(serial=serial, command=arguments[0]):
+                    with self.assertRaisesRegex(AssertionError, "approved-uploader-client"):
+                        self.run_cli(arguments, serial=serial)
+                    self.client_open.assert_not_called()
+                    self.node.command.assert_not_called()
+                    self.node.write_frame.assert_not_called()
+                    self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                    self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_normal_uploader_commands_cannot_redirect_client_role_or_hide_role_guard_errors(self):
+        for role in ("target", "recovery", "pine"):
+            with self.subTest(role=role), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.run_cli(["--client-role", role, "status"])
+                self.resolve.assert_not_called()
+                self.client_open.assert_not_called()
+        argv = ["ota_uploader.py", "--artifact-dir", str(self.directory), "status"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(ota.lab, "Evidence", return_value=self.evidence), \
+                mock.patch.object(ota.lab_device, "resolve", side_effect=SystemExit("unapproved active lab role")), \
+                mock.patch.object(ota.lab, "FramedSerial") as client_open:
+            with self.assertRaisesRegex(SystemExit, "unapproved active lab role"):
+                ota.main()
+            client_open.assert_not_called()
+            self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+            self.evidence.finish.assert_called_once_with("SystemExit: unapproved active lab role")
 
     def test_cache_cannot_select_remote_options_or_redirect_role(self):
         for arguments in ([*self.cache_arguments(), "--target", TARGET.hex()],
