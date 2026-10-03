@@ -81,10 +81,10 @@ struct StockBootFixture {
     if (phase == ::ota::storage::OtaCandidateStore::Phase::Aborted) {
       const auto status = fx.integration.leanReceiver().status();
       uint8_t message[usb::kAbortSignedBytes];
-      usb::buildAbortSignedMessage(fx.target_public_key, status.imageHash, message);
+      usb::buildAbortSignedMessage(fx.target_public_key, status.imageHash, status.generation, message);
       owner.sign(message, sizeof(message), signature);
       ASSERT_EQ(usb::UsbOtaResult::Ok,
-                fx.integration.leanReceiver().abort(owner.publicKey(), signature, status.imageHash));
+                fx.integration.leanReceiver().abort(owner.publicKey(), signature, status.imageHash, status.generation));
     }
   }
 };
@@ -656,11 +656,11 @@ TEST(LoraOtaStockBoot, PartialEraseOwnedSuffixKeepsSignedAbortDurableAcrossColdB
       f.fx.admins.add(admin.publicKey());
       const auto& signer = another_admin ? admin : f.owner;
       uint8_t message[usb::kAbortSignedBytes], signature[64];
-      usb::buildAbortSignedMessage(f.fx.target_public_key, before.imageHash, message);
+      usb::buildAbortSignedMessage(f.fx.target_public_key, before.imageHash, before.generation, message);
       signer.sign(message, sizeof(message), signature);
       const auto erases = f.fx.candidate_flash.eraseOpCount();
       ASSERT_EQ(usb::UsbOtaResult::Ok,
-                cold.leanReceiver().abort(signer.publicKey(), signature, before.imageHash));
+                cold.leanReceiver().abort(signer.publicKey(), signature, before.imageHash, before.generation));
       EXPECT_EQ(Store::Phase::Aborted, cold.leanReceiver().status().phase);
       EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
 
@@ -754,16 +754,16 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
                 cache.handleUsbCacheFrame(other_begin, sizeof(other_begin), f.owner.publicKey()));
       uint8_t message[usb::kAbortSignedBytes], signature[64];
       const auto status = cache.status();
-      usb::buildAbortSignedMessage(f.fx.target_public_key, status.imageHash, message);
+      usb::buildAbortSignedMessage(f.fx.target_public_key, status.imageHash, status.generation, message);
       outsider.sign(message, sizeof(message), signature);
-      EXPECT_EQ(usb::UsbOtaResult::Denied, cache.abort(outsider.publicKey(), signature, status.imageHash));
+      EXPECT_EQ(usb::UsbOtaResult::Denied, cache.abort(outsider.publicKey(), signature, status.imageHash, status.generation));
       const auto& signer = another_admin ? admin : f.owner;
       signer.sign(message, sizeof(message), signature);
       const auto erases = f.fx.candidate_flash.eraseOpCount();
       if (abort_cut) f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
                                                   f.fx.candidate_flash.programOpCount() + 2});
       ASSERT_EQ(abort_cut ? usb::UsbOtaResult::IoError : usb::UsbOtaResult::Ok,
-                cache.abort(signer.publicKey(), signature, status.imageHash));
+                cache.abort(signer.publicKey(), signature, status.imageHash, status.generation));
       f.fx.candidate_flash.clearFault();
       ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
       if (abort_cut) {
@@ -775,7 +775,7 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
         ASSERT_TRUE(retry_backend.attach(retry, f.fx.sig_verifier));
         EXPECT_EQ(before.phase, retry.leanReceiver().status().phase);
         ASSERT_EQ(usb::UsbOtaResult::Ok,
-                  retry.leanReceiver().abort(signer.publicKey(), signature, status.imageHash));
+                  retry.leanReceiver().abort(signer.publicKey(), signature, status.imageHash, status.generation));
         ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
       }
       OtaFirmwareIntegration rebooted;

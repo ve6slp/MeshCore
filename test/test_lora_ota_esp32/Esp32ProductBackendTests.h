@@ -1203,7 +1203,7 @@ TEST_F(Esp32Product, ConfigurationFloorWriteFailureDoesNotAttachOrRetireCandidat
   EXPECT_FALSE(cold.leanReceiver().hasStore());
 }
 
-TEST_F(Esp32Product, ColdBootRealProvenanceProjectsTrialAndInstalledIntoUsb86AndRfCensusWithoutWritableBackend) {
+TEST_F(Esp32Product, ColdBootRealProvenanceProjectsTrialAndInstalledIntoUsbAbi2AndRfCensusWithoutWritableBackend) {
   ready();
   ASSERT_FALSE(HasFatalFailure());
   ASSERT_EQ(Result::Ok, commit());
@@ -1244,7 +1244,7 @@ TEST_F(Esp32Product, ColdBootRealProvenanceProjectsTrialAndInstalledIntoUsb86And
     reply.setNoSnapshot();
     cold.fillUsbReadback(reply);
     uint8_t encoded[usb::kReplyBytes];
-    ASSERT_EQ(86u, usb::encodeUsbOtaReply(reply, encoded));
+    ASSERT_EQ(90u, usb::encodeUsbOtaReply(reply, encoded));
     EXPECT_NE(0, encoded[5] & usb::kReplyFlagSnapshotValid);
     EXPECT_EQ(static_cast<uint8_t>(phase), encoded[4]);
     EXPECT_EQ(0, std::memcmp(original.manifestHash, encoded + 38, 32));
@@ -1252,6 +1252,7 @@ TEST_F(Esp32Product, ColdBootRealProvenanceProjectsTrialAndInstalledIntoUsb86And
     EXPECT_EQ(original.totalBlocks, usb::getBE16(encoded + 72));
     EXPECT_EQ(original.counter, usb::getBE32(encoded + 74));
     EXPECT_EQ(0u, usb::getBE32(encoded + 78));
+    EXPECT_EQ(original.generation, usb::getBE32(encoded + 86));
 
     uint8_t poll[kOtaCensusPollBytes], frame[kOtaCensusReportBytes];
     ASSERT_EQ(sizeof(poll), encodeOtaCensusPoll(target, original.manifestHash, 0, poll, sizeof(poll)));

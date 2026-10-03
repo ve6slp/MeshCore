@@ -419,8 +419,12 @@ public:
   }
 
   Result abort(const uint8_t signer_public_key[32], const uint8_t signature[64], const uint8_t image_hash[32],
-                bool local_owner_trusted = false) {
+                uint32_t generation, bool local_owner_trusted = false) {
     if (!candidate_.valid) return Result::NotFound;
+    const bool aborted = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted;
+    // Durable ABORT advances sessionId; its original signature may still finish cleanup after reset.
+    if (generation != candidate_.sessionId && !(aborted && generation == candidate_.sessionId - 1u))
+      return Result::Mismatch;
     const bool committed = commit_started_ || candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
     if (committed && !unadmitted_abort_) return Result::TooLate;
     if (signer_public_key == nullptr || signature == nullptr || image_hash == nullptr || !have_target_public_key_) {
@@ -437,9 +441,9 @@ public:
           !std::memcmp(signer_public_key, candidate_.ownerPublicKey, 32) &&
           !std::memcmp(signer_public_key, target_public_key_, 32))) return Result::Denied;
     uint8_t message[usb::kAbortSignedBytes] = {};
-    const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, message);
+    const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, generation, message);
     if (!verifyOwnerSignature(signer_public_key, message, message_len, signature)) return Result::Denied;
-    if (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted) {
+    if (aborted) {
       const auto recovered = !candidate_.localCache && unadmitted_abort_ ?
           unadmitted_abort_(unadmitted_ctx_, candidate_, true) : Result::Ok;
       if (recovered == Result::Ok) { commit_started_ = false; commit_sink_done_ = false; }

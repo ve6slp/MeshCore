@@ -1860,6 +1860,7 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       reply.totalBlocks = obs.totalBlocks;
       reply.statusAgeMs = obs.ageMs;
       reply.counter = obs.haveLifecycle ? obs.counter : local_snap.counter;
+      reply.generation = obs.generation;
       break;
     }
     default:
@@ -3213,7 +3214,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     } else if (op >= 0x10 && op <= 0x18) {
       // Lean local-USB uploader/status wire contract (see
-      // helpers/ota/OtaUsbProtocol.h) -- fixed 86-byte reply shape, NOT
+      // helpers/ota/OtaUsbProtocol.h) -- fixed 90-byte ABI2 reply shape, NOT
       // writeOKFrame()/writeErrFrame().
       handleUsbOtaProtocolOp(op, cmd_frame, len);
     } else {

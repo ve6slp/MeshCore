@@ -318,6 +318,11 @@ request was made; Pine and the failed target remained untouched. This extends
 actual application/local-cache evidence to the refined tree, **not** remote
 OTA, installation, rollback, physical RF-register readback or duty acceptance.
 
+That physical firmware and its recorded uploader used ABI1. The current
+generation-bound cancellation protocol uses ABI2/90-byte replies and has not
+been qualified on this client. The new host refuses ABI1; do not bypass its
+version guard or relabel the earlier cache evidence as ABI2 acceptance.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh

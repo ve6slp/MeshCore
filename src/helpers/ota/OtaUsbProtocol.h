@@ -7,7 +7,7 @@
 // see examples/companion_radio/MyMesh.cpp). Outer framing (the existing
 // '<' + LE16 length + payload / '>' reply FramedSerial envelope) is
 // completely unchanged; every NEW multi-byte integer INSIDE this
-// contract (both request bodies and the fixed 86-byte reply below) is
+// contract (both request bodies and the fixed 90-byte ABI2 reply below) is
 // BIG-ENDIAN, unlike the rest of the pre-existing companion command set
 // (which is little-endian) -- this is a deliberate, explicit exception
 // scoped to only these new opcodes, not a repo-wide convention change.
@@ -44,8 +44,9 @@ constexpr uint8_t kReplyCode = 31;
 
 // Wire ABI version stamped into every reply's byte[1], so a host can
 // detect a future incompatible revision of this fixed layout without
-// guessing from reply length alone.
-constexpr uint8_t kAbiVersion = 1;
+// guessing from reply length alone. ABI2 keeps ABI1 field offsets and
+// appends generationBE32; ABORT now requires an explicit generation.
+constexpr uint8_t kAbiVersion = 2;
 
 constexpr size_t kPubKeyBytes = 32;
 constexpr size_t kHashBytes = 32;
@@ -63,7 +64,7 @@ enum class UsbOtaOp : uint8_t {
   AddTarget       = 0x13, // targetPubKey32                                => 34B total
   Start           = 0x14, // modeU8+channelU8+freqKHzBE32+leaseMsBE16+dutyMilliPercentBE32 => 14B total
   Commit          = 0x15, // targetPubKey32 + manifestHash32 + counterBE32 => 70B total
-  Abort           = 0x16, // targetPubKey32 + imageHash32                  => 66B total
+  Abort           = 0x16, // targetPubKey32 + imageHash32 + generationBE32 => 70B total
   Status          = 0x17, // targetPubKey32 (all-zero => local cache)      => 34B total
   SetContactAdmin = 0x18, // contactPubKey32 + enabledU8                   => 35B total
 };
@@ -104,7 +105,7 @@ constexpr size_t kCacheSealTotalBytes       = 2;                                
 constexpr size_t kAddTargetTotalBytes       = 2 + kPubKeyBytes;                                   // 34
 constexpr size_t kStartTotalBytes           = 2 + 1 + 1 + 4 + 2 + 4;                              // 14
 constexpr size_t kCommitTotalBytes          = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70
-constexpr size_t kAbortTotalBytes           = 2 + kPubKeyBytes + kHashBytes;                      // 66
+constexpr size_t kAbortTotalBytes           = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70
 constexpr size_t kStatusTotalBytes          = 2 + kPubKeyBytes;                                   // 34
 constexpr size_t kSetContactAdminTotalBytes = 2 + kPubKeyBytes + 1;                                // 35
 
@@ -146,7 +147,7 @@ constexpr uint8_t kReplyFlagRemote        = 0x02;
 // Sentinel "no snapshot age known" value for reply bytes [78..82).
 constexpr uint32_t kStatusAgeUnknown = 0xFFFFFFFFu;
 
-constexpr size_t kReplyBytes = 86;
+constexpr size_t kReplyBytes = 90;
 
 inline void putBE16(uint8_t* out, uint16_t v) {
   out[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
@@ -169,7 +170,7 @@ inline uint32_t getBE32(const uint8_t* in) {
          (static_cast<uint32_t>(in[2]) << 8) | static_cast<uint32_t>(in[3]);
 }
 
-// Plain working struct for the fixed 86-byte reply; see field offsets
+// Plain working struct for the fixed 90-byte reply; see field offsets
 // documented above each member. `target`/`manifestHash` are the raw 32-
 // byte values (all-zero target legitimately means "local cache", never
 // encoded/decoded specially).
@@ -191,9 +192,10 @@ struct UsbOtaReply {
   uint32_t counter = 0;
   uint32_t statusAgeMs = kStatusAgeUnknown;
   uint32_t retryAfterMs = 0;
+  uint32_t generation = 0; // BE32 at byte 86; the durable candidate sessionId.
 
   // Sets this reply to the canonical "no snapshot" shape required by the
-  // contract: flags bit0 clear, phase Unknown, hash/counts/counter zero,
+  // contract: flags bit0 clear, phase Unknown, hash/counts/counter/generation zero,
   // age kStatusAgeUnknown -- callers must not hand-roll this elsewhere.
   void setNoSnapshot() {
     phase = UsbOtaPhase::Unknown;
@@ -202,6 +204,7 @@ struct UsbOtaReply {
     durableReceivedBlocks = 0;
     totalBlocks = 0;
     counter = 0;
+    generation = 0;
     statusAgeMs = kStatusAgeUnknown;
   }
 };
@@ -225,6 +228,7 @@ inline size_t encodeUsbOtaReply(const UsbOtaReply& input, uint8_t* out) {
   putBE32(&out[74], reply.counter);
   putBE32(&out[78], reply.statusAgeMs);
   putBE32(&out[82], reply.retryAfterMs);
+  putBE32(&out[86], reply.generation);
   return kReplyBytes;
 }
 
@@ -274,20 +278,22 @@ inline size_t buildCommitSignedMessage(const uint8_t target[kPubKeyBytes], const
 // owner" required for COMMIT -- reusing COMMIT's domain string would
 // blur that different authorization rule even though the byte SHAPE
 // happens to be similar). Signed bytes = domain || target32 ||
-// imageHash32 (the content hash, see note above -- NOT manifestHash32).
-constexpr char kAbortDomain[] = "MeshCore/OTA/abort/v1";
+// imageHash32 (the content hash, see note above -- NOT manifestHash32) ||
+// generationBE32 (the durable candidate sessionId, not a new epoch).
+constexpr char kAbortDomain[] = "MeshCore/OTA/abort/v2";
 constexpr size_t kAbortDomainLen = sizeof(kAbortDomain) - 1;
-constexpr size_t kAbortSignedBytes = kAbortDomainLen + kPubKeyBytes + kHashBytes;
+constexpr size_t kAbortSignedBytes = kAbortDomainLen + kPubKeyBytes + kHashBytes + 4;
 
 // Fills `out` (>= kAbortSignedBytes) with the exact byte sequence that
 // must be Ed25519-signed/verified for a per-target ABORT -- domain ||
-// target32 || imageHash32.
+// target32 || imageHash32 || generationBE32.
 inline size_t buildAbortSignedMessage(const uint8_t target[kPubKeyBytes], const uint8_t imageHash[kHashBytes],
-                                      uint8_t* out) {
+                                      uint32_t generation, uint8_t* out) {
   size_t i = 0;
   std::memcpy(&out[i], kAbortDomain, kAbortDomainLen); i += kAbortDomainLen;
   std::memcpy(&out[i], target, kPubKeyBytes); i += kPubKeyBytes;
   std::memcpy(&out[i], imageHash, kHashBytes); i += kHashBytes;
+  putBE32(&out[i], generation); i += 4;
   return i;
 }
 

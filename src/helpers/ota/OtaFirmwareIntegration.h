@@ -226,9 +226,10 @@ public:
         for (const auto byte : reply.target) if (byte) zero_target = false;
         if (!zero_target && std::memcmp(reply.target, local_owner, sizeof(reply.target))) return reply;
         uint8_t message[usb::kAbortSignedBytes], signature[64];
-        const auto message_len = usb::buildAbortSignedMessage(local_owner, command + 34, message);
+        const auto generation = usb::getBE32(command + 66);
+        const auto message_len = usb::buildAbortSignedMessage(local_owner, command + 34, generation, message);
         rf_sign_(rf_ctx_, message, message_len, signature);
-        reply.result = lean_.abort(local_owner, signature, command + 34, true);
+        reply.result = lean_.abort(local_owner, signature, command + 34, generation, true);
         fillUsbReadback(reply);
         break;
       }
@@ -258,7 +259,8 @@ public:
       reply.result = usb::UsbOtaResult::Unavailable;
       return reply;
     }
-    uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaAbortFrameBytes];
+    uint8_t message[usb::kCommitSignedBytes > usb::kAbortSignedBytes ?
+                    usb::kCommitSignedBytes : usb::kAbortSignedBytes], signature[64], frame[kOtaAbortFrameBytes];
     size_t message_len, frame_len;
     if (op == usb::UsbOtaOp::Commit) {
       const auto st = lean_.status();
@@ -271,9 +273,10 @@ public:
       rf_sign_(rf_ctx_, message, message_len, signature);
       frame_len = encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame));
     } else {
-      message_len = usb::buildAbortSignedMessage(target, hash, message);
+      const auto generation = usb::getBE32(command + 66);
+      message_len = usb::buildAbortSignedMessage(target, hash, generation, message);
       rf_sign_(rf_ctx_, message, message_len, signature);
-      frame_len = encodeOtaAbortFrame(lean_.targetPublicKey(), target, hash, signature, frame, sizeof(frame));
+      frame_len = encodeOtaAbortFrame(lean_.targetPublicKey(), target, hash, generation, signature, frame, sizeof(frame));
     }
     reply.result = frame_len && send(send_ctx, target, frame, frame_len) ?
         usb::UsbOtaResult::Ok : usb::UsbOtaResult::Busy;
@@ -358,6 +361,7 @@ public:
     reply.durableReceivedBlocks = st.receivedBlocks;
     reply.totalBlocks = st.totalBlocks;
     reply.counter = st.counter;
+    reply.generation = st.generation;
     reply.statusAgeMs = 0;
   }
   usb::UsbOtaPhase reportedPhase(const OtaBootLifecycleEvidence& boot) const {
@@ -833,7 +837,7 @@ private:
         OtaAbortFrame parsed;
         if (!parseOtaAbortFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
         if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32)) return LeanControlResult::Rejected;
-        const auto r = lean_.abort(parsed.signerPublicKey, parsed.signature, parsed.imageHash);
+        const auto r = lean_.abort(parsed.signerPublicKey, parsed.signature, parsed.imageHash, parsed.generation);
         if (r == usb::UsbOtaResult::Ok) stopDirect();
         return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
       }

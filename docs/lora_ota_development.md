@@ -151,7 +151,7 @@ the captured early refusal separately from later backend capability. The
 companion accepts payload `420001` for preflight and `420002` for capability,
 returning response code 29 followed by ASCII; the repeater accepts
 `ota preflight` and `ota capability`. These diagnostics do not alter the
-existing `4200` reply, canonical 86-byte OTA replies, storage or boot state.
+existing `4200` reply, versioned signed-upload replies, storage or boot state.
 Older applications ignore the selector, so a lifecycle-only reply is not
 preflight evidence.
 
@@ -317,7 +317,7 @@ length encoding. Multi-byte fields inside the OTA payload are big-endian.
 | AddTarget | `0x13` | full target PK32 |
 | Start | `0x14` | mode8, channel8, frequencyKHz32, leaseMs16, dutyMilliPercent32 |
 | Commit | `0x15` | target PK32, manifestHash32, counter32 |
-| Abort | `0x16` | target PK32, imageHash32; all-zero target selects local cache |
+| Abort | `0x16` | target PK32, imageHash32, generation32; all-zero target selects local cache |
 | Status | `0x17` | target PK32; all zero selects the local cache |
 | SetContactAdmin | `0x18` | target PK32, enabled8 |
 
@@ -334,6 +334,14 @@ purpose. A different image or owner requires an explicit abort first.
 `make ota-lab-abort-cache` selects the local cache with zero target32 and
 the old image's content hash. The companion binds its internally signed
 abort to its own full identity and applies it locally, without RF traffic.
+ABORT signs `MeshCore/OTA/abort/v2 || target32 || imageHash32 || generationBE32`.
+The USB command is 70 bytes; its signed RF frame is 165 bytes, with generation
+at offset 97 and signature at 101. There is no generationless fallback.
+Active candidates require their current durable generation. An already
+ABORTED candidate also accepts the immediately preceding generation to finish
+the same authorized cleanup after lost acknowledgement or reboot, without
+advancing the journal again. Explicit reupload advances the generation and
+invalidates those older cancellations.
 
 Start modes are direct 0, directed 1 and background 2. Direct requires one
 target, channel 255 and a frequency with a 250..60,000 ms lease. Directed
@@ -352,12 +360,14 @@ On-mesh admission reserves `floor(1.5 * estimatedMs) + 20` for both the
 quota and available accounting capacity. Recording still charges the actual
 completed duration, not that conservative bound.
 
-Every reply for operations `0x10` through `0x18` is exactly 86 bytes:
-response code 31, ABI version 1, echoed
+Every reply for operations `0x10` through `0x18` is exactly 90 bytes:
+response code 31, ABI version 2, echoed
 operation, result, phase, flags, target PK32, hash32, received16, total16,
-counter32, statusAgeMs32 and retryAfterMs32. Flags are snapshot-valid 1 and
-remote 2. A reply without a snapshot has unknown phase, zero hash, counts
-and counter, and age `0xFFFFFFFF`. It still reports the actual operation
+counter32, statusAgeMs32, retryAfterMs32 and generation32. Generation is appended
+at offset 86; preceding field offsets are unchanged. Flags are snapshot-valid 1 and
+remote 2. A reply without a snapshot has unknown phase, zero hash, counts,
+counter and generation, and age `0xFFFFFFFF`. A valid wrapped-zero generation
+is permitted. The reply still reports the actual operation
 result and requested target. Unknown versions, flags or enum values are
 errors, not successful defaults.
 
@@ -602,13 +612,16 @@ blocks, not evidence of an implemented upload or bootloader handoff.
 
 `scripts/ota_uploader.py` implements the replacement host side of
 `src/helpers/ota/OtaUsbProtocol.h`: command 66, operations `0x10` to
-`0x18`, with versioned 86-byte replies. It matches the operation and full
+`0x18`, with ABI2 90-byte replies. It matches the operation and full
 target identity, rejects unavailable or malformed replies, and uses
 snapshot age rather than reply arrival time when waiting for READY.
 An old failure snapshot does not invalidate a newer candidate; a fresh
 failure or abort ends the wait explicitly. Companion signing shares the
 upload deadline, rather than starting a separate timeout for each command.
-ABORT supplies the image-content SHA-256; COMMIT supplies the canonical
+ABORT requires fresh, valid, correctly scoped STATUS before supplying its
+observed generation and image-content SHA-256. It then waits for fresh,
+generation-bound durable ABORTED state, not merely an accepted command.
+ABI1 is refused before an abort can be sent. COMMIT supplies the canonical
 manifest SHA-256 and counter. These hashes are not interchangeable.
 
 `make ota-lab-manifest` builds the unsigned descriptor from a raw nRF52840

@@ -51,13 +51,14 @@ def image_manifest(counter=7, role=1, image=None):
 
 
 def reply(candidate, phase, target=TARGET_KEY, result=ota.Result.OK, age=0,
-          received=None, total=None):
+          received=None, total=None, generation=1):
     total = candidate.blocks if total is None else total
     received = total if received is None else received
-    wire = (bytes([31, 1, ota.Op.STATUS, result, phase,
+    wire = (bytes([31, 2, ota.Op.STATUS, result, phase,
                    ota.SNAPSHOT_VALID | (ota.REMOTE if target != ota.LOCAL_TARGET else 0)])
             + target + candidate.manifest_hash
-            + struct.pack(">HHIII", received, total, candidate.counter, age, 0))
+            + struct.pack(">HHIII", received, total, candidate.counter, age, 0)
+            + struct.pack(">I", generation))
     return ota.decode_reply(wire)
 
 
@@ -231,8 +232,8 @@ class CampaignFixture:
                     self.remote_lifecycle.pop(0)
                 self.phase_requests.append(phase)
             return reply(self.candidate, phase, target=target)
-        return ota.decode_reply(bytes([31, 1, ota.Op.STATUS, 0, 0, 0]) + bytes(64)
-                                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0))
+        return ota.decode_reply(bytes([31, 2, ota.Op.STATUS, 0, 0, 0]) + bytes(64)
+                                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0) + bytes(4))
 
     def cache(self, canonical, image, owner, deadline, reupload=False):
         self.ops.append(ota.Op.CACHE_BEGIN)
@@ -296,21 +297,23 @@ class ProductCompanion(Companion):
         self.packets = []
         self.baseline_path = None
         self.status_mutator = None
+        self.generation = 0
 
     def empty_reply(self, op, result, target):
         remote = target != ota.LOCAL_TARGET and op != ota.Op.ADD_TARGET
-        return (bytes([31, 1, op, result, 0, ota.REMOTE if remote else 0])
-                + target + bytes(32) + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0))
+        return (bytes([31, 2, op, result, 0, ota.REMOTE if remote else 0])
+                + target + bytes(32) + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0) + bytes(4))
 
     def snapshot_reply(self, op, result, target, candidate, phase):
         if candidate is None:
             return self.empty_reply(op, result, target)
         total = candidate.blocks
         received = len(self.blocks) if target == ota.LOCAL_TARGET else total
-        digest = hashlib.sha256(candidate.image).digest() if op == ota.Op.ABORT else candidate.manifest_hash
+        digest = candidate.manifest_hash
         remote = target != ota.LOCAL_TARGET and op != ota.Op.ADD_TARGET
-        return (bytes([31, 1, op, result, phase, 1 | (ota.REMOTE if remote else 0)])
-                + target + digest + struct.pack(">HHIII", received, total, candidate.counter, 0, 0))
+        return (bytes([31, 2, op, result, phase, 1 | (ota.REMOTE if remote else 0)])
+                + target + digest + struct.pack(">HHIII", received, total, candidate.counter, 0, 0)
+                + struct.pack(">I", self.generation))
 
     def write_frame(self, packet):
         self.packets.append(packet)
@@ -334,6 +337,7 @@ class ProductCompanion(Companion):
                 result = ota.Result.DENIED
             if result == ota.Result.OK:
                 if self.local is None or self.local.canonical != canonical or flags:
+                    self.generation = (self.generation + 1) & 0xFFFFFFFF
                     self.local = signed.Candidate(canonical, bytes(struct.unpack_from(">I", canonical, 9)[0]),
                                                   {"counter": struct.unpack_from(">I", canonical, 45)[0]})
                     self.blocks = {}
@@ -351,11 +355,20 @@ class ProductCompanion(Companion):
             self.boot = (f"boot=unknown phase=cache-sealed floor=unknown counter={self.local.counter} "
                          "verified=0 image=unknown").encode()
         elif op == ota.Op.ABORT:
-            assert len(packet) == 66 and body[:32] == ota.LOCAL_TARGET
-            assert body[32:] == hashlib.sha256(self.local.image).digest()
-            self.local_phase = ota.Phase.ABORTED
-            self.boot = (f"boot=unknown phase=aborted floor=unknown counter={self.local.counter} "
-                         "verified=0 image=unknown").encode()
+            assert len(packet) == 70 and body[:32] == ota.LOCAL_TARGET
+            assert body[32:64] == hashlib.sha256(self.local.image).digest()
+            generation = struct.unpack_from(">I", body, 64)[0]
+            allowed = {self.generation}
+            if self.local_phase == ota.Phase.ABORTED:
+                allowed.add((self.generation - 1) & 0xFFFFFFFF)
+            if generation not in allowed:
+                result = ota.Result.MISMATCH
+            else:
+                if self.local_phase != ota.Phase.ABORTED:
+                    self.generation = (self.generation + 1) & 0xFFFFFFFF
+                self.local_phase = ota.Phase.ABORTED
+                self.boot = (f"boot=unknown phase=aborted floor=unknown counter={self.local.counter} "
+                             "verified=0 image=unknown").encode()
         elif op == ota.Op.ADD_TARGET:
             target = body
             assert body == self.target.key
@@ -800,7 +813,7 @@ class SignedLabTests(unittest.TestCase):
                 node, pair, uploader = self.product_pair()
                 old = node.local
                 uploader.abort(ota.LOCAL_TARGET, hashlib.sha256(old.image).digest())
-                abort = node.packets[-1]
+                abort = next(packet for packet in reversed(node.packets) if packet[1] == ota.Op.ABORT)
                 self.assertEqual(abort[:34], bytes([66, ota.Op.ABORT]) + bytes(32))
                 image = old.image[:-1] + b"\x66" if different_content else old.image
                 candidate = self.candidate_inputs(7, image)
@@ -1372,8 +1385,8 @@ class SignedLabTests(unittest.TestCase):
                     reply(self.candidate, ota.Phase.CACHE_SEALED if target == ota.LOCAL_TARGET
                           else ota.Phase.READY, target=target))
                 denial = ota.decode_reply(
-                    bytes([31, 1, ota.Op.COMMIT, result, 0, ota.REMOTE]) + TARGET_KEY + bytes(32)
-                    + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0))
+                    bytes([31, 2, ota.Op.COMMIT, result, 0, ota.REMOTE]) + TARGET_KEY + bytes(32)
+                    + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0) + bytes(4))
                 uploader.exchange = mock.Mock(return_value=denial)
                 with self.assertRaisesRegex(ota.UploaderError, result.name):
                     signed.commit(self.pair, uploader, self.candidate, args, evidence, self.deadline)
@@ -1450,8 +1463,8 @@ class SignedLabTests(unittest.TestCase):
             sent.append(payload)
             # Real new-operation no-snapshot DENIED reply, not an ACK shortcut.
             self.client.pending.append((self.clock.now,
-                bytes([31, 1, payload[1], ota.Result.DENIED, 0, 0]) + bytes(64)
-                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0)))
+                bytes([31, 2, payload[1], ota.Result.DENIED, 0, 0]) + bytes(64)
+                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0) + bytes(4)))
 
         self.client.write_frame = deny
         uploader = ota.Uploader(self.client, self.evidence)
@@ -1477,8 +1490,8 @@ class SignedLabTests(unittest.TestCase):
             sent.append(payload)
             result = 255 if payload[1] == ota.Op.CACHE_BEGIN else ota.Result.OK
             self.client.pending.append((self.clock.now,
-                bytes([31, 1, payload[1], result, 0, 0]) + bytes(64)
-                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0)))
+                bytes([31, 2, payload[1], result, 0, 0]) + bytes(64)
+                + struct.pack(">HHIII", 0, 0, 0, ota.AGE_UNKNOWN, 0) + bytes(4)))
 
         self.client.write_frame = answer
         with self.assertRaisesRegex(ota.UploaderError, "unknown OTA reply"):

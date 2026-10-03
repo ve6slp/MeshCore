@@ -1,7 +1,7 @@
 // Native, production-code coverage for the fixed-layout lean USB OTA
 // uploader/status wire contract (see src/helpers/ota/OtaUsbProtocol.h).
 // Pure codec: exercises the exact byte offsets/big-endian encoding of
-// the 86-byte reply and the commit-signature message shape, with no
+// the 90-byte ABI2 reply and the signed-message shapes, with no
 // hardware/flash dependency.
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -12,7 +12,7 @@
 
 using namespace mesh::ota::usb;
 
-TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed86ByteContract) {
+TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed90ByteAbi2Contract) {
   UsbOtaReply reply;
   reply.requestOp = static_cast<uint8_t>(UsbOtaOp::Status);
   reply.result = UsbOtaResult::Ok;
@@ -25,6 +25,7 @@ TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed86ByteContract) {
   reply.counter = 0x01020304;
   reply.statusAgeMs = 42;
   reply.retryAfterMs = 0;
+  reply.generation = 0xA1B2C3D4;
 
   uint8_t out[kReplyBytes];
   ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, out));
@@ -44,6 +45,8 @@ TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed86ByteContract) {
   EXPECT_EQ(getBE32(&out[74]), 0x01020304u);
   EXPECT_EQ(getBE32(&out[78]), 42u);
   EXPECT_EQ(getBE32(&out[82]), 0u);
+  EXPECT_EQ(2u, out[1]);
+  EXPECT_EQ(0xA1B2C3D4u, getBE32(&out[86]));
 }
 
 TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
@@ -55,6 +58,7 @@ TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
   reply.totalBlocks = 9;
   reply.counter = 55;
   reply.statusAgeMs = 3;
+  reply.generation = 99;
 
   reply.setNoSnapshot();
 
@@ -65,6 +69,7 @@ TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
   EXPECT_EQ(0, reply.totalBlocks);
   EXPECT_EQ(0u, reply.counter);
   EXPECT_EQ(kStatusAgeUnknown, reply.statusAgeMs);
+  EXPECT_EQ(0u, reply.generation);
 }
 
 TEST(OtaUsbProtocolTest, BigEndianRoundTrip) {
@@ -98,6 +103,7 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         reply.counter = 33;
         reply.statusAgeMs = 4;
         reply.retryAfterMs = 442;
+        reply.generation = 0x01020304;
         uint8_t encoded[kReplyBytes];
         ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, encoded));
         EXPECT_EQ(op, encoded[2]);
@@ -109,6 +115,7 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         EXPECT_EQ(0, std::memcmp(empty, encoded + 38, sizeof(empty)));
         EXPECT_EQ(kStatusAgeUnknown, getBE32(encoded + 78));
         EXPECT_EQ(442u, getBE32(encoded + 82));
+        EXPECT_EQ(0u, getBE32(encoded + 86));
         EXPECT_EQ(UsbOtaPhase::Ready, reply.phase);
         EXPECT_EQ(0x5A, reply.manifestHash[0]);  // Encoding does not mutate the working reply.
         reply.flags |= kReplyFlagSnapshotValid;
@@ -121,6 +128,7 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         EXPECT_EQ(33u, getBE32(encoded + 74));
         EXPECT_EQ(4u, getBE32(encoded + 78));
         EXPECT_EQ(442u, getBE32(encoded + 82));
+        EXPECT_EQ(0x01020304u, getBE32(encoded + 86));
       }
     }
   }
@@ -168,24 +176,29 @@ TEST(OtaUsbProtocolTest, FixedWireSizesMatchContract) {
   EXPECT_EQ(34u, kAddTargetTotalBytes);
   EXPECT_EQ(14u, kStartTotalBytes);
   EXPECT_EQ(70u, kCommitTotalBytes);
-  EXPECT_EQ(66u, kAbortTotalBytes);
+  EXPECT_EQ(70u, kAbortTotalBytes);
   EXPECT_EQ(34u, kStatusTotalBytes);
   EXPECT_EQ(35u, kSetContactAdminTotalBytes);
-  EXPECT_EQ(86u, kReplyBytes);
+  EXPECT_EQ(90u, kReplyBytes);
 }
 
-TEST(OtaUsbProtocolTest, AbortSignedMessageBindsOwnDomainTargetAndImageHash) {
+TEST(OtaUsbProtocolTest, AbortSignedMessageBindsV2DomainTargetImageHashAndGeneration) {
   uint8_t target[kPubKeyBytes];
   uint8_t imageHash[kHashBytes];
   for (int i = 0; i < 32; i++) { target[i] = (uint8_t)(200 + i); imageHash[i] = (uint8_t)(50 + i); }
 
   uint8_t msg[kAbortSignedBytes];
-  size_t n = buildAbortSignedMessage(target, imageHash, msg);
+  size_t n = buildAbortSignedMessage(target, imageHash, 0x12345678, msg);
   ASSERT_EQ(kAbortSignedBytes, n);
 
   EXPECT_EQ(0, std::memcmp(msg, kAbortDomain, kAbortDomainLen));
   EXPECT_EQ(0, std::memcmp(msg + kAbortDomainLen, target, kPubKeyBytes));
   EXPECT_EQ(0, std::memcmp(msg + kAbortDomainLen + kPubKeyBytes, imageHash, kHashBytes));
+  EXPECT_STREQ("MeshCore/OTA/abort/v2", kAbortDomain);
+  EXPECT_EQ(0x12345678u, getBE32(msg + kAbortDomainLen + kPubKeyBytes + kHashBytes));
+  uint8_t other[kAbortSignedBytes];
+  buildAbortSignedMessage(target, imageHash, 0x12345679, other);
+  EXPECT_NE(0, std::memcmp(msg, other, sizeof(msg)));
 
   // ABORT's domain must differ from COMMIT's: a COMMIT signature can
   // never double as a valid ABORT signature or vice versa, even when

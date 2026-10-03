@@ -25,9 +25,10 @@ HASH = b"\xa5" * 32
 
 def frame(op=ota.Op.STATUS, result=ota.Result.OK, phase=ota.Phase.READY,
           flags=3, target=TARGET, manifest_hash=HASH, received=2, total=2,
-          counter=7, age=0, retry=0):
-    return (bytes([31, 1, op, result, phase, flags]) + target + manifest_hash
-            + struct.pack(">HHIII", received, total, counter, age, retry))
+          counter=7, age=0, retry=0, generation=0):
+    return (bytes([31, 2, op, result, phase, flags]) + target + manifest_hash
+            + struct.pack(">HHIII", received, total, counter, age, retry)
+            + struct.pack(">I", generation))
 
 
 def manifest(image):
@@ -38,12 +39,27 @@ def manifest(image):
 class ReplyTests(unittest.TestCase):
     def test_exact_big_endian_layout_and_full_identities(self):
         decoded = ota.decode_reply(frame(received=0x1234, total=0x5678,
-                                         counter=0x12345678, age=0x23456789, retry=0x3456789A))
+                                         counter=0x12345678, age=0x23456789, retry=0x3456789A,
+                                         generation=0xFEDCBA98))
         self.assertEqual(decoded.op, ota.Op.STATUS)
         self.assertEqual(decoded.target, TARGET)
         self.assertEqual(decoded.manifest_hash, HASH)
         self.assertEqual((decoded.received, decoded.total, decoded.counter, decoded.age_ms, decoded.retry_after_ms),
                          (0x1234, 0x5678, 0x12345678, 0x23456789, 0x3456789A))
+        self.assertEqual(decoded.generation, 0xFEDCBA98)
+        self.assertEqual(decoded.summary()["generation"], 0xFEDCBA98)
+        self.assertEqual(len(frame()), 90)
+        self.assertEqual(frame(generation=0xFEDCBA98)[86:90], bytes.fromhex("fedcba98"))
+
+    def test_valid_wrapped_zero_generation_and_legacy_abi_refusal(self):
+        self.assertTrue(ota.decode_reply(frame(generation=0)).valid)
+        self.assertEqual(ota.decode_reply(frame(generation=0)).summary()["generation"], 0)
+        legacy = bytearray(frame()[:86])
+        legacy[1] = 1
+        for data in (bytes(legacy), frame()[:86], frame()[:1] + b"\x01" + frame()[2:]):
+            with self.subTest(length=len(data)):
+                with self.assertRaisesRegex(ota.UploaderError, "ABI version"):
+                    ota.decode_reply(data)
 
     def test_invalid_layout_enums_counts_and_flags_are_rejected(self):
         original = frame()
@@ -64,7 +80,7 @@ class ReplyTests(unittest.TestCase):
         decoded = ota.decode_reply(empty)
         self.assertFalse(decoded.valid)
         self.assertFalse(decoded.fresh_since(0, 100))
-        for offset in (4, 38, 70, 72, 74, 78):
+        for offset in (4, 38, 70, 72, 74, 78, 86):
             with self.subTest(offset=offset):
                 changed = bytearray(empty)
                 changed[offset] ^= 1
@@ -85,7 +101,7 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(decoded.target, TARGET)
         self.assertFalse(decoded.valid)
         self.assertFalse(decoded.fresh_since(0, 100))
-        for offset in (4, 38, 70, 72, 74, 78):
+        for offset in (4, 38, 70, 72, 74, 78, 86):
             with self.subTest(offset=offset):
                 changed = bytearray(acknowledgement)
                 changed[offset] ^= 1
@@ -363,14 +379,28 @@ class LifecycleTests(unittest.TestCase):
     def test_abort_uses_image_hash_not_manifest_hash(self):
         image_hash = hashlib.sha256(self.image).digest()
         self.assertNotEqual(image_hash, self.manifest_hash)
-        self.uploader.abort(TARGET, image_hash)
-        self.uploader.exchange.assert_called_once_with(ota.Op.ABORT, TARGET + image_hash, TARGET)
+        before = ota.decode_reply(frame(manifest_hash=self.manifest_hash, generation=0x12345678))
+        after = ota.decode_reply(frame(phase=ota.Phase.ABORTED, manifest_hash=self.manifest_hash,
+                                      generation=0x12345679))
+        self.uploader.exchange.side_effect = [before, self.good, after]
+        self.assertEqual(self.uploader.abort(TARGET, image_hash), after)
+        self.assertEqual([call.args[:3] for call in self.uploader.exchange.call_args_list], [
+            (ota.Op.STATUS, TARGET, TARGET),
+            (ota.Op.ABORT, TARGET + image_hash + bytes.fromhex("12345678"), TARGET),
+            (ota.Op.STATUS, TARGET, TARGET),
+        ])
 
     def test_local_cache_abort_uses_zero_target_and_content_hash(self):
         image_hash = hashlib.sha256(self.image).digest()
-        self.uploader.abort(ota.LOCAL_TARGET, image_hash)
-        self.uploader.exchange.assert_called_once_with(
-            ota.Op.ABORT, ota.LOCAL_TARGET + image_hash, ota.LOCAL_TARGET)
+        before = ota.decode_reply(frame(target=ota.LOCAL_TARGET, flags=1,
+                                       manifest_hash=self.manifest_hash, generation=0xFFFFFFFF))
+        after = ota.decode_reply(frame(target=ota.LOCAL_TARGET, flags=1, phase=ota.Phase.ABORTED,
+                                      manifest_hash=self.manifest_hash, generation=0))
+        self.uploader.exchange.side_effect = [before, self.good, after]
+        self.assertEqual(self.uploader.abort(ota.LOCAL_TARGET, image_hash), after)
+        self.assertEqual(self.uploader.exchange.call_args_list[1].args[:3],
+                         (ota.Op.ABORT, ota.LOCAL_TARGET + image_hash + bytes.fromhex("ffffffff"),
+                          ota.LOCAL_TARGET))
         self.assertNotEqual(image_hash, self.manifest_hash)
 
     def test_old_ready_is_not_accepted_as_fresh_completion(self):
@@ -414,12 +444,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.uploader.exchange.call_count, 2)
 
     def test_current_failure_or_abort_stops_waiting(self):
-        for phase in (ota.Phase.FAILED, ota.Phase.ABORTED):
-            with self.subTest(phase=phase):
+        for phase, wanted in ((ota.Phase.FAILED, ota.Phase.READY),
+                              (ota.Phase.ABORTED, ota.Phase.READY),
+                              (ota.Phase.FAILED, ota.Phase.FAILED)):
+            with self.subTest(phase=phase, wanted=wanted):
                 self.uploader.exchange.return_value = ota.decode_reply(
                     frame(phase=phase, manifest_hash=self.manifest_hash))
                 with self.assertRaisesRegex(ota.UploaderError, phase.name):
-                    self.uploader.wait_phase(TARGET, ota.Phase.READY, self.manifest_hash, 7,
+                    self.uploader.wait_phase(TARGET, wanted, self.manifest_hash, 7,
                                              time.monotonic() - 1, time.monotonic() + 10)
 
     def test_status_reports_failed_candidate_without_claiming_successful_completion(self):
@@ -433,6 +465,13 @@ class LifecycleTests(unittest.TestCase):
                 self.uploader.cache(self.canonical, self.image, TARGET, time.monotonic() - 1)
         sign.assert_not_called()
         self.uploader.exchange.assert_not_called()
+
+    def test_invalid_or_expired_abort_deadline_cannot_query_or_mutate(self):
+        for deadline in (time.monotonic() - 1, float("nan"), float("inf")):
+            with self.subTest(deadline=deadline):
+                with self.assertRaises(TimeoutError):
+                    self.uploader.abort(TARGET, HASH, deadline=deadline)
+                self.uploader.exchange.assert_not_called()
 
     def test_wrong_hash_counter_scope_or_incomplete_ready_is_rejected(self):
         for reply in (frame(), frame(manifest_hash=self.manifest_hash, counter=8),
@@ -491,6 +530,10 @@ class CliLifecycleTests(unittest.TestCase):
         self.signature_override = None
         self.local_status = {}
         self.cache_already_sealed = False
+        self.local_phase = ota.Phase.CACHE_SEALED
+        self.generation = 0x12345678
+        self.reply_mutator = None
+        self.drop_abort_reply = False
 
         def check(name, passed, **details):
             if not passed:
@@ -524,11 +567,13 @@ class CliLifecycleTests(unittest.TestCase):
         remote = op in (ota.Op.ADD_TARGET, ota.Op.COMMIT, ota.Op.ABORT, ota.Op.SET_ADMIN)
         target = payload[2:34] if remote or op == ota.Op.STATUS else ota.LOCAL_TARGET
         flags = ota.SNAPSHOT_VALID | (ota.REMOTE if target != ota.LOCAL_TARGET else 0)
-        phase = self.remote_phase if target != ota.LOCAL_TARGET else ota.Phase.CACHE_SEALED
+        phase = self.remote_phase if target != ota.LOCAL_TARGET else self.local_phase
         blocks = (len(self.image) + 83) // 84
         received = blocks
         result = self.results.get(op, ota.Result.OK)
         if op == ota.Op.CACHE_BEGIN and not self.cache_already_sealed:
+            if self.local_phase == ota.Phase.ABORTED and payload[2] == 1:
+                self.generation = (self.generation + 1) & 0xFFFFFFFF
             phase, received = ota.Phase.RECEIVING, 0
         elif op == ota.Op.CACHE_PUT:
             if self.cache_already_sealed:
@@ -536,16 +581,38 @@ class CliLifecycleTests(unittest.TestCase):
             else:
                 self.received += 1
                 phase, received = ota.Phase.RECEIVING, self.received
+        elif op == ota.Op.CACHE_SEAL:
+            self.local_phase = phase = ota.Phase.CACHE_SEALED
         elif op == ota.Op.COMMIT:
             phase = ota.Phase.COMMIT_PENDING
         elif op == ota.Op.ABORT:
-            phase = ota.Phase.ABORTED
+            self.assertEqual(len(payload), 70)
+            requested_generation = struct.unpack_from(">I", payload, 66)[0]
+            allowed = {self.generation}
+            if phase == ota.Phase.ABORTED:
+                allowed.add((self.generation - 1) & 0xFFFFFFFF)
+            if requested_generation not in allowed:
+                result = ota.Result.MISMATCH
+            if payload[34:66] != hashlib.sha256(self.image).digest():
+                result = ota.Result.MISMATCH
+            if result == ota.Result.OK:
+                if phase != ota.Phase.ABORTED:
+                    self.generation = (self.generation + 1) & 0xFFFFFFFF
+                phase = ota.Phase.ABORTED
+                if target == ota.LOCAL_TARGET:
+                    self.local_phase = phase
+                else:
+                    self.remote_phase = phase
         fields = dict(op=op, result=result, phase=phase, target=target, flags=flags,
                       manifest_hash=self.manifest_hash, received=received, total=blocks,
-                      counter=struct.unpack_from(">I", self.canonical, 45)[0])
+                      counter=struct.unpack_from(">I", self.canonical, 45)[0], generation=self.generation)
         if op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
             fields.update(self.local_status)
         response = frame(**fields)
+        if self.reply_mutator is not None:
+            response = self.reply_mutator(op, response)
+        if op == ota.Op.ABORT and self.drop_abort_reply:
+            return
         self.pending.append((self.clock.now, response))
 
     def take_pending(self, codes):
@@ -668,7 +735,8 @@ class CliLifecycleTests(unittest.TestCase):
             ({"target": OTHER_TARGET}, TimeoutError),
             ({"result": ota.Result.BUSY}, ota.UploaderError),
             ({"flags": 0, "phase": ota.Phase.UNKNOWN, "manifest_hash": bytes(32),
-              "received": 0, "total": 0, "counter": 0, "age": ota.AGE_UNKNOWN}, TimeoutError),
+              "received": 0, "total": 0, "counter": 0, "age": ota.AGE_UNKNOWN,
+              "generation": 0}, TimeoutError),
         )
         for fields, error in cases:
             with self.subTest(fields=fields):
@@ -854,25 +922,330 @@ class CliLifecycleTests(unittest.TestCase):
     def test_abort_passes_image_content_hash_not_descriptor_hash(self):
         self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
         self.assertEqual(self.sent_payloads(),
-                         [bytes([66, ota.Op.ABORT]) + TARGET + hashlib.sha256(self.image).digest()])
+                         [bytes([66, ota.Op.STATUS]) + TARGET,
+                          bytes([66, ota.Op.ABORT]) + TARGET + hashlib.sha256(self.image).digest()
+                          + bytes.fromhex("12345678"),
+                          bytes([66, ota.Op.STATUS]) + TARGET])
+        self.assertEqual(self.evidence.log.call_args.kwargs["generation"], 0x12345679)
         self.node.close.assert_called_once()
         self.evidence.finish.assert_called_once_with(None)
 
     def test_explicit_cache_abort_does_not_address_a_remote_target(self):
         self.run_cli(["abort-cache", "--image", str(self.image_path)])
         self.assertEqual(self.sent_payloads(),
-                         [bytes([66, ota.Op.ABORT]) + ota.LOCAL_TARGET
-                          + hashlib.sha256(self.image).digest()])
+                         [bytes([66, ota.Op.STATUS]) + ota.LOCAL_TARGET,
+                          bytes([66, ota.Op.ABORT]) + ota.LOCAL_TARGET
+                          + hashlib.sha256(self.image).digest() + bytes.fromhex("12345678"),
+                          bytes([66, ota.Op.STATUS]) + ota.LOCAL_TARGET])
         self.node.command.assert_not_called()
         self.node.close.assert_called_once()
         self.assertFalse(self.evidence.log.call_args.kwargs["remote"])
         self.assertEqual(self.evidence.log.call_args.kwargs["phase"], ota.Phase.ABORTED.name)
 
+    def test_abort_transmits_observed_nonzero_or_wrapped_zero_generation_in_exact_70_byte_request(self):
+        for generation in (0, 0x12345678, 0xFFFFFFFF):
+            with self.subTest(generation=generation):
+                self.setUp()
+                self.generation = generation
+                self.run_cli(["abort-cache", "--image", str(self.image_path)])
+                payloads = self.sent_payloads()
+                self.assertEqual([payload[1] for payload in payloads], [0x17, 0x16, 0x17])
+                self.assertEqual(len(payloads[1]), 70)
+                self.assertEqual(payloads[1][2:34], bytes(32))
+                self.assertEqual(payloads[1][34:66], hashlib.sha256(self.image).digest())
+                self.assertEqual(payloads[1][66:70], struct.pack(">I", generation))
+                result = self.evidence.log.call_args.kwargs
+                self.assertEqual(result["op"], "STATUS")
+                self.assertEqual(result["generation"], (generation + 1) & 0xFFFFFFFF)
+                self.assertEqual(result["hash"], self.manifest_hash.hex())
+                self.assertNotEqual(result["hash"], hashlib.sha256(self.image).hexdigest())
+                self.node.command.assert_not_called()
+                aborted_generation = self.generation
+                self.node.reset_mock()
+                self.run_cli(["abort-cache", "--image", str(self.image_path)])
+                self.assertEqual(self.sent_payloads()[1][66:70], struct.pack(">I", aborted_generation))
+                self.assertEqual(self.generation, aborted_generation)
+                self.assertEqual(self.evidence.log.call_args.kwargs["generation"], aborted_generation)
+
+    def test_missing_stale_wrong_target_scope_or_blocked_status_cannot_write_abort(self):
+        cases = (
+            ({"age": 20000}, TimeoutError),
+            ({"target": OTHER_TARGET}, TimeoutError),
+            ({"flags": 3}, ota.UploaderError),
+            ({"result": ota.Result.BUSY}, ota.UploaderError),
+            ({"result": ota.Result.DENIED}, ota.UploaderError),
+            ({"result": ota.Result.UNAVAILABLE}, ota.UploaderError),
+            ({"phase": ota.Phase.UNKNOWN}, ota.UploaderError),
+            ({"phase": ota.Phase.IDLE}, ota.UploaderError),
+            ({"flags": 0, "phase": ota.Phase.UNKNOWN, "manifest_hash": bytes(32),
+              "received": 0, "total": 0, "counter": 0, "age": ota.AGE_UNKNOWN,
+              "generation": 0}, TimeoutError),
+        )
+        for fields, error in cases:
+            with self.subTest(fields=fields):
+                self.setUp()
+                self.local_status = fields
+                with self.assertRaises(error):
+                    self.run_cli(["abort-cache", "--image", str(self.image_path)])
+                self.assertTrue(self.sent_payloads())
+                self.assertTrue(all(payload == bytes.fromhex("4217") + bytes(32)
+                                    for payload in self.sent_payloads()))
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+        self.setUp()
+        self.node.take_pending.side_effect = lambda codes: []
+        with self.assertRaises(TimeoutError):
+            self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        self.assertEqual([payload[1] for payload in self.sent_payloads()], [0x17])
+
+    def test_legacy_missing_generation_or_malformed_reply_cannot_emit_abort(self):
+        for defect in ("legacy", "short-v2", "bad-enum", "no-snapshot-generation"):
+            with self.subTest(defect=defect):
+                self.setUp()
+
+                def malformed(op, response):
+                    data = bytearray(response)
+                    if defect == "legacy":
+                        data[1] = 1
+                        return bytes(data[:86])
+                    if defect == "short-v2":
+                        return bytes(data[:86])
+                    if defect == "bad-enum":
+                        data[4] = 255
+                    else:
+                        return frame(target=ota.LOCAL_TARGET, flags=0, phase=ota.Phase.UNKNOWN,
+                                     manifest_hash=bytes(32), received=0, total=0, counter=0,
+                                     age=ota.AGE_UNKNOWN, generation=1)
+                    return bytes(data)
+
+                self.reply_mutator = malformed
+                with self.assertRaises(ota.UploaderError):
+                    self.run_cli(["abort-cache", "--image", str(self.image_path)])
+                self.assertEqual([payload[1] for payload in self.sent_payloads()], [0x17])
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_abort_ack_cannot_claim_success_without_fresh_durable_generation_bound_readback(self):
+        cases = (
+            ({"age": 20000}, TimeoutError),
+            ({"generation": 0x12345678}, ota.UploaderError),
+            ({"manifest_hash": HASH}, ota.UploaderError),
+            ({"counter": 8}, ota.UploaderError),
+            ({"flags": 3}, ota.UploaderError),
+            ({"phase": ota.Phase.CACHE_SEALED}, TimeoutError),
+            ({"result": ota.Result.BUSY}, ota.UploaderError),
+            ({"result": ota.Result.PENDING}, TimeoutError),
+            ({"target": OTHER_TARGET}, TimeoutError),
+            ({"flags": 0, "phase": ota.Phase.UNKNOWN, "manifest_hash": bytes(32),
+              "received": 0, "total": 0, "counter": 0, "age": ota.AGE_UNKNOWN,
+              "generation": 0}, TimeoutError),
+        )
+        for fields, error in cases:
+            with self.subTest(fields=fields):
+                self.setUp()
+
+                def uncertain(op, response):
+                    if op == ota.Op.ABORT:
+                        return frame(op=op, result=ota.Result.PENDING, target=ota.LOCAL_TARGET,
+                                     flags=0, phase=ota.Phase.UNKNOWN, manifest_hash=bytes(32),
+                                     received=0, total=0, counter=0, age=ota.AGE_UNKNOWN, generation=0)
+                    if op == ota.Op.STATUS and self.local_phase == ota.Phase.ABORTED:
+                        values = dict(target=ota.LOCAL_TARGET, flags=1, phase=ota.Phase.ABORTED,
+                                      manifest_hash=self.manifest_hash, generation=self.generation)
+                        values.update(fields)
+                        return frame(**values)
+                    return response
+
+                self.reply_mutator = uncertain
+                with self.assertRaises(error):
+                    self.run_cli(["abort-cache", "--image", str(self.image_path)])
+                ops = [payload[1] for payload in self.sent_payloads()]
+                self.assertEqual(ops[:2], [0x17, 0x16])
+                self.assertEqual(ops.count(0x16), 1)
+                self.assertTrue(all(op == 0x17 for op in ops[2:]))
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+                self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_receiver_content_mismatch_is_not_confused_with_canonical_status_hash_or_forced(self):
+        self.image_path.write_bytes(b"other" * 20)
+        with self.assertRaisesRegex(ota.UploaderError, "MISMATCH"):
+            self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        payloads = self.sent_payloads()
+        self.assertEqual([payload[1] for payload in payloads], [0x17, 0x16])
+        self.assertEqual(payloads[1][34:66], hashlib.sha256(b"other" * 20).digest())
+        self.assertEqual(self.local_phase, ota.Phase.CACHE_SEALED)
+        self.assertEqual(self.generation, 0x12345678)
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_remote_abort_waits_through_fresh_prior_generation_until_durable_aborted_including_wrap(self):
+        for generation in (0x12345678, 0xFFFFFFFF, 0):
+            with self.subTest(generation=generation):
+                self.setUp()
+                self.generation = generation
+                phases = [ota.Phase.RECEIVING, ota.Phase.VERIFYING,
+                          ota.Phase.READY, ota.Phase.COMMIT_PENDING]
+
+                def in_transit(op, response):
+                    if op == ota.Op.ABORT:
+                        return frame(op=op, target=TARGET, flags=ota.REMOTE, phase=ota.Phase.UNKNOWN,
+                                     manifest_hash=bytes(32), received=0, total=0, counter=0,
+                                     age=ota.AGE_UNKNOWN, generation=0)
+                    if op == ota.Op.STATUS and self.remote_phase == ota.Phase.ABORTED and phases:
+                        data = bytearray(response)
+                        data[4] = phases.pop(0)
+                        struct.pack_into(">I", data, 86, generation)
+                        return bytes(data)
+                    return response
+
+                self.reply_mutator = in_transit
+                self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
+                self.assertEqual([payload[1] for payload in self.sent_payloads()],
+                                 [0x17, 0x16, 0x17, 0x17, 0x17, 0x17, 0x17])
+                self.assertEqual(self.sent_payloads()[1][66:70], struct.pack(">I", generation))
+                result = self.evidence.log.call_args.kwargs
+                self.assertEqual((result["op"], result["phase"]), ("STATUS", "ABORTED"))
+                self.assertEqual(result["generation"], (generation + 1) & 0xFFFFFFFF)
+                self.assertFalse(phases)
+                self.evidence.finish.assert_called_once_with(None)
+
+    def test_remote_abort_stuck_at_fresh_prior_generation_times_out_without_resending_or_claiming_cancel(self):
+        generation = self.generation
+
+        def in_transit(op, response):
+            if op == ota.Op.STATUS and self.remote_phase == ota.Phase.ABORTED:
+                data = bytearray(response)
+                data[4] = ota.Phase.RECEIVING
+                struct.pack_into(">I", data, 86, generation)
+                return bytes(data)
+            return response
+
+        self.reply_mutator = in_transit
+        with self.assertRaisesRegex(TimeoutError, "fresh ABORTED"):
+            self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
+        ops = [payload[1] for payload in self.sent_payloads()]
+        self.assertEqual(ops[:2], [0x17, 0x16])
+        self.assertEqual(ops.count(0x16), 1)
+        self.assertTrue(all(op == 0x17 for op in ops[2:]))
+        self.assertLessEqual(self.clock.now, 112.1)
+        self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+        self.assertIsNotNone(self.evidence.finish.call_args.args[0])
+
+    def test_remote_abort_rejects_new_attempt_or_wrong_generation_aborted_instead_of_waiting(self):
+        for phase, delta in ((ota.Phase.RECEIVING, 2), (ota.Phase.READY, -1),
+                             (ota.Phase.ABORTED, 0), (ota.Phase.ABORTED, 2)):
+            with self.subTest(phase=phase, delta=delta):
+                self.setUp()
+                generation = self.generation
+
+                def unrelated(op, response):
+                    if op == ota.Op.STATUS and self.remote_phase == ota.Phase.ABORTED:
+                        data = bytearray(response)
+                        data[4] = phase
+                        struct.pack_into(">I", data, 86, (generation + delta) & 0xFFFFFFFF)
+                        return bytes(data)
+                    return response
+
+                self.reply_mutator = unrelated
+                with self.assertRaisesRegex(ota.UploaderError, "different generation"):
+                    self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
+                self.assertEqual([payload[1] for payload in self.sent_payloads()], [0x17, 0x16, 0x17])
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_already_aborted_remote_cleanup_never_allows_previous_generation_intermediate(self):
+        for generation in (0, 0x12345678):
+            with self.subTest(generation=generation):
+                self.setUp()
+                self.generation = generation
+                self.remote_phase = ota.Phase.ABORTED
+                requested = False
+
+                def previous(op, response):
+                    nonlocal requested
+                    if op == ota.Op.ABORT:
+                        requested = True
+                    elif op == ota.Op.STATUS and requested:
+                        data = bytearray(response)
+                        data[4] = ota.Phase.RECEIVING
+                        struct.pack_into(">I", data, 86, (generation - 1) & 0xFFFFFFFF)
+                        return bytes(data)
+                    return response
+
+                self.reply_mutator = previous
+                with self.assertRaisesRegex(ota.UploaderError, "different generation"):
+                    self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
+                self.assertEqual(self.sent_payloads()[1][66:70], struct.pack(">I", generation))
+                self.assertEqual([payload[1] for payload in self.sent_payloads()], [0x17, 0x16, 0x17])
+
+    def test_prior_generation_intermediate_still_requires_fresh_bound_content_counter_and_scope(self):
+        for defect, error, message in (
+            ("hash", ota.UploaderError, "different manifest or counter"),
+            ("counter", ota.UploaderError, "different manifest or counter"),
+            ("scope", ota.UploaderError, "wrong local/remote scope"),
+            ("stale", TimeoutError, "fresh ABORTED"),
+        ):
+            with self.subTest(defect=defect):
+                self.setUp()
+                generation = self.generation
+
+                def corrupt(op, response):
+                    if op == ota.Op.STATUS and self.remote_phase == ota.Phase.ABORTED:
+                        data = bytearray(response)
+                        data[4] = ota.Phase.READY
+                        struct.pack_into(">I", data, 86, generation)
+                        if defect == "hash":
+                            data[38:70] = HASH
+                        elif defect == "counter":
+                            struct.pack_into(">I", data, 74, 8)
+                        elif defect == "scope":
+                            data[5] &= ~ota.REMOTE
+                        else:
+                            struct.pack_into(">I", data, 78, 20000)
+                        return bytes(data)
+                    return response
+
+                self.reply_mutator = corrupt
+                with self.assertRaisesRegex(error, message):
+                    self.run_cli(["abort", "--target", TARGET.hex(), "--image", str(self.image_path)])
+                self.assertEqual([payload[1] for payload in self.sent_payloads()].count(0x16), 1)
+                self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
+
+    def test_lost_abort_ack_retry_uses_current_aborted_generation_without_reupload_or_takeover(self):
+        self.drop_abort_reply = True
+        with self.assertRaises(TimeoutError):
+            self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        self.assertEqual(self.local_phase, ota.Phase.ABORTED)
+        old_abort = self.sent_payloads()[1]
+        self.drop_abort_reply = False
+        generation = self.generation
+        self.node.reset_mock()
+        self.evidence.reset_mock()
+        self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        payloads = self.sent_payloads()
+        self.assertEqual([payload[1] for payload in payloads], [0x17, 0x16, 0x17])
+        self.assertEqual(payloads[1][66:70], struct.pack(">I", generation))
+        self.assertEqual(self.generation, generation)
+        self.node.write_frame(old_abort)
+        self.assertEqual(ota.decode_reply(self.pending[-1][1]).result, ota.Result.OK)
+        self.assertEqual(self.generation, generation)
+
+    def test_old_abort_generation_cannot_cancel_explicit_same_image_reupload(self):
+        self.run_cli(["abort-cache", "--image", str(self.image_path)])
+        old_abort = self.sent_payloads()[1]
+        self.node.reset_mock()
+        self.received = 0
+        self.run_cli([*self.cache_arguments(), "--reupload"])
+        generation = self.generation
+        self.assertEqual(self.local_phase, ota.Phase.CACHE_SEALED)
+        self.node.write_frame(old_abort)
+        delayed = ota.decode_reply(self.pending[-1][1])
+        self.assertEqual(delayed.result, ota.Result.MISMATCH)
+        self.assertEqual(self.generation, generation)
+        self.assertEqual(self.local_phase, ota.Phase.CACHE_SEALED)
+
     def test_denied_local_cache_abort_is_not_success(self):
         self.results[ota.Op.ABORT] = ota.Result.DENIED
         with self.assertRaisesRegex(ota.UploaderError, "DENIED"):
             self.run_cli(["abort-cache", "--image", str(self.image_path)])
-        self.assertEqual([payload[1] for payload in self.sent_payloads()], [ota.Op.ABORT])
+        self.assertEqual([payload[1] for payload in self.sent_payloads()], [ota.Op.STATUS, ota.Op.ABORT])
         self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
         self.node.close.assert_called_once()
 

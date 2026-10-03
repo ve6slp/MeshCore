@@ -3,6 +3,7 @@
 
 cache only signs/stages a local image and observes CACHE_SEALED. It never starts
 RF, selects a remote target, commits or proves installation/airtime.
+ABORT requires ABI2 fresh STATUS generation and durable ABORTED readback.
 """
 
 import argparse
@@ -62,8 +63,8 @@ class Phase(IntEnum):
 
 
 REPLY_CODE = 31
-ABI_VERSION = 1
-REPLY_BYTES = 86
+ABI_VERSION = 2
+REPLY_BYTES = 90
 BLOCK_BYTES = 84
 LOCAL_TARGET = bytes(32)
 SNAPSHOT_VALID = 1
@@ -89,6 +90,7 @@ class Reply:
     counter: int
     age_ms: int
     retry_after_ms: int
+    generation: int
 
     @property
     def valid(self):
@@ -104,6 +106,7 @@ class Reply:
             "received": self.received, "total": self.total, "counter": self.counter,
             "snapshot_valid": self.valid, "remote": bool(self.flags & REMOTE),
             "snapshot_age_ms": self.age_ms, "retry_after_ms": self.retry_after_ms,
+            "generation": self.generation,
         }
 
 
@@ -116,12 +119,12 @@ def decode_reply(frame):
         raise UploaderError("unknown OTA reply opcode, result or phase") from exc
     received, total, counter, age, retry = struct.unpack_from(">HHIII", frame, 70)
     reply = Reply(op, result, phase, frame[5], frame[6:38], frame[38:70],
-                  received, total, counter, age, retry)
+                  received, total, counter, age, retry, struct.unpack_from(">I", frame, 86)[0])
     if reply.flags & ~(SNAPSHOT_VALID | REMOTE) or received > total:
         raise UploaderError("invalid OTA reply flags or durable block counts")
     if not reply.valid:
         if (phase != Phase.UNKNOWN or reply.manifest_hash != bytes(32)
-                or received or total or counter or age != AGE_UNKNOWN):
+                or received or total or counter or age != AGE_UNKNOWN or reply.generation):
             raise UploaderError("invalid OTA no-snapshot reply")
     elif age == AGE_UNKNOWN:
         raise UploaderError("OTA snapshot has no known age")
@@ -218,7 +221,8 @@ class Uploader:
             raise TimeoutError("OTA operation deadline expired")
         return min(self.command_timeout, remaining)
 
-    def wait_phase(self, target, phase, manifest_hash, counter, since, deadline):
+    def wait_phase(self, target, phase, manifest_hash, counter, since, deadline, generation=None,
+                   prior_generation=None):
         while time.monotonic() < deadline:
             reply = self.status(target, timeout=self.remaining(deadline))
             if reply.valid and bool(reply.flags & REMOTE) != (target != LOCAL_TARGET):
@@ -227,9 +231,14 @@ class Uploader:
             fresh = reply.fresh_since(since, now)
             if fresh and (reply.manifest_hash != manifest_hash or reply.counter != counter):
                 raise UploaderError("OTA status belongs to a different manifest or counter")
-            if fresh and reply.phase in (Phase.FAILED, Phase.ABORTED):
+            if (fresh and generation is not None and reply.generation != generation
+                    and not (phase == Phase.ABORTED and prior_generation is not None
+                             and reply.generation == prior_generation and reply.phase != Phase.ABORTED)):
+                raise UploaderError("OTA status belongs to a different generation")
+            if fresh and (reply.phase == Phase.FAILED
+                          or (reply.phase == Phase.ABORTED and phase != Phase.ABORTED)):
                 raise UploaderError(f"OTA candidate is {reply.phase.name}")
-            if reply.phase == phase and fresh:
+            if reply.phase == phase and fresh and (phase != Phase.ABORTED or reply.result == Result.OK):
                 if phase in (Phase.READY, Phase.CACHE_SEALED) and (reply.total == 0 or reply.received != reply.total):
                     raise UploaderError("completed OTA phase has incomplete durable blocks")
                 return reply
@@ -286,10 +295,36 @@ class Uploader:
         return self.require_accepted(self.exchange(
             Op.COMMIT, target + manifest_hash + struct.pack(">I", counter), target, self.remaining(deadline)))
 
-    def abort(self, target, image_hash):
+    def abort(self, target, image_hash, deadline=None):
         if len(target) != 32 or len(image_hash) != 32:
             raise ValueError("abort requires a target identity or local cache and image SHA-256")
-        return self.require_accepted(self.exchange(Op.ABORT, target + image_hash, target))
+        since = time.monotonic()
+        deadline = since + self.command_timeout if deadline is None else deadline
+        self.remaining(deadline)
+        while time.monotonic() < deadline:
+            observed = self.status(target, timeout=self.remaining(deadline))
+            if observed.op != Op.STATUS or observed.target != target:
+                raise UploaderError("abort STATUS has the wrong opcode or target")
+            if observed.valid and bool(observed.flags & REMOTE) != (target != LOCAL_TARGET):
+                raise UploaderError("abort STATUS has the wrong local/remote scope")
+            now = time.monotonic()
+            if observed.fresh_since(since, now):
+                if observed.phase in (Phase.UNKNOWN, Phase.IDLE):
+                    raise UploaderError("abort STATUS does not identify a candidate")
+                break
+            time.sleep(min(max(0.1, observed.retry_after_ms / 1000), max(0.0, deadline - now)))
+        else:
+            raise TimeoutError("no fresh valid STATUS generation for abort")
+        generation = (observed.generation if observed.phase == Phase.ABORTED
+                      else (observed.generation + 1) & 0xFFFFFFFF)
+        since = time.monotonic()
+        self.require_accepted(self.exchange(
+            Op.ABORT, target + image_hash + struct.pack(">I", observed.generation),
+            target, self.remaining(deadline)))
+        return self.wait_phase(target, Phase.ABORTED, observed.manifest_hash, observed.counter,
+                               since, deadline, generation=generation,
+                               prior_generation=(None if observed.phase == Phase.ABORTED
+                                                 else observed.generation))
 
 
 def parser():
@@ -316,10 +351,10 @@ def parser():
     commit = commands.add_parser("commit", help="explicitly commit one READY target")
     commit.add_argument("--target", required=True, type=full_key)
     commit.add_argument("--manifest", required=True, type=Path)
-    abort = commands.add_parser("abort")
+    abort = commands.add_parser("abort", help="generation-bound abort; fresh STATUS and durable readback required")
     abort.add_argument("--target", required=True, type=full_key)
     abort.add_argument("--image", required=True, type=Path)
-    abort_cache = commands.add_parser("abort-cache", help="explicitly abort the companion's local cache")
+    abort_cache = commands.add_parser("abort-cache", help="generation-bound local cache abort; never remote")
     abort_cache.add_argument("--image", required=True, type=Path)
     admin = commands.add_parser("admin")
     admin.add_argument("--target", required=True, type=full_key)
@@ -385,9 +420,9 @@ def main():
         elif args.command == "commit":
             reply = uploader.commit(args.target, canonical, deadline)
         elif args.command == "abort":
-            reply = uploader.abort(args.target, hashlib.sha256(image).digest())
+            reply = uploader.abort(args.target, hashlib.sha256(image).digest(), deadline)
         elif args.command == "abort-cache":
-            reply = uploader.abort(LOCAL_TARGET, hashlib.sha256(image).digest())
+            reply = uploader.abort(LOCAL_TARGET, hashlib.sha256(image).digest(), deadline)
         elif args.command == "admin":
             reply = uploader.require_accepted(uploader.exchange(
                 Op.SET_ADMIN, args.target + bytes([args.enabled]), args.target))

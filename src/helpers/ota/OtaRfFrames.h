@@ -27,7 +27,7 @@
 //   0x03 Commit -- target-bound, signed by the ORIGINAL manifest owner
 //        (OtaLeanReceiver::commit() already enforces this by verifying
 //        against the already-admitted candidate_.ownerPublicKey).
-//   0x04 Abort -- target-bound, signed by ANY current admin (carries its
+//   0x04 Abort -- target/generation-bound, signed by ANY current admin (carries its
 //        own signer key on the wire, since the aborting admin need not
 //        be the original owner).
 //   0x06 StatusReport -- unsigned, informational only (receiver's own
@@ -214,7 +214,7 @@ inline size_t buildOtaReuploadMessage(const uint8_t* frame, uint8_t* out) {
 static constexpr size_t kOtaAuthorizationFrameBytes =
     1u + 32u + kOtaCanonicalManifestBytes + 64u;  // 1+32+59+64 = 156
 static constexpr size_t kOtaCommitFrameBytes = 1u + 32u + 32u + 4u + 64u;        // 133
-static constexpr size_t kOtaAbortFrameBytes = 1u + 32u + 32u + 32u + 64u;        // 161
+static constexpr size_t kOtaAbortFrameBytes = 1u + 32u + 32u + 32u + 4u + 64u;   // 165
 // StatusReport carries the reporting device's own public key: unlike a
 // signed frame, PAYLOAD_TYPE_LORA_OTA packets carry no implicit sender
 // identity at all, and without this field an uploader tracking several
@@ -247,6 +247,7 @@ struct OtaAbortFrame {
   uint8_t signerPublicKey[32] = {0};
   uint8_t target[32] = {0};
   uint8_t imageHash[32] = {0};
+  uint32_t generation = 0;
   uint8_t signature[64] = {0};
 };
 
@@ -311,7 +312,7 @@ inline bool parseOtaCommitFrame(const uint8_t* frame, size_t frame_len, OtaCommi
 }
 
 inline size_t encodeOtaAbortFrame(const uint8_t signer_public_key[32], const uint8_t target[32],
-                                  const uint8_t image_hash[32], const uint8_t signature[64],
+                                  const uint8_t image_hash[32], uint32_t generation, const uint8_t signature[64],
                                   uint8_t* out, size_t out_capacity) {
   if (out == nullptr || out_capacity < kOtaAbortFrameBytes) return 0;
   size_t i = 0;
@@ -319,6 +320,7 @@ inline size_t encodeOtaAbortFrame(const uint8_t signer_public_key[32], const uin
   std::memcpy(&out[i], signer_public_key, 32); i += 32;
   std::memcpy(&out[i], target, 32); i += 32;
   std::memcpy(&out[i], image_hash, 32); i += 32;
+  usb::putBE32(&out[i], generation); i += 4;
   std::memcpy(&out[i], signature, 64); i += 64;
   return i;
 }
@@ -329,6 +331,7 @@ inline bool parseOtaAbortFrame(const uint8_t* frame, size_t frame_len, OtaAbortF
   std::memcpy(out.signerPublicKey, &frame[i], 32); i += 32;
   std::memcpy(out.target, &frame[i], 32); i += 32;
   std::memcpy(out.imageHash, &frame[i], 32); i += 32;
+  out.generation = usb::getBE32(&frame[i]); i += 4;
   std::memcpy(out.signature, &frame[i], 64); i += 64;
   return true;
 }

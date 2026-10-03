@@ -158,7 +158,7 @@ public:
 
   // Dispatches CMD_OTA_CONTROL subops 0x10..0x18 (the lean local-USB
   // uploader/status wire contract; see helpers/ota/OtaUsbProtocol.h).
-  // Writes the fixed 86-byte reply via _serial directly; does not use
+  // Writes the fixed 90-byte ABI2 reply via _serial directly; does not use
   // writeOKFrame()/writeErrFrame() (those are 1-2 byte legacy shapes,
   // incompatible with this contract's fixed-layout reply requirement).
   void handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int len);

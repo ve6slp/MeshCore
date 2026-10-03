@@ -143,7 +143,10 @@ does not rewrite the intent or postpone its deadline.
 
 To abort before commit, use `make ota-lab-abort` with the target key and
 original `OTA_UPLOAD_IMAGE`. Abort identifies the firmware content hash,
-not its manifest hash. An explicit reupload uses
+not its manifest hash. The host first requires fresh target STATUS and binds
+the abort to that observed upload generation. Command acceptance alone is
+insufficient: success requires fresh, generation-bound durable ABORTED state.
+An explicit reupload uses
 `OTA_UPLOAD_REUPLOAD=1`; changing the manifest does not bypass an abort.
 Reupload is not a force-overwrite option. An active candidate must retain
 the same owner, image content and cache or install purpose. Abort an
@@ -205,7 +208,9 @@ update explicitly without affecting ordinary mesh service.
 ## Control surface
 
 Use the signed uploader commands above for an update. The current host ABI
-is command 66, operations `0x10` to `0x18`, with versioned 86-byte replies.
+is command 66, operations `0x10` to `0x18`, with ABI2 90-byte replies.
+ABI1 firmware is explicitly refused; do not bypass that guard or treat
+earlier ABI1 hardware evidence as qualification of the updated protocol.
 It distinguishes local cache state from individually addressed target state.
 The old command-66 mode/duty controls, raw fixed-key sender and binary
 boot-journal cleanup are not an alternative upload workflow; their host

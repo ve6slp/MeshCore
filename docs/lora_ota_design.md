@@ -86,7 +86,10 @@ that image and that individual target.
 
 Any currently trusted administrator may abort before commit and suppress
 further reception of that image until an explicit administrator-directed
-restart. Once installation has begun, boot recovery completes the operation
+restart. Cancellation binds the target, image content and existing upload
+generation, so a delayed cancellation cannot stop an explicitly restarted
+attempt. Duplicate cancellation may finish already durable cleanup.
+Once installation has begun, boot recovery completes the operation
 or restores the backup; it does not depend on another radio packet.
 
 ### 2. Recoverable update with rollback
