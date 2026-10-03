@@ -156,6 +156,40 @@ APP erasure before SDK invalidation is also a coupled recovery-write gap;
 it must be closed before claiming global zero-CRC fallback safety. None of
 these source results establishes what ran on the failed board.
 
+### Paired-primary source review
+
+The first private OTAFIX-primary/64 KiB installer prototype fits its assigned
+regions in four ARM board/role builds. Those primaries still refuse APP writes;
+their fit does **not** establish a complete USB/BLE recovery implementation.
+The frozen source review found a mandatory recovery-exit defect that has not
+been flashed on any unit:
+
+| Finding | Mechanism and required outcome |
+|---|---|
+| P1: DFU return can strand the node in BLE DFU | An explicit escape skips the installer. When DFU returns, the primary's tail sets GPREGRET `0xA8`, which is itself another installer escape. The next boot therefore re-enters BLE DFU instead of validating the installer and APP. Clear the old double-reset marker and request a normal reset after DFU returns; the next boot must run the fresh installer gate, never reuse an earlier APP grant |
+| Fault recovery remains unqualified | The inherited HardFault handler loops. An installer fault before a watchdog is running can strand a remote node; local reset escape is not proof of automatic fault recovery |
+
+P1 is being corrected in a separate private source snapshot, with two-boot
+cases for each escape and DFU completion/reset/timeout. Preserve the vendor's
+app-requested serial/UF2 timeout separately from persistent recovery forced
+by an unusable installer. Neither this correction nor a reset-on-fault policy
+is established by the first prototype's single-boot escape cases.
+
+BLE APP recovery and legitimate pending-update completion must remain
+available in the final primary; the limited serial/UF2 writer proof that
+refuses those paths is not accepted as complete. Recovery writes must use
+primary-local SDK invalidation/publication without QSPI or installer
+dependencies, and successful recovery must re-enter the fresh installer gate.
+ACL/S140 coexistence, complete recovery writes and real fault/reset timing
+remain unqualified.
+
+Live integration must reduce only the nRF OTA internal install limit to
+643,072 bytes (`0x27000..0xC4000`). External image regions, identity/security
+tails, journal, filesystems and scratch addresses stay fixed. Generic/ESP
+transfer limits and ordinary firmware linker limits must not be reduced as a
+side effect. The private test snapshot's globally reduced geometry is not
+evidence that those existing behaviors are preserved.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does
