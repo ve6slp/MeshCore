@@ -293,6 +293,31 @@ target was opened. Full serial evidence is retained privately under
 `review-candidates/working-client-app83-final-evidence/`; the radio,
 installation, rollback and full-window duty outcomes above remain unverified.
 
+**Refined application validation, Oct. 3, 2026 UTC (Oct. 2 local):** MAIN
+application-only flashed the immutable `18ca2dcc` companion build from
+`971830d0` onto the same approved client. ZIP SHA256:
+`fc384ba78a9667c97f76068350045987d81d58c4901e12d5ceaaa54cfab55db4`.
+The application is 548,276 bytes, SHA256
+`82569bad34e793c7eb50b986e3d068ebf499ea8f4047f3d11f00117c88b961e5`.
+Stock DFU again acknowledged `Device programmed.` and returned to APP USB.
+Fresh public configuration before/after, after an ordinary application reboot,
+and at the final check matched every captured field above. Stock proof remained
+healthy with allowed writes, blank marker, SDK size 548276, CRC `0000/2769`
+and **CACHE_ONLY**.
+
+An explicit local reupload of the same image-bound aborted candidate sealed
+all 6,403 blocks at `2026-10-03T00:42:45Z`. Fresh local STATUS after the
+ordinary reboot retained that exact sealed image/counter/count at `00:44:26Z`.
+Both sealed-cache retries sent signing/BEGIN/STATUS, with no PUT or SEAL.
+Image-bound local ABORT was independently confirmed at `00:45:05Z`; this is
+not an erasure claim. Final `00:45:11Z` diagnostics reported the normal tuple,
+healthy radio and zero radio faults/apply failures, OTA airtime, all-TX time,
+timeouts or accounting failures. All 18 recorded serial opens were the
+approved client. No ADD_TARGET, START, COMMIT, administrator or radio-setting
+request was made; Pine and the failed target remained untouched. This extends
+actual application/local-cache evidence to the refined tree, **not** remote
+OTA, installation, rollback, physical RF-register readback or duty acceptance.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
