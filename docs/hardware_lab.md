@@ -100,7 +100,13 @@ No settings were replayed to hide this failure. Restoring the exact ordinary
 APP recovered every original captured setting and the complete ACL without
 setters; the tested migration did not erase those stored preferences.
 Further OTA migration is held for a causally verified preference-read/startup
-correction. The replacement is back on its ordinary bench APP with stock
+correction. The correction selects an existing OTA `/repeater_prefs.json`
+first; if absent, it reuses the ordinary `/prefs.json`. That one selected path
+is used for load, save and storage-health probes. It does not copy, rename,
+create another preference store or write during startup, and does not fall
+back from a present unreadable/malformed OTA file to stale ordinary data.
+Other profiles keep their existing paths and serialization.
+The replacement is back on its ordinary bench APP with stock
 recovery intact. The final `03:55:01Z` probe again observed a host-verified signed
 target advert; native companion acceptance was not observed in that final
 probe. Neither probe qualifies bidirectional, routed, multicast or OTA delivery.

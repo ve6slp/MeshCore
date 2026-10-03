@@ -37,6 +37,7 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
+#include "RepeaterPrefs.h"
 
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaFirmwareService.h>
@@ -50,20 +51,6 @@
 
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
-#endif
-
-// A role-1 (repeater) OTA build on the SAME physical Xiao nRF52840
-// hardware family as companion_radio (role 0) must never share its
-// prefs file with a role-0 image that might coexist on the same
-// candidate-bank-capable device during genesis/commissioning -- see
-// CommonCLI::loadPrefs/savePrefs's filename parameter. Every OTHER
-// simple_repeater build (ESP32/RAK/etc, where XIAO_OTA_COMPILED_ROLE_ID
-// is simply never defined) is completely unaffected and keeps the
-// original "/prefs.json" path byte-for-byte.
-#if defined(XIAO_OTA_COMPILED_ROLE_ID) && XIAO_OTA_COMPILED_ROLE_ID == 1
-static constexpr const char* kRepeaterPrefsFilename = "/repeater_prefs.json";
-#else
-static constexpr const char* kRepeaterPrefsFilename = "/prefs.json";
 #endif
 
 struct RepeaterStats {
@@ -109,6 +96,7 @@ struct NeighbourInfo {
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FILESYSTEM* _fs;
+  const char* _prefs_filename = kRepeaterPrefsFilename;
   uint32_t last_millis;
   uint64_t uptime_millis;
   unsigned long next_local_advert, next_flood_advert;
@@ -295,7 +283,7 @@ public:
   }
 
   void savePrefs() override {
-    _cli.savePrefs(_fs, kRepeaterPrefsFilename);
+    _cli.savePrefs(_fs, _prefs_filename);
   }
 
   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);

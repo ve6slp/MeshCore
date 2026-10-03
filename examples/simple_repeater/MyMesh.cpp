@@ -1009,7 +1009,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
   // load persisted prefs
-  _cli.loadPrefs(_fs, kRepeaterPrefsFilename);
+  _prefs_filename = resolveRepeaterPrefsFilename(*_fs);
+  _cli.loadPrefs(_fs, _prefs_filename);
   // acl.load() keys every entry against self_id's own identity -- skip it
   // entirely (ACL stays empty) rather than load/bind against an unset
   // identity when _identity_available_ is false (see its doc comment in
@@ -1755,18 +1756,18 @@ bool MyMesh::probeIdentityStorageReadiness() const {
 #endif
   if (!identity_store.checkIntegrity("_main", const_cast<mesh::LocalIdentity&>(self_id))) return false;
 
-  if (!_fs->exists(kRepeaterPrefsFilename)) {
+  if (!_fs->exists(_prefs_filename)) {
     // Legitimately nothing to check yet (freshly-formatted device that
     // has never saved prefs) -- absence of an optional file is NOT
     // evidence of an IO fault.
     return true;
   }
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  File file = _fs->open(kRepeaterPrefsFilename, FILE_O_READ);
+  File file = _fs->open(_prefs_filename, FILE_O_READ);
 #elif defined(RP2040_PLATFORM)
-  File file = _fs->open(kRepeaterPrefsFilename, "r");
+  File file = _fs->open(_prefs_filename, "r");
 #else
-  File file = _fs->open(kRepeaterPrefsFilename, "r", false);
+  File file = _fs->open(_prefs_filename, "r", false);
 #endif
   if (!file) return false;  // exists() said yes but the open genuinely failed.
   file.close();
