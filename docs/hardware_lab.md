@@ -99,21 +99,51 @@ Stock proof was healthy, size 538328, CRC `0000/E87C`, marker blank, CACHE_ONLY.
 No settings were replayed to hide this failure. Restoring the exact ordinary
 APP recovered every original captured setting and the complete ACL without
 setters; the tested migration did not erase those stored preferences.
-Further OTA migration is held for a causally verified preference-read/startup
+Further OTA migration was held for a causally verified preference-read/startup
 correction. The correction selects an existing OTA `/repeater_prefs.json`
 first; if absent, it reuses the ordinary `/prefs.json`. That one selected path
 is used for load, save and storage-health probes. It does not copy, rename,
 create another preference store or write during startup, and does not fall
 back from a present unreadable/malformed OTA file to stale ordinary data.
 Other profiles keep their existing paths and serialization.
-The replacement is back on its ordinary bench APP with stock
-recovery intact. The final `03:55:01Z` probe again observed a host-verified signed
+The replacement was returned to its ordinary bench APP with stock
+recovery intact. The `03:55:01Z` probe again observed a host-verified signed
 target advert; native companion acceptance was not observed in that final
 probe. Neither probe qualifies bidirectional, routed, multicast or OTA delivery.
 No custom loader, SoftDevice, MBR or UICR update, power cut, OTA START or COMMIT
 was requested; Pine and the failed recovery target were not opened.
 Source-bound first-provision and regression evidence is retained privately in
 `review-candidates/replacement-77-stock-first-provision-evidence/`.
+
+**Corrected migration qualified on the replacement:** source fix `5c41f3a9`
+passed the scoped Opus 5.5 review, causal native tests and product builds.
+ROOT's exact `04705d6a` build contains a 538,360-byte APP, SHA256
+`69c961ff66602c865a3cf8b3855478a8191cfc605ed4d811e70a7cdcc9f18fd2`;
+ZIP SHA256 is `60dd1f636fc7788d2be8fb9d1fb0a41a4dd82d84cf003f22dc961ee629f11d95`.
+Its only byte differences from the owner's reviewed APP are three ASCII
+`__TIME__` bytes; code and all other image bytes agree. The APP-only retry
+returned to USB with healthy stock proof, size 538360, CRC `0000/B968`,
+marker blank and CACHE_ONLY. Before/after/reboot captures preserved both
+identities, every captured public setting and the complete ADMIN ACL, without
+replaying any setter or grant. The target kept its saved bench name, BW250 kHz
+and path-hash mode 2.
+
+The `04:36:38Z` probe received a host-verified signed advert from that exact
+target; native companion acceptance was not observed in this probe. Final
+driver-applied observations were the normal bench tuple with healthy radios,
+zero reported faults/apply failures/timeouts/accounting failures, zero OTA
+airtime, and 242 ms target all-TX time. These are not physical PHY-register or
+duty-window proof. The companion's original ABI2 cache remains ABORTED
+generation 6 / 6,403 blocks. No OTA START or COMMIT, custom-loader/SoftDevice/
+MBR/UICR update or protected-device operation was requested.
+
+The replacement now runs the corrected OTA APP but remains **CACHE_ONLY**:
+stock recovery is intact, and receiver/install authority and a confirmed
+version floor are not qualified. Full radio image staging/installation,
+trial confirmation, rollback and duty acceptance remain gated on separately
+proven recoverable commissioning; do not bypass the current refusal.
+Corrected source/artifacts and actual migration evidence are retained privately
+in `review-candidates/replacement-77-prefs-migration-04705d6a/`.
 
 An inventory listing can override a role for one run without editing the file:
 
