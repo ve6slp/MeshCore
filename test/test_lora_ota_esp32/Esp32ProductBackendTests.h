@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <gtest/gtest.h>
 #include <helpers/ota/OtaFirmwareBackend.h>
 #include <helpers/ota/OtaFirmwareIntegration.h>
 #include <helpers/ota/OtaEsp32RollbackGuard.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
+#include <helpers/ota/OtaRfUploader.h>
 #include <ota/trust/Ed25519SignatureVerifier.h>
 #include "../test_lora_ota_trust/Ed25519TestSigner.h"
 #include "Esp32SdkModel.h"
@@ -2121,6 +2125,151 @@ TEST(Esp32ProductPolicy, SizeAndRoleLimitsAreDerivedFromActualSlotAndBitmap) {
   EXPECT_TRUE(repeater.accepts(d));
   ++d.exactSizeBytes;
   EXPECT_FALSE(repeater.accepts(d));
+}
+
+TEST_F(Esp32Product, AdvertisedMaximumLastBlockDoesNotOverlapSelectionMarkerAndOversizeNeverErases) {
+  descriptor.exactSizeBytes = Esp32OtaPolicy::kMaxImageBytes + 1;
+  signDescriptor();
+  const auto before = sdk.bytes;
+  ASSERT_EQ(Result::Denied, receiver().begin(owner.publicKey(), canonical, signature, false, false));
+  EXPECT_EQ(before, sdk.bytes);
+  EXPECT_TRUE(sdk.erasedOffsets.empty());
+  descriptor.exactSizeBytes = Esp32OtaPolicy::kMaxImageBytes;
+  signDescriptor();
+  begin();
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(32736u, receiver().status().totalBlocks);
+  uint8_t last[kOtaBlockMaxDataBytes] = {0xe9};
+  ASSERT_EQ(Result::Ok, receiver().putBlock(32735, last, sizeof(last)));
+  EXPECT_EQ(1u, receiver().status().receivedBlocks);
+  uint8_t marker[4];
+  ASSERT_EQ(FlashStatus::Ok, metadata.read(Esp32OtaStagingSink::kSelectionMarkerOffset, marker, sizeof(marker)));
+  for (uint8_t byte : marker) EXPECT_EQ(0xff, byte);
+  EXPECT_EQ(Result::Incomplete, receiver().requestSeal());
+  EXPECT_EQ(InstallOutcome::None, sink.activateDurableCommit());
+  EXPECT_EQ(0u, install.selections);
+}
+
+TEST_F(Esp32Product, FullImageHostCacheProductionSenderAndInactivePartitionRequireIndividualCommit) {
+  const char* path = std::getenv("ESP32_OTA_IMAGE_PATH_FIXTURE");
+  if (!path) GTEST_SKIP() << "Provide the offline host cache fixture for an actual ESP application image";
+  std::ifstream input(path, std::ios::binary);
+  ASSERT_TRUE(input.is_open()) << path;
+  const std::vector<uint8_t> fixture((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  ASSERT_GT(fixture.size(), 12u);
+  ASSERT_EQ(0, std::memcmp(fixture.data(), "ESPIMG1\0", 8));
+  const uint32_t image_bytes = usb::getBE32(fixture.data() + 8);
+  ASSERT_GT(image_bytes, 643072u);
+  ASSERT_LE(image_bytes, Esp32OtaPolicy::kMaxImageBytes);
+  ASSERT_GE(fixture.size(), 12u + image_bytes + 2u + usb::kCacheBeginTotalBytes);
+  image.assign(fixture.begin() + 12, fixture.begin() + 12 + image_bytes);
+  size_t cursor = 12u + image_bytes;
+  const auto source_before = sdk.bytes;
+  uint32_t cached_blocks = 0;
+  while (cursor < fixture.size()) {
+    ASSERT_GE(fixture.size() - cursor, 2u);
+    const size_t frame_bytes = usb::getBE16(fixture.data() + cursor);
+    cursor += 2;
+    ASSERT_LE(frame_bytes, fixture.size() - cursor);
+    const auto* frame = fixture.data() + cursor;
+    ASSERT_GE(frame_bytes, 2u);
+    const auto op = static_cast<usb::UsbOtaOp>(frame[1]);
+    if (op == usb::UsbOtaOp::CacheBegin) {
+      ASSERT_EQ(usb::kCacheBeginTotalBytes, frame_bytes);
+      std::memcpy(canonical, frame + 35, sizeof(canonical));
+      std::memcpy(signature, frame + 94, sizeof(signature));
+      ASSERT_EQ(meshcore::ota::protocol::OtaDescriptorCodecResult::Ok,
+                meshcore::ota::protocol::decodeOtaDescriptorCanonical(canonical, sizeof(canonical), descriptor));
+      ASSERT_EQ(image_bytes, descriptor.exactSizeBytes);
+    } else {
+      ASSERT_TRUE(op == usb::UsbOtaOp::CachePut || op == usb::UsbOtaOp::CacheSeal);
+    }
+    const auto reply = integration.handleUsbLocalControl(frame, frame_bytes, owner.publicKey());
+    if (op == usb::UsbOtaOp::CacheSeal) ASSERT_EQ(Result::Pending, reply.result);
+    else ASSERT_EQ(Result::Ok, reply.result) << cursor;
+    if (op == usb::UsbOtaOp::CachePut) ++cached_blocks;
+    integration.loop();
+    cursor += frame_bytes;
+  }
+  const auto cached = receiver().status();
+  ASSERT_TRUE(cached.valid && cached.localCache);
+  ASSERT_EQ(OtaCandidateStore::Phase::Ready, cached.phase);
+  ASSERT_EQ((image_bytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes, cached_blocks);
+  ASSERT_EQ(cached_blocks, cached.totalBlocks);
+  ASSERT_EQ(cached.totalBlocks, cached.receivedBlocks);
+  EXPECT_EQ(0u, install.selections);
+  EXPECT_EQ(0, std::memcmp(image.data(), sdk.bytes.data() + sdk.snapshot.next.address, image.size()));
+  if (image_bytes > 708608u) ASSERT_GT(cached_blocks, 708608u / kOtaBlockMaxDataBytes);
+
+  Esp32PartitionModel target_sdk(true);
+  const auto target_before = target_sdk.bytes;
+  Esp32OtaLease target_lease;
+  Esp32FlashAdapter target_flash(target_sdk, target_lease);
+  FlashRegion target_image(target_flash, 0, Esp32OtaPolicy::kCandidateBytes);
+  FlashRegion target_metadata(target_flash, Esp32OtaPolicy::kCandidateBytes, 8192);
+  OtaCandidateStore target_store(target_metadata);
+  Esp32OtaPolicy target_policy{descriptor.role};
+  Esp32OtaTrustProvider target_trust(target_policy, target_image);
+  InstallModel target_install(target_sdk, target_policy, signatures);
+  Esp32OtaStagingSink target_sink(target_flash, target_lease, target_image, target_metadata,
+                                 target_store, target_trust, target_policy, signatures, target_install);
+  OtaFirmwareIntegration destination;
+  destination.attachTrustProvider(&target_trust);
+  destination.attachLeanSignatureVerifier(&signatures);
+  destination.attachStagingSink(&target_sink);
+  destination.attachCandidateStore(&target_store);
+  setIdentity(destination);
+  integration.setLeanTargetPublicKey(owner.publicKey());
+
+  struct Wire {
+    OtaFirmwareIntegration& destination;
+    Ed25519TestSigner& signer;
+    uint32_t frames = 0;
+  } wire{destination, owner};
+  const auto sign = [](void* ctx, const uint8_t* data, size_t len, uint8_t out[64]) {
+    static_cast<Wire*>(ctx)->signer.sign(data, len, out);
+  };
+  const auto send = [](void* ctx, OtaRfRoute route, const uint8_t[32], const uint8_t* frame,
+                       size_t len, meshcore::ota::protocol::OtaAirtimeCategory) {
+    auto& wire = *static_cast<Wire*>(ctx);
+    EXPECT_EQ(OtaRfRoute::Directed, route);
+    const bool accepted = wire.destination.handleReceivedFrame(frame, len, ++wire.frames);
+    wire.destination.loop();
+    return accepted;
+  };
+  OtaRfUploader sender;
+  ASSERT_TRUE(sender.start(integration, usb::kStartModeDirected, target, 1, 0, 0, 1, false));
+  for (uint32_t pass = 0; pass <= cached_blocks; ++pass)
+    sender.pump(integration, pass + 1, &wire, sign, send);
+  sender.stop(integration);
+  ASSERT_EQ(cached_blocks + 1, wire.frames);
+  const auto received = destination.leanReceiver().status();
+  ASSERT_EQ(OtaCandidateStore::Phase::Ready, received.phase);
+  ASSERT_EQ(cached_blocks, received.receivedBlocks);
+  ASSERT_EQ(cached.totalBlocks, received.totalBlocks);
+  ASSERT_EQ(0, std::memcmp(cached.manifestHash, received.manifestHash, 32));
+  ASSERT_EQ(0, std::memcmp(image.data(), target_sdk.bytes.data() + target_sdk.snapshot.next.address, image.size()));
+  EXPECT_EQ(0u, target_install.selections);
+  EXPECT_EQ(InstallOutcome::None, target_sink.activateDurableCommit());
+  EXPECT_TRUE(esp32PartitionEquals(target_sdk.snapshot.boot, target_sdk.snapshot.running));
+
+  ASSERT_EQ(Result::Ok, commit(destination));
+  OtaCandidateStore::Snapshot durable;
+  ASSERT_TRUE(target_store.load(durable));
+  ASSERT_EQ(OtaCandidateStore::Phase::Committed, durable.phase);
+  ASSERT_EQ(InstallOutcome::Selected, target_sink.activateDurableCommit());
+  EXPECT_EQ(2u, target_install.imageChecks);
+  EXPECT_EQ(1u, target_install.selections);
+  EXPECT_EQ(0x10000u, target_sdk.snapshot.boot.address);
+  EXPECT_EQ(Esp32ImageState::New, target_sdk.snapshot.appStates[0]);
+  for (const auto& context : {std::make_pair(&sdk, &source_before), std::make_pair(&target_sdk, &target_before)}) {
+    const auto& bytes = context.first->bytes;
+    const auto& before = *context.second;
+    const auto& inactive = context.first->snapshot.next;
+    EXPECT_TRUE(std::equal(before.begin(), before.begin() + inactive.address, bytes.begin()));
+    EXPECT_TRUE(std::equal(before.begin() + inactive.address + inactive.size, before.end(),
+                           bytes.begin() + inactive.address + inactive.size));
+  }
 }
 
 TEST_F(Esp32Product, RefusesWrongRoleBoardAddressCapabilitiesAndCounterBeforeErase) {

@@ -344,6 +344,26 @@ writes are stopped. SWD and additional qualification boards are still
 unavailable, as confirmed by the operator. No additional primary transfer or
 automatic APP retry was made.
 
+The selected primary also synthesizes flash-backed UF2 records for raw MSC
+reads beyond CURRENT's declared file length. Its read handler bounds the
+payload to the physical 1 MiB flash. This allowed a guarded, read-only
+`O_DIRECT` capture without SWD: SDK LBAs 4587-4602 map to
+`0xFF000..0x100000`, and primary LBAs 4411-4570 map to
+`0xF4000..0xFE000`. Each readback record was validated independently; these
+beyond-file records are not valid programming files and must never be
+copied back. Only digests and decoded SDK fields were saved.
+
+The 05:31 UTC capture finally proves the entire installed primary matches
+the reviewed boot-only RAW SHA-256
+`93df3f04530d170acf097fa77a3cf5363207275882f48fbb38c6573ec8c472b5`.
+The SDK has bank0 INVALID (`FF`), CRC0 and size0; bank1 remains VALID_BOOT
+(`AA`), with bootloader size 40,960, SD/app sizes0 and SD image start0.
+The alignment word is0 and all bytes after the 28-byte settings record are
+erased. The observed pending-BOOT marker explains the shared APP-preparation
+refusal. Why pending finalization did not clear it is still under
+investigation; no SDK repair, reset or further firmware transfer has been
+performed.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does
