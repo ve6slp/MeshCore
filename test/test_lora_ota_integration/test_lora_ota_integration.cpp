@@ -6956,6 +6956,390 @@ struct QualifiedOriginalFixture {
     ASSERT_TRUE(::ota::platform::isOk(f.boot.state.program(0x100, sidecar, sizeof(sidecar))));
   }
 };
+
+struct ProofWindowFlash : ::ota::test::FakeNorFlash {
+  mutable std::vector<std::pair<uint32_t, uint32_t>> requests;
+  uint32_t shortReadOffset = UINT32_MAX;
+  uint32_t mutationReadOffset = UINT32_MAX;
+  ::ota::platform::FlashRegion* mutationRegion = nullptr;
+  uint32_t mutationOffset = 0;
+  mutable bool mutated = false;
+  std::function<void()> readHook;
+  mutable bool hookCalled = false;
+  explicit ProofWindowFlash(uint32_t erase_bytes) : FakeNorFlash(2 * erase_bytes, erase_bytes) {}
+  ::ota::platform::FlashStatus read(uint32_t offset, uint8_t* out, uint32_t len) const override {
+    requests.emplace_back(offset, len);
+    if (offset == shortReadOffset) {
+      const auto result = FakeNorFlash::read(offset, out, len ? len - 1 : 0);
+      return ::ota::platform::isOk(result) ? ::ota::platform::FlashStatus::IoError : result;
+    }
+    const auto result = FakeNorFlash::read(offset, out, len);
+    if (::ota::platform::isOk(result) && readHook && !hookCalled) {
+      hookCalled = true;
+      readHook();
+    }
+    if (::ota::platform::isOk(result) && mutationRegion && !mutated && offset == mutationReadOffset) {
+      const uint8_t byte = 0;
+      mutated = true;
+      return mutationRegion->program(mutationOffset, &byte, 1);
+    }
+    return result;
+  }
+};
+
+void oldStateWindowDigest(const uint8_t* bytes, uint32_t erase_bytes, uint8_t out[32]) {
+  ::ota::trust::Sha256 hash;
+  uint8_t prefix[256], sidecar[88], tail[256];
+  for (uint32_t slot = 0; slot < 2; ++slot) {
+    const auto* window = bytes + slot * erase_bytes;
+    std::memcpy(prefix, window, sizeof(prefix));
+    std::memcpy(sidecar, window + sizeof(prefix), sizeof(sidecar));
+    hash.update(prefix, sizeof(prefix));
+    hash.update(sidecar, sizeof(sidecar));
+    for (uint32_t offset = sizeof(prefix) + sizeof(sidecar); offset < erase_bytes;) {
+      const auto count = std::min<uint32_t>(sizeof(tail), erase_bytes - offset);
+      std::memcpy(tail, window + offset, count);
+      hash.update(tail, count);
+      offset += count;
+    }
+  }
+  hash.finish(out);
+}
+
+struct ReenteringProofVerifier : ::ota::trust::SignatureVerifier {
+  const ::ota::trust::SignatureVerifier& actual;
+  std::function<void()> hook;
+  mutable bool called = false;
+  explicit ReenteringProofVerifier(const ::ota::trust::SignatureVerifier& verifier) : actual(verifier) {}
+  bool verify(const uint8_t* signature, size_t signature_len, const uint8_t* message,
+              size_t message_len, const uint8_t* key, size_t key_len) const override {
+    if (!called) { called = true; hook(); }
+    return actual.verify(signature, signature_len, message, message_len, key, key_len);
+  }
+};
+}
+
+TEST(LoraOtaProofStack, RejectedNestedLeaseDoesNotReleaseTheOwnersWorkspace) {
+  std::atomic_flag busy = ATOMIC_FLAG_INIT;
+  {
+    OtaBoardProofScratchLease owner(busy);
+    ASSERT_TRUE(static_cast<bool>(owner));
+    { OtaBoardProofScratchLease nested(busy); EXPECT_FALSE(static_cast<bool>(nested)); }
+    OtaBoardProofScratchLease still_busy(busy);
+    EXPECT_FALSE(static_cast<bool>(still_busy));
+  }
+  OtaBoardProofScratchLease next(busy);
+  EXPECT_TRUE(static_cast<bool>(next));
+}
+
+TEST(LoraOtaProofStack, InspectorReentryFailsClosedWithoutChangingEitherDigestOrTheOuterStream) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  ProofWindowFlash flash(4096);
+  ::ota::platform::FlashRegion region(flash, 0, 8192);
+  uint8_t newest[State::kRecordBytes] = {}, digest[32], nested[32], expected[32], old[32];
+  std::memset(nested, 0xa5, sizeof(nested));
+  ::ota::trust::Sha256::hash(flash.rawBuffer(), flash.rawSize(), expected);
+  oldStateWindowDigest(flash.rawBuffer(), 4096, old);
+  flash.readHook = [&]() {
+    EXPECT_EQ(usb::UsbOtaResult::IoError,
+              inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, nested));
+  };
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, digest));
+  ASSERT_TRUE(flash.hookCalled);
+  EXPECT_EQ(0, std::memcmp(digest, expected, sizeof(digest)));
+  EXPECT_EQ(0, std::memcmp(digest, old, sizeof(digest)));
+  for (auto byte : nested) EXPECT_EQ(0xa5, byte);
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, digest));
+  EXPECT_EQ(0, std::memcmp(digest, expected, sizeof(digest)));
+}
+
+TEST(LoraOtaProofStack, OriginalReadersRejectCrossInstanceReentryButPermitTheirDistinctInspectorLevel) {
+  QualifiedOriginalFixture first, other;
+  struct NestedRead {
+    QualifiedOriginalFixture& other;
+    bool called = false;
+  } nested{other};
+  first.running.hookAt = first.running.reads + 1;
+  first.running.hookContext = &nested;
+  first.running.hook = [](void* ptr) {
+    auto& nested = *static_cast<NestedRead*>(ptr);
+    nested.called = true;
+    OtaBoardOriginalImageSnapshot snapshot;
+    OtaBoardOriginalSnapshotProvider::Context context;
+    EXPECT_FALSE(nested.other.original.read(snapshot, context));
+    EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::None, context);
+    EXPECT_EQ(0u, snapshot.image.active_image_extent);
+  };
+  OtaBoardOriginalImageSnapshot snapshot;
+  OtaBoardOriginalSnapshotProvider::Context context;
+  ASSERT_TRUE(first.original.read(snapshot, context));
+  ASSERT_TRUE(nested.called);
+  EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::FactoryFloor, context);
+  uint8_t expected[32];
+  ::ota::trust::Sha256::hash(first.f.boot.state_flash.rawBuffer(), first.f.boot.state_flash.rawSize(), expected);
+  EXPECT_EQ(0, std::memcmp(expected, snapshot.stateWindowHash, sizeof(expected)));
+  ::ota::trust::Sha256::hash(first.f.boot.floor_flash.rawBuffer(), first.f.boot.floor_flash.rawSize(), expected);
+  EXPECT_EQ(0, std::memcmp(expected, snapshot.floorWindowHash, sizeof(expected)));
+  ASSERT_TRUE(other.original.read(snapshot, context));
+  EXPECT_EQ(OtaBoardOriginalSnapshotProvider::Context::FactoryFloor, context);
+}
+
+TEST(LoraOtaProofStack, InstallExtentScratchRejectsNestedReadersAndAlwaysResolvesTheNextImageEpoch) {
+  QualifiedOriginalFixture q, other;
+  struct NestedExtent {
+    QualifiedOriginalFixture& other;
+    bool called = false;
+  } nested{other};
+  q.running.hookAt = q.running.reads + 1;
+  q.running.hookContext = &nested;
+  q.running.hook = [](void* ptr) {
+    auto& nested = *static_cast<NestedExtent*>(ptr);
+    nested.called = true;
+    ::ota::storage::XiaoOtaActiveExtentInfo extent;
+    extent.active_image_extent = 1;
+    EXPECT_FALSE(nested.other.original.readOriginalSnapshot(extent));
+    EXPECT_EQ(0u, extent.active_image_extent);
+  };
+  ::ota::storage::XiaoOtaActiveExtentInfo first, second;
+  ASSERT_TRUE(q.original.readOriginalSnapshot(first));
+  ASSERT_TRUE(nested.called);
+  q.f.boot.accessor.image[37] ^= 1;
+  ASSERT_TRUE(q.original.readOriginalSnapshot(second));
+  EXPECT_EQ(first.active_image_extent, second.active_image_extent);
+  EXPECT_NE(0, std::memcmp(first.active_image_hash_sha256, second.active_image_hash_sha256, 32));
+  ASSERT_TRUE(other.original.readOriginalSnapshot(second));
+}
+
+TEST(LoraOtaProofStack, DeferredCommitRejectsReentryBeforeMutationAndStillUsesItsRealPostcommitNonce) {
+  QualifiedOriginalFixture q;
+  q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
+  const auto before = q.f.fx.integration.leanReceiver().status();
+  uint8_t message[usb::kCommitSignedBytes], signature[64];
+  usb::buildCommitSignedMessage(q.f.fx.target_public_key, before.manifestHash, before.counter, message);
+  q.f.owner.sign(message, sizeof(message), signature);
+  int resets = 0;
+  q.f.fx.integration.attachCommitReboot(&resets, [](void* ptr) { ++*static_cast<int*>(ptr); });
+  ReenteringProofVerifier verifier(q.f.fx.sig_verifier);
+  q.f.fx.integration.attachLeanSignatureVerifier(&verifier);
+  verifier.hook = [&]() {
+    const auto programs = q.f.fx.candidate_flash.programOpCount();
+    const auto erases = q.f.command_flash.eraseOpCount();
+    EXPECT_EQ(usb::UsbOtaResult::Busy,
+              q.f.fx.integration.commitAndDeferReboot(before.counter, signature, 100));
+    EXPECT_EQ(programs, q.f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(erases, q.f.command_flash.eraseOpCount());
+    EXPECT_EQ(0, resets);
+  };
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            q.f.fx.integration.commitAndDeferReboot(before.counter, signature, 100));
+  ASSERT_TRUE(verifier.called);
+  EXPECT_FALSE(q.f.fx.integration.tickCommitReboot(2099, false, false));
+  EXPECT_TRUE(q.f.fx.integration.tickCommitReboot(2100, false, false));
+  EXPECT_EQ(1, resets);
+  EXPECT_FALSE(q.f.fx.integration.tickCommitReboot(2101, false, false));
+}
+
+TEST(LoraOtaProofStack, CommandVerifierReentryCannotOverwriteTheOuterSignedCommandProof) {
+  QualifiedOriginalFixture q;
+  q.f.stage(1); q.f.commit(); q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+  ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+  ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+  ReenteringProofVerifier verifier(q.f.fx.sig_verifier);
+  verifier.hook = [&]() {
+    EXPECT_FALSE(q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier,
+                                                 q.f.target, q.f.role));
+  };
+  EXPECT_TRUE(q.original.ordinaryWritesAllowed(q.f.command, confirm, verifier, q.f.target, q.f.role));
+  EXPECT_TRUE(verifier.called);
+  EXPECT_TRUE(q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier,
+                                              q.f.target, q.f.role));
+}
+
+TEST(LoraOtaProofStack, SignedAbortReentryReturnsBusyWithoutMutationAndReleasesItsWorkspace) {
+  QualifiedOriginalFixture q;
+  q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
+  ReenteringProofVerifier verifier(q.f.fx.sig_verifier);
+  q.f.fx.integration.attachLeanSignatureVerifier(&verifier);
+  verifier.hook = [&]() {
+    const auto programs = q.f.fx.candidate_flash.programOpCount();
+    const auto erases = q.f.command_flash.eraseOpCount();
+    EXPECT_EQ(usb::UsbOtaResult::Busy, q.f.abort());
+    EXPECT_EQ(programs, q.f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(erases, q.f.command_flash.eraseOpCount());
+  };
+  EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
+  EXPECT_TRUE(verifier.called);
+  EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Aborted,
+            q.f.fx.integration.leanReceiver().status().phase);
+  EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
+}
+
+TEST(LoraOtaProofStack, RecoveryReentryFailsClosedAndTheAuthorizedOuterAbortStillCompletes) {
+  QualifiedOriginalFixture q;
+  q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
+  struct NestedRecovery {
+    QualifiedOriginalFixture& q;
+    ::ota::storage::OtaCandidateStore::Snapshot candidate;
+    bool called = false;
+  } nested{q, {}};
+  ASSERT_TRUE(q.f.fx.candidate_store.load(nested.candidate));
+  q.running.hookAt = q.running.reads + 1;
+  q.running.hookContext = &nested;
+  q.running.hook = [](void* ptr) {
+    auto& nested = *static_cast<NestedRecovery*>(ptr);
+    nested.called = true;
+    const auto programs = nested.q.f.fx.candidate_flash.programOpCount();
+    const auto erases = nested.q.f.command_flash.eraseOpCount();
+    EXPECT_EQ(usb::UsbOtaResult::TooLate, nested.q.recovery.recover(nested.candidate, false));
+    EXPECT_EQ(programs, nested.q.f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(erases, nested.q.f.command_flash.eraseOpCount());
+  };
+  EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
+  EXPECT_TRUE(nested.called);
+  EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
+}
+
+TEST(LoraOtaProofStack, StreamingStateWindowsHashEveryByteWithBoundedReadsAndShortFinalChunk) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  for (uint32_t erase_bytes : {344u, 4096u, 8192u}) {
+    SCOPED_TRACE(erase_bytes);
+    ProofWindowFlash flash(erase_bytes);
+    ::ota::platform::FlashRegion region(flash, 0, 2 * erase_bytes);
+    uint8_t newest[State::kRecordBytes] = {}, digest[32], expected[32], old[32];
+    ::ota::trust::Sha256::hash(flash.rawBuffer(), flash.rawSize(), expected);
+    oldStateWindowDigest(flash.rawBuffer(), erase_bytes, old);
+    ASSERT_EQ(usb::UsbOtaResult::Ok,
+              inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, digest));
+    EXPECT_EQ(0, std::memcmp(expected, digest, sizeof(digest)));
+    EXPECT_EQ(0, std::memcmp(old, digest, sizeof(digest)));
+    uint32_t next = 0;
+    for (const auto& request : flash.requests) {
+      EXPECT_EQ(next, request.first);
+      EXPECT_LE(request.second, 256u);
+      next += request.second;
+    }
+    EXPECT_EQ(2 * erase_bytes, next);
+    EXPECT_EQ(0u, flash.programOpCount());
+    EXPECT_EQ(0u, flash.eraseOpCount());
+  }
+}
+
+TEST(LoraOtaProofStack, StateRecordAndSavedSdkSidecarKeepTheExactFullWindowDigest) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  QualifiedOriginalFixture q;
+  q.f.stage(1); q.f.commit(); q.restoredState(); ASSERT_FALSE(HasFatalFailure());
+  uint8_t newest[State::kRecordBytes], digest[32], expected[32], old[32];
+  ASSERT_EQ(State::ReadStatus::Found, State::readNewestWithStatus(q.f.boot.state, newest));
+  ::ota::trust::Sha256::hash(q.f.boot.state_flash.rawBuffer(), q.f.boot.state_flash.rawSize(), expected);
+  oldStateWindowDigest(q.f.boot.state_flash.rawBuffer(), 4096, old);
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            inspectOtaBoardStateWindows(q.f.boot.state, newest, State::ReadStatus::Found, 0, digest));
+  EXPECT_EQ(0, std::memcmp(expected, digest, sizeof(digest)));
+  EXPECT_EQ(0, std::memcmp(old, digest, sizeof(digest)));
+  EXPECT_EQ(usb::UsbOtaResult::TooLate, inspectOtaBoardStateWindows(
+      q.f.boot.state, newest, State::ReadStatus::Found, State::transactionNonce(newest), digest));
+}
+
+TEST(LoraOtaProofStack, StateWindowBoundaryCorruptionNeverProducesAProofDigest) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  for (uint32_t offset : {0u, 151u, 152u, 255u, 256u, 343u, 344u, 599u, 4095u, 4096u, 8191u}) {
+    SCOPED_TRACE(offset);
+    ProofWindowFlash flash(4096);
+    ::ota::platform::FlashRegion region(flash, 0, 8192);
+    const uint8_t byte = 0;
+    ASSERT_TRUE(::ota::platform::isOk(region.program(offset, &byte, 1)));
+    uint8_t newest[State::kRecordBytes] = {}, digest[32];
+    std::memset(digest, 0xa5, sizeof(digest));
+    EXPECT_EQ(usb::UsbOtaResult::TooLate,
+              inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, digest));
+    for (const auto value : digest) EXPECT_EQ(0xa5, value);
+  }
+}
+
+TEST(LoraOtaProofStack, EveryStreamedReadFailsClosedBeforeAfterOrOnAShortRead) {
+  using State = ::ota::storage::XiaoOtaStateReader;
+  ProofWindowFlash baseline(4096);
+  ::ota::platform::FlashRegion baseline_region(baseline, 0, 8192);
+  uint8_t newest[State::kRecordBytes] = {}, digest[32];
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            inspectOtaBoardStateWindows(baseline_region, newest, State::ReadStatus::Blank, 0, digest));
+  for (uint32_t i = 0; i < baseline.requests.size(); ++i) {
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+      SCOPED_TRACE(::testing::Message() << i << '/' << fault);
+      ProofWindowFlash flash(4096);
+      ::ota::platform::FlashRegion region(flash, 0, 8192);
+      if (fault == 2) flash.shortReadOffset = baseline.requests[i].first;
+      else flash.armFault({::ota::test::FakeNorFlash::OpKind::Read,
+          fault ? ::ota::test::FakeNorFlash::InjectionTiming::After :
+                  ::ota::test::FakeNorFlash::InjectionTiming::Before, i + 1});
+      std::memset(digest, 0xa5, sizeof(digest));
+      EXPECT_EQ(usb::UsbOtaResult::IoError,
+                inspectOtaBoardStateWindows(region, newest, State::ReadStatus::Blank, 0, digest));
+      for (const auto value : digest) EXPECT_EQ(0xa5, value);
+      EXPECT_EQ(0u, flash.programOpCount());
+      EXPECT_EQ(0u, flash.eraseOpCount());
+    }
+  }
+}
+
+TEST(LoraOtaProofStack, CompletedSnapshotIsNotReusedForANewRunningImageEpoch) {
+  QualifiedOriginalFixture q;
+  OtaBoardOriginalImageSnapshot first, second;
+  OtaBoardOriginalSnapshotProvider::Context context;
+  ASSERT_TRUE(q.original.read(first, context));
+  const auto reads = q.running.reads;
+  q.f.boot.accessor.image[37] ^= 1;
+  ASSERT_TRUE(q.original.read(second, context));
+  EXPECT_GT(q.running.reads, reads);
+  EXPECT_NE(0, std::memcmp(first.image.active_image_hash_sha256, second.image.active_image_hash_sha256, 32));
+  EXPECT_EQ(0, std::memcmp(first.stateWindowHash, second.stateWindowHash, 32));
+}
+
+TEST(LoraOtaProofStack, OrdinaryWriteProofRejectsMutationsAfterTheFirstSnapshotEpoch) {
+  for (uint32_t fault = 0; fault < 5; ++fault) {
+    SCOPED_TRACE(fault);
+    QualifiedOriginalFixture q;
+    ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+    ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+    struct Mutation {
+      QualifiedOriginalFixture& q;
+      ::ota::platform::FlashRegion& confirm;
+      uint32_t fault;
+    } mutation{q, confirm, fault};
+    q.running.hookAt = q.running.reads + 3;
+    q.running.hookContext = &mutation;
+    q.running.hook = [](void* context) {
+      auto& m = *static_cast<Mutation*>(context);
+      const uint8_t byte = 0;
+      if (m.fault == 0) m.q.f.boot.accessor.image[37] ^= 1;
+      if (m.fault == 1) m.q.running.unusedSdkByte = 1;
+      if (m.fault == 2) ASSERT_TRUE(::ota::platform::isOk(m.q.f.boot.state.program(8191, &byte, 1)));
+      if (m.fault == 3) ASSERT_TRUE(::ota::platform::isOk(m.q.f.boot.floor.program(8191, &byte, 1)));
+      if (m.fault == 4) ASSERT_TRUE(::ota::platform::isOk(m.confirm.program(8191, &byte, 1)));
+    };
+    EXPECT_FALSE(q.original.ordinaryWritesAllowed(q.f.command, confirm, q.f.fx.sig_verifier,
+                                                 q.f.target, q.f.role));
+    EXPECT_EQ(0u, q.f.command_flash.programOpCount());
+    EXPECT_EQ(0u, q.f.command_flash.eraseOpCount());
+  }
+}
+
+TEST(LoraOtaProofStack, CommandMutationAfterReadIsCaughtByTheSecondWholeWindowHash) {
+  QualifiedOriginalFixture q;
+  ProofWindowFlash command_flash(4096);
+  ::ota::platform::FlashRegion command(command_flash, 0, 8192);
+  ::ota::test::FakeNorFlash confirm_flash(8192, 4096);
+  ::ota::platform::FlashRegion confirm(confirm_flash, 0, 8192);
+  command_flash.mutationRegion = &command;
+  command_flash.mutationReadOffset = 0;
+  command_flash.mutationOffset = 0;
+  EXPECT_FALSE(q.original.ordinaryWritesAllowed(command, confirm, q.f.fx.sig_verifier,
+                                               q.f.target, q.f.role));
+  EXPECT_TRUE(command_flash.mutated);
+  EXPECT_EQ(1u, command_flash.programOpCount());
+  EXPECT_EQ(0u, command_flash.eraseOpCount());
 }
 
 TEST(LoraOtaQualifiedOriginal, VendorZeroFactoryFloorProducesRealSignedCommitWordRoundedV3AndLiteralHandoff) {

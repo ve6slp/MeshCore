@@ -1772,10 +1772,8 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       if (local_target) {
         if (!snap.valid) { reply.result = UsbOtaResult::NotFound; break; }
         if (std::memcmp(snap.manifestHash, manifest_hash, kHashBytes) != 0) { reply.result = UsbOtaResult::Mismatch; break; }
-        uint8_t message[kCommitSignedBytes] = {};
-        const size_t message_len = buildCommitSignedMessage(target, manifest_hash, counter, message);
         uint8_t signature[64] = {};
-        self_id.sign(signature, message, static_cast<int>(message_len));
+        signOtaCommitMessage(target, manifest_hash, counter, signature);
         reply.result = getOtaIntegration().commitAndDeferReboot(counter, signature, _ms->getMillis());
         fillLocalSnapshot();
         break;
@@ -1886,6 +1884,14 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
   _serial->writeFrame(out, kReplyBytes);
 }
 
+#if MESHCORE_LORA_OTA
+__attribute__((noinline)) void MyMesh::signOtaCommitMessage(
+    const uint8_t target[32], const uint8_t manifest_hash[32], uint32_t counter, uint8_t signature[64]) {
+  uint8_t message[mesh::ota::usb::kCommitSignedBytes] = {};
+  const size_t message_len = mesh::ota::usb::buildCommitSignedMessage(target, manifest_hash, counter, message);
+  self_id.sign(signature, message, static_cast<int>(message_len));
+}
+#endif
 
 void MyMesh::replyUf2Reboot(companion_usb_uf2::Reply reply) {
   using Reply = companion_usb_uf2::Reply;
@@ -1911,6 +1917,16 @@ bool MyMesh::uf2RebootAllowed() {
 #endif
 
 void MyMesh::handleCmdFrame(size_t len) {
+#if MESHCORE_LORA_OTA
+  if (len >= 2 && cmd_frame[0] == CMD_OTA_CONTROL && cmd_frame[1] >= 0x10 && cmd_frame[1] <= 0x18) {
+    handleUsbOtaProtocolOp(cmd_frame[1], cmd_frame, len);
+    return;
+  }
+#endif
+  handleOrdinaryCmdFrame(len);
+}
+
+void MyMesh::handleOrdinaryCmdFrame(size_t len) {
 #if XIAO_OTA_COMPANION_USB_UF2
   auto* uf2_pending = &_uf2_reboot;
   const bool local_usb = _command_from_local_usb;
@@ -3617,6 +3633,13 @@ void MyMesh::checkSerialInterface() {
   } else if (_iter_started              // check if our ContactsIterator is 'running'
              && !_serial->isWriteBusy() // don't spam the Serial Interface too quickly!
   ) {
+    sendNextContact();
+  //} else if (!_serial->isWriteBusy()) {
+  //  checkConnections();    // TODO - deprecate the 'Connections' stuff
+  }
+}
+
+__attribute__((noinline)) void MyMesh::sendNextContact() {
     ContactInfo contact;
     if (_iter.hasNext(this, contact)) {
       if (contact.lastmod > _iter_filter_since) { // apply the 'since' filter
@@ -3632,9 +3655,6 @@ void MyMesh::checkSerialInterface() {
       _serial->writeFrame(out_frame, 5);
       _iter_started = false;
     }
-  //} else if (!_serial->isWriteBusy()) {
-  //  checkConnections();    // TODO - deprecate the 'Connections' stuff
-  }
 }
 
 void MyMesh::loop() {

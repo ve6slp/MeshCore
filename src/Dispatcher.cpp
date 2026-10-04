@@ -201,10 +201,8 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
   return true;  // success
 }
 
-void Dispatcher::checkRecv() {
+__attribute__((noinline)) Packet* Dispatcher::readReceivedPacket(float& score, uint32_t& air_time) {
   Packet* pkt;
-  float score;
-  uint32_t air_time;
   {
     uint8_t raw[MAX_TRANS_UNIT+1];
     int len = _radio->recvRaw(raw, MAX_TRANS_UNIT);
@@ -244,6 +242,13 @@ void Dispatcher::checkRecv() {
       pkt = NULL;
     }
   }
+  return pkt;
+}
+
+void Dispatcher::checkRecv() {
+  float score;
+  uint32_t air_time;
+  Packet* pkt = readReceivedPacket(score, air_time);
   if (pkt) {
     #if MESH_PACKET_LOGGING
     Serial.print(getLogDateTime());

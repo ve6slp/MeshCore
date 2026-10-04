@@ -359,6 +359,7 @@ public:
   bool tryParsePacket(Packet* pkt, const uint8_t* raw, int len);
 
 private:
+  Packet* readReceivedPacket(float& score, uint32_t& air_time);
   void checkRecv();
   void checkSend();
 };

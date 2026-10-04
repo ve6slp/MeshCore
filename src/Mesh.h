@@ -247,6 +247,8 @@ public:
 
 #if MESHCORE_LORA_OTA
 private:
+  void pumpOtaControl();
+  DispatcherAction onRecvOrdinaryPacket(Packet* pkt);
   mesh::ota::OtaFirmwareIntegration _ota;
 #endif
 };

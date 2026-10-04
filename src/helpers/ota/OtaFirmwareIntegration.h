@@ -149,13 +149,18 @@ public:
   void setLeanTargetPublicKey(const uint8_t key[32]) { lean_.setTargetPublicKey(key); }
   OtaLeanReceiver& leanReceiver() { return lean_; }
   const OtaLeanReceiver& leanReceiver() const { return lean_; }
-  void loop() { lean_.loop(); }
+  __attribute__((noinline)) void loop() { lean_.loop(); }
   static constexpr uint32_t kCommitRebootGraceMs = 2000;
   static constexpr uint32_t kCommitRebootQueueWaitMs = 15000;
   using CommitRebootFn = void (*)(void*);
   void attachCommitReboot(void* ctx, CommitRebootFn fn) { commit_reboot_ctx_ = ctx; commit_reboot_ = fn; }
-  usb::UsbOtaResult commitAndDeferReboot(uint32_t counter, const uint8_t signature[64], uint32_t now_ms) {
-    const auto before = lean_.status();
+  __attribute__((noinline)) usb::UsbOtaResult commitAndDeferReboot(
+      uint32_t counter, const uint8_t signature[64], uint32_t now_ms) {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return usb::UsbOtaResult::Busy;
+    static OtaLeanReceiver::Status before;
+    captureLeanStatus(before);
     const auto result = lean_.commit(counter, signature);
     if (result != usb::UsbOtaResult::Ok) return result;
     stopDirect();
@@ -163,7 +168,7 @@ public:
     if (commit_reboot_ && before.phase == ::ota::storage::OtaCandidateStore::Phase::Ready &&
         (!commit_reboot_pending_ || commit_reboot_nonce_ != before.transactionNonce)) {
       commit_reboot_pending_ = true;
-      commit_reboot_nonce_ = lean_.status().transactionNonce;
+      commit_reboot_nonce_ = currentTransactionNonce();
       commit_reboot_due_ms_ = now_ms + kCommitRebootGraceMs;
       commit_reboot_queue_deadline_ms_ = now_ms + kCommitRebootQueueWaitMs;
     }
@@ -188,7 +193,8 @@ public:
     commit_reboot_pending_ = false;
     return true;
   }
-  bool tickCommitReboot(uint32_t now_ms, bool tx_active, bool outbound_queued, bool interface_busy = false) {
+  __attribute__((noinline)) bool tickCommitReboot(
+      uint32_t now_ms, bool tx_active, bool outbound_queued, bool interface_busy = false) {
     if (!commit_reboot_ || !takeCommitReboot(now_ms, tx_active, outbound_queued, interface_busy)) return false;
     commit_reboot_(commit_reboot_ctx_);
     return true;
@@ -395,7 +401,7 @@ public:
     if (pending_control_frame_valid_ && pending_control_frame_[0] == kOtaDirectAckKind) pending_control_frame_valid_ = false;
     if (direct_active_ && rf_radio_change_ && rf_radio_change_(rf_ctx_, normal_freq_khz_, true)) direct_active_ = false;
   }
-  void tickDirect(uint32_t now_ms, bool radio_idle = true) {
+  __attribute__((noinline)) void tickDirect(uint32_t now_ms, bool radio_idle = true) {
     if (direct_active_ && static_cast<int32_t>(now_ms - direct_expiry_ms_) >= 0) stopDirect();
     if (direct_pending_ && static_cast<int32_t>(now_ms - direct_transition_deadline_) >= 0) stopDirect();
     if (direct_pending_ && direct_ack_tx_wait_ && !pending_control_frame_valid_ && radio_idle) {
@@ -580,7 +586,8 @@ public:
     return airtime_.recordUsage(now_ms, category, airtime_ms);
   }
 
-  bool handleReceivedFrame(const uint8_t* frame, size_t frame_len, uint32_t now_ms = 0) {
+  __attribute__((noinline)) bool handleReceivedFrame(
+      const uint8_t* frame, size_t frame_len, uint32_t now_ms = 0) {
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
 
@@ -611,6 +618,14 @@ public:
     // session to write the same candidate bank around its durable owner.
     if (lean_.hasStore()) { ++bad_frames_; return false; }
     ++rx_frames_;
+    return handleDecodedEnvelope(hdr, payload, payload_len);
+  }
+
+private:
+  __attribute__((noinline)) bool handleDecodedEnvelope(
+      const meshcore::ota::protocol::OtaEnvelopeHeader& hdr, const uint8_t* payload, size_t payload_len) {
+    using namespace meshcore::ota::protocol;
+    using namespace meshcore::ota::runtime;
     const OtaSessionId id = otaSessionFromEnvelope(hdr);
     switch (hdr.type) {
       case OtaMessageType::DescriptorFragment:
@@ -657,6 +672,7 @@ public:
     return false;
   }
 
+public:
   void abortSession() {
     stopDirect();
     if (lean_.hasStore()) {
@@ -799,48 +815,107 @@ private:
   // parse or is denied by lean_ is Rejected (counted as a bad frame, no
   // fallback attempted -- these kind bytes can never also be a valid
   // SignedBlock frame, see OtaBlockSigning.h kOtaSignedBlockKind=0x01).
-  LeanControlResult handleLeanControlFrame(const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
+  __attribute__((noinline)) LeanControlResult handleLeanControlFrame(
+      const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
     if (frame == nullptr || frame_len == 0) return LeanControlResult::NotControlFrame;
     switch (frame[0]) {
-      case kOtaTargetAuthorizationKind: {
-        if (frame_len != 164 || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
-        uint8_t tag[8]; otaTargetTag(lean_.targetPublicKey(), tag);
-        if (std::memcmp(tag, frame + 1, 8)) return LeanControlResult::Rejected;
-        const auto r = lean_.begin(frame + 9, frame + 41, frame + 100, false, false);
-        return r == usb::UsbOtaResult::Ok || lean_.prepareReupload(frame + 9, frame + 41, frame + 100) ?
-                  LeanControlResult::Handled : LeanControlResult::Rejected;
-      }
-      case kOtaAuthorizationKind: {
-        OtaAuthorizationFrame parsed;
-        if (!parseOtaAuthorizationFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
-        const auto r = lean_.begin(parsed.ownerPublicKey, parsed.canonical, parsed.signature,
-                                   /*reupload=*/false, /*local_owner_trusted=*/false);
-        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
-      }
-      case kOtaCommitKind: {
-        OtaCommitFrame parsed;
-        if (!parseOtaCommitFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
-        const auto st = lean_.status();
-        if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32) ||
-            !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32)) return LeanControlResult::Rejected;
-        const auto r = commitAndDeferReboot(parsed.counter, parsed.signature, now_ms);
-        if (r == usb::UsbOtaResult::Ok) {
-          uint8_t tag[kOtaManifestTagBytes];
-          manifestTagFromHash(st.manifestHash, tag);
-          pending_control_frame_valid_ = false;
-          queueStatusReportReply(tag);
-          pending_control_due_ms_ = now_ms;
-        }
-        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
-      }
-      case kOtaAbortKind: {
-        OtaAbortFrame parsed;
-        if (!parseOtaAbortFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
-        if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32)) return LeanControlResult::Rejected;
-        const auto r = lean_.abort(parsed.signerPublicKey, parsed.signature, parsed.imageHash, parsed.generation);
-        if (r == usb::UsbOtaResult::Ok) stopDirect();
-        return (r == usb::UsbOtaResult::Ok) ? LeanControlResult::Handled : LeanControlResult::Rejected;
-      }
+      case kOtaTargetAuthorizationKind:
+      case kOtaAuthorizationKind: return handleAuthorizationControl(frame, frame_len);
+      case kOtaCommitKind: return handleCommitControl(frame, frame_len, now_ms);
+      case kOtaAbortKind: return handleAbortControl(frame, frame_len);
+      case kOtaReuploadKind: return handleReuploadControl(frame, frame_len);
+      default: return handleInformationalControlFrame(frame, frame_len, now_ms);
+    }
+  }
+
+  __attribute__((noinline)) LeanControlResult handleAuthorizationControl(const uint8_t* frame, size_t frame_len) {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return LeanControlResult::Rejected;
+    if (frame[0] == kOtaTargetAuthorizationKind) {
+      if (frame_len != 164 || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
+      uint8_t tag[8]; otaTargetTag(lean_.targetPublicKey(), tag);
+      if (std::memcmp(tag, frame + 1, 8)) return LeanControlResult::Rejected;
+      const auto r = lean_.begin(frame + 9, frame + 41, frame + 100, false, false);
+      return r == usb::UsbOtaResult::Ok || lean_.prepareReupload(frame + 9, frame + 41, frame + 100) ?
+                LeanControlResult::Handled : LeanControlResult::Rejected;
+    }
+    static OtaAuthorizationFrame parsed;
+    if (!parseOtaAuthorizationFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+    const auto r = lean_.begin(parsed.ownerPublicKey, parsed.canonical, parsed.signature, false, false);
+    return r == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
+  }
+
+  __attribute__((noinline)) LeanControlResult handleCommitControl(
+      const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return LeanControlResult::Rejected;
+    static OtaCommitFrame parsed;
+    if (!parseOtaCommitFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+    static OtaLeanReceiver::Status st;
+    captureLeanStatus(st);
+    if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32) ||
+        !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32)) return LeanControlResult::Rejected;
+    const auto r = commitAndDeferReboot(parsed.counter, parsed.signature, now_ms);
+    if (r == usb::UsbOtaResult::Ok) {
+      uint8_t tag[kOtaManifestTagBytes];
+      manifestTagFromHash(st.manifestHash, tag);
+      pending_control_frame_valid_ = false;
+      queueStatusReportReply(tag);
+      pending_control_due_ms_ = now_ms;
+    }
+    return r == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
+  }
+
+  __attribute__((noinline)) LeanControlResult handleAbortControl(const uint8_t* frame, size_t frame_len) {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return LeanControlResult::Rejected;
+    static OtaAbortFrame parsed;
+    if (!parseOtaAbortFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
+    if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32))
+      return LeanControlResult::Rejected;
+    const auto r = lean_.abort(parsed.signerPublicKey, parsed.signature, parsed.imageHash, parsed.generation);
+    if (r == usb::UsbOtaResult::Ok) stopDirect();
+    return r == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
+  }
+
+  __attribute__((noinline)) LeanControlResult handleReuploadControl(const uint8_t* frame, size_t frame_len) {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return LeanControlResult::Rejected;
+    if (frame_len != kOtaReuploadFrameBytes) return LeanControlResult::Rejected;
+    static OtaLeanReceiver::Status st;
+    captureLeanStatus(st);
+    if (!st.valid || st.localCache || st.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
+        !lean_.haveTargetPublicKey() || std::memcmp(frame + 33, lean_.targetPublicKey(), 32) ||
+        usb::getBE32(frame + 97) != st.generation || !lean_.currentAdmin(frame + 1))
+      return LeanControlResult::Rejected;
+    static uint8_t message[160], canonical[59], sig[64];
+    auto len = buildOtaReuploadMessage(frame, message);
+    if (!lean_.verifySignature(frame + 1, message, len, frame + 101)) return LeanControlResult::Rejected;
+    usb::UsbOtaResult result;
+    if (std::memcmp(frame + 65, st.manifestHash, 32) == 0 && std::memcmp(frame + 1, st.ownerPublicKey, 32) == 0) {
+      if (!lean_.exportCandidateForUpload(canonical, sig)) return LeanControlResult::Rejected;
+      result = lean_.begin(st.ownerPublicKey, canonical, sig, true, false);
+    } else {
+      result = lean_.activatePreparedReupload(frame + 1, frame + 65);
+    }
+    return result == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
+  }
+
+  __attribute__((noinline)) void captureLeanStatus(OtaLeanReceiver::Status& out) const {
+    out = lean_.status();
+  }
+  __attribute__((noinline)) uint64_t currentTransactionNonce() const {
+    return lean_.status().transactionNonce;
+  }
+
+  __attribute__((noinline)) LeanControlResult handleInformationalControlFrame(
+      const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
+    if (frame == nullptr || frame_len == 0) return LeanControlResult::NotControlFrame;
+    switch (frame[0]) {
       case kOtaStatusReportKind: {
         OtaStatusReportFrame parsed;
         if (!parseOtaStatusReportFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
@@ -899,27 +974,6 @@ private:
       case kOtaDirectRequestKind:
       case kOtaDirectAckKind:
         return handleDirectFrame(frame, frame_len, now_ms);
-      case kOtaReuploadKind: {
-        if (frame_len != kOtaReuploadFrameBytes) return LeanControlResult::Rejected;
-        const auto st = lean_.status();
-        if (!st.valid || st.localCache || st.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
-            !lean_.haveTargetPublicKey() ||
-            std::memcmp(frame + 33, lean_.targetPublicKey(), 32) ||
-            usb::getBE32(frame + 97) != st.generation ||
-            !lean_.currentAdmin(frame + 1)) return LeanControlResult::Rejected;
-        uint8_t message[160];
-        auto len = buildOtaReuploadMessage(frame, message);
-        if (!lean_.verifySignature(frame + 1, message, len, frame + 101)) return LeanControlResult::Rejected;
-        usb::UsbOtaResult result;
-        if (std::memcmp(frame + 65, st.manifestHash, 32) == 0 && std::memcmp(frame + 1, st.ownerPublicKey, 32) == 0) {
-          uint8_t canonical[59], sig[64];
-          if (!lean_.exportCandidateForUpload(canonical, sig)) return LeanControlResult::Rejected;
-          result = lean_.begin(st.ownerPublicKey, canonical, sig, true, false);
-        } else {
-          result = lean_.activatePreparedReupload(frame + 1, frame + 65);
-        }
-        return result == usb::UsbOtaResult::Ok ? LeanControlResult::Handled : LeanControlResult::Rejected;
-      }
       case kOtaStatusPollKind: {
         OtaStatusPollFrame parsed;
         if (!parseOtaStatusPollFrame(frame, frame_len, parsed)) return LeanControlResult::Rejected;
@@ -993,7 +1047,7 @@ private:
   // candidate matching the polled manifest tag -- a poll for any other
   // tag, or arriving while idle, is silently ignored (never an error:
   // StatusPoll carries no authority, so there is nothing to fail closed).
-  void queueStatusReportReply(const uint8_t manifest_tag[kOtaManifestTagBytes]) {
+  __attribute__((noinline)) void queueStatusReportReply(const uint8_t manifest_tag[kOtaManifestTagBytes]) {
     const auto st = lean_.status();
     if (!st.valid || st.localCache || !lean_.haveTargetPublicKey() || pending_control_frame_valid_) return;
     uint8_t my_tag[kOtaManifestTagBytes];

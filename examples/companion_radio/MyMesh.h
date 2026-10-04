@@ -280,6 +280,8 @@ public:
   bool isOtaAdminKey(const uint8_t key[32]) const;
   static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #if MESHCORE_LORA_OTA
+  void signOtaCommitMessage(const uint8_t target[32], const uint8_t manifest_hash[32],
+                            uint32_t counter, uint8_t signature[64]);
   bool attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
                                 meshcore::ota::runtime::IOtaStagingSink& staging_sink);
   // Genuine trial-boot health confirmation: setOtaTrialBootHealthSignals()
@@ -490,6 +492,8 @@ private:
 
   void checkCLIRescueCmd();
   void checkSerialInterface();
+  void sendNextContact();
+  void handleOrdinaryCmdFrame(size_t len);
   bool isValidClientRepeatFreq(uint32_t f) const;
   void checkTempRadioLease();
   void revertTempRadioLeaseIfDue();

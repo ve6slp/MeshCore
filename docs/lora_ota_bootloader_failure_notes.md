@@ -375,6 +375,31 @@ device; it does not establish a working firmware-write path. No firmware
 write probe was repeated. The source-defined startup defect below remains
 applicable to the freshly verified installed bytes;77's repair does not gate41.
 
+After the operator's new USB enumeration, ROOT made one official XIAO
+repeater1.17.1 APP-only serial restoration attempt. It failed in START's ACK
+read with a disconnect/EOF, before INIT or DATA transmission; this was not a
+captured device NOT_SUPPORTED response. The device returned as CDC+MSC.
+Read-only capture at `21:15:20Z` again found the complete primary `93df3f...`
+and SDK page `20fee123...` unchanged. No BOOT transfer or automatic retry
+occurred; ModemManager was inactive and no competing serial owner was observed.
+
+The installed Source21 is ROOT's modified OTAFIX-derived paired loader, not
+untouched vendor OTAFIX. Firmware-generated Sense/PID0045 strings do not prove
+the physical board variant. The operator identifies77,41 and Pine as the same
+XIAO nRF52840/Wio SX1262 kit. The official flasher catalog lists both
+`xiao_nrf52840_ble_bootloader-0.9.2-OTAFIX2.2.zip` and its `ble_sense` variant;
+the Solar P1 OTAFIX in Downloads declares a different board. Neither vendor
+package was transferred.
+
+Source21's serial START queries SoftDevice state before validating update
+kind, and its APP_ERROR_CHECK path resets on failure, matching the observed
+disconnect without identifying the live return code. It also explicitly
+admits APP-only mode4 with zero SD/BOOT sizes. The official vendor ZIP's
+combined SD/BOOT mode3 is rejected before preparation and is not a USB
+recovery bypass. No supported USB bootloader repair path is established;
+external repair is a consequence of this installed software, not evidence of
+different hardware or dead USB. The actual fault PC remains unmeasured.
+
 Replaying the exact captured tuple against the selected pending handlers
 accepts SD image start0, validates the identical staged primary, clears
 bank1, and permits APP preparation when the modeled runtime services

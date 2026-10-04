@@ -6,6 +6,7 @@
 
 #include <helpers/ota/OtaBlockSigning.h>
 #include <helpers/ota/OtaUsbProtocol.h>
+#include <helpers/ota/OtaProofScratch.h>
 #include <ota/protocol/OtaDescriptor.h>
 #include <ota/trust/SignatureVerifier.h>
 #include <ota/runtime/OtaTrustInterfaces.h>
@@ -96,8 +97,7 @@ public:
     return true;
   }
   Result activatePreparedReupload(const uint8_t owner[32], const uint8_t hash[32]) {
-    Status pending;
-    if (!pendingReuploadStatus(hash, pending) || std::memcmp(owner, pending_owner_, 32)) return Result::Mismatch;
+    if (!matchesPreparedReupload(owner, hash)) return Result::Mismatch;
     return begin(pending_owner_, pending_canonical_, pending_signature_, true, false);
   }
 
@@ -147,7 +147,7 @@ public:
     seal_pending_ = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Verifying;
   }
 
-  Status status() const {
+  __attribute__((noinline)) Status status() const {
     return snapshotStatus(candidate_);
   }
 
@@ -221,7 +221,7 @@ public:
     if (candidate_.valid && candidate_.phase != Phase::Idle && !terminal) {
       const bool same_content_owner = candidate_.localCache == local_cache &&
           !std::memcmp(candidate_.ownerPublicKey, owner_public_key, 32) &&
-          !std::memcmp(status().imageHash, descriptor.sha256, 32);
+          candidateImageMatches(descriptor.sha256);
       if (candidate_.phase == Phase::Aborted) {
         if (!reupload) return same_candidate ? Result::Denied : Result::Busy;
       } else {
@@ -242,6 +242,16 @@ public:
     if (begin_result == meshcore::ota::runtime::IOtaStagingSink::Result::Rejected) return Result::Busy;
     if (begin_result == meshcore::ota::runtime::IOtaStagingSink::Result::IoError) return Result::IoError;
 
+    return publishBegin(descriptor, manifest_hash, canonical, owner_public_key, signature, local_cache);
+  }
+
+private:
+  __attribute__((noinline)) bool candidateImageMatches(const uint8_t hash[32]) const {
+    return !std::memcmp(status().imageHash, hash, 32);
+  }
+  __attribute__((noinline)) Result publishBegin(const meshcore::ota::protocol::OtaDescriptor& descriptor,
+      const uint8_t manifest_hash[32], const uint8_t canonical[59], const uint8_t owner_public_key[32],
+      const uint8_t signature[64], bool local_cache) {
     ::ota::storage::OtaCandidateStore::Snapshot next;
     next.valid = true;
     next.localCache = local_cache;
@@ -273,6 +283,7 @@ public:
     return Result::Ok;
   }
 
+public:
   Result putBlock(uint16_t index, const uint8_t* data, size_t data_len) {
     return acceptBlock(index, data, data_len);
   }
@@ -306,7 +317,7 @@ public:
     }
   }
 
-  Result handleSignedBlockFrame(const uint8_t* frame, size_t frame_len) {
+  __attribute__((noinline)) Result handleSignedBlockFrame(const uint8_t* frame, size_t frame_len) {
     if (!candidate_.valid || candidate_.localCache ||
         (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Receiving &&
          candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Verifying &&
@@ -383,18 +394,14 @@ public:
     else seal_pending_ = true;
   }
 
-  Result commit(uint32_t counter, const uint8_t signature[64]) {
+  __attribute__((noinline)) Result commit(uint32_t counter, const uint8_t signature[64]) {
     if (!candidate_.valid) return Result::NotFound;
     if (candidate_.localCache) return Result::Denied;
     const bool already_committed = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
     if (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready && !already_committed) return Result::TooLate;
     if (!have_target_public_key_ || signature == nullptr) return Result::BadRequest;
     if (!isCurrentAdmin(candidate_.ownerPublicKey)) return Result::Denied;
-    uint8_t manifest_hash[32] = {};
-    computeOtaManifestHash(candidate_.canonical, manifest_hash);
-    uint8_t message[usb::kCommitSignedBytes] = {};
-    const size_t message_len = usb::buildCommitSignedMessage(target_public_key_, manifest_hash, counter, message);
-    if (!verifyOwnerSignature(candidate_.ownerPublicKey, message, message_len, signature)) return Result::Denied;
+    if (!commitSignatureValid(counter, signature)) return Result::Denied;
     if (counter != usb::getBE32(candidate_.canonical + 45)) return Result::Mismatch;
     if (already_committed) return Result::Ok;
     if (!commit_sink_done_) {
@@ -411,6 +418,24 @@ public:
     }
     // A boot command may already be durable even if the following
     // candidate journal append fails. Permit signed retry, not replacement.
+    return publishCommitted();
+  }
+
+private:
+  __attribute__((noinline)) bool commitSignatureValid(uint32_t counter, const uint8_t signature[64]) const {
+    uint8_t manifest_hash[32] = {};
+    computeOtaManifestHash(candidate_.canonical, manifest_hash);
+    uint8_t message[usb::kCommitSignedBytes] = {};
+    const size_t message_len = usb::buildCommitSignedMessage(target_public_key_, manifest_hash, counter, message);
+    return verifyOwnerSignature(candidate_.ownerPublicKey, message, message_len, signature);
+  }
+
+  __attribute__((noinline)) bool matchesPreparedReupload(const uint8_t owner[32], const uint8_t hash[32]) const {
+    Status pending;
+    return pendingReuploadStatus(hash, pending) && !std::memcmp(owner, pending_owner_, 32);
+  }
+
+  __attribute__((noinline)) Result publishCommitted() {
     auto next = candidate_;
     next.phase = ::ota::storage::OtaCandidateStore::Phase::Committed;
     if (!store_->append(next)) return Result::IoError;
@@ -418,9 +443,14 @@ public:
     return Result::Ok;
   }
 
+public:
   Result abort(const uint8_t signer_public_key[32], const uint8_t signature[64], const uint8_t image_hash[32],
                 uint32_t generation, bool local_owner_trusted = false) {
     if (!candidate_.valid) return Result::NotFound;
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return Result::Busy;
+    auto& scratch = abortScratch();
     const bool aborted = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted;
     // Durable ABORT advances sessionId; its original signature may still finish cleanup after reset.
     if (generation != candidate_.sessionId && !(aborted && generation == candidate_.sessionId - 1u))
@@ -430,7 +460,7 @@ public:
     if (signer_public_key == nullptr || signature == nullptr || image_hash == nullptr || !have_target_public_key_) {
       return Result::BadRequest;
     }
-    meshcore::ota::protocol::OtaDescriptor descriptor;
+    auto& descriptor = scratch.descriptor;
     if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(candidate_.canonical, sizeof(candidate_.canonical), descriptor) !=
         meshcore::ota::protocol::OtaDescriptorCodecResult::Ok) {
       return Result::Mismatch;
@@ -440,7 +470,8 @@ public:
         !(local_owner_trusted && candidate_.localCache &&
           !std::memcmp(signer_public_key, candidate_.ownerPublicKey, 32) &&
           !std::memcmp(signer_public_key, target_public_key_, 32))) return Result::Denied;
-    uint8_t message[usb::kAbortSignedBytes] = {};
+    auto& message = scratch.message;
+    std::memset(message, 0, sizeof(message));
     const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, generation, message);
     if (!verifyOwnerSignature(signer_public_key, message, message_len, signature)) return Result::Denied;
     if (aborted) {
@@ -450,12 +481,14 @@ public:
       return recovered;
     }
     if (!candidate_.localCache && unadmitted_abort_) {
-      auto proof = candidate_;
+      auto& proof = scratch.snapshot;
+      proof = candidate_;
       if (committed) proof.phase = ::ota::storage::OtaCandidateStore::Phase::Committed;
       const auto checked = unadmitted_abort_(unadmitted_ctx_, proof, false);
       if (checked != Result::Ok) return checked;
     }
-    auto next = candidate_;
+    auto& next = scratch.snapshot;
+    next = candidate_;
     next.phase = ::ota::storage::OtaCandidateStore::Phase::Aborted;
     ++next.sessionId;
     if (!store_->append(next)) return Result::IoError;
@@ -474,6 +507,15 @@ public:
   }
 
 private:
+  struct AbortScratch {
+    meshcore::ota::protocol::OtaDescriptor descriptor;
+    uint8_t message[usb::kAbortSignedBytes];
+    ::ota::storage::OtaCandidateStore::Snapshot snapshot;
+  };
+  __attribute__((noinline)) static AbortScratch& abortScratch() {
+    static AbortScratch scratch;
+    return scratch;
+  }
 
   void tryResumeSink() {
     if (!candidate_.valid || staging_sink_ == nullptr) return;

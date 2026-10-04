@@ -784,6 +784,28 @@ to the recovery-chain repair. The existing ROLE1 receiver and nonconfirming
 candidate profiles provide that test path once77 is repaired through SWD.
 No compatible SWD probe was observed in the current USB inventory.
 
+**Final recovery-stack repair physically running on41:** ROOT made one
+APP-only transfer of the reviewed552756-byte/CRC4181 image, BIN
+`dbcac4fcec4f90b9423c1c477c5f49cda327685e4f9a69067cbc263e8c265dd7`.
+At `21:24:45Z`, actual APP_START and diagnostics again reported qualified
+writes and INSTALL_CAPABLE with the same unbound sequence1/counter0 floor.
+Real local STATUS at `21:24:47Z` retained ABORTED generation8/counter1,
+hash `8eeecabd...` and6403/6403 chunks. Complete before/after private snapshots
+matched identity, settings, SelfInfo, all4 contacts/ACL flags and40 channels.
+BOOT, installer, geometry, preferences and the4096-byte task allocation did
+not change.
+
+The final repair releases outer packet/control frames before proof calls and
+uses independent, guarded workspaces rather than nested stack buffers. Every
+read and hash remains fresh; no proof result is cached between epochs.
+These entry points run synchronously in the main loop task; the workspace
+guards are not a general multithread synchronization primitive. The actual
+ARM ELF's conservative maximum is3032 bytes including104 bytes for exception
+overhead, with6760 additional BSS bytes. This supersedes the initial repair's
+remaining recovery-stack gate, but still does not prove RF delivery, signed
+installation, confirmation or rollback. Receiver builds must use this repair,
+not the preserved pre-fix cached image.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands

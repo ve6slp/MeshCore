@@ -14,6 +14,12 @@ void Mesh::loop() {
 #endif
   Dispatcher::loop();
 #if MESHCORE_LORA_OTA
+  pumpOtaControl();
+#endif
+}
+
+#if MESHCORE_LORA_OTA
+__attribute__((noinline)) void Mesh::pumpOtaControl() {
   _ota.loop();
   // Leave the reply pending on queue/budget pressure. Census is a real RF
   // exchange even with no USB client connected.
@@ -35,8 +41,8 @@ void Mesh::loop() {
       }
     }
   }
-#endif
 }
+#endif
 
 bool Mesh::allowPacketForward(const mesh::Packet* packet) { 
   return false;  // by default, Transport NOT enabled
@@ -139,6 +145,20 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 
   if (pkt->isRouteFlood() && filterRecvFloodPacket(pkt)) return ACTION_RELEASE;
 
+#if MESHCORE_LORA_OTA
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) {
+    if (!_tables->wasSeen(pkt)) {
+      _tables->markSeen(pkt);
+      onOtaDataRecv(pkt);
+      return routeRecvPacket(pkt);
+    }
+    return ACTION_RELEASE;
+  }
+  return onRecvOrdinaryPacket(pkt);
+}
+
+__attribute__((noinline)) DispatcherAction Mesh::onRecvOrdinaryPacket(Packet* pkt) {
+#endif
   DispatcherAction action = ACTION_RELEASE;
 
   switch (pkt->getPayloadType()) {
