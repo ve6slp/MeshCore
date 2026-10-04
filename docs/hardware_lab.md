@@ -952,6 +952,20 @@ were not promoted into a receiver image; the fresh signed RF descriptor,
 generation-bound REUPLOAD and complete retransmission remain required.
 Actual signed RF confirmation/automatic rollback are still unqualified.
 
+**Actual restart and stock transport,23:15-23:18Z:** an ordinary41 application
+reboot retained ABORTED generation10 and the unchanged qualified floor0.
+Normal stock-to41 RF still worked afterward; complete identity/settings/all4
+contact ACLs/all40 channels remained unchanged.
+
+The unchanged stock companion then signed the exact59-byte ROLE0 confirming
+descriptor through commands33/34/35. Independent Ed25519 verification passed
+against its actual authorized public key. Ordinary RAW_CUSTOM nonce traffic
+also physically exercised command65 at175 USB bytes, with171 payload bytes,
+and the return packet arrived through stock notification0x88 at the full176
+USB-byte ceiling without truncation. Stock SelfInfo/DeviceInfo were unchanged
+afterward, and41's full private userdata still matched. These are actual
+signing and transport-boundary results, not delivery of an OTA image.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
