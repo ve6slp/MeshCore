@@ -630,6 +630,13 @@ counter1, hash and reported6,403 blocks. Reported retained counts are not data
 erasure or resealing proof. No primary, installer, SD, UICR, filesystem,
 shared-power or Pine write was requested.
 
+Source qualification boundary: the reviewed UF2 delta passed the focused
+native cases and actual nRF USB/ESP USB builds. The standard nRF BLE GNU++11
+profile fails both the saved pre-UF2 baseline and the new source, with existing
+OTA aggregate-initialization errors and an excluded ed25519 dependency.
+BLE build compatibility remains a separate whole-feature release gate, not a
+passed outcome or a regression attributed to this UF2 command.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh

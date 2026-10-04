@@ -9,6 +9,12 @@
 #include <helpers/ota/OtaDirectLease.h>
 #include <helpers/ota/OtaMeshHooks.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
+#if XIAO_OTA_COMPANION_USB_UF2
+#include <helpers/ArduinoSerialInterface.h>
+#include <helpers/MultiSerialInterface.h>
+extern MultiSerialInterface interface_manager;
+extern ArduinoSerialInterface usb_serial_interface;
+#endif
 __attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
   out = mesh::ota::OtaBootLifecycleEvidence();
   return false;
@@ -1879,7 +1885,52 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
 }
 
 
+void MyMesh::replyUf2Reboot(companion_usb_uf2::Reply reply) {
+  using Reply = companion_usb_uf2::Reply;
+  switch (reply) {
+    case Reply::Ok: writeOKFrame(); break;
+    case Reply::Unsupported: writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); break;
+    case Reply::BadState: writeErrFrame(ERR_CODE_BAD_STATE); break;
+    case Reply::IllegalArgument: writeErrFrame(ERR_CODE_ILLEGAL_ARG); break;
+    case Reply::FileIo: writeErrFrame(ERR_CODE_FILE_IO_ERROR); break;
+  }
+}
+
+#if XIAO_OTA_COMPANION_USB_UF2
+bool MyMesh::uf2RebootAllowed() {
+  if (_serial != &interface_manager || !_serial->isEnabled() || !usb_serial_interface.isEnabled()) {
+    return false;
+  }
+  return companion_usb_uf2::permitted(
+      !_store->destructiveWritesDisallowed(), otaBoardTrialHealthWindowActive(),
+      otaBoardBootLifecycleVerificationPending(), getOtaIntegration().hasPendingRfWork(),
+      getOtaIntegration().readback().phase);
+}
+#endif
+
 void MyMesh::handleCmdFrame(size_t len) {
+#if XIAO_OTA_COMPANION_USB_UF2
+  auto* uf2_pending = &_uf2_reboot;
+  const bool local_usb = _command_from_local_usb;
+#else
+  companion_usb_uf2::Pending* uf2_pending = nullptr;
+  const bool local_usb = false;
+#endif
+  if (companion_usb_uf2::request(
+          cmd_frame, len, uf2_pending, local_usb,
+          mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs,
+          mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs,
+          [this]() {
+#if XIAO_OTA_COMPANION_USB_UF2
+            return uf2RebootAllowed();
+#else
+            return false;
+#endif
+          },
+          [this]() { return _ms->getMillis(); },
+          [this](companion_usb_uf2::Reply reply) { replyUf2Reboot(reply); })) {
+    return;
+  }
   if (cmd_frame[0] == CMD_DEVICE_QUERY && len >= 2) { // sent when app establishes connection
     app_target_ver = cmd_frame[1];                    // which version of protocol does app understand
 
@@ -2434,10 +2485,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     // IO fault, no fake-persisted claim) rather than attempting a
     // disallowed save right before rebooting; permitted boots keep the
     // existing real-IO-fault behavior of saveContacts() unchanged.
-    if (dirty_contacts_expiry && !_store->destructiveWritesDisallowed()) { // is there are pending dirty contacts write needed?
-      saveContacts();
-    }
-    board.reboot();
+    companion_usb_uf2::ordinaryReboot(
+        dirty_contacts_expiry != 0, !_store->destructiveWritesDisallowed(),
+        [this]() { saveContacts(); }, []() { board.reboot(); });
   } else if (cmd_frame[0] == CMD_GET_BATT_AND_STORAGE) {
     uint8_t reply[11];
     int i = 0;
@@ -3543,9 +3593,21 @@ void MyMesh::checkCLIRescueCmd() {
 }
 
 void MyMesh::checkSerialInterface() {
+#if XIAO_OTA_COMPANION_USB_UF2
+  bool local_usb = false;
+  size_t len = companion_usb_uf2::receive(
+      _serial, interface_manager, usb_serial_interface, cmd_frame, local_usb);
+#else
   size_t len = _serial->checkRecvFrame(cmd_frame);
+#endif
   if (len > 0) {
+#if XIAO_OTA_COMPANION_USB_UF2
+    _command_from_local_usb = local_usb;
+#endif
     handleCmdFrame(len);
+#if XIAO_OTA_COMPANION_USB_UF2
+    _command_from_local_usb = false;
+#endif
   } else if (_iter_started              // check if our ContactsIterator is 'running'
              && !_serial->isWriteBusy() // don't spam the Serial Interface too quickly!
   ) {
@@ -3619,6 +3681,16 @@ void MyMesh::loop() {
 #if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
   getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(),
                                       _mgr->getOutboundTotal() != 0, _serial->isWriteBusy());
+#endif
+#if XIAO_OTA_COMPANION_USB_UF2
+  companion_usb_uf2::tick(
+      _uf2_reboot, _ms->getMillis(), isSendInProgress(), _mgr->getOutboundTotal() != 0,
+      _serial->isWriteBusy(), [this]() { return uf2RebootAllowed(); },
+      [this]() {
+        return !dirty_contacts_expiry || _store->destructiveWritesDisallowed() || saveContacts();
+      },
+      [this](companion_usb_uf2::Reply reply) { replyUf2Reboot(reply); },
+      []() { Serial.flush(); enterUf2Dfu(); });
 #endif
 }
 
@@ -3813,6 +3885,9 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+#if XIAO_OTA_COMPANION_USB_UF2
+  if (_uf2_reboot.active) return true;
+#endif
   bool trial_active = false;
 #if MESHCORE_LORA_OTA
   // Never let this device deep-sleep while a trial-boot health window is

@@ -155,6 +155,26 @@ existing `4200` reply, versioned signed-upload replies, storage or boot state.
 Older applications ignore the selector, so a lifecycle-only reply is not
 preflight evidence.
 
+The USB-only XIAO nRF52840 OTA-lab companion accepts the exact framed
+CMD_REBOOT payload `13 72 65 62 6f 6f 74 20 75 66 32` (`reboot uf2`, no
+terminator). Provenance comes from the actual USB reader, not command data.
+Mixed-transport and other profiles are unsupported. Accepted requests reply
+with the ordinary one-byte OK frame, then wait at least two seconds for RF,
+outbound and interface queues to drain, with the target's fifteen-second
+bound. Permission is checked again during the wait and immediately before
+entry; cancellation emits a standard bad-state error. Eligible dirty contacts
+are saved before entry; a failed save emits file-I/O error and cancels entry.
+The existing ordinary `reboot` and its persistence eligibility are unchanged.
+
+UF2 entry refuses trial/unknown-write state, pending boot verification or OTA
+RF work, and erasing, receiving, verifying, ready, cache-sealed, commit-pending
+or trial phases. Explicitly abort a sealed local cache through the existing
+control before requesting entry; entry never aborts or erases it implicitly.
+Malformed UF2 payloads return illegal-argument error without ordinary reset.
+This uses the framework's `enterUf2Dfu()` (`GPREGRET=0x57`), not the
+1200-baud serial-only path (`0x4e`). Source support does not prove installed
+MSC availability or bootloader version; those still require ROOT readback.
+
 `build-ota-esp32-targets` builds `Xiao_S3_WIO_companion_radio_usb` and
 `Xiao_S3_WIO_repeater_ota_usb`. The new repeater profile inherits the
 ordinary repeater's configuration and dependencies, adding the OTA flag,

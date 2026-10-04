@@ -1,5 +1,110 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <helpers/ota/OtaFirmwareIntegration.h>
+#include <helpers/ota/OtaUsbProtocol.h>
+
+namespace companion_usb_uf2 {
+
+enum class Request { Other, Ordinary, Uf2, Malformed };
+enum class Reply { Ok, Unsupported, BadState, IllegalArgument, FileIo };
+
+struct Pending {
+  bool active = false;
+  uint32_t due_ms = 0;
+  uint32_t queue_deadline_ms = 0;
+};
+
+inline Request classify(const uint8_t* frame, size_t len) {
+  if (len == 0 || frame == nullptr) return Request::Malformed;
+  if (frame[0] != 19) return Request::Other;
+  if (len < 7 || std::memcmp(frame + 1, "reboot", 6) != 0) return Request::Malformed;
+  if (len == 7 || (frame[7] != ' ' && frame[7] != 'u')) return Request::Ordinary;
+  return len == 11 && std::memcmp(frame + 1, "reboot uf2", 10) == 0 ?
+      Request::Uf2 : Request::Malformed;
+}
+
+inline bool permitted(bool writes_allowed, bool trial_active, bool boot_pending,
+                      bool rf_pending, mesh::ota::usb::UsbOtaPhase phase) {
+  using Phase = mesh::ota::usb::UsbOtaPhase;
+  return writes_allowed && !trial_active && !boot_pending && !rf_pending &&
+      phase != Phase::Erasing && phase != Phase::Receiving && phase != Phase::Verifying &&
+      phase != Phase::Ready && phase != Phase::CacheSealed &&
+      phase != Phase::CommitPending && phase != Phase::Trial;
+}
+
+template <typename Interface, typename Manager, typename Usb>
+size_t receive(Interface* serial, Manager& manager, Usb& usb, uint8_t* frame, bool& local_usb) {
+  local_usb = false;
+  // Only used by the USB-only profile: identify the real reader, not payload metadata.
+  if (serial == &manager) {
+    if (!manager.isEnabled() || !usb.isEnabled()) return 0;
+    const size_t len = usb.checkRecvFrame(frame);
+    local_usb = len != 0;
+    return len;
+  }
+  return serial == nullptr ? 0 : serial->checkRecvFrame(frame);
+}
+
+template <typename Allowed, typename Clock, typename Respond>
+bool request(const uint8_t* frame, size_t len, Pending* pending, bool local_usb,
+             uint32_t grace_ms, uint32_t queue_wait_ms, Allowed allowed, Clock clock,
+             Respond respond) {
+  const auto kind = classify(frame, len);
+  if (kind == Request::Other || kind == Request::Ordinary) return false;
+  if (kind == Request::Malformed) {
+    respond(Reply::IllegalArgument);
+  } else if (pending == nullptr || !local_usb) {
+    respond(Reply::Unsupported);
+  } else if (!allowed()) {
+    respond(Reply::BadState);
+  } else {
+    if (!pending->active) {
+      const uint32_t now = clock();
+      pending->active = true;
+      pending->due_ms = now + grace_ms;
+      pending->queue_deadline_ms = now + queue_wait_ms;
+    }
+    respond(Reply::Ok);
+  }
+  return true;
+}
+
+template <typename Save, typename Reboot>
+void ordinaryReboot(bool contacts_dirty, bool writes_allowed, Save save, Reboot reboot) {
+  if (contacts_dirty && writes_allowed) save();
+  reboot();
+}
+
+template <typename Allowed, typename Persist, typename Respond, typename Enter>
+void tick(Pending& pending, uint32_t now, bool tx_active, bool outbound_queued,
+          bool interface_busy, Allowed allowed, Persist persist, Respond respond, Enter enter) {
+  if (!pending.active) return;
+  if (!allowed()) {
+    pending.active = false;
+    respond(Reply::BadState);
+    return;
+  }
+  if (static_cast<int32_t>(now - pending.due_ms) < 0) return;
+  if ((tx_active || outbound_queued || interface_busy) &&
+      static_cast<int32_t>(now - pending.queue_deadline_ms) < 0) return;
+  pending.active = false;
+  if (!persist()) {
+    respond(Reply::FileIo);
+  } else if (!allowed()) {
+    respond(Reply::BadState);
+  } else {
+    enter();
+  }
+}
+
+}  // namespace companion_usb_uf2
+
+// The same bounded command operations above are exercised by native product tests.
+#if defined(ARDUINO)
+
 #include <Arduino.h>
 #include <Mesh.h>
 #include "AbstractUITask.h"
@@ -34,6 +139,13 @@
 #include <helpers/StaticPoolPacketManager.h>
 #include <helpers/TemporaryRadioLease.h>
 #include <target.h>
+
+#if MESHCORE_LORA_OTA && MESHCORE_OTA_LAB_BACKEND && defined(NRF52_PLATFORM) && \
+    defined(NRF52840_XXAA) && defined(_SEEED_XIAO_NRF52840_H_) && defined(USE_TINYUSB) && \
+    defined(ENABLE_USB_INTERFACE) && !defined(BLE_PIN_CODE) && !defined(WIFI_SSID) && \
+    !defined(ETHERNET_ENABLED) && !defined(SERIAL_RX)
+#define XIAO_OTA_COMPANION_USB_UF2 1
+#endif
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
@@ -323,6 +435,12 @@ public:
 private:
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
+ void replyUf2Reboot(companion_usb_uf2::Reply reply);
+#if XIAO_OTA_COMPANION_USB_UF2
+ bool uf2RebootAllowed();
+ companion_usb_uf2::Pending _uf2_reboot;
+ bool _command_from_local_usb = false;
+#endif
   // Returns true (and has ALREADY replied ERR_CODE_BAD_STATE) iff
   // ordinary persisted-userdata writes are currently policy-disallowed
   // this boot (OTA trial/unknown -- see DataStore::destructiveWritesDisallowed()).
@@ -501,3 +619,5 @@ private:
 };
 
 extern MyMesh the_mesh;
+
+#endif  // ARDUINO
