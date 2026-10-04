@@ -552,6 +552,40 @@ resume, not receiver recovery, installation, rollback, duplicate-write counts,
 radio delivery or duty fairness. No primary, SoftDevice, MBR, UICR, shared-power
 or Pine operation was performed;77 remained in USB recovery.
 
+**Current companion APP on41, Oct. 4, 2026 UTC:** ROOT installed the
+548,132-byte role0/XN40 application through ordinary APP-only serial DFU.
+Its BIN SHA256 is
+`dd3b3af2fdbbfeaf6cb0da3fb2e82cf619bf1c82f018cd248995295656240d2d`;
+the package SHA256 is
+`554e1902f0bbcc6b59b21caa23d939bae1910e8279a7e06da8376b9fd46e80cd`.
+APP USB returned, and fresh `07:41:37Z` diagnostics reported healthy SDK
+extent548132 / CRC `0000/C3EC`, blank marker and CACHE_ONLY. Fresh
+`07:41:39Z` cache STATUS retained CACHE_SEALED, 6,403/6,403 blocks,
+counter1, generation7 and canonical hash `8eeecabd...`.
+
+Complete pre-/post-update companion protocol snapshots matched all four
+contact records, including administrator flags, all40 advertised channel
+records, identity, complete self-info/radio and exposed device settings.
+The channel protocol exposes128 PSK bits, not any hidden upper bits; the
+comparison does not claim a filesystem or private-key dump. Raw snapshots
+remain in private0600 evidence. No settings, permissions or identity were
+changed, and the stock primary was not updated.
+
+Subsequent bounded BOOT discovery measured41's actual Sense USB profile
+`2886:0045`; its generic APP product had not established that BSP. The
+1200-baud entry exposed serial DFU only, with no MSC interface, so no UF2 INFO
+or mounted-volume proof was inferred. ROOT restored the same verified current
+APP through ordinary APP-only DFU. Fresh `07:50:26Z` diagnostics again showed
+548132 / CRC `0000/C3EC`, healthy stock boot and CACHE_ONLY; `07:51:19Z`
+STATUS retained the sealed 6,403-block generation7 cache. The complete
+userdata comparison still matched after this return to APP.
+
+Actual Sense role0 packaging, UF2 metadata and a separately verified
+commissioning write set are still prerequisites to any41 paired-primary work;
+a base-role0 build is not that qualification. Companion command `0x13` is
+CMD_REBOOT, not a text CLI; the current `"reboot"` prefix handler performs an
+ordinary restart and does not provide a `"reboot-uf2"` transition.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh

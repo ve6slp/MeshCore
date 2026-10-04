@@ -433,6 +433,29 @@ longer the blocker; the installed77 loader still has no supported USB route
 for this repair. The healthy41 remains available for APP, cache and radio
 qualification independently of the missing probe.
 
+The old-staged/new-primary binding is now reproduced explicitly. With the
+captured SDK page, old staged RAW `93df...` and corrected live RAW
+`003590...`, the all40KiB comparison rejects finalization, retains bank1AA and
+performs zero SDK or APP erases. Tested incomplete staging also fails closed.
+Thus primary-only replacement is not a sufficient repair.
+
+The reviewed, nine-case native repair proof uses identical corrected40KiB
+payloads at `0x27000..0x31000` and `0xF4000..0xFE000`. The prepared HEX SHA256
+is `8ed703e6c2b7757fa728805dcb4d5b427b02fcc4f6775531167fa013e53d5744`.
+Both ranges must be
+programmed and verified while the CPU is halted/reset; execution of an
+incomplete primary is not qualified. The bounded HEX contains only those
+ranges and leaves SD/MBR, UICR, SDK, installer, filesystems and QSPI untouched.
+Matching images permit the existing strict finalizer to clearAA. Exact
+official stock restoration then publishes CRC16 `973F` for UF2's387840-byte
+padded extent or `871C` for serial's387752-byte extent.
+
+Root independently reproduced all nine cases. Separate cold APP activation
+cases use a healthy, factory-erased QSPI fixture, not77's actual history.
+There is still no supported programming route on installed77 without the
+probe. Physical repair must stop on APPROTECT, never recover/mass-erase,
+and never release an incompletely programmed primary.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does
