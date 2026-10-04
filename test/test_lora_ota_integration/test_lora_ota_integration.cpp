@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -3355,6 +3356,311 @@ TEST(LoraOtaLeanReceiver, UsbReuploadCannotTakeOverActiveOrUnabortedFailedOwnerC
   }
 }
 
+namespace {
+struct CacheRetirementFixture {
+  using Result = mesh::ota::usb::UsbOtaResult;
+  using Phase = ::ota::storage::OtaCandidateStore::Phase;
+  LeanFixture fx;
+  uint8_t local_seed[32] = {0xC1}, remote_seed[32] = {0xC2};
+  ::ota::test::Ed25519TestSigner local{local_seed}, remote{remote_seed};
+  ::ota::trust::DescriptorVerifier verifier;
+  mesh::ota::OtaNrf52FirmwareTrustProvider trust;
+  uint8_t image[257] = {0x57};
+  uint8_t canonical[59] = {}, signature[64] = {}, hash[32] = {};
+
+  static ::ota::trust::DeviceTrustAnchor receiverAnchor() {
+    auto anchor = makeLeanTrustAnchor();
+    anchor.expected_target_id = 0x584E3430u;
+    anchor.expected_role_id = 0;
+    return anchor;
+  }
+
+  CacheRetirementFixture()
+      : verifier(fx.hasher, fx.sig_verifier, fx.counter, receiverAnchor()),
+        trust(verifier, fx.image_region) {
+    fx.integration.attachTrustProvider(&trust);
+    fx.integration.setLeanTargetPublicKey(local.publicKey());
+    fx.admins.add(local.publicKey());
+    fx.admins.add(remote.publicKey());
+  }
+
+  mesh::ota::OtaLeanReceiver& receiver() { return fx.integration.leanReceiver(); }
+
+  OtaDescriptor descriptor(uint8_t role = 0, uint32_t counter = 1) const {
+    auto d = buildProtocolDescriptor(image, sizeof(image), counter);
+    d.boardFamily = 0x584E; d.boardVariant = 0x3430; d.role = role;
+    d.appAddress = 0x27000; d.minBootloaderCapabilities = 1;
+    return d;
+  }
+
+  void manifest(const ::ota::test::Ed25519TestSigner& signer, const OtaDescriptor& d) {
+    size_t len = 0;
+    ASSERT_EQ(OtaDescriptorCodecResult::Ok,
+              encodeOtaDescriptorCanonical(d, canonical, sizeof(canonical), len));
+    ASSERT_EQ(sizeof(canonical), len);
+    signer.sign(canonical, len, signature);
+    mesh::ota::computeOtaManifestHash(canonical, hash);
+  }
+
+  void cache(bool sealed = true, uint8_t role = 1) {
+    manifest(local, descriptor(role));
+    uint8_t begin[mesh::ota::usb::kCacheBeginTotalBytes] = {
+        mesh::ota::usb::kCommand, static_cast<uint8_t>(mesh::ota::usb::UsbOtaOp::CacheBegin)};
+    std::memcpy(begin + 3, local.publicKey(), 32);
+    std::memcpy(begin + 35, canonical, 59);
+    std::memcpy(begin + 94, signature, 64);
+    ASSERT_EQ(Result::Ok, receiver().handleUsbCacheFrame(begin, sizeof(begin), local.publicKey()));
+    for (uint16_t i = 0; i < receiver().status().totalBlocks; ++i) {
+      const size_t offset = i * 84u;
+      ASSERT_EQ(Result::Ok, receiver().putBlock(i, image + offset, std::min<size_t>(84, sizeof(image) - offset)));
+    }
+    if (sealed) {
+      ASSERT_EQ(Result::Pending, receiver().requestSeal());
+      fx.integration.loop();
+      ASSERT_EQ(Phase::Ready, receiver().status().phase);
+    }
+  }
+
+  void abortCache() {
+    const auto st = receiver().status();
+    uint8_t message[mesh::ota::usb::kAbortSignedBytes], sig[64];
+    mesh::ota::usb::buildAbortSignedMessage(local.publicKey(), st.imageHash, st.generation, message);
+    local.sign(message, sizeof(message), sig);
+    ASSERT_EQ(Result::Ok, receiver().abort(local.publicKey(), sig, st.imageHash, st.generation, true));
+    ASSERT_EQ(Phase::Aborted, receiver().status().phase);
+  }
+
+  bool authorize(const ::ota::test::Ed25519TestSigner& signer, bool targeted = true) {
+    uint8_t frame[164];
+    const auto len = targeted
+        ? mesh::ota::encodeOtaTargetAuthorization(local.publicKey(), signer.publicKey(), canonical, signature, frame, sizeof(frame))
+        : mesh::ota::encodeOtaAuthorizationFrame(signer.publicKey(), canonical, signature, frame, sizeof(frame));
+    return fx.integration.handleReceivedFrame(frame, len, 10);
+  }
+
+  bool reupload(const ::ota::test::Ed25519TestSigner& signer, uint8_t mismatch = 0) {
+    uint8_t frame[mesh::ota::kOtaReuploadFrameBytes] = {mesh::ota::kOtaReuploadKind}, message[160];
+    std::memcpy(frame + 1, signer.publicKey(), 32);
+    std::memcpy(frame + 33, local.publicKey(), 32);
+    std::memcpy(frame + 65, hash, 32);
+    mesh::ota::usb::putBE32(frame + 97, receiver().status().generation - (mismatch == 2 ? 1u : 0u));
+    if (mismatch == 1) frame[33] ^= 1;
+    if (mismatch == 4) frame[65] ^= 1;
+    const auto len = mesh::ota::buildOtaReuploadMessage(frame, message);
+    signer.sign(message, len, frame + 101);
+    if (mismatch == 3) frame[101] ^= 1;
+    return fx.integration.handleReceivedFrame(frame, sizeof(frame), 11);
+  }
+
+  void expectNoMutation(const std::function<void()>& action) {
+    const auto before = receiver().status();
+    const auto erases = fx.image_flash.eraseOpCount(), programs = fx.image_flash.programOpCount();
+    const auto metadata_erases = fx.candidate_flash.eraseOpCount(), metadata_programs = fx.candidate_flash.programOpCount();
+    const std::vector<uint8_t> image_before(fx.image_flash.rawBuffer(), fx.image_flash.rawBuffer() + fx.image_flash.rawSize());
+    const std::vector<uint8_t> metadata_before(fx.candidate_flash.rawBuffer(), fx.candidate_flash.rawBuffer() + fx.candidate_flash.rawSize());
+    action();
+    const auto after = receiver().status();
+    EXPECT_EQ(before.phase, after.phase);
+    EXPECT_EQ(before.localCache, after.localCache);
+    EXPECT_EQ(before.generation, after.generation);
+    EXPECT_EQ(before.transactionNonce, after.transactionNonce);
+    EXPECT_EQ(before.receivedBlocks, after.receivedBlocks);
+    EXPECT_EQ(erases, fx.image_flash.eraseOpCount());
+    EXPECT_EQ(programs, fx.image_flash.programOpCount());
+    EXPECT_EQ(metadata_erases, fx.candidate_flash.eraseOpCount());
+    EXPECT_EQ(metadata_programs, fx.candidate_flash.programOpCount());
+    EXPECT_EQ(0, std::memcmp(image_before.data(), fx.image_flash.rawBuffer(), image_before.size()));
+    EXPECT_EQ(0, std::memcmp(metadata_before.data(), fx.candidate_flash.rawBuffer(), metadata_before.size()));
+  }
+};
+}  // namespace
+
+TEST(LoraOtaCacheRetirement, ReceivingAndSealedLocalCachesRejectReceiverPreparationAndReuploadWithoutMutation) {
+  for (const bool sealed : {false, true}) {
+    CacheRetirementFixture f;
+    f.cache(sealed);
+    f.manifest(f.remote, f.descriptor());
+    f.expectNoMutation([&] {
+      EXPECT_FALSE(f.authorize(f.remote));
+      EXPECT_FALSE(f.reupload(f.remote));
+    });
+  }
+}
+
+TEST(LoraOtaCacheRetirement, AbortedCacheRejectsUnauthorizedInvalidPolicySignatureAndBareAuthorizationWithoutMutation) {
+  for (uint8_t fault = 0; fault < 8; ++fault) {
+    SCOPED_TRACE(fault);
+    CacheRetirementFixture f;
+    f.cache(); f.abortCache();
+    auto d = f.descriptor();
+    if (fault == 1) d.role = 1;
+    if (fault == 2) d.boardVariant ^= 1;
+    if (fault == 3) d.securityCounter = 0;
+    if (fault == 4) d.exactSizeBytes = 643073;
+    if (fault == 5) d.minBootloaderCapabilities = 0x80000000u;
+    f.manifest(f.remote, d);
+    if (fault == 0) f.fx.admins.count = 1;
+    if (fault == 6) f.signature[0] ^= 1;
+    f.expectNoMutation([&] {
+      EXPECT_FALSE(f.authorize(f.remote, fault != 7));
+      EXPECT_FALSE(f.reupload(f.remote));
+    });
+  }
+}
+
+TEST(LoraOtaCacheRetirement, PreparedReceiverRejectsWrongTargetGenerationSignatureHashAndOwnerWithoutMutation) {
+  CacheRetirementFixture f;
+  f.cache(); f.abortCache(); f.manifest(f.remote, f.descriptor());
+  f.expectNoMutation([&] { ASSERT_TRUE(f.authorize(f.remote)); });
+  for (uint8_t mismatch = 1; mismatch <= 4; ++mismatch) {
+    SCOPED_TRACE(mismatch);
+    f.expectNoMutation([&] { EXPECT_FALSE(f.reupload(f.remote, mismatch)); });
+  }
+  f.expectNoMutation([&] { EXPECT_FALSE(f.reupload(f.local)); });
+}
+
+TEST(LoraOtaCacheRetirement, ActivationRechecksCurrentAdminFloorAndFloorAvailabilityBeforeAnyWrite) {
+  for (uint8_t changed = 0; changed < 3; ++changed) {
+    SCOPED_TRACE(changed);
+    CacheRetirementFixture f;
+    f.cache(); f.abortCache(); f.manifest(f.remote, f.descriptor());
+    ASSERT_TRUE(f.authorize(f.remote));
+    if (changed == 0) f.fx.admins.count = 1;
+    if (changed == 1) ASSERT_TRUE(f.fx.counter.commitNewValue(1));
+    if (changed == 2) f.fx.counter.setAvailable(false);
+    f.expectNoMutation([&] {
+      EXPECT_FALSE(f.reupload(f.remote));
+      EXPECT_EQ(CacheRetirementFixture::Result::Denied, f.receiver().activatePreparedReupload(f.remote.publicKey(), f.hash));
+    });
+  }
+}
+
+TEST(LoraOtaCacheRetirement, IdenticalOwnerAndHashStillRequireFreshTargetedReceiverPreparation) {
+  CacheRetirementFixture f;
+  f.cache(true, 0); f.abortCache();
+  f.expectNoMutation([&] { EXPECT_FALSE(f.reupload(f.local)); });
+  f.expectNoMutation([&] { ASSERT_TRUE(f.authorize(f.local)); });
+  mesh::ota::OtaLeanReceiver::Status pending;
+  ASSERT_TRUE(f.receiver().pendingReuploadStatus(f.hash, pending));
+  EXPECT_FALSE(pending.localCache);
+  EXPECT_EQ(CacheRetirementFixture::Phase::Aborted, pending.phase);
+  EXPECT_EQ(0u, pending.receivedBlocks);
+  f.expectNoMutation([&] {
+    uint8_t poll[mesh::ota::kOtaCensusPollBytes], reply[256]; size_t len = 0;
+    const auto poll_len = mesh::ota::encodeOtaCensusPoll(f.local.publicKey(), f.hash, 0, poll, sizeof(poll));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(poll, poll_len, 10));
+    EXPECT_FALSE(f.fx.integration.pollOutboundControlFrame(reply, sizeof(reply), len));
+  });
+  const auto generation = f.receiver().status().generation;
+  ASSERT_TRUE(f.reupload(f.local));
+  EXPECT_EQ(generation + 1u, f.receiver().status().generation);
+  EXPECT_FALSE(f.receiver().status().localCache);
+  EXPECT_EQ(0u, f.receiver().status().receivedBlocks);
+}
+
+TEST(LoraOtaCacheRetirement, PendingCensusReportsPreparedReceiverWhileOriginalCacheHashRemainsSilent) {
+  using namespace mesh::ota;
+  CacheRetirementFixture f;
+  f.cache(); f.abortCache();
+  const auto cached = f.receiver().status();
+  f.manifest(f.remote, f.descriptor(0, 2));
+  ASSERT_NE(0, std::memcmp(cached.manifestHash, f.hash, 32));
+  ASSERT_TRUE(f.authorize(f.remote));
+  f.expectNoMutation([&] {
+    uint8_t frame[kOtaCensusPollBytes], reply[256]; size_t len = 0;
+    auto frame_len = encodeOtaCensusPoll(f.local.publicKey(), cached.manifestHash, 0, frame, sizeof(frame));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(frame, frame_len, 20));
+    EXPECT_FALSE(f.fx.integration.pollOutboundControlFrame(reply, sizeof(reply), len));
+    frame_len = encodeOtaCensusPoll(f.local.publicKey(), f.hash, 0, frame, sizeof(frame));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(frame, frame_len, 21));
+    ASSERT_TRUE(f.fx.integration.pollOutboundControlFrame(reply, sizeof(reply), len));
+    OtaCensusReport report;
+    ASSERT_TRUE(parseOtaCensusReport(reply, len, report));
+    EXPECT_EQ(static_cast<uint8_t>(CacheRetirementFixture::Phase::Aborted), report.phase);
+    EXPECT_EQ(cached.generation, report.generation);
+    EXPECT_EQ(2u, report.counter);
+    EXPECT_EQ(4u, report.total);
+    EXPECT_EQ(0u, report.received);
+    EXPECT_EQ(0, std::memcmp(f.hash, report.manifestHash, 32));
+    for (const uint8_t byte : report.bitmap) EXPECT_EQ(0u, byte);
+    frame_len = encodeOtaCensusPoll(f.local.publicKey(), cached.manifestHash, 0, frame, sizeof(frame));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(frame, frame_len, 22));
+    EXPECT_FALSE(f.fx.integration.pollOutboundControlFrame(reply, sizeof(reply), len));
+  });
+}
+
+TEST(LoraOtaCacheRetirement, CacheOnlyStockBackendCannotPrepareBeginOrActivateReceiverPurpose) {
+  using namespace mesh::ota;
+  CacheRetirementFixture f;
+  OtaBoardCacheOnlyBackend stock(f.fx.image_region, f.fx.candidate_store_region, &leanNoTrial);
+  ASSERT_TRUE(stock.attach(f.fx.integration, f.fx.sig_verifier));
+  f.cache(); f.abortCache();
+  f.manifest(f.remote, f.descriptor());
+  ASSERT_TRUE(f.trust.verifyDescriptorPolicyOnly(f.descriptor()));
+  f.expectNoMutation([&] {
+    EXPECT_FALSE(f.receiver().prepareReupload(f.remote.publicKey(), f.canonical, f.signature));
+    EXPECT_EQ(CacheRetirementFixture::Result::Denied,
+              f.receiver().begin(f.remote.publicKey(), f.canonical, f.signature, true, false));
+    EXPECT_FALSE(f.authorize(f.remote));
+    EXPECT_FALSE(f.reupload(f.remote));
+    OtaLeanReceiver::Status pending;
+    EXPECT_FALSE(f.receiver().pendingReuploadStatus(f.hash, pending));
+    EXPECT_EQ(CacheRetirementFixture::Result::Mismatch,
+              f.receiver().activatePreparedReupload(f.remote.publicKey(), f.hash));
+    EXPECT_EQ(CacheRetirementFixture::Result::Denied, f.receiver().commit(1, f.signature));
+  });
+}
+
+TEST(LoraOtaCacheRetirement, SignedRfReplacementResetsCacheAndRequiresAllFreshBlocksHashVerificationAndCommit) {
+  using namespace mesh::ota;
+  using Result = CacheRetirementFixture::Result;
+  using Phase = CacheRetirementFixture::Phase;
+  CacheRetirementFixture f;
+  f.cache(); f.abortCache();
+  const auto old = f.receiver().status();
+  f.image[0] ^= 0x80; f.image[256] ^= 1;
+  f.manifest(f.remote, f.descriptor());
+  f.expectNoMutation([&] { ASSERT_TRUE(f.authorize(f.remote)); });
+  ASSERT_TRUE(f.reupload(f.remote));
+  const auto active = f.receiver().status();
+  ASSERT_EQ(Phase::Receiving, active.phase);
+  EXPECT_FALSE(active.localCache);
+  EXPECT_EQ(old.generation + 1u, active.generation);
+  EXPECT_NE(old.transactionNonce, active.transactionNonce);
+  EXPECT_EQ(0u, active.receivedBlocks);
+  EXPECT_EQ(0, std::memcmp(f.remote.publicKey(), active.ownerPublicKey, 32));
+  EXPECT_EQ(0, std::memcmp(f.hash, active.manifestHash, 32));
+  for (uint16_t i = 0; i < active.totalBlocks; ++i) EXPECT_FALSE(f.receiver().isBlockReceived(i));
+  EXPECT_EQ(Result::Incomplete, f.receiver().requestSeal());
+  uint8_t commit[kOtaCommitFrameBytes], message[usb::kCommitSignedBytes], commit_sig[64];
+  usb::buildCommitSignedMessage(f.local.publicKey(), f.hash, 1, message);
+  f.remote.sign(message, sizeof(message), commit_sig);
+  const auto commit_len = encodeOtaCommitFrame(f.local.publicKey(), f.hash, 1, commit_sig, commit, sizeof(commit));
+  EXPECT_FALSE(f.fx.integration.handleReceivedFrame(commit, commit_len, 25));
+  f.fx.integration.loop();
+  ASSERT_EQ(Phase::Receiving, f.receiver().status().phase);
+  uint8_t cache_put[6] = {usb::kCommand, static_cast<uint8_t>(usb::UsbOtaOp::CachePut), 0, 0, 1, 0x57};
+  EXPECT_EQ(Result::Denied, f.receiver().handleUsbCacheFrame(cache_put, sizeof(cache_put), f.local.publicKey()));
+  for (uint16_t i = 0; i < active.totalBlocks; ++i) {
+    const size_t offset = i * 84u, len = std::min<size_t>(84, sizeof(f.image) - offset);
+    uint8_t signed_message[kOtaBlockSignedMessageMaxBytes], sig[64], block[256]; size_t block_len = 0;
+    const auto message_len = buildOtaBlockSignedMessage(f.hash, kOtaSignedBlockKind, i, f.image + offset, len, signed_message);
+    f.remote.sign(signed_message, message_len, sig);
+    ASSERT_TRUE(encodeOtaSignedBlockFrame(kOtaSignedBlockKind, f.hash, i, f.image + offset, len, sig, block, sizeof(block), block_len));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(block, block_len, 30 + i));
+  }
+  ASSERT_EQ(Phase::Verifying, f.receiver().status().phase);
+  f.fx.integration.loop();
+  ASSERT_EQ(Phase::Ready, f.receiver().status().phase);
+  EXPECT_EQ(4u, f.receiver().status().receivedBlocks);
+  EXPECT_EQ(0, std::memcmp(f.image, f.fx.image_flash.rawBuffer(), sizeof(f.image)));
+  ASSERT_TRUE(f.fx.integration.handleReceivedFrame(commit, commit_len, 40));
+  EXPECT_EQ(Phase::Committed, f.receiver().status().phase);
+  uint32_t floor = 99;
+  ASSERT_TRUE(f.fx.counter.currentValue(floor));
+  EXPECT_EQ(0u, floor);
+}
+
 TEST(LoraOtaLeanReceiver, SignedBlockFrameRejectsForeignSignatureAndWrongManifestTagHarmlessly) {
   LeanFixture fx;
   uint8_t owner_seed[32] = {};
@@ -4544,6 +4850,41 @@ TEST(LoraOtaRfProduct, LegacyTransportAbortPreservesDurableLocalCacheReadback) {
   ASSERT_EQ(usb::UsbOtaResult::Ok, cache.readBlock(0, bytes, sizeof(bytes), length));
   EXPECT_EQ(84u, length);
   EXPECT_EQ(0, std::memcmp(bytes, h.image.data(), length));
+}
+
+TEST(LoraOtaRfProduct, ExplicitUploaderReuploadRetiresAbortedForeignRoleLocalCacheThroughPendingCensus) {
+  RfProductHarness h;
+  h.prepare(257, usb::kStartModeDirected);
+  auto& receiver = h.a.fx.integration.leanReceiver();
+  uint8_t old_image[24] = {0x48}, canonical[59], signature[64];
+  auto descriptor = buildProtocolDescriptor(old_image, sizeof(old_image), 5);
+  descriptor.role = 8;
+  size_t len = 0;
+  ASSERT_EQ(OtaDescriptorCodecResult::Ok, encodeOtaDescriptorCanonical(descriptor, canonical, sizeof(canonical), len));
+  h.a.signer.sign(canonical, len, signature);
+  ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.begin(h.a.signer.publicKey(), canonical, signature, false, true, true));
+  ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.putBlock(0, old_image, sizeof(old_image)));
+  ASSERT_EQ(usb::UsbOtaResult::Pending, receiver.requestSeal());
+  h.a.fx.integration.loop();
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, receiver.status().phase);
+  auto old = receiver.status();
+  uint8_t message[usb::kAbortSignedBytes];
+  usb::buildAbortSignedMessage(h.a.signer.publicKey(), old.imageHash, old.generation, message);
+  h.a.signer.sign(message, sizeof(message), signature);
+  ASSERT_EQ(usb::UsbOtaResult::Ok,
+            receiver.abort(h.a.signer.publicKey(), signature, old.imageHash, old.generation, true));
+  old = receiver.status();
+  const auto programs = h.a.fx.candidate_flash.programOpCount();
+  for (int i = 0; i < 30; ++i) h.step();
+  EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Aborted, receiver.status().phase);
+  EXPECT_TRUE(receiver.status().localCache);
+  EXPECT_EQ(programs, h.a.fx.candidate_flash.programOpCount());
+  ASSERT_TRUE(h.uploader.start(h.sender.fx.integration, usb::kStartModeDirected, &h.targets[0][0], 1, 0, 0, 0, true));
+  for (int i = 0; i < 100 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.a));
+  EXPECT_FALSE(receiver.status().localCache);
+  EXPECT_EQ(old.generation + 1u, receiver.status().generation);
+  EXPECT_EQ(0, std::memcmp(h.image.data(), h.a.fx.image_flash.rawBuffer(), h.image.size()));
 }
 
 TEST(LoraOtaRfProduct, SignedCommitRetryAfterMetadataFailurePreservesReadyAndNeverReplacesQueuedIntent) {

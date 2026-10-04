@@ -853,9 +853,27 @@ The stock176-byte USB limit requires the existing compact kind01 signed
 84-byte block format, not the183-byte full-owner block format. A zero-hop
 171-byte direct ACK exactly fits its176-byte raw RX notification.
 
-The user offered an additional stock companion; none has yet been identified
-or operated for this flow. The host adapter and a distinct, matching ROLE0
-companion candidate for41 are being prepared. ROLE1 images above cannot be
+The user supplied an additional stock companion, now identified read-only as
+`lab-stock`, Heltec V3, public key
+`0f7cc3e7f6fe812ca754a8dcc563757ab15a87e2ce762143898077539d9a6783`.
+At `22:43:24Z`, its version was `v1.17.1-d929643`; the suffix matches the
+actual `companion-v1.17.1` release commit. Its original settings read back as
+907.525MHz,250kHz bandwidth,SF7, coding rate4/5 (wire value5),2dBm, repeater
+disabled and path-hash mode2. No firmware, radio settings, signatures or RF
+transfers were changed/requested during identification.
+
+Its CP2102 USB serial is `0001`, but another attached, unauthorized CP2102
+has the same serial. The shared by-id link currently resolves to ttyUSB1:
+`/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0`.
+It is not a unique device binding. ROOT instead pins the authorized USB path
+`/dev/serial/by-path/pci-0000:0d:00.0-usb-0:4.2.4:1.0-port0`, its serial/USB
+ancestry, and the verified full public key. The other CP2102 on path4.1 is not
+authorized and must not be opened. APP_START first after ordinary UART settling,
+then DEVICE_QUERY, obtained the public identity/version; BLE PIN and GPS fields
+were neither displayed nor recorded in the public baseline.
+
+The host adapter and distinct, matching ROLE0 companion candidates for41
+are being prepared. ROLE1 images above cannot be
 installed on41's ROLE0 loader. Only an explicit lab-only nonconfirming ROLE0
 candidate may be used for the later genuine trial-deadline rollback outcome.
 No stock-companion firmware/BOOT transfer, USB self-stage workaround or
@@ -879,8 +897,18 @@ descriptor, then the existing target/generation-bound signed RF REUPLOAD.
 The new receiver session must have a new generation and empty received bitmap;
 old cached bytes must never be promoted to READY or installation. Sealed caches,
 bare authorization, unauthorized signers and stale generations remain blocked.
-This gate is under implementation/review. No new USB STAGE/reset API or
-boot-journal erase is proposed.
+The reviewed fix retains these guards and makes prepared receiver census
+replies visible without changing stored cache purpose. Queries for the cached
+hash remain silent; a different prepared descriptor hash is required for the
+automatic RF flow. ROOT independently passed all252 integration cases on the
+exact combined source tree `7c68821f530d339fcfb9b09ec9c136193aa9144c`, including
+the nine added retirement cases. Opus5.5 actual patch/profile review found no
+blockers. The guarded ROLE0 profiles reuse the existing health callback and
+45000ms deadline, changing only lab-negative loop readiness.
+
+These are source results. The three integrated baseline/confirm/nonconfirm
+ELFs and actual receiver41/RF qualification remain separate gates. No new USB
+STAGE/reset API or boot-journal erase is introduced.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77

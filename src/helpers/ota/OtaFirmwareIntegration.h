@@ -888,7 +888,7 @@ private:
     if (frame_len != kOtaReuploadFrameBytes) return LeanControlResult::Rejected;
     static OtaLeanReceiver::Status st;
     captureLeanStatus(st);
-    if (!st.valid || st.localCache || st.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
+    if (!st.valid || st.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
         !lean_.haveTargetPublicKey() || std::memcmp(frame + 33, lean_.targetPublicKey(), 32) ||
         usb::getBE32(frame + 97) != st.generation || !lean_.currentAdmin(frame + 1))
       return LeanControlResult::Rejected;
@@ -896,7 +896,8 @@ private:
     auto len = buildOtaReuploadMessage(frame, message);
     if (!lean_.verifySignature(frame + 1, message, len, frame + 101)) return LeanControlResult::Rejected;
     usb::UsbOtaResult result;
-    if (std::memcmp(frame + 65, st.manifestHash, 32) == 0 && std::memcmp(frame + 1, st.ownerPublicKey, 32) == 0) {
+    // A local cache always needs fresh receiver authorization, even for identical content.
+    if (!st.localCache && std::memcmp(frame + 65, st.manifestHash, 32) == 0 && std::memcmp(frame + 1, st.ownerPublicKey, 32) == 0) {
       if (!lean_.exportCandidateForUpload(canonical, sig)) return LeanControlResult::Rejected;
       result = lean_.begin(st.ownerPublicKey, canonical, sig, true, false);
     } else {

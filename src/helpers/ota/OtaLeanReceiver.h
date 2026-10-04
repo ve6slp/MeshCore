@@ -72,7 +72,7 @@ public:
     return verifyOwnerSignature(key, message, len, sig);
   }
   bool prepareReupload(const uint8_t owner[32], const uint8_t canonical[59], const uint8_t signature[64]) {
-    if (!owner || !canonical || !signature || !candidate_.valid || candidate_.localCache || !trust_provider_ ||
+    if (!owner || !canonical || !signature || !candidate_.valid || !trust_provider_ ||
         candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Aborted ||
         !isCurrentAdmin(owner) || !verifyOwnerSignature(owner, canonical, 59, signature)) return false;
     meshcore::ota::protocol::OtaDescriptor descriptor;
@@ -89,6 +89,7 @@ public:
     uint8_t pending_hash[32]; computeOtaManifestHash(pending_canonical_, pending_hash);
     if (std::memcmp(hash, pending_hash, 32)) return false;
     out = status();
+    out.localCache = false;
     std::memcpy(out.manifestHash, pending_hash, 32);
     std::memcpy(out.ownerPublicKey, pending_owner_, 32);
     out.totalBlocks = totalBlocksFor(usb::getBE32(pending_canonical_ + 9));

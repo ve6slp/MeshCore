@@ -6,8 +6,9 @@
 #if defined(XIAO_OTA_LAB_NONCONFIRMING_TRIAL) && XIAO_OTA_LAB_NONCONFIRMING_TRIAL
 #if !defined(MESHCORE_LORA_OTA) || !MESHCORE_LORA_OTA || \
     !defined(MESHCORE_OTA_LAB_BACKEND) || !MESHCORE_OTA_LAB_BACKEND || \
-    !defined(XIAO_OTA_COMPILED_ROLE_ID) || XIAO_OTA_COMPILED_ROLE_ID != 1
-#error "Nonconfirming trial fixture requires the OTA lab repeater (role 1)"
+    !defined(XIAO_OTA_COMPILED_ROLE_ID) || \
+    (XIAO_OTA_COMPILED_ROLE_ID != 0 && XIAO_OTA_COMPILED_ROLE_ID != 1)
+#error "Nonconfirming trial fixture requires an explicit OTA lab companion (role 0) or repeater (role 1)"
 #endif
 #endif
 
