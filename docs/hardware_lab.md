@@ -870,6 +870,18 @@ not on-air transfer evidence. The new sender must be explicitly identified and
 authorized, its original radio settings retained/restored, and the signed
 uploader cache deliberately retired before receiver admission if required.
 
+The receiver41 preparation exposed a concrete lifecycle gate: local ABORT
+alone cannot currently retire an uploader cache into a new RF receiver session.
+Both `prepareReupload` and the RF REUPLOAD handler exclude local-cache purpose,
+including ABORTED caches. The required fix is limited to an explicitly aborted
+cache, a fresh fully signed/admin-authorized and policy-qualified receiver
+descriptor, then the existing target/generation-bound signed RF REUPLOAD.
+The new receiver session must have a new generation and empty received bitmap;
+old cached bytes must never be promoted to READY or installation. Sealed caches,
+bare authorization, unauthorized signers and stale generations remain blocked.
+This gate is under implementation/review. No new USB STAGE/reset API or
+boot-journal erase is proposed.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
