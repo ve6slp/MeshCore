@@ -976,6 +976,25 @@ all4 contact ACLs and all40 channels matched afterward. Stock remains2dBm;
 the sender's setting. This proves the high-speed PHY, not a signed temporary
 lease, OTA image delivery or installation.
 
+**Actual durable stock authority,23:49-23:50Z:** ROOT added only the exact
+authorized lab-stock contact and used the existing dedicated SET_ADMIN API,
+which returned durable OK. Complete five-contact readback showed all four
+original contacts/ACL bytes unchanged; only the new stock contact gained
+the0x10 admin flag and current-time lastmod. All40 channels, identity,
+SelfInfo and settings matched. An ordinary application reboot retained the
+complete five-contact snapshot and qualified INSTALL_CAPABLE floor0.
+The aborted generation10 cache was unchanged.
+
+The first private preparation attempt exposed a contact-protocol trap:
+including an explicit optional lastmod0 in the148-byte add request hides
+that contact from GET_CONTACTS, whose START still reports the total count.
+ROOT measured the exact new contact through GET_CONTACT_BY_KEY, verified all
+original contact/channel bytes and a nonzero RTC, then used SET_ADMIN rather
+than retrying ADD. SET_ADMIN assigned a positive lastmod and restored complete
+contact iteration. New add requests should omit that optional timestamp.
+Actual OTA image delivery/confirmation/automatic rollback remain unqualified;
+the stock host uploader handoff is the remaining canary prerequisite.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
