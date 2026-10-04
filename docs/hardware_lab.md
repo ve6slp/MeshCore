@@ -817,9 +817,12 @@ source tree `8c79d1f3ab83b0efe610386e084411333a4bed87`:
 | `ota-rollback02` | 537752 | `7508cf2a3ad11deae01262883d6065a0feb50bb0009fae3844975b200e195261` | `A13A` |
 
 Their packages contain no SoftDevice or BOOT segment and stay below the
-C4000 installer boundary. Selected ROLE1 ELF frames were inspected, but
-complete ROLE1 critical-path stack bounds remain a separate gate; the ROLE0
-3032-byte bound must not be assumed to apply to these different executables.
+C4000 installer boundary. Subsequent Opus5.5 review checked all three actual
+ROLE1 ELFs rather than assuming the ROLE0 bound applies. No static OTA stack
+overrun was found: the conservative largest root bound is3948 bytes including
+104 bytes of exception allowance, against the4096-byte task allocation.
+Some indirect flash and radio callbacks are bounded by implementation family.
+These are static executable bounds, not physical stack high-water measurements.
 
 ROOT intentionally replaced41's obsolete ABORTED generation8 cache with the
 new `ota-confirm02` image using the existing signed, explicit-reupload cache
@@ -839,7 +842,33 @@ confirmed floor. No RF START or COMMIT was sent. This is a durable uploader
 cache, explicitly noninstallable locally; it is not receiver READY, signed
 installation, confirmation or rollback. Existing private generation8 records
 remain as historical evidence.77 still requires recovery of the defective
-installed modified loader before the two-board RF outcome can proceed.
+installed modified loader before its ROLE1 receiver flow can proceed.
+
+**Alternative receiver41 with an unchanged stock USB companion:** the actual
+`companion-v1.17.1` source supports USB signing commands33-35, raw-packet TX
+command65 and raw RX notifications88 hex, emitted before payload dispatch.
+These permit a PC-managed OTA sender without flashing the stock companion.
+The existing firmware-cache uploader uses command66 and is not that adapter.
+The stock176-byte USB limit requires the existing compact kind01 signed
+84-byte block format, not the183-byte full-owner block format. A zero-hop
+171-byte direct ACK exactly fits its176-byte raw RX notification.
+
+The user offered an additional stock companion; none has yet been identified
+or operated for this flow. The host adapter and a distinct, matching ROLE0
+companion candidate for41 are being prepared. ROLE1 images above cannot be
+installed on41's ROLE0 loader. Only an explicit lab-only nonconfirming ROLE0
+candidate may be used for the later genuine trial-deadline rollback outcome.
+No stock-companion firmware/BOOT transfer, USB self-stage workaround or
+additional primary commissioning is part of this route.
+
+At `22:14:23Z`, fresh read-only41 APP_START/diagnostics still reported qualified
+writes and INSTALL_CAPABLE with sequence1/counter0/extent0/hash0 and `io=ok`.
+At `22:14:25Z`, actual STATUS retained the complete sealed generation9 tuple.
+The new complete private protocol snapshot matched the preceding preserved
+identity, settings, SelfInfo,4 contacts/ACLs and40 channels. This is preparation,
+not on-air transfer evidence. The new sender must be explicitly identified and
+authorized, its original radio settings retained/restored, and the signed
+uploader cache deliberately retired before receiver admission if required.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
