@@ -966,6 +966,16 @@ USB-byte ceiling without truncation. Stock SelfInfo/DeviceInfo were unchanged
 afterward, and41's full private userdata still matched. These are actual
 signing and transport-boundary results, not delivery of an OTA image.
 
+**Actual fast PHY,23:39Z:** both41 and the unchanged stock companion accepted
+908.525MHz/250kHz/SF5/CR5 through their normal radio APIs. Full-size ordinary
+command65 traffic and the176-byte raw return notification worked in both
+directions, with forward RSSI-44dBm/SNR7.25dB. Both original normal profiles
+and complete SelfInfo/DeviceInfo were restored;41's full identity/settings,
+all4 contact ACLs and all40 channels matched afterward. Stock remains2dBm;
+41's actual original TX setting is22dBm and was preserved, not changed to
+the sender's setting. This proves the high-speed PHY, not a signed temporary
+lease, OTA image delivery or installation.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
