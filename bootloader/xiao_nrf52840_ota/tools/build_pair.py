@@ -168,6 +168,19 @@ def prepare_primary(out, tree, board, role, stage):
         "void xiao_ota_primary_invalidate_app_grant(void) { pair_intact = false; }")
     text = text.replace("static void check_dfu_mode(void)",
                         "static void check_dfu_mode(bool pair_forced_recovery)")
+    text = once(text, "  sd_mbr_command(&com);",
+        "  APP_ERROR_CHECK(sd_mbr_command(&com));\n  _sd_inited = true;")
+    text = once(text, "  board_init();",
+        "  _sd_inited = NRF_POWER->GPREGRET == DFU_MAGIC_OTA_APPJUM;\n\n"
+        "  board_init();")
+    text = once(text,
+        "  // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC\n"
+        "  _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);",
+        "  // Preserve the entry/INIT_SD phase even when recovery changes GPREGRET.")
+    primary = custom / "xiao_ota_primary.c"
+    primary.write_text(once(primary.read_text(),
+        "sd_softdevice_is_enabled(&enabled)",
+        "xiao_ota_vendor_sd_is_enabled(&enabled)"))
     text = once(text, "  bootloader_init();",
         "  bootloader_init();\n  uint32_t pair_init = xiao_ota_primary_init();")
     text = once(text, "    bootloader_dfu_sd_update_continue();\n"
@@ -256,7 +269,7 @@ def test_pair(out, vendor, board, role):
     folder = out / "tests"
     folder.mkdir(exist_ok=True)
     generated = (out / "primary-source/src/main.c").read_text()
-    start = generated.index("int main(void)")
+    start = generated.index("static void mbr_init_sd(void)")
     end = generated.index("static uint32_t ble_stack_init", start)
     (folder / "generated_primary.inc").write_text(
         generated[start:end].replace("int main(void)", "int vendor_main(void)", 1))
@@ -332,7 +345,7 @@ def main():
     sentinel.write_text(PIN)
     shutil.copytree(vendor, tree, ignore=shutil.ignore_patterns(".git", "_build", "_bin"))
     patch = PRODUCT / "patches/otafix-preserving.patch"
-    assert sha(patch) == "728f1e2619c65d523f1094f8b4cca521960896853a06ee58352ff095c669ceca"
+    assert sha(patch) == "97c539f9216bf2569937b150dfaff743a5799aa8668c3222fe16fe5b36718bb0"
     run(["git", "apply", "--check", patch], tree)
     run(["git", "apply", patch], tree)
     prepare_primary(out, tree, args.board, args.role, stage)

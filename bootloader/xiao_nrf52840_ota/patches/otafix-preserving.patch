@@ -72,7 +72,7 @@
 +    if ((p_packet->params.start_packet->dfu_update_mode & DFU_UPDATE_APP) &&
 +        !xiao_ota_vendor_sdk_upload_begin()) return NRF_ERROR_INVALID_STATE;
 +    uint8_t sd_enabled = 1;
-+    uint32_t sd_error = sd_softdevice_is_enabled(&sd_enabled);
++    uint32_t sd_error = xiao_ota_vendor_sd_is_enabled(&sd_enabled);
 +    VERIFY_SUCCESS(sd_error);
 +    if (is_ota() != (sd_enabled != 0)) return NRF_ERROR_INVALID_STATE;
 +    if (DFU_STATE_IDLE != m_dfu_state) return NRF_ERROR_INVALID_STATE;
@@ -97,7 +97,7 @@
  uint32_t dfu_data_pkt_handle(dfu_update_packet_t * p_packet)
  {
 +    uint8_t sd_enabled = 1;
-+    uint32_t sd_error = sd_softdevice_is_enabled(&sd_enabled);
++    uint32_t sd_error = xiao_ota_vendor_sd_is_enabled(&sd_enabled);
 +    VERIFY_SUCCESS(sd_error);
 +    if (is_ota() != (sd_enabled != 0)) return NRF_ERROR_INVALID_STATE;
      uint32_t   data_length;
@@ -599,7 +599,7 @@
 +  }
 +  if (state->aborted) return -2;
 +  uint8_t sd_enabled = 1;
-+  uint32_t err = sd_softdevice_is_enabled(&sd_enabled);
++  uint32_t err = xiao_ota_vendor_sd_is_enabled(&sd_enabled);
 +  if (err != NRF_SUCCESS || sd_enabled || is_ota() ||
 +      !is_uf2_block(bl) || bl->flags != UF2_FLAG_FAMILYID ||
 +      (bl->familyID != CFG_UF2_BOARD_APP_ID && bl->familyID != CFG_UF2_FAMILY_APP_ID) ||
@@ -700,28 +700,29 @@
  }
 --- a/src/flash_nrf5x.c
 +++ b/src/flash_nrf5x.c
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,9 @@
  #include "nrf_sdm.h"
  #include "flash_nrf5x.h"
  #include "boards.h"
 +#include "app_error.h"
 +#include "xiao_ota_vendor.h"
++#include "xiao_ota_vendor_sdk.h"
  
  #define FLASH_PAGE_SIZE           4096
  #define FLASH_CACHE_INVALID_ADDR  0xffffffff
-@@ -35,6 +37,11 @@
+@@ -35,6 +38,11 @@
  
  void flash_nrf5x_flush (bool need_erase)
  {
 +    uint8_t sd_enabled = 1;
-+    uint32_t sd_error = sd_softdevice_is_enabled(&sd_enabled);
++    uint32_t sd_error = xiao_ota_vendor_sd_is_enabled(&sd_enabled);
 +    APP_ERROR_CHECK(sd_error);
 +    APP_ERROR_CHECK(sd_enabled || is_ota() ? NRF_ERROR_NOT_SUPPORTED : NRF_SUCCESS);
 +
    if ( _fl_addr == FLASH_CACHE_INVALID_ADDR ) return;
  
    // skip the write if contents matches
-@@ -48,11 +55,14 @@
+@@ -48,11 +56,14 @@
      if ( need_erase )
      {
        PRINTF("Erase and ");
@@ -763,3 +764,23 @@
  
          PRINTF("Application update complete\r\n");
        }
+--- a/src/usb/usb.c
++++ b/src/usb/usb.c
+@@ -36,6 +36,8 @@
+ 
+ #include "uf2/uf2.h"
+ #include "boards.h"
++#include "app_error.h"
++#include "xiao_ota_vendor_sdk.h"
+ 
+ //--------------------------------------------------------------------+
+ // MACRO TYPEDEF CONSTANT ENUM DECLARATION
+@@ -63,7 +65,7 @@
+   uint8_t sd_en = false;
+ 
+   if (is_sd_existed()) {
+-    sd_softdevice_is_enabled(&sd_en);
++    APP_ERROR_CHECK(xiao_ota_vendor_sd_is_enabled(&sd_en));
+   }
+ 
+   if (sd_en) {

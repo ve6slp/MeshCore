@@ -12,6 +12,18 @@ static pstorage_handle_t settings_handle;
 static uint32_t words[6] __attribute__((aligned(4)));
 static bool initialized, poisoned, completed;
 static uint32_t result;
+extern bool _sd_inited;
+
+uint32_t xiao_ota_vendor_sd_is_enabled(uint8_t *enabled) {
+  /* main establishes cold-reset/B1 entry before any query; INIT_SD advances it. */
+  if (!_sd_inited) {
+    *enabled = 0;
+    return NRF_SUCCESS;
+  }
+  uint32_t error = sd_softdevice_is_enabled(enabled);
+  if (error != NRF_SUCCESS) poisoned = true;
+  return error;
+}
 
 static void settings_done(pstorage_handle_t *handle, uint8_t op, uint32_t error,
                           uint8_t *data, uint32_t bytes) {
@@ -67,10 +79,7 @@ static bool read_internal(void *ctx, uint32_t address, void *out, size_t bytes) 
 
 static bool sd_enabled(bool *enabled) {
   uint8_t value = 1;
-  if (sd_softdevice_is_enabled(&value) != NRF_SUCCESS) {
-    poisoned = true;
-    return false;
-  }
+  if (xiao_ota_vendor_sd_is_enabled(&value) != NRF_SUCCESS) return false;
   *enabled = value != 0;
   return true;
 }

@@ -386,6 +386,35 @@ retain its original ordering. The current installed primary has no
 supported USB command to install the correction; reset alone repeats the
 defective startup.
 
+### Reviewed lifecycle correction, not installed
+
+The correction captures the original B1 routing state at main entry, before
+any forced-recovery marker overwrite. Cold entry knows the SoftDevice is
+disabled and does not issue the unavailable query. Initialized queries remain
+strict; SDK query errors still poison the driver. The existing MBR helper now
+checks INIT_SD success before setting the routing latch. Pending-SD continuation
+still precedes INIT_SD, and all SDK, primary, serial, UF2, flash and USB query
+sites use the same policy.
+
+Independent review closed the six-file correction. Root rebuilt its exact
+prospective source tree and reproduced primary RAW SHA-256
+`fbe2db4591114e4125f492daa650aa0394e8c7baedfc446318b38be38f0c38b1`,
+with 38,748/38,912 LOAD bytes. Installer bytes remain unchanged
+(`7809324747eda396bc25662a5f0b84498e4bc6dba1dee560970c7acc4c3b4ae7`).
+The selected main/helper, packaging and boot-process gates passed, as did
+seven actual-caller lifecycle cases, including the captured SDK tuple,
+serial/UF2 restoration, stale-B1 refusal and pending-SD ordering.
+SVC routing, MBR/NVMC and QSPI hardware leaves were modeled, not run on77.
+
+The restoration cases use a matching corrected staged primary. They do not
+establish that replacing only77's live primary is sufficient: its APP staging
+copy still contains Source21. Before any physical repair, qualify that original
+pending-image binding and the exact repair write set without weakening it.
+77 remains on Source21 in USB recovery; no further firmware write or reset
+has occurred. Delivering the correction requires the missing probe and
+explicit authorization for the bounded repair, then actual stock1.17.1
+version, identity, settings, full ACL and normal-peer confirmation.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does

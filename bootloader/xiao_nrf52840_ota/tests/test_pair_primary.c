@@ -9,16 +9,39 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef PAIR_VENDOR_LIFECYCLE
+#include <ucontext.h>
+#endif
 
 typedef struct { uint32_t CC[4]; } mock_timer_t;
+#ifdef PAIR_VENDOR_LIFECYCLE
+typedef struct {
+  uint16_t bank_0, bank_0_crc, bank_1, padding;
+  uint32_t bank_0_size, sd_image_size, bl_image_size, app_image_size, sd_image_start;
+} bootloader_settings_t;
+uint32_t lifecycle_sdk_init(void);
+uint32_t lifecycle_dfu_start(bool, uint32_t, bool);
+uint32_t lifecycle_init_sd(void);
+void lifecycle_ble_enable(void);
+uint32_t bootloader_init(void);
+bool bootloader_dfu_sd_in_progress(void);
+uint32_t bootloader_dfu_sd_update_continue(void);
+uint32_t bootloader_dfu_sd_update_finalize(void);
+bool bootloader_app_is_valid(void);
+void bootloader_util_settings_get(const bootloader_settings_t **);
+bool xiao_ota_vendor_recovery_complete(void);
+#else
 typedef struct { uint32_t bank_0; } bootloader_settings_t;
-static mock_timer_t timer;
 static bootloader_settings_t sdk = {1};
+#endif
+static mock_timer_t timer;
 static uint32_t retention;
 uint32_t *dbl_reset_mem = &retention;
 static bool single_tap, pending;
 static unsigned service_calls, dfu_calls, getter_calls, app_calls, pending_calls;
 static uint32_t timeout, pending_result;
+static unsigned init_sd_calls;
+static uint32_t init_sd_error;
 static jmp_buf route;
 bool _ota_dfu, _ota_connected, _sd_inited;
 #define NRF_TIMER2 (&timer)
@@ -42,22 +65,44 @@ bool _ota_dfu, _ota_connected, _sd_inited;
 #define STATE_USB_UNMOUNTED 4
 #define BANK_VALID_APP 1u
 #define NRF_SUCCESS 0u
+#define SD_MBR_COMMAND_INIT_SD 2u
+#define APP_ERROR_CHECK(error) do { if ((error) != NRF_SUCCESS) longjmp(route, 3); } while (0)
 #define APP_ASKS_FOR_SINGLE_TAP_RESET() single_tap
 #define PRINTF(...) ((void)0)
 #define NRFX_DELAY_MS(ms) ((void)(ms))
 static void check_dfu_mode(bool);
-static uint32_t ble_stack_init(void) { return 0; }
+static uint32_t ble_stack_init(void) {
+  assert(_sd_inited);
+#ifdef PAIR_VENDOR_LIFECYCLE
+  lifecycle_ble_enable();
+#endif
+  return 0;
+}
 static bool button_pressed(unsigned button) { (void)button; return false; }
 static void board_init(void) {}
 static void board_teardown(void) {}
+#ifndef PAIR_VENDOR_LIFECYCLE
 static void bootloader_init(void) {}
+#endif
 static void led_state(unsigned state) { (void)state; }
 static void usb_teardown(void) {}
 static void usb_init(bool serial) { (void)serial; }
 static bool is_ota(void) { return _ota_dfu; }
 static bool is_sd_existed(void) { return true; }
-static void mbr_init_sd(void) {}
+typedef struct { uint32_t command; } sd_mbr_command_t;
+static uint32_t sd_mbr_command(sd_mbr_command_t *command) {
+  assert(command->command == SD_MBR_COMMAND_INIT_SD && !_sd_inited);
+  ++init_sd_calls;
+#ifdef PAIR_VENDOR_LIFECYCLE
+  return lifecycle_init_sd();
+#else
+  return init_sd_error;
+#endif
+}
 static void sd_softdevice_disable(void) {}
+#ifdef PAIR_VENDOR_LIFECYCLE
+static uint32_t xiao_ota_primary_init(void) { return lifecycle_sdk_init(); }
+#else
 static uint32_t xiao_ota_primary_init(void) { return 0; }
 static bool bootloader_dfu_sd_in_progress(void) { return pending; }
 static uint32_t bootloader_dfu_sd_update_continue(void) {
@@ -72,13 +117,21 @@ static bool bootloader_app_is_valid(void) {
   return xiao_ota_app_is_intact(xiao_ota_boot_internal_io());
 }
 static void bootloader_util_settings_get(const bootloader_settings_t **out) { *out = &sdk; }
+#endif
 #include "primary_grant.inc"
 static uint32_t bootloader_dfu_start(bool ble, uint32_t ms, bool startup) {
   (void)ble; (void)startup;
   assert(!pair_intact && "cached preupload grant reached DFU");
-  ++dfu_calls; timeout = ms; return NRF_SUCCESS;
+  ++dfu_calls; timeout = ms;
+#ifdef PAIR_VENDOR_LIFECYCLE
+  return lifecycle_dfu_start(ble, ms, startup);
+#else
+  return NRF_SUCCESS;
+#endif
 }
+#ifndef PAIR_VENDOR_LIFECYCLE
 static bool xiao_ota_vendor_recovery_complete(void) { ++getter_calls; return false; }
+#endif
 static __attribute__((noreturn)) void bootloader_app_start(void) {
   ++app_calls; longjmp(route, 1);
 }
@@ -111,9 +164,31 @@ static void fresh_runtime(void) {
   retention = 0;
   service_calls = dfu_calls = getter_calls = app_calls = pending_calls = 0;
   pending_result = 0;
+  init_sd_calls = 0; init_sd_error = 0;
   _ota_dfu = _ota_connected = _sd_inited = single_tap = pending = false;
 }
 
+#ifdef PAIR_VENDOR_LIFECYCLE
+static int boot_result;
+static void low_stack_boot(void) { boot_result = boot(); }
+int lifecycle_boot(uint32_t marker) {
+  fresh_runtime();
+  mock_power.GPREGRET = marker;
+  void *stack = mmap((void *)0x20030000, 65536, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  assert(stack == (void *)0x20030000);
+  ucontext_t caller, entry;
+  assert(getcontext(&entry) == 0);
+  entry.uc_stack.ss_sp = stack; entry.uc_stack.ss_size = 65536;
+  entry.uc_link = &caller;
+  makecontext(&entry, low_stack_boot, 0);
+  assert(swapcontext(&caller, &entry) == 0);
+  return boot_result;
+}
+unsigned lifecycle_init_calls(void) { return init_sd_calls; }
+uint32_t lifecycle_timeout(void) { return timeout; }
+void lifecycle_initialize_sd(void) { mbr_init_sd(); }
+#else
 int main(int argc, char **argv) {
   assert(argc == 2);
   void *stage = mmap((void *)PAIR_STAGE_START, 65536, PROT_READ | PROT_WRITE,
@@ -154,6 +229,18 @@ int main(int argc, char **argv) {
   reset_adapter();
   assert(boot() == 1 && service_calls == 2 && dfu_calls == 1 && app_calls == 1);
   assert(retention == 0);
+  fresh_runtime();
+  mbr_init_sd();
+  assert(_sd_inited && init_sd_calls == 1);
+  mock_power.GPREGRET = DFU_MAGIC_UF2_RESET;
+  check_dfu_mode(true);
+  assert(_sd_inited && init_sd_calls == 1);
+  fresh_runtime(); mock_power.GPREGRET = DFU_MAGIC_OTA_APPJUM;
+  assert(boot() == 2 && _sd_inited && !init_sd_calls);
+  fresh_runtime(); init_sd_error = 1;
+  if (!setjmp(route)) { mbr_init_sd(); assert(!"failed INIT_SD returned"); }
+  assert(!_sd_inited && init_sd_calls == 1);
   puts("Sense selected main + actual adapter/kernel/runtime: R1 recovery, SDK unchanged, "
        "timeout separation, pending-first/error, grant invalidation/fresh stage PASS");
 }
+#endif
