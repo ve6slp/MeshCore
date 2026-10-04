@@ -80,9 +80,11 @@ weakened to obtain a fit. The flash-completion/wake correction is source-reviewe
 at `c67d30db`; its separate pre-F2 build leaves 52 bytes, not integrated headroom.
 
 **The user approved the fixed OTAFIX-primary/internal-installer architecture
-for source implementation and qualification.** This is not authorization to
-flash a device. Both components are initially frozen, with no remote bootloader
-update path. The approved reservation is:
+for source implementation and qualification.** The later development-hardware
+review selected a supervised compound APP preload, one serial primary
+replacement and final APP restoration on the authorized canary; it did not
+qualify an unattended fleet rollout. Both components are initially frozen,
+with no remote bootloader update path. The approved reservation is:
 
 | Range | Owner and limit |
 | --- | --- |
@@ -92,16 +94,16 @@ update path. The approved reservation is:
 | `0xF4000..0xFE000` | minimally modified OTAFIX primary/configuration, unchanged start |
 | `0xFE000..0x100000` | MBR parameters and SDK settings, unchanged |
 
-The reservation is not yet wired into the live application/boot contracts.
-Moving a binary is not sufficient: both existing runtimes use overlapping RAM,
-and a returning installer call is not the vendor's non-returning reset-vector
-jump. A source prototype must establish a small typed ABI, disjoint runtime
+Live integration must wire the reservation into application/boot contracts.
+Moving a binary is not sufficient: the existing monolithic runtimes use
+overlapping RAM, and a returning installer call is not the vendor's
+non-returning reset-vector jump. A source prototype must establish a small typed ABI, disjoint runtime
 storage, retained reset escape and actual paired-artifact fit. Every
 USB/BLE/LoRa writing path must exclude the secondary, filesystems and primary.
 The vendor UF2 APP upper bound currently does not protect the new reservation.
 
 The F2 kernel's native cut model covers SDK invalidation and validity-last
-publication, but **vendor recovery writers are a coupled open dependency**.
+publication, but **vendor recovery writers are a coupled integration dependency**.
 Pinned SDK11 `dfu_single_bank.c` starts APP erasure before the completed-erase
 callback invalidates bank0. That invalidates a global CRC0-fallback claim.
 Every destructive APP/staging writer needs a verified pre-erase barrier;
@@ -120,10 +122,16 @@ The existing serial DFU path also publishes CRC0; simply rejecting CRC0
 fallback would disable it without closing interrupted UF2 writes.
 
 Neither A/B nor chaining protects the first replacement of the working
-primary. Keep the replacement's official OTAFIX unchanged until recovery
-access and commissioning are qualified. See the
+primary. The selected bench route preloads the matched installer under the
+working vendor loader and verifies bounded APP/installer bytes before that
+replacement. SWD remains the recovery requirement if the canary then loses
+all USB access; optional automatic fault handling is deferred, not proven.
+Keep the vendor loader unchanged until the complete Sense role1 pair,
+ordinary recovery writers and ordered source sequence pass final review.
+See the
 [incident notes](lora_ota_bootloader_failure_notes.md) for the distinction
-between source findings and the unresolved original activation failure.
+between source findings, the supervised commissioning sequence and the
+unresolved original activation failure.
 
 ## Hardware and existing storage
 

@@ -169,19 +169,29 @@ been flashed on any unit:
 | P1: DFU return can strand the node in BLE DFU | An explicit escape skips the installer. When DFU returns, the primary's tail sets GPREGRET `0xA8`, which is itself another installer escape. The next boot therefore re-enters BLE DFU instead of validating the installer and APP. Clear the old double-reset marker and request a normal reset after DFU returns; the next boot must run the fresh installer gate, never reuse an earlier APP grant |
 | Fault recovery remains unqualified | The inherited HardFault handler loops. An installer fault before a watchdog is running can strand a remote node; local reset escape is not proof of automatic fault recovery |
 
-P1 is being corrected in a separate private source snapshot, with two-boot
-cases for each escape and DFU completion/reset/timeout. Preserve the vendor's
-app-requested serial/UF2 timeout separately from persistent recovery forced
-by an unusable installer. Neither this correction nor a reset-on-fault policy
-is established by the first prototype's single-boot escape cases.
+P1 is source-closed in the separate recovery-exit snapshot: an independent
+Make replay passed 1,024 two-boot cases and the compiled old-`0xA8` negative
+control. These are not hardware results. Preserve the vendor's app-requested
+serial/UF2 timeout separately from persistent recovery forced by an unusable
+installer.
+
+The same review found R1: the production installer requested recovery by
+resetting with GPREGRET `0x57`. The paired primary interprets that as an
+ordinary app-requested, three-second DFU session, then retries the failing
+installer. Live integration must instead return a stage-only recovery latch
+through the existing runtime ABI; every force-recovery call must stop before
+any subsequent write. This correction remains a first-bench prerequisite.
 
 BLE APP recovery and legitimate pending-update completion must remain
 available in the final primary; the limited serial/UF2 writer proof that
 refuses those paths is not accepted as complete. Recovery writes must use
 primary-local SDK invalidation/publication without QSPI or installer
 dependencies, and successful recovery must re-enter the fresh installer gate.
-ACL/S140 coexistence, complete recovery writes and real fault/reset timing
-remain unqualified.
+The preserving vendor-writer snapshot passed an independent Make replay of
+38 writer cases, five ordinary UF2 cases, four primary-only cases and 12
+compiled assertion controls. Those results do not establish the combined
+primary's ARM fit, integration or physical recovery behavior.
+ACL/S140 coexistence and physical fault/reset timing remain unqualified.
 
 Live integration must reduce only the nRF OTA internal install limit to
 643,072 bytes (`0x27000..0xC4000`). External image regions, identity/security
@@ -189,6 +199,49 @@ tails, journal, filesystems and scratch addresses stay fixed. Generic/ESP
 transfer limits and ordinary firmware linker limits must not be reduced as a
 side effect. The private test snapshot's globally reduced geometry is not
 evidence that those existing behaviors are preserved.
+
+### Selected development commissioning sequence
+
+After the user's development-hardware scope correction, Opus 5.5 and GPT-6
+Astra reviewed the source and ordered rollout. Keep the measured fixed
+primary/installer split and F1/F2/P1/R1 corrections; defer the optional
+fault/lockup layer and generalized legacy-compatibility machinery. Manual
+reset remains the first bench's fault escape, not an unattended-recovery
+guarantee. SWD is not a technical prerequisite for this supervised serial
+attempt, but no chaining arrangement protects the first primary replacement.
+Losing all USB recovery at that step would require SWD.
+
+Use `77CD...` as the canary and leave `4186...` as the working uploader:
+
+1. Under its working OTAFIX primary, establish healthy SDK state with no
+   pending legacy update and retain identity, preferences and the full ACL.
+2. Preload an ordinary APP-only serial image containing the known working
+   APP prefix, erased-byte padding and the matching fixed installer at
+   `0xC4000`. Enforce an erase end no later than `0xD4000`; the old vendor
+   admission ceiling is `0xEA000`, not our filesystem-preserving boundary.
+3. Compare only the authorized APP/installer bytes through `CURRENT.UF2`
+   before replacing the primary. Do not retain its filesystem blocks.
+4. Replace the matching primary once through bootloader-only serial DFU.
+   Low-APP staging erasure is expected. Its actual erase callback publishes
+   bank0 INVALID, CRC0 and size0; the new primary must finalize the identical
+   pending loader before the installer gate and remain in USB recovery.
+5. Restore the final ordinary APP-only firmware within 643,072 bytes. Verify
+   the installed image, configuration, installer capability and genuine
+   factory state, then run signed LoRa install/confirmation and rollback.
+
+The old serial APP publisher stores SDK CRC0 even when the package/transfer
+CRC is nonzero. Transport completion is not installed-byte evidence. A
+healthy restored APP may legitimately initialize factory counter0; an invalid
+or staging APP must not write the floor, and commissioning must not erase
+authoritative history or advance the counter.
+
+The fresh read-only baseline on October 3 retained both nodes' identities,
+radio preferences and the canary's complete ACL. The canary reported healthy
+bank0 VALID, bank1 `FF`, APP size 538,360, SDK CRC0/computed `B968`, and boot/
+parameter addresses `0xF4000`/`0xFE000`; both nodes still reported CACHE_ONLY.
+This is not an installed custom pair. Actual Sense role1 paired artifacts,
+one focused source-sequence case and final integrated review remain necessary
+before the first new flash.
 
 ## First SWD capture
 
