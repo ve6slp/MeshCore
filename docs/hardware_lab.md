@@ -806,6 +806,41 @@ remaining recovery-stack gate, but still does not prove RF delivery, signed
 installation, confirmation or rollback. Receiver builds must use this repair,
 not the preserved pre-fix cached image.
 
+**Repaired receiver images and actual uploader cache restart, Oct. 4, 2026:**
+three distinct ROLE1 APP-only packages were built from the same final repaired
+source tree `8c79d1f3ab83b0efe610386e084411333a4bed87`:
+
+| Label | BIN bytes | BIN SHA256 | CRC16 |
+| --- | ---: | --- | --- |
+| `ota-base02` | 537800 | `c594a61d8a73b337285bbe9ce7a7d010fc0bec93e05cae616b814792cb153528` | `521B` |
+| `ota-confirm02` | 537816 | `0d2199821968260e3aea076bf582b0f79ed28697f8adaac919e7a2708512cf98` | `3497` |
+| `ota-rollback02` | 537752 | `7508cf2a3ad11deae01262883d6065a0feb50bb0009fae3844975b200e195261` | `A13A` |
+
+Their packages contain no SoftDevice or BOOT segment and stay below the
+C4000 installer boundary. Selected ROLE1 ELF frames were inspected, but
+complete ROLE1 critical-path stack bounds remain a separate gate; the ROLE0
+3032-byte bound must not be assumed to apply to these different executables.
+
+ROOT intentionally replaced41's obsolete ABORTED generation8 cache with the
+new `ota-confirm02` image using the existing signed, explicit-reupload cache
+operation. At `21:51:56Z`, actual local STATUS reported CACHE_SEALED, OK,
+generation9, counter1,6403/6403 chunks and manifest hash
+`48c9eebe3e723495527291e5b667f4feb3ead91f4c01c7fe91dbf9439f003a1c`.
+An ordinary application reboot through `make lab-reset-client` observed
+disconnect and return of the exact41 APP. Fresh APP_START/diagnostics at
+`21:52:51Z` again reported qualified writes and INSTALL_CAPABLE with unchanged
+sequence1/counter0/extent0/hash0. At `21:52:53Z`, fresh local STATUS returned
+the same complete CACHE_SEALED generation9 tuple. Complete private protocol
+snapshots matched identity, settings, SelfInfo, all4 contacts including ACL
+flags, and all40 channel slots.
+
+The canonical counter1 is preparation metadata, not a measurement of77's
+confirmed floor. No RF START or COMMIT was sent. This is a durable uploader
+cache, explicitly noninstallable locally; it is not receiver READY, signed
+installation, confirmation or rollback. Existing private generation8 records
+remain as historical evidence.77 still requires recovery of the defective
+installed modified loader before the two-board RF outcome can proceed.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
