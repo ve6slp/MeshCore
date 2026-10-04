@@ -698,6 +698,34 @@ filesystem/QSPI/UICR/MBRparams read or primary transfer occurred in this
 qualification. Primary activation, full installed-primary hash, factoryfloor0
 and INSTALL_CAPABLE remain separate physical gates.
 
+**Actual41 primary bytes verified, APP health still incomplete:** ROOT made
+one matched BOOT-only transfer after a fresh complete compound/slot comparison.
+The operator confirmed one pin reset. Read-only capture at `18:52:59Z`
+Oct. 4, 2026 verified every40960 primary byte against
+`fff496269455f4e323779cffcaf3523b5557892fcecb29dd68f6906cf8d92eef`
+and the complete installer slot against `91c62360655a7e...`. Parsed CF2,
+ROLE0 XOBI, stage ABI and the primary's stage tuple also matched. INFO matched
+the compiled0.9.2-OTAFIX2.3-BP1.4 Sense/May21 2026/S1407.3.0 text.
+SDK then showed bank0/bank1 FF, zero sizes/start and an FF settings tail:
+no pending tuple was observed, but no valid APP or durable floor was inferred.
+
+The mandatory SAME550308/A69D APP transport subsequently completed and its
+normal USB identity appeared. It did **not** establish a working APP:
+independent APP_START and local STATUS requests timed out. A separate
+operator-confirmed single cold-start reset did not restore STATUS responses;
+the reviewed1200-bps/DTR diagnostic also failed to enter BOOT. No primary
+retry, shared-power operation or journal erase was performed.
+
+Selected-ELF startup analysis identifies a4136-byte live proof/hash call chain
+against the4096-byte loop task allocation, before command registration.
+That path is activated by the paired marker and was bypassed on stock BOOT.
+This is a compiled stack-budget defect; the actual fault PC is unmeasured.
+The APP-only fix must preserve full-window proof semantics and demonstrate
+bounded compiled stack use plus actual responsive hardware, not just
+enumeration. The verified primary remains intact. Final APP health,
+post-restoration SDK/factoryfloor0 and full userdata/cache preservation are
+still unqualified; this commissioning outcome is not complete.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
