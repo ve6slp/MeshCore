@@ -669,6 +669,35 @@ generation8, counter1, hash and reported6403 blocks. The measured raw64KiB
 baseline and typed provenance receipt are retained privately with0700/0600
 permissions. No primary or installer write occurred during this capture.
 
+**Actual41 compound/ordinary restoration and full readback, `18:40:01Z`
+Oct. 4, 2026:** ROOT used the reviewed host03 Sense ROLE0 pair/source release
+`e3af600c2946be76e4ae614c6f81d37a0aa6f3ec9118a1897d8e66d087a0d5ef`.
+Compound659548 and SAME ordinary550308 transfers completed, followed by
+fresh healthy550308/A69D SDK diagnostics and complete matching userdata.
+An initial userdata request timed out; a fresh read-only preflight and complete
+snapshot passed without another firmware transfer. `18:38:12Z` STATUS retained
+ABORTED generation8, counter1, manifest hash and reported6403 blocks.
+
+After explicit UF2 entry, the mount guard initially refused before any mount
+action because the MSC block was not yet ready. Exact current41 ancestry then
+exposed one whole block; ROOT mounted that block once, read-only, without a
+reset or unmount/remount. Bounded O_DIRECT reads validated every touched UF2
+record and compared every659548 compound byte plus all65536 installer bytes.
+The complete compound matched SHA256
+`5b40e31e1f7165f9b7a1a75770cd07847ac701a2652da42d884d39dbbba12f91`.
+Full-slot SHA256 was
+`91c62360655a7e05410be2438753602cb9a949c69ff89759f389bfca8bc5432d`:
+stage16476 matched `aa078fbc...`, padding throughC9000 was FF, and the measured
+C9000..D4000 baseline tail was unchanged. Thus the installed Seeed fork
+actually preserved this installer through the ordinary APP restoration;
+this is no longer only an upstream erase-range model.
+
+The exclusive0600 receipt binds the actual USB/block/mount, package/BIN/stage/
+baseline digests and all2768 validated record mappings. No raw APP dump,
+filesystem/QSPI/UICR/MBRparams read or primary transfer occurred in this
+qualification. Primary activation, full installed-primary hash, factoryfloor0
+and INSTALL_CAPABLE remain separate physical gates.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
@@ -683,7 +712,10 @@ make verify-xiao-ota-client41-bootloader-pair-packages
 
 ROOT must first retain actual41 primary/SDK evidence and the raw65536-byte
 installer-slot baseline C4000..D4000, associated with the captured device and
-unchanged read-only USB ancestry. Before primary transfer, arrange ONE
+unchanged read-only USB ancestry. For an already-frozen qualified pair, pass
+explicit `XIAO_OTA_CLIENT41_PAIR_DIR` and `XIAO_OTA_CLIENT41_PACKAGE_DIR` to
+the preload/primary aliases; their defaults do not select ROOT's host03 freeze.
+Before primary transfer, arrange ONE
 physical pin reset or an independently qualified target-only reset mechanism.
 The reviewed GP_A8 activation path can remain in unlimited BLE DFU with no
 USB endpoint; 1200-baud/DTR requires an enumerated APP and cannot rescue that
