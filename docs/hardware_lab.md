@@ -750,6 +750,29 @@ Cache ABORTED generation8 alone does not prove those journal conditions.
 Any non-genesis floor or nonterminal transaction evidence must stop the
 ordinary replacement rather than being silently reset.
 
+**Actual41 responsive paired APP checkpoint, Oct. 4, 2026 UTC:** one ordinary
+APP-only DFU installed the reviewed550580-byte stack repair (CRC5406, BIN
+`f955de00ded89c71c71372aea9b9a1b785d47ff5e566c94d9821468ed64478f3`).
+Its early-proof chain is3048 bytes, instead of4136, with unchanged4096-byte
+task allocation and proof semantics. The exact frozen source passed ROOT's
+focused native gate before this single APP transfer; BOOT was not rewritten.
+
+At `20:31:22Z`, actual APP_START returned SelfInfo and framed diagnostics
+reported `writes=allowed marker=qualified proof=qualified-state` and
+`INSTALL_CAPABLE`, with floor present, sequence1/counter0/extent0/hash0 and
+`io=ok`. At `20:31:54Z`, the real90-byte local STATUS returned OK and retained
+ABORTED cache generation8, counter1, hash `8eeecabd...` and6403/6403 chunks.
+The full private before/after protocol snapshots matched identity, settings,
+SelfInfo, all4 contacts including their ACL flags, and all40 channel slots.
+
+This establishes responsive paired BOOT+APP operation and actual unbound
+genesis admission, superseding the unmeasured APP/floor/preservation outcomes
+above. It supports the stack-overflow explanation; the live fault PC was not
+captured. This initial repair does not fix every recovery caller's stack
+budget. Signed installation remains gated on the final recovery-chain repair;
+no signed install, confirmation, automatic rollback or on-air success is
+claimed by this checkpoint.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands

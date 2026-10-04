@@ -363,6 +363,18 @@ erased. The observed pending-BOOT marker independently blocks APP
 preparation. No SDK repair, reset or further firmware transfer has been
 performed.
 
+ROOT repeated the exact read-only primary/SDK capture at `20:27:27Z`
+Oct. 4, 2026, after the operator reported77's slowly breathing red LED.
+All40960 primary bytes and the entire4096-byte SDK page had the same digests
+as the05:31 capture: primary `93df3f...`, SDK
+`20fee123b04cbab99703ee82990559df3254e28c5cf4008e2f35e7b7d30801fd`.
+Bank0 remained INVALID, bank1 VALID_BOOT, bootloader size40960 and SD/app
+sizes/start0. Exact77 USB and its read-only MSC volume remained available.
+The LED therefore agrees with a live recovery bootloader, not a dead USB
+device; it does not establish a working firmware-write path. No firmware
+write probe was repeated. The source-defined startup defect below remains
+applicable to the freshly verified installed bytes;77's repair does not gate41.
+
 Replaying the exact captured tuple against the selected pending handlers
 accepts SD image start0, validates the identical staged primary, clears
 bank1, and permits APP preparation when the modeled runtime services
