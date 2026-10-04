@@ -773,6 +773,17 @@ budget. Signed installation remains gated on the final recovery-chain repair;
 no signed install, confirmation, automatic rollback or on-air success is
 claimed by this checkpoint.
 
+Fresh APP_START and diagnostics at `20:58:59Z` still reported the same qualified
+state and INSTALL_CAPABLE floor0, without another flash or reset.
+INSTALL_CAPABLE is not receiver READY: the existing USB begin/put/seal commands
+stage an explicitly noninstallable uploader cache, local COMMIT refuses that
+purpose, and RF START rejects the self identity. No USB self-install path was
+added or assumed. Real signed installation, confirmation and failed-trial
+rollback therefore require a second working authorized RF peer, in addition
+to the recovery-chain repair. The existing ROLE1 receiver and nonconfirming
+candidate profiles provide that test path once77 is repaired through SWD.
+No compatible SWD probe was observed in the current USB inventory.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
