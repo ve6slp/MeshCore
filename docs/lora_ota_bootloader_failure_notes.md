@@ -359,10 +359,32 @@ the reviewed boot-only RAW SHA-256
 The SDK has bank0 INVALID (`FF`), CRC0 and size0; bank1 remains VALID_BOOT
 (`AA`), with bootloader size 40,960, SD/app sizes0 and SD image start0.
 The alignment word is0 and all bytes after the 28-byte settings record are
-erased. The observed pending-BOOT marker explains the shared APP-preparation
-refusal. Why pending finalization did not clear it is still under
-investigation; no SDK repair, reset or further firmware transfer has been
+erased. The observed pending-BOOT marker independently blocks APP
+preparation. No SDK repair, reset or further firmware transfer has been
 performed.
+
+Replaying the exact captured tuple against the selected pending handlers
+accepts SD image start0, validates the identical staged primary, clears
+bank1, and permits APP preparation when the modeled runtime services
+succeed. Changing the SDK start-address policy is therefore not justified.
+The initialization-order reproduction instead exposes the defect: on cold
+entry, early pending handling issues SDM SVC `0x12` before MBR service routing is
+initialized. The selected bootloader's SVC handler accepts peer-data SVC0
+but returns HANDLER_MISSING for that query. The strict SDK check sets sticky
+poison, leaves the captured settings unchanged, and forces USB; subsequent
+APP transfers also fail without writing APP data. Initializing routing
+later does not clear that poison. This source/native failure matches the
+physical observations; the lost hardware return code itself was not captured.
+
+Earlier native qualification always returned SUCCESS/disabled from the SDM
+leaf, supplying a runtime precondition that the real startup lacked. The
+correction must explicitly preserve cold-entry and B1 APP-jump routing
+state and keep initialized-service errors fatal. Unconditionally moving
+INIT_SD earlier is unsafe: the MBR operation executes the SD reset function,
+which must not run on a partially swapped SD. Pending-SD continuation must
+retain its original ordering. The current installed primary has no
+supported USB command to install the correction; reset alone repeats the
+defective startup.
 
 ## First SWD capture
 
