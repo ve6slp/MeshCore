@@ -30,6 +30,8 @@ uint32_t bootloader_dfu_sd_update_finalize(void);
 bool bootloader_app_is_valid(void);
 void bootloader_util_settings_get(const bootloader_settings_t **);
 bool xiao_ota_vendor_recovery_complete(void);
+uint32_t xiao_ota_vendor_sdk_boot_entry(bool);
+uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t);
 #else
 typedef struct { uint32_t bank_0; } bootloader_settings_t;
 static bootloader_settings_t sdk = {1};
@@ -99,6 +101,13 @@ static uint32_t sd_mbr_command(sd_mbr_command_t *command) {
   return init_sd_error;
 #endif
 }
+#ifndef PAIR_VENDOR_LIFECYCLE
+static uint32_t xiao_ota_vendor_sdk_boot_entry(bool routed) {
+  _sd_inited = routed;
+  return NRF_SUCCESS;
+}
+static uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t error) { return error; }
+#endif
 static void sd_softdevice_disable(void) {}
 #ifdef PAIR_VENDOR_LIFECYCLE
 static uint32_t xiao_ota_primary_init(void) { return lifecycle_sdk_init(); }
@@ -232,7 +241,6 @@ int main(int argc, char **argv) {
   fresh_runtime();
   mbr_init_sd();
   assert(_sd_inited && init_sd_calls == 1);
-  mock_power.GPREGRET = DFU_MAGIC_UF2_RESET;
   check_dfu_mode(true);
   assert(_sd_inited && init_sd_calls == 1);
   fresh_runtime(); mock_power.GPREGRET = DFU_MAGIC_OTA_APPJUM;

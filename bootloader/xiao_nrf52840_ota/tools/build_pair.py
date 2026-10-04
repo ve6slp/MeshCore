@@ -164,23 +164,29 @@ def prepare_primary(out, tree, board, role, stage):
         '#include "boards.h"\n#include "pair_abi.h"\n#include "pair_expected.h"\n'
         '#include "xiao_ota_primary.h"\n#include "xiao_ota_vendor.h"\n'
         '#include "xiao_ota_vendor_sdk.h"\n#include "bootloader_settings.h"\n'
+        "static uint32_t entry_gpregret;\n"
         "static bool pair_intact;\n"
         "void xiao_ota_primary_invalidate_app_grant(void) { pair_intact = false; }")
     text = text.replace("static void check_dfu_mode(void)",
                         "static void check_dfu_mode(bool pair_forced_recovery)")
     text = once(text, "  sd_mbr_command(&com);",
-        "  APP_ERROR_CHECK(sd_mbr_command(&com));\n  _sd_inited = true;")
-    text = once(text, "  board_init();",
-        "  _sd_inited = NRF_POWER->GPREGRET == DFU_MAGIC_OTA_APPJUM;\n\n"
-        "  board_init();")
+        "  APP_ERROR_CHECK(xiao_ota_vendor_sdk_sd_init_result(sd_mbr_command(&com)));\n"
+        "  _sd_inited = true;")
+    text = once(text, "int main(void) {",
+        "int main(void) {\n"
+        "  entry_gpregret = NRF_POWER->GPREGRET;\n"
+        "  APP_ERROR_CHECK(xiao_ota_vendor_sdk_boot_entry(\n"
+        "      entry_gpregret == DFU_MAGIC_OTA_APPJUM));\n")
+    text = once(text, "  uint32_t const gpregret = NRF_POWER->GPREGRET;",
+        "  uint32_t const gpregret = pair_forced_recovery ?\n"
+        "      DFU_MAGIC_UF2_RESET : entry_gpregret;")
     text = once(text,
         "  // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC\n"
         "  _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);",
         "  // Preserve the entry/INIT_SD phase even when recovery changes GPREGRET.")
-    primary = custom / "xiao_ota_primary.c"
-    primary.write_text(once(primary.read_text(),
-        "sd_softdevice_is_enabled(&enabled)",
-        "xiao_ota_vendor_sd_is_enabled(&enabled)"))
+    text = once(text, "      if (!_sd_inited) mbr_init_sd();\n"
+        "      _sd_inited = true;",
+        "      if (!_sd_inited) mbr_init_sd();")
     text = once(text, "  bootloader_init();",
         "  bootloader_init();\n  uint32_t pair_init = xiao_ota_primary_init();")
     text = once(text, "    bootloader_dfu_sd_update_continue();\n"
@@ -195,7 +201,7 @@ def prepare_primary(out, tree, board, role, stage):
     text = once(text, "  // Check all inputs and enter DFU if needed",
         "  uint32_t const prior_marker = *dbl_reset_mem;\n"
         "  bool const pin_reset = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) != 0;\n"
-        "  bool const escape = pair_explicit_escape(NRF_POWER->GPREGRET, pin_reset,\n"
+        "  bool const escape = pair_explicit_escape(entry_gpregret, pin_reset,\n"
         "                                          prior_marker, button_pressed(BUTTON_DFU));\n"
         "  bool const protected = pair_lock_protection();\n"
         "  pair_intact = false;\n"
@@ -275,7 +281,8 @@ def test_pair(out, vendor, board, role):
         generated[start:end].replace("int main(void)", "int vendor_main(void)", 1))
     grant = re.search(r"static bool pair_intact;\nvoid xiao_ota_primary_invalidate_app_grant\(void\) \{[^}]*\}", generated)
     assert grant
-    (folder / "primary_grant.inc").write_text(grant[0] + "\n")
+    (folder / "primary_grant.inc").write_text(
+        "static uint32_t entry_gpregret;\n" + grant[0] + "\n")
     shutil.copy2(out / "primary-source/src/xiao_ota/pair_expected.h", folder / "pair_expected.h")
     flags = ["-std=c11", "-D_GNU_SOURCE", "-O2", "-Wall", "-Wextra", "-Werror",
              "-Wno-unused-function", "-Wno-sign-compare",

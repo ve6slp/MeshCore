@@ -406,6 +406,18 @@ seven actual-caller lifecycle cases, including the captured SDK tuple,
 serial/UF2 restoration, stale-B1 refusal and pending-SD ordering.
 SVC routing, MBR/NVMC and QSPI hardware leaves were modeled, not run on77.
 
+The subsequent hardened correction supersedes that artifact: boot entry must
+be explicitly recorded or queries poison and fail closed; both later routing
+latch overrides are removed, and an MBR initialization failure poisons before
+the latch can advance. The primary query is wired directly in its source.
+Independent review closed this delta, and Root's exact-tree rebuild reproduced
+RAW SHA-256
+`00359046ef0b3668b1c46599933162961ce540d20e776798317c435506a438c5`,
+with 38,876/38,912 LOAD bytes and the same installer. Twelve actual-caller
+lifecycle cases passed, including unrecorded entry, stale B1 and failed MBR
+initialization from both APP and BLE callers. Neither correction has been
+installed on77.
+
 The restoration cases use a matching corrected staged primary. They do not
 establish that replacing only77's live primary is sufficient: its APP staging
 copy still contains Source21. Before any physical repair, qualify that original
@@ -414,6 +426,12 @@ pending-image binding and the exact repair write set without weakening it.
 has occurred. Delivering the correction requires the missing probe and
 explicit authorization for the bounded repair, then actual stock1.17.1
 version, identity, settings, full ACL and normal-peer confirmation.
+
+The operator subsequently authorized needed writes on both approved nRF
+devices, 41 and77, while continuing to exclude Pine. Write permission is no
+longer the blocker; the installed77 loader still has no supported USB route
+for this repair. The healthy41 remains available for APP, cache and radio
+qualification independently of the missing probe.
 
 ## First SWD capture
 

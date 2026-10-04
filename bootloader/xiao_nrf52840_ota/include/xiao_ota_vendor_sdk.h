@@ -14,6 +14,8 @@ typedef struct {
 } xiao_ota_vendor_sdk_config_t;
 
 uint32_t xiao_ota_vendor_sdk_init(const xiao_ota_vendor_sdk_config_t *config);
+uint32_t xiao_ota_vendor_sdk_boot_entry(bool routed);
+uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t error);
 uint32_t xiao_ota_vendor_sd_is_enabled(uint8_t *enabled);
 uint32_t xiao_ota_vendor_sdk_drain(void);
 bool xiao_ota_vendor_sdk_upload_begin(void);

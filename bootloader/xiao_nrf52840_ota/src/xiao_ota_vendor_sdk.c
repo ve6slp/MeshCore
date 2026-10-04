@@ -11,11 +11,34 @@ static xiao_ota_vendor_sdk_config_t config;
 static pstorage_handle_t settings_handle;
 static uint32_t words[6] __attribute__((aligned(4)));
 static bool initialized, poisoned, completed;
+static bool entry_captured;
 static uint32_t result;
 extern bool _sd_inited;
 
+uint32_t xiao_ota_vendor_sdk_boot_entry(bool routed) {
+  if (entry_captured || poisoned) {
+    poisoned = true;
+    return NRF_ERROR_INVALID_STATE;
+  }
+  _sd_inited = routed;
+  entry_captured = true;
+  return NRF_SUCCESS;
+}
+
+uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t error) {
+  if (!entry_captured || poisoned || error != NRF_SUCCESS) {
+    poisoned = true;
+    return error != NRF_SUCCESS ? error : NRF_ERROR_INVALID_STATE;
+  }
+  return NRF_SUCCESS;
+}
+
 uint32_t xiao_ota_vendor_sd_is_enabled(uint8_t *enabled) {
-  /* main establishes cold-reset/B1 entry before any query; INIT_SD advances it. */
+  if (!entry_captured || poisoned) {
+    poisoned = true;
+    return NRF_ERROR_INVALID_STATE;
+  }
+  /* Only the explicitly captured cold-reset entry establishes disabled SD. */
   if (!_sd_inited) {
     *enabled = 0;
     return NRF_SUCCESS;

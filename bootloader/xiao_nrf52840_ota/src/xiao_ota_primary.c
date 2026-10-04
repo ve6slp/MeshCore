@@ -51,7 +51,7 @@ static bool direct_app_operation(uint32_t address, size_t bytes) {
   uint8_t enabled = 1;
   return address >= XIAO_OTA_APP_START && address < XIAO_OTA_INSTALL_ALLOWED_END &&
          bytes <= XIAO_OTA_INSTALL_ALLOWED_END - address &&
-         sd_softdevice_is_enabled(&enabled) == NRF_SUCCESS && !enabled;
+         xiao_ota_vendor_sd_is_enabled(&enabled) == NRF_SUCCESS && !enabled;
 }
 
 bool xiao_ota_vendor_erase_page(uint32_t address) {
