@@ -44,8 +44,8 @@ class CompanionUf2 : public testing::Test {
   bool request(const std::vector<uint8_t>& frame, uint32_t now = 100) {
     return uf2::request(
         frame.data(), frame.size(), supported ? &pending : nullptr, local_usb,
-        mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs,
-        mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs,
+        supported ? mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs : 0,
+        supported ? mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs : 0,
         [this]() { return allowed(); }, [this, now]() { ++clock_queries; return now; },
         [this](Reply reply) { replies.push_back(reply); });
   }
@@ -101,6 +101,7 @@ TEST_F(CompanionUf2, UnsupportedProfileDoesNotQueryReadinessOrReset) {
   EXPECT_EQ(std::vector<Reply>{Reply::Unsupported}, replies);
   EXPECT_FALSE(pending.active);
   EXPECT_EQ(0u, permission_queries);
+  EXPECT_EQ(0u, clock_queries);
   EXPECT_EQ(0u, saves);
   EXPECT_EQ(0u, resets);
 }

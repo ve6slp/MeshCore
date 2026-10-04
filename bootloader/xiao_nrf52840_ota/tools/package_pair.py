@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline Sense ROLE1 compound APP preload and matching boot-only packages."""
+"""Offline literal Sense ROLE1/77 or explicitly selected ROLE0/41 paired packages."""
 import argparse
 import binascii
 import copy
@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import struct
 import subprocess
+import time
 import zipfile
 
 import build_pair as build
@@ -17,6 +18,9 @@ import install_uf2 as host
 
 CURRENT_APP_SHA256 = "69c961ff66602c865a3cf8b3855478a8191cfc605ed4d811e70a7cdcc9f18fd2"
 CURRENT_APP_BYTES = 538360
+CLIENT_APP_BYTES = 550308
+CLIENT_APP_SHA256 = "9f7f013ad118f501118aea8e7c234e5d989625443e93b5aa3349043588449733"
+CLIENT_APP_ZIP_SHA256 = "4b9813fd43489232eaa158f4cda21546bb42e37f17c85595b5e1972f32d8d0d9"
 
 
 def require(condition, message):
@@ -66,12 +70,14 @@ def package_payload(path, kind, expected=None):
         return raw, init
 
 
-def verify_pair(pair):
+def verify_pair(pair, *, client41=False):
+    require(type(client41) is bool, "client41 must be an explicit boolean profile")
+    role = 0 if client41 else 1
     manifest = read_json(pair / "pair-manifest.json")
     require((manifest["vendor_pin"], manifest["vendor_release"], manifest["actual_vendor_bsp"],
              manifest["logical_board"], manifest["role"]) ==
-            (build.PIN, build.RELEASE, "xiao_nrf52840_ble_sense", "xiao_nrf52840", 1),
-            "requires genuine pinned Sense BSP / logical Xiao ROLE1 pair")
+            (build.PIN, build.RELEASE, "xiao_nrf52840_ble_sense", "xiao_nrf52840", role),
+            f"requires genuine pinned Sense BSP / logical Xiao ROLE{role} pair")
     require(manifest["architecture"] == "fixed-otafix-primary-secondary" and
             manifest["optional_fault_layer"] == "excluded", "wrong selected architecture/layer")
     known = {str(p.relative_to(build.PRODUCT)) for p in build.PRODUCT.rglob("*")
@@ -93,7 +99,7 @@ def verify_pair(pair):
     require(36 <= len(stage) <= 65536 and len(stage) == detail["extent"] and
             binascii.crc32(stage) & 0xFFFFFFFF == detail["crc32"], "stage extent/CRC mismatch")
     require(struct.unpack("<9I", stage[:36]) ==
-            (0x3253464F, 1, 36, 0x584E3430, 1, len(stage), detail["entry"],
+            (0x3253464F, 1, 36, 0x584E3430, role, len(stage), detail["entry"],
              0x20020000, 0x20030000) and detail["entry"] == 0xC4041,
             "wrong fixed installer header/ABI")
     memory = build.ihex(pair / "primary.hex")
@@ -131,11 +137,11 @@ def verify_pair(pair):
             symbols["g_xiao_ota_boot_info"] == 0xFDC00, "vendor version/marker address mismatch")
     offset = symbols["paired_stage"] - 0xF4000
     require(struct.unpack("<5I", primary[offset:offset + 20]) ==
-            (0x584E3430, 1, len(stage), detail["entry"], detail["crc32"]),
+            (0x584E3430, role, len(stage), detail["entry"], detail["crc32"]),
             "primary compiled factory binding differs from stage")
     marker = primary[0x9C00:0x9C3C]
     fields = struct.unpack("<IHHIIIHH32sI", marker)
-    require(fields[:8] == (0x584F4249, 1, 60, 0x584E3430, 1, 1, 1, 1) and
+    require(fields[:8] == (0x584F4249, 1, 60, 0x584E3430, role, 1, 1, 1) and
             fields[-1] == binascii.crc32(marker[:-4]) & 0xFFFFFFFF, "invalid existing XOBI marker")
     public = {name: manifest[name] for name in
               ("currentSourceRelease", "vendor_pin", "vendor_release", "logical_board",
@@ -148,9 +154,12 @@ def verify_pair(pair):
     return primary, stage, public
 
 
-def compound_payload(app, stage):
-    require(len(app) == CURRENT_APP_BYTES and digest(app) == CURRENT_APP_SHA256,
-            "APP prefix is not immutable CURRENT538360")
+def compound_payload(app, stage, *, client41=False):
+    require(type(client41) is bool, "client41 must be an explicit boolean profile")
+    size, fingerprint = ((CLIENT_APP_BYTES, CLIENT_APP_SHA256) if client41 else
+                         (CURRENT_APP_BYTES, CURRENT_APP_SHA256))
+    require(len(app) == size and digest(app) == fingerprint,
+            "APP prefix is not immutable " + ("CLIENT41550308" if client41 else "CURRENT538360"))
     stack, reset = struct.unpack_from("<II", app)
     require(0x20000000 < stack <= 0x20040000 and stack % 8 == 0 and reset & 1 and
             0x27000 <= (reset & ~1) < 0x27000 + len(app), "invalid APP vectors")
@@ -182,14 +191,29 @@ def emit(args, kind, filename, raw, init):
     expected = copy.deepcopy(init)
     expected["firmware_crc16"] = binascii.crc_hqx(raw, 0xFFFF)
     require(actual == expected, "creator changed standard init profile")
+    if args.client41:
+        stamp = time.gmtime(read_json(args.pair / "pair-manifest.json")["source_date_epoch"])[:6]
+        with zipfile.ZipFile(package) as archive:
+            members = [(item, archive.read(item)) for item in
+                       sorted(archive.infolist(), key=lambda item: item.filename)]
+        with zipfile.ZipFile(package, "w") as archive:
+            for item, data in members:
+                item.date_time = stamp
+                archive.writestr(item, data)
+        require(package_payload(package, kind, raw)[1] == expected,
+                "reproducible ZIP changed standard init profile")
     return {"kind": kind, "raw": binary.name, "raw_sha256": digest(raw), "bytes": len(raw),
             "zip": package.name, "zip_sha256": build.sha(package), "init": actual}
 
 
 def run(args):
-    primary, stage, public = verify_pair(args.pair)
+    client41 = args.client41
+    primary, stage, public = verify_pair(args.pair, client41=client41)
     app, original_init = package_payload(args.app_package, "application")
-    compound = compound_payload(app, stage)
+    if client41:
+        require(build.sha(args.app_package) == CLIENT_APP_ZIP_SHA256,
+                "ordinary restore ZIP is not the immutable approved client41 package")
+    compound = compound_payload(app, stage, client41=client41)
     binding = dict(pair=public, app_prefix_sha256=digest(app), app_prefix_bytes=len(app),
                    input_app_zip_sha256=build.sha(args.app_package), app_start=0x27000,
                    stage_start=0xC4000, stage_bytes=len(stage), primary_start=0xF4000,
@@ -197,6 +221,8 @@ def run(args):
                    erase_end=(0x27000 + len(compound) + 4095) & ~4095,
                    boot_only_sha256=digest(primary), boot_only_bytes=len(primary),
                    hardware="NOT accessed; package/byte verification only")
+    if client41:
+        binding["commission_profile"] = "sense-role0-client41"
     if args.verify_only:
         existing = read_json(args.output / "package-manifest.json")
         packages = existing.pop("packages")
@@ -216,7 +242,8 @@ def run(args):
                     item["raw_sha256"] == digest(payload) and item["bytes"] == len(payload) and
                     (args.output / (name + ".bin")).read_bytes() == payload,
                     "package manifest/RAW/ZIP binding mismatch")
-        print("VERIFIED matching SenseROLE1 pair + immutable APP + APP-only compound/boot-only ZIPs")
+        print(f"VERIFIED matching SenseROLE{0 if client41 else 1} pair + immutable APP + "
+              "APP-only compound/boot-only ZIPs")
         return
     require(args.output.is_relative_to(build.ROOT / ".tmp/ota-boot-builds"),
             "output must stay in the project-owned build namespace")
@@ -240,6 +267,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--nrfutil", required=True)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--client41", action="store_true",
+                        help="only the literal approved Sense ROLE0/client41 APP/ZIP profile")
     args = parser.parse_args()
     args.pair, args.app_package, args.output = (
         p.resolve() for p in (args.pair, args.app_package, args.output))

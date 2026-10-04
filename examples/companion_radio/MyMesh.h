@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaFirmwareIntegration.h>
+#endif
 #include <helpers/ota/OtaUsbProtocol.h>
 
 namespace companion_usb_uf2 {
@@ -186,9 +188,10 @@ void tick(Pending& pending, uint32_t now, bool tx_active, bool outbound_queued,
 #include <helpers/BaseChatMesh.h>
 #include <helpers/TransportKeyStore.h>
 #include "helpers/ota/OtaTrialSafeIdentityBoot.h"
+#if MESHCORE_LORA_OTA
 #include "helpers/ota/OtaFirmwareService.h"
-#include "helpers/ota/OtaUsbProtocol.h"
 #include "helpers/ota/OtaRfUploader.h"
+#endif
 
 /* -------------------------------------------------------------------------------------- */
 

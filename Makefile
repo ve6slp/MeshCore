@@ -51,6 +51,11 @@ XIAO_OTA_PAIR_APP_PACKAGE ?=
 XIAO_OTA_PAIR_PACKAGE_DIR ?= $(XIAO_OTA_PAIR_DIR)-packages
 XIAO_OTA_PAIR_VERIFY_ONLY ?= 0
 XIAO_OTA_PAIR_TIMEOUT ?= 120
+XIAO_OTA_PAIR_CLIENT41 ?= 0
+XIAO_OTA_CLIENT41_PAIR_DIR ?= $(TMPDIR)/ota-boot-builds/sense-role0-client41-pair
+XIAO_OTA_CLIENT41_PACKAGE_DIR ?= $(XIAO_OTA_CLIENT41_PAIR_DIR)-packages
+XIAO_OTA_CLIENT41_APP_PACKAGE ?= $(CURDIR)/.tmp/live-app-contract/companion41-uf2-01/app-build/Xiao_nrf52_companion_radio_usb/firmware.zip
+XIAO_OTA_CLIENT41_BASELINE_SLOT ?=
 XIAO_OTA_PIN ?= c67f0bcf0fa8e841426335b1bbde91cda6ca1f50
 XIAO_OTA_SOURCE_DATE_EPOCH ?= 1779344629
 XIAO_OTA_PRIVATE_KEY ?=
@@ -418,6 +423,25 @@ commission-xiao-nrf52-target-primary: tmpdir
 
 enter-xiao-nrf52-target-bootloader: tmpdir
 	@$(LAB_DEVICE) bootloader target
+
+.PHONY: commission-xiao-nrf52-client41-preload lab-mount-xiao-nrf52-client41-commission-uf2 commission-xiao-nrf52-client41-primary
+commission-xiao-nrf52-client41-preload: tmpdir
+	$(LAB_DEVICE) commission-client-compound client \
+	  --preload-package "$(XIAO_OTA_CLIENT41_PACKAGE_DIR)/compound.zip" \
+	  --restore-package "$(XIAO_OTA_CLIENT41_APP_PACKAGE)" \
+	  --pair-manifest "$(XIAO_OTA_CLIENT41_PAIR_DIR)/pair-manifest.json" --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"
+
+lab-mount-xiao-nrf52-client41-commission-uf2:
+	$(LAB_DEVICE) mount-client-commission-uf2 client --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"
+
+commission-xiao-nrf52-client41-primary: tmpdir
+	@test -n "$(XIAO_OTA_CLIENT41_BASELINE_SLOT)" || \
+	  { echo "Set XIAO_OTA_CLIENT41_BASELINE_SLOT to ROOT's actual precommission raw64KiB C4000..D4000 capture." >&2; exit 1; }
+	$(LAB_DEVICE) commission-client-primary client \
+	  --package "$(XIAO_OTA_CLIENT41_PACKAGE_DIR)/bootloader.zip" \
+	  --preload-package "$(XIAO_OTA_CLIENT41_PACKAGE_DIR)/compound.zip" \
+	  --restore-package "$(XIAO_OTA_CLIENT41_APP_PACKAGE)" --baseline-slot "$(XIAO_OTA_CLIENT41_BASELINE_SLOT)" \
+	  --pair-manifest "$(XIAO_OTA_CLIENT41_PAIR_DIR)/pair-manifest.json" --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"
 
 configure-xiao-nrf52-ota-lab: tmpdir
 	python3 scripts/ota_rf_lab.py --artifact-dir $(OTA_LAB_ARTIFACT_DIR) --configure-only \
@@ -810,7 +834,9 @@ build-xiao-ota-bootloader-pair: tmpdir
 
 test-xiao-ota-bootloader-pair: tmpdir
 	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile test \
-	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)"
+	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)" \
+	  CLIENT41="$(XIAO_OTA_PAIR_CLIENT41)" \
+	  $(if $(strip $(XIAO_OTA_PAIR_APP_PACKAGE)),APP_PACKAGE="$(XIAO_OTA_PAIR_APP_PACKAGE)")
 
 verify-xiao-ota-bootloader-pair-packages: XIAO_OTA_PAIR_VERIFY_ONLY = 1
 verify-xiao-ota-bootloader-pair-packages: package-xiao-ota-bootloader-pair
@@ -821,7 +847,21 @@ package-xiao-ota-bootloader-pair: tmpdir
 	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile package-pair \
 	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)" \
 	  APP_PACKAGE="$(XIAO_OTA_PAIR_APP_PACKAGE)" PACKAGE_OUTPUT="$(XIAO_OTA_PAIR_PACKAGE_DIR)" \
-	  VERIFY_ONLY="$(XIAO_OTA_PAIR_VERIFY_ONLY)"
+	  VERIFY_ONLY="$(XIAO_OTA_PAIR_VERIFY_ONLY)" CLIENT41="$(XIAO_OTA_PAIR_CLIENT41)"
+
+CLIENT41_PAIR_TARGETS := build-xiao-ota-client41-bootloader-pair test-xiao-ota-client41-bootloader-pair \
+                        package-xiao-ota-client41-bootloader-pair verify-xiao-ota-client41-bootloader-pair-packages
+.PHONY: $(CLIENT41_PAIR_TARGETS)
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_BOARD = xiao_nrf52840_sense
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_ROLE_ID = 0
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_DIR = $(XIAO_OTA_CLIENT41_PAIR_DIR)
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_APP_PACKAGE = $(XIAO_OTA_CLIENT41_APP_PACKAGE)
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_PACKAGE_DIR = $(XIAO_OTA_CLIENT41_PACKAGE_DIR)
+$(CLIENT41_PAIR_TARGETS): XIAO_OTA_PAIR_CLIENT41 = 1
+build-xiao-ota-client41-bootloader-pair: build-xiao-ota-bootloader-pair
+test-xiao-ota-client41-bootloader-pair: test-xiao-ota-bootloader-pair
+package-xiao-ota-client41-bootloader-pair: package-xiao-ota-bootloader-pair
+verify-xiao-ota-client41-bootloader-pair-packages: verify-xiao-ota-bootloader-pair-packages
 
 build-xiao-ota-bootloader: fetch-xiao-ota-bootloader
 	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py --board "$(XIAO_OTA_BOARD)" --role-id "$(XIAO_OTA_ROLE_ID)" --source-dir "$(XIAO_OTA_UPSTREAM)" --work-dir "$(XIAO_OTA_WORK)"

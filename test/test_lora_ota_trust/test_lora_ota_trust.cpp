@@ -9,6 +9,9 @@
 #include <string>
 #include <memory>
 
+#define ED25519_NO_SEED 1
+#include <ed_25519.h>
+
 #include "ota/platform/FlashDevice.h"
 #include "ota/platform/FlashRegion.h"
 #include "ota/trust/Sha256.h"
@@ -61,6 +64,54 @@ std::string toHex(const uint8_t* data, size_t len) {
 }
 
 }  // namespace
+
+TEST(LegacyIdentityCrypto, OriginalKeypairAndSignatureMatchRfc8032) {
+  const auto seed = hexToBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+  uint8_t public_key[32], private_key[64], signature[64];
+  ed25519_create_keypair(public_key, private_key, seed.data());
+  EXPECT_EQ(toHex(public_key, sizeof(public_key)),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+  ed25519_sign(signature, nullptr, 0, public_key, private_key);
+  EXPECT_EQ(toHex(signature, sizeof(signature)),
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555f"
+            "b8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+}
+
+TEST(LegacyIdentityCrypto, ExpandedPrivateKeyDerivesOriginalPublicKeyAndSigns) {
+  const auto seed = hexToBytes("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+  uint8_t public_key[32], private_key[64], restored_private_key[64], derived_public_key[32];
+  ed25519_create_keypair(public_key, private_key, seed.data());
+  std::memcpy(restored_private_key, private_key, sizeof(private_key));
+  ed25519_derive_pub(derived_public_key, restored_private_key);
+  EXPECT_EQ(0, std::memcmp(public_key, derived_public_key, sizeof(public_key)));
+  EXPECT_EQ(toHex(derived_public_key, sizeof(derived_public_key)),
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+  const uint8_t message[] = {0x72};
+  uint8_t signature[64];
+  ed25519_sign(signature, message, sizeof(message), derived_public_key, restored_private_key);
+  EXPECT_EQ(toHex(signature, sizeof(signature)),
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085"
+            "ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+  ota::trust::Ed25519SignatureVerifier verifier;
+  EXPECT_TRUE(verifier.verify(signature, sizeof(signature), message, sizeof(message),
+                              derived_public_key, sizeof(derived_public_key)));
+  const uint8_t tampered[] = {0x73};
+  EXPECT_FALSE(verifier.verify(signature, sizeof(signature), tampered, sizeof(tampered),
+                               derived_public_key, sizeof(derived_public_key)));
+}
+
+TEST(LegacyIdentityCrypto, OriginalKeyExchangeRemainsBilateralAndNonzero) {
+  const auto alice_seed = hexToBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+  const auto bob_seed = hexToBytes("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+  uint8_t alice_public[32], alice_private[64], bob_public[32], bob_private[64];
+  ed25519_create_keypair(alice_public, alice_private, alice_seed.data());
+  ed25519_create_keypair(bob_public, bob_private, bob_seed.data());
+  uint8_t alice_secret[32], bob_secret[32], zero[32] = {};
+  ed25519_key_exchange(alice_secret, bob_public, alice_private);
+  ed25519_key_exchange(bob_secret, alice_public, bob_private);
+  EXPECT_EQ(0, std::memcmp(alice_secret, bob_secret, sizeof(alice_secret)));
+  EXPECT_NE(0, std::memcmp(alice_secret, zero, sizeof(alice_secret)));
+}
 
 TEST(Sha256KnownAnswer, EmptyString) {
   uint8_t digest[32];

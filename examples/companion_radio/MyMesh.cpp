@@ -4,17 +4,20 @@
 #include <algorithm>
 #include <cmath>
 #include <Mesh.h>
+#include <helpers/ota/OtaMeshHooks.h>
+#if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaBoardBackendCommon.h>
 #include <helpers/ota/OtaBlockSigning.h>
 #include <helpers/ota/OtaDirectLease.h>
-#include <helpers/ota/OtaMeshHooks.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
+#endif
 #if XIAO_OTA_COMPANION_USB_UF2
 #include <helpers/ArduinoSerialInterface.h>
 #include <helpers/MultiSerialInterface.h>
 extern MultiSerialInterface interface_manager;
 extern ArduinoSerialInterface usb_serial_interface;
 #endif
+#if MESHCORE_LORA_OTA
 __attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
   out = mesh::ota::OtaBootLifecycleEvidence();
   return false;
@@ -24,7 +27,6 @@ __attribute__((weak)) bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLif
                                                     ::ota::storage::OtaCandidateStore::Snapshot&) { return false; }
 #include <helpers/ota/OtaRfFrames.h>
 #include <helpers/ota/OtaRfUploader.h>
-#if MESHCORE_LORA_OTA
 #include <helpers/radiolib/OtaTrialRadioReadiness.h>
 #endif
 
@@ -1918,8 +1920,12 @@ void MyMesh::handleCmdFrame(size_t len) {
 #endif
   if (companion_usb_uf2::request(
           cmd_frame, len, uf2_pending, local_usb,
+#if XIAO_OTA_COMPANION_USB_UF2
           mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs,
           mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs,
+#else
+          0, 0,  // Unsupported profiles reject before consulting either deadline.
+#endif
           [this]() {
 #if XIAO_OTA_COMPANION_USB_UF2
             return uf2RebootAllowed();

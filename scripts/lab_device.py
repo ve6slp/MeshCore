@@ -454,13 +454,13 @@ class _StockInfoSnapshot:
         return "bounded INFO_UF2.TXT snapshot"
 
 
-def _sense_target_device(mode: str = MODE_BOOT) -> Device:
+def _sense_commission_device(role: str, mode: str) -> Device:
     tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
     sys.path.insert(0, str(tools))
     import install_uf2
 
-    device = resolve("target", mode)
-    serial = APPROVED_ADMIN_PAIR["target"]
+    device = resolve(role, mode)
+    serial = APPROVED_ADMIN_PAIR[role]
     _validate_uf2_identity(device, serial)
     matches = [candidate for candidate in discover() if candidate.serial == serial]
     if len(matches) != 1 or matches[0] != device:
@@ -480,6 +480,14 @@ def _sense_target_device(mode: str = MODE_BOOT) -> Device:
     return device
 
 
+def _sense_target_device(mode: str = MODE_BOOT) -> Device:
+    return _sense_commission_device("target", mode)
+
+
+def _sense_client_device(mode: str = MODE_BOOT) -> Device:
+    return _sense_commission_device("client", mode)
+
+
 @dataclass(frozen=True)
 class _ReadOnlyTargetVolume:
     path: Path
@@ -489,10 +497,9 @@ class _ReadOnlyTargetVolume:
     block_link: Path
 
 
-def _read_only_target_volume(device: Device) -> _ReadOnlyTargetVolume:
+def _read_only_commission_volume(device: Device, serial: str) -> _ReadOnlyTargetVolume:
     import install_uf2
 
-    serial = APPROVED_ADMIN_PAIR["target"]
     if not _has_msc_interface(device):
         raise ValueError("approved target bootloader must expose its own MSC class08 interface")
     volumes = install_uf2.matching_mounts(serial, MOUNTINFO, SYS_DEV_BLOCK)
@@ -518,6 +525,14 @@ def _read_only_target_volume(device: Device) -> _ReadOnlyTargetVolume:
             or device.sysfs.resolve() not in block_link.resolve().parents):
         raise ValueError("mounted target volume ancestry does not match the approved target USB node")
     return _ReadOnlyTargetVolume(volume, mount_text, options, super_options, block_link)
+
+
+def _read_only_target_volume(device: Device) -> _ReadOnlyTargetVolume:
+    return _read_only_commission_volume(device, APPROVED_ADMIN_PAIR["target"])
+
+
+def _read_only_client_volume(device: Device) -> _ReadOnlyTargetVolume:
+    return _read_only_commission_volume(device, APPROVED_ADMIN_PAIR["client"])
 
 
 def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
@@ -751,6 +766,15 @@ def _commission_guard(args: argparse.Namespace) -> None:
         raise SystemExit("paired commissioning requires the literal approved target serial 77CD44653A967172")
 
 
+def _client_commission_guard(args: argparse.Namespace) -> None:
+    if args.role != "client":
+        raise SystemExit("client41 commissioning is authorized for the client role only")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise SystemExit("client41 commissioning timeout must be finite and positive")
+    if load_roles().get("client") != APPROVED_ADMIN_PAIR["client"]:
+        raise SystemExit("client41 commissioning requires literal approved serial 4186AE911D94CDB1")
+
+
 def _commission_preload(args: argparse.Namespace, package: Path) -> bytes:
     tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
     sys.path.insert(0, str(tools))
@@ -780,6 +804,42 @@ def cmd_commission_compound(args: argparse.Namespace) -> int:
     return 0
 
 
+def _client_preload(args: argparse.Namespace) -> bytes:
+    tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
+    sys.path.insert(0, str(tools))
+    from commission_pair import validate_client_preload_packages
+
+    restore = Path(args.restore_package)
+    expected = validate_client_preload_packages(
+        Path(args.preload_package), Path(args.pair_manifest), restore)
+    validate_application_package(restore)
+    return expected
+
+
+def cmd_client_commission_compound(args: argparse.Namespace) -> int:
+    """Compound, then the SAME selected ordinary APP to restore legal SDK extent."""
+    _client_commission_guard(args)
+    try:
+        expected = _client_preload(args)
+        script = _nrfutil_script()
+        _sense_client_device("any")
+        for package in (Path(args.preload_package), Path(args.restore_package)):
+            port = cmd_bootloader_port("client", args.timeout)
+            if _sense_client_device().by_id != port:
+                raise ValueError("client41 DFU port changed before transfer")
+            _serial_dfu(package, port, script, timeout=args.timeout)
+            ready = wait_for("client", MODE_APP, args.timeout)
+            if _sense_client_device(MODE_APP) != ready:
+                raise ValueError("client41 APP identity changed after transport")
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, struct.error) as exc:
+        raise SystemExit(f"refusing client41 compound/ordinary commissioning: {exc}") from exc
+    print(f"client41 compound ({len(expected)} bytes) and SAME ordinary APP transports complete; "
+          "APP enumerated; installed bytes/SDK extent not yet verified. "
+          "ROOT: explicit UF2, read-only mount and full compound + 64KiB slot readback "
+          "are required before any primary transfer.")
+    return 0
+
+
 def _identity_token(path: Path, *, follow: bool = True) -> tuple[int, int, int, int]:
     metadata = path.stat() if follow else path.lstat()
     return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_rdev
@@ -795,7 +855,7 @@ def _volume_identity(device: Device, mounted: _ReadOnlyTargetVolume) -> tuple:
                               mounted.block_link, mounted.path))
 
 
-def _commission_block_device(device: Device) -> tuple[Path, Path]:
+def _commission_block_device(device: Device, *, client41=False) -> tuple[Path, Path]:
     import install_uf2
 
     if not _has_msc_interface(device):
@@ -806,7 +866,8 @@ def _commission_block_device(device: Device) -> tuple[Path, Path]:
     if len(links) != 1:
         raise ValueError(f"expected one unambiguous target USB block device, found {len(links)}")
     link = links[0]
-    if install_uf2.usb_serial_ancestor(link) != APPROVED_ADMIN_PAIR["target"]:
+    serial = APPROVED_ADMIN_PAIR["client" if client41 else "target"]
+    if install_uf2.usb_serial_ancestor(link) != serial:
         raise ValueError("block device ancestry does not match the approved target serial")
     block = link.resolve(strict=True)
     fields = {}
@@ -831,21 +892,35 @@ def _commission_block_device(device: Device) -> tuple[Path, Path]:
 def cmd_mount_commission_uf2(args: argparse.Namespace) -> int:
     """Mount only the approved already-BOOT+MSC target read-only; never remount."""
     _commission_guard(args)
+    return _mount_commission_uf2(args)
+
+
+def cmd_mount_client_commission_uf2(args: argparse.Namespace) -> int:
+    """Explicit literal41 already-BOOT+MSC read-only mount; never remount."""
+    _client_commission_guard(args)
+    return _mount_commission_uf2(args, client41=True)
+
+
+def _mount_commission_uf2(args: argparse.Namespace, *, client41=False) -> int:
+    sense = _sense_client_device if client41 else _sense_target_device
+    volume = _read_only_client_volume if client41 else _read_only_target_volume
+    serial = APPROVED_ADMIN_PAIR["client" if client41 else "target"]
     try:
-        device = _sense_target_device()
+        device = sense()
         import install_uf2
 
-        block, link = _commission_block_device(device)
+        block, link = (_commission_block_device(device, client41=True) if client41 else
+                       _commission_block_device(device))
         tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
         paths = (device.sysfs, device.by_id, tty_link, link, block)
         identity = tuple((_identity_token(path, follow=False), _identity_token(path))
                          for path in paths)
         mounts = install_uf2.matching_mounts(
-            APPROVED_ADMIN_PAIR["target"], MOUNTINFO, SYS_DEV_BLOCK)
+            serial, MOUNTINFO, SYS_DEV_BLOCK)
         existing = None
         if mounts:
             try:
-                existing = _read_only_target_volume(device)
+                existing = volume(device)
             except ValueError as exc:
                 raise ValueError(f"existing target mount refused; no automatic unmount/remount: {exc}") from exc
         else:
@@ -854,12 +929,14 @@ def cmd_mount_commission_uf2(args: argparse.Namespace) -> int:
             if rc != 0:
                 raise ValueError(f"udisksctl read-only mount failed (exit {rc}); "
                                  f"no retry or remount: {output}")
-        final_device = _sense_target_device()
-        if (final_device != device or _commission_block_device(final_device) != (block, link)
+        final_device = sense()
+        final_block = (_commission_block_device(final_device, client41=True) if client41 else
+                       _commission_block_device(final_device))
+        if (final_device != device or final_block != (block, link)
                 or tuple((_identity_token(path, follow=False), _identity_token(path))
                          for path in paths) != identity):
             raise ValueError("target USB/block identity changed during read-only mounting")
-        mounted = _read_only_target_volume(final_device)
+        mounted = volume(final_device)
         if existing is not None and mounted != existing:
             raise ValueError("existing read-only target mount records changed")
     except (OSError, ValueError) as exc:
@@ -868,13 +945,21 @@ def cmd_mount_commission_uf2(args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_compound_current(expected: bytes) -> Device:
+def _read_compound_current(
+        expected: bytes, *, client41=False, baseline_slot: bytes | None = None) -> Device:
     """Seek only to APP/installer UF2 blocks; never read the virtual filesystem spans."""
-    from commission_pair import APP_START, STAGE_END, verify_compound_preload_readback
+    from commission_pair import (APP_START, STAGE_END, verify_compound_preload_readback,
+                                 verify_client_preload_readback)
     import install_uf2
 
-    device = _sense_target_device()
-    mounted = _read_only_target_volume(device)
+    if client41 and (baseline_slot is None or len(baseline_slot) != 65536):
+        raise ValueError("client41 requires an actual full 64KiB installer baseline")
+    sense = _sense_client_device if client41 else _sense_target_device
+    volume = _read_only_client_volume if client41 else _read_only_target_volume
+    device = sense()
+    mounted = volume(device)
+    if client41:
+        _validate_client_stock_info(mounted)
     identity = _volume_identity(device, mounted)
     current = mounted.path / "CURRENT.UF2"
     descriptor = os.open(current, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -886,7 +971,8 @@ def _read_compound_current(expected: bytes) -> Device:
 
         def read_at(address: int, count: int) -> bytes:
             if (type(address) is not int or type(count) is not int or not 0 < count <= 4096
-                    or address < APP_START or address + count > APP_START + len(expected)
+                    or address < APP_START
+                    or address + count > (STAGE_END if client41 else APP_START + len(expected))
                     or address + count > STAGE_END):
                 raise ValueError("CURRENT.UF2 callback exceeds authorized bounded APP/installer read")
             result = bytearray()
@@ -906,11 +992,14 @@ def _read_compound_current(expected: bytes) -> Device:
                 result.extend(block[32 + first:32 + last])
             return bytes(result)
 
-        verify_compound_preload_readback(read_at, expected)
+        if client41:
+            verify_client_preload_readback(read_at, expected, baseline_slot)
+        else:
+            verify_compound_preload_readback(read_at, expected)
         if MOUNTINFO.read_text(encoding="utf-8") != mounted.mount_text:
             raise ValueError("mount records changed during compound readback")
-        final_device = _sense_target_device()
-        final_mount = _read_only_target_volume(final_device)
+        final_device = sense()
+        final_mount = volume(final_device)
         if (final_device != device or final_mount != mounted
                 or _volume_identity(final_device, final_mount) != identity
                 or _identity_token(current, follow=False) != (
@@ -920,6 +1009,64 @@ def _read_compound_current(expected: bytes) -> Device:
     finally:
         os.close(descriptor)
     return device
+
+
+def _validate_client_stock_info(mounted: _ReadOnlyTargetVolume) -> None:
+    import install_uf2
+
+    path = mounted.path / "INFO_UF2.TXT"
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("client41 INFO must be a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(STOCK_INFO_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > STOCK_INFO_MAX_BYTES or b"\0" in data:
+        raise ValueError("invalid bounded client41 stock INFO")
+    text = data.decode("utf-8")
+    snapshot = _StockInfoSnapshot(text)
+    install_uf2.validate_stock_info(snapshot)
+    if (install_uf2.board_id(snapshot) != "Seeed_XIAO_nRF52840_Sense"
+            or [line for line in text.splitlines() if line.startswith("Date:")] !=
+            ["Date: Nov 12 2021"]):
+        raise ValueError("client41 requires exact observed Sense stock0.6.1 Nov12 2021 profile")
+
+
+def cmd_client_commission_primary(args: argparse.Namespace) -> int:
+    """Literal41 primary only AFTER actual full compound and slot verification."""
+    _client_commission_guard(args)
+    try:
+        expected = _client_preload(args)
+        with Path(args.baseline_slot).open("rb") as stream:
+            baseline = stream.read(65537)
+        if len(baseline) != 65536:
+            raise ValueError("client41 requires an actual full 64KiB installer baseline")
+        import package_pair
+
+        primary, stage, _ = package_pair.verify_pair(
+            Path(args.pair_manifest).parent, client41=True)
+        if package_pair.compound_payload(
+                expected[:package_pair.CLIENT_APP_BYTES], stage, client41=True) != expected:
+            raise ValueError("client41 paired stage changed before primary")
+        if len(primary) != 40960:
+            raise ValueError("client41 matched primary RAW must be exactly 40960 bytes")
+        package = Path(args.package)
+        _, init = package_pair.package_payload(package, "bootloader", primary)
+        if init["application_version"] != 0x902 or init["device_revision"] != 52840:
+            raise ValueError("bootloader standard init does not match Sense ROLE0")
+        script = _nrfutil_script()
+        device = _read_compound_current(expected, client41=True, baseline_slot=baseline)
+        print("client41 full compound AND full64KiB installer slot readback verified; "
+              "transferring matched bootloader-only primary.", flush=True)
+        _serial_dfu(package, device.by_id, script, timeout=args.timeout)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, struct.error) as exc:
+        raise SystemExit(f"refusing client41 primary commissioning: {exc}") from exc
+    print("client41 bootloader-only transport complete; activation/installed primary SHA unverified. "
+          "Final ordinary APP restoration is still required: low APP staging overwrites27000..31000. "
+          "ROOT owns activation/reset observation; no automatic retry, reset or power-cycle.")
+    return 0
 
 
 def cmd_commission_primary(args: argparse.Namespace) -> int:
@@ -1104,6 +1251,11 @@ def main() -> int:
     mount.add_argument("role", choices=["target"])
     mount.add_argument("--timeout", type=float, default=30.0)
     mount.set_defaults(func=cmd_mount_commission_uf2)
+    client_mount = sub.add_parser("mount-client-commission-uf2",
+                                  help="literal41 already-BOOT+MSC read-only mount")
+    client_mount.add_argument("role", choices=["client"])
+    client_mount.add_argument("--timeout", type=float, default=30.0)
+    client_mount.set_defaults(func=cmd_mount_client_commission_uf2)
     stock = sub.add_parser("inspect-stock-bootloader",
                            help="read approved target stock Sense INFO from an already read-only mounted MSC; no serial or writes")
     stock.add_argument("role", choices=["target"])
@@ -1124,6 +1276,20 @@ def main() -> int:
         if name == "commission-primary":
             commission.add_argument("--preload-package", required=True)
         commission.set_defaults(func=handler)
+    for name, handler in (
+            ("commission-client-compound", cmd_client_commission_compound),
+            ("commission-client-primary", cmd_client_commission_primary)):
+        client = sub.add_parser(name, help="explicit literal Sense ROLE0/client41 commissioning")
+        client.add_argument("role", choices=["client"])
+        client.add_argument("--preload-package", required=True)
+        client.add_argument("--restore-package", required=True)
+        client.add_argument("--pair-manifest", required=True)
+        client.add_argument("--timeout", type=float, default=120.0)
+        if name == "commission-client-primary":
+            client.add_argument("--package", required=True)
+            client.add_argument("--baseline-slot", required=True,
+                                help="ROOT's actual precommission C4000..D4000 raw64KiB capture")
+        client.set_defaults(func=handler)
     cycle = add_role_command("power-cycle", cmd_power_cycle, mode_default=MODE_APP,
                              help_text="cut and restore USB port power")
     cycle.add_argument("--delay", type=int, default=3, help="seconds to stay powered down")

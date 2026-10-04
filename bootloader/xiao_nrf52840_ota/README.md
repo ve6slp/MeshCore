@@ -113,6 +113,60 @@ at most 4096-byte reads, including the FF gap and actual stage. MBR, SoftDevice,
 filesystems, primary/configuration and SDK settings are never requested.
 Neither function opens a device, selects a programmer or creates a flash archive.
 
+### Explicit Sense ROLE0 / client41 commissioning
+
+The separate `CLIENT41=1` / `--client41` package profile permits only the genuine
+Sense ROLE0 pair and the selected 550308-byte APP
+`9f7f013ad118f501118aea8e7c234e5d989625443e93b5aa3349043588449733`
+in its exact ordinary ZIP
+`4b9813fd43489232eaa158f4cda21546bb42e37f17c85595b5e1972f32d8d0d9`.
+The default remains the original ROLE1/538360 profile. Neither option admits
+arbitrary roles, board profiles or APPs. Root Make provides
+`build-xiao-ota-client41-bootloader-pair`,
+`test-xiao-ota-client41-bootloader-pair`,
+`package-xiao-ota-client41-bootloader-pair` and
+`verify-xiao-ota-client41-bootloader-pair-packages`; fresh outputs are selected
+by `XIAO_OTA_CLIENT41_PAIR_DIR` and `XIAO_OTA_CLIENT41_PACKAGE_DIR`.
+New client41 archives retain nrfutil's exact standard member bytes, with
+sorted entries and timestamps taken from the paired build's source-date epoch
+for byte-reproducible ZIPs. Selected ordinary input ZIPs and default ROLE1
+archive production are unchanged.
+
+`validate_client_preload_packages(package: Path, pair_manifest: Path,
+restore_package: Path) -> bytes` validates BOTH the compound and SAME selected
+ordinary restore package before transport. `verify_client_preload_readback(
+read_at, expected, baseline_slot: bytes) -> None` additionally requires ROOT's
+actual precommission **raw 65536-byte C4000..D4000 capture**, not JSON or UF2.
+The callback reads at most4096 bytes per request: the entire compound, then
+the entire slot. Expected slot bytes are the actual measured paired stage
+plus word padding, FF through the compound's rounded erase boundary
+(currently C9000), and the unchanged captured remainder through D4000.
+No filesystem or primary read is requested, and captured-tail provenance
+remains ROOT's responsibility.
+
+The literal `4186AE911D94CDB1` transport commands are separate from77:
+`commission-client-compound client --preload-package ... --restore-package ...
+--pair-manifest ...`, `mount-client-commission-uf2 client`, and
+`commission-client-primary client --package ... --preload-package ...
+--restore-package ... --pair-manifest ... --baseline-slot ...`.
+The preload command performs compound APP-only DFU, APP enumeration, SAME
+ordinary550308 APP-only DFU, then APP enumeration. Restoring the ordinary
+SDK extent **before** explicit UF2 is essential: compound659548 exceeds the
+unchanged643072 runtime write ceiling and denies the APP's UF2 command.
+The CDC1200 serial entry does not weaken that runtime gate. ROOT separately
+requests the existing companion USB `0x13 + "reboot uf2"` operation.
+
+Primary transport is fail-closed until the exact41 Sense BOOT0045/MSC,
+stable whole-volume read-only mount, observed stock0.6.1/S1407.3.0/
+Nov12 2021 INFO profile and both full readbacks pass. It sends only the
+matched40960-byte BOOT-only package. APP enumeration and `Device programmed.`
+are transport observations, not SDK, primary SHA or activation proof.
+There is no automatic reset, power-cycle, retry, unmount or remount.
+BOOT staging overwrites low APP27000..31000; ROOT must subsequently restore
+the SAME ordinary APP and independently observe activation/userdata.
+Upstream stock0.6.1 ordinary-erase range modelling is not proof of the installed
+Seeed fork: actual full compound/slot comparison is mandatory.
+
 The older monolithic preparation/package targets and historical sections below
 are **not** the selected pair recipe. Do not deploy their output as this pair.
 

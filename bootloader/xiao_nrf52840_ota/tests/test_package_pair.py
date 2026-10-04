@@ -20,6 +20,7 @@ class PackagePairTest(unittest.TestCase):
     def setUp(self):
         self.pair = Path(os.environ["XIAO_TEST_PAIR_DIR"])
         self.app = Path(os.environ["XIAO_TEST_APP_PACKAGE"])
+        self.client41 = os.environ.get("XIAO_TEST_CLIENT41", "0") == "1"
         self.workspace = tempfile.TemporaryDirectory(dir=self.pair / "scratch")
         self.addCleanup(self.workspace.cleanup)
         self.work = Path(self.workspace.name)
@@ -27,7 +28,13 @@ class PackagePairTest(unittest.TestCase):
     def arguments(self, output="packages"):
         return argparse.Namespace(
             pair=self.pair, app_package=self.app, output=self.work / output,
-            nrfutil=os.environ["XIAO_TEST_NRFUTIL"], verify_only=False)
+            nrfutil=os.environ["XIAO_TEST_NRFUTIL"], verify_only=False, client41=self.client41)
+
+    def validate_preload(self, path):
+        if self.client41:
+            return commission.validate_client_preload_packages(
+                path, self.pair / "pair-manifest.json", self.app)
+        return commission.validate_compound_preload_package(path, self.pair / "pair-manifest.json")
 
     def test_real_creator_exact_pair_payload_and_standard_init(self):
         args = self.arguments()
@@ -48,14 +55,25 @@ class PackagePairTest(unittest.TestCase):
         boot, _ = package.package_payload(args.output / "bootloader.zip", "bootloader")
         self.assertEqual(boot, (self.pair / "primary-boot-only.bin").read_bytes())
         self.assertEqual(self.app.read_bytes(), original)
-        self.assertEqual(commission.validate_compound_preload_package(
-            args.output / "compound.zip", self.pair / "pair-manifest.json"), compound)
+        self.assertEqual(self.validate_preload(args.output / "compound.zip"), compound)
         with self.assertRaises(ValueError):
-            commission.validate_compound_preload_package(
-                args.output / "bootloader.zip", self.pair / "pair-manifest.json")
+            self.validate_preload(args.output / "bootloader.zip")
         with self.assertRaisesRegex(ValueError, "exact matched"):
-            commission.validate_compound_preload_package(
-                self.app, self.pair / "pair-manifest.json")
+            self.validate_preload(self.app)
+        if self.client41:
+            replay = self.arguments("replayed-packages")
+            package.run(replay)
+            for name in ("compound.zip", "bootloader.zip"):
+                self.assertEqual((args.output / name).read_bytes(),
+                                 (replay.output / name).read_bytes())
+            with self.assertRaisesRegex(ValueError, "ROLE1"):
+                commission.validate_compound_preload_package(
+                    args.output / "compound.zip", self.pair / "pair-manifest.json")
+            wrong = self.work / "wrong-ordinary.zip"
+            wrong.write_bytes(self.app.read_bytes() + b"extra")
+            with self.assertRaisesRegex(ValueError, "immutable approved"):
+                commission.validate_client_preload_packages(
+                    args.output / "compound.zip", self.pair / "pair-manifest.json", wrong)
         self.check_preload_readback(compound)
         for offset in (len(app), offset):
             changed = bytearray(compound)
@@ -63,8 +81,7 @@ class PackagePairTest(unittest.TestCase):
             path = self.work / f"corrupt-{offset}.zip"
             self.rewrite_application_zip(args.output / "compound.zip", path, changed)
             with self.assertRaisesRegex(ValueError, "exact matched"):
-                commission.validate_compound_preload_package(
-                    path, self.pair / "pair-manifest.json")
+                self.validate_preload(path)
         args.verify_only = True
         package.run(args)
         with self.assertRaisesRegex(ValueError, "overwrite"):
@@ -112,13 +129,42 @@ class PackagePairTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bounds"):
             commission.verify_compound_preload_readback(read_at, compound[:0x9D000])
 
+    def test_client_full_installer_slot_readback_retains_actual_baseline_tail(self):
+        app, _ = package.package_payload(self.app, "application")
+        stage = (self.pair / "stage2/stage2.bin").read_bytes()
+        compound = package.compound_payload(app, stage, client41=self.client41)
+        baseline = bytes(index % 251 for index in range(65536))
+        erased = ((0x27000 + len(compound) + 4095) & ~4095) - 0xC4000
+        slot = stage + b"\xff" * (erased - len(stage)) + baseline[erased:]
+        memory = compound[:0x9D000] + slot
+        reads = []
+
+        def read_at(address, count):
+            self.assertGreaterEqual(address, 0x27000)
+            self.assertLessEqual(address + count, 0xD4000)
+            self.assertLessEqual(count, 4096)
+            reads.append((address, count))
+            return memory[address - 0x27000:address - 0x27000 + count]
+
+        commission.verify_client_preload_readback(read_at, compound, baseline)
+        self.assertIn((0xD3000, 4096), reads)
+        with self.assertRaisesRegex(ValueError, "actual full 64KiB"):
+            commission.verify_client_preload_readback(read_at, compound, baseline[:-1])
+        for offset in (len(compound), 0xC9000 - 0x27000, len(memory) - 1):
+            damaged = bytearray(memory)
+            damaged[offset] ^= 1
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "slot/baseline"):
+                commission.verify_client_preload_readback(
+                    lambda address, count: damaged[address - 0x27000:address - 0x27000 + count],
+                    compound, baseline)
+
     def test_current_prefix_and_stage_bounds_fail_before_output(self):
         app, _ = package.package_payload(self.app, "application")
-        with self.assertRaisesRegex(ValueError, "CURRENT538360"):
-            package.compound_payload(app[:-4], b"\xff" * 36)
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            package.compound_payload(app[:-4], b"\xff" * 36, client41=self.client41)
         with self.assertRaisesRegex(ValueError, "beyond"):
-            package.compound_payload(app, b"\xff" * (65536 + 4))
-        self.assertEqual(len(package.compound_payload(app, b"\xff" * 65536)),
+            package.compound_payload(app, b"\xff" * (65536 + 4), client41=self.client41)
+        self.assertEqual(len(package.compound_payload(app, b"\xff" * 65536, client41=self.client41)),
                          0xD4000 - 0x27000)
 
     def test_wrong_role_and_stage_corruption_rejected(self):
@@ -130,14 +176,14 @@ class PackagePairTest(unittest.TestCase):
         shutil.copy2(self.pair / "stage2/stage2.bin", clone / "stage2/stage2.bin")
         original = package.read_json(clone / "pair-manifest.json")
         wrong = copy.deepcopy(original)
-        wrong["role"] = 0
+        wrong["role"] = 1 if self.client41 else 0
         (clone / "pair-manifest.json").write_text(json.dumps(wrong))
-        with self.assertRaisesRegex(ValueError, "ROLE1"):
-            package.verify_pair(clone)
+        with self.assertRaisesRegex(ValueError, "ROLE"):
+            package.verify_pair(clone, client41=self.client41)
         (clone / "pair-manifest.json").write_text(json.dumps(original))
         (clone / "stage2/stage2.bin").write_bytes(b"\xff" * original["stage2"]["extent"])
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
-            package.verify_pair(clone)
+            package.verify_pair(clone, client41=self.client41)
 
     def test_sd_bl_or_extra_zip_member_refused(self):
         corrupted = self.work / "extra.zip"

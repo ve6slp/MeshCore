@@ -948,5 +948,310 @@ class CommissioningTests(unittest.TestCase):
                 resolve.assert_not_called()
 
 
+class ClientCommissioningTests(unittest.TestCase):
+    write_package = CommissioningTests.write_package
+    uf2_block = CommissioningTests.uf2_block
+    write_current = CommissioningTests.write_current
+    block_metadata = CommissioningTests.block_metadata
+
+    def setUp(self):
+        CommissioningTests.setUp(self)
+        self.serial = "4186AE911D94CDB1"
+        (self.node / "serial").write_text(self.serial)
+        new_port = self.by_id / f"usb-Sense_{self.serial}-if00"
+        self.port.rename(new_port)
+        self.port = new_port
+        self.stack.enter_context(mock.patch.object(package_pair, "CLIENT_APP_BYTES", len(self.prefix)))
+        self.stack.enter_context(mock.patch.object(
+            package_pair, "CLIENT_APP_SHA256", package_pair.digest(self.prefix)))
+        self.restore = self.root / "selected-ordinary.zip"
+        self.write_package(self.restore, "application", self.prefix)
+        self.stack.enter_context(mock.patch.object(
+            package_pair, "CLIENT_APP_ZIP_SHA256", package_pair.build.sha(self.restore)))
+        self.baseline = bytes(index % 251 for index in range(65536))
+        self.baseline_file = self.root / "initial-slot.bin"
+        self.baseline_file.write_bytes(self.baseline)
+        erased = ((0x27000 + len(self.compound) + 4095) & ~4095) - 0xC4000
+        slot = self.stage + b"\xff" * (erased - len(self.stage)) + self.baseline[erased:]
+        with self.current.open("r+b") as stream:
+            for offset in range(0, 65536, 256):
+                address = 0xC4000 + offset
+                stream.seek((address - 0x1000) // 256 * 512)
+                stream.write(self.uf2_block(address, slot[offset:offset + 256]))
+        self.info = self.volume / "INFO_UF2.TXT"
+        self.stock_info = ("UF2 Bootloader 0.6.1\nDate: Nov 12 2021\n"
+                           "Board-ID: Seeed_XIAO_nRF52840_Sense\n"
+                           "SoftDevice: S140 version 7.3.0\n")
+        self.info.write_text(self.stock_info)
+
+    def args(self):
+        return argparse.Namespace(
+            role="client", timeout=3.0, preload_package=str(self.preload_package),
+            restore_package=str(self.restore), pair_manifest=str(self.pair_manifest),
+            package=str(self.boot_package), baseline_slot=str(self.baseline_file))
+
+    def invoke(self, *, primary=False, args=None):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            command = (lab_device.cmd_client_commission_primary if primary else
+                       lab_device.cmd_client_commission_compound)
+            self.assertEqual(command(args or self.args()), 0)
+        return output.getvalue()
+
+    def refuse(self, pattern, *, primary=False, args=None):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(SystemExit, pattern):
+            command = (lab_device.cmd_client_commission_primary if primary else
+                       lab_device.cmd_client_commission_compound)
+            command(args or self.args())
+        self.dfu.assert_not_called()
+        self.touch.assert_not_called()
+        self.wait.assert_not_called()
+        self.power.assert_not_called()
+
+    def test_preload_two_app_only_transfers_and_two_app_waits_are_not_installation_proof(self):
+        events = []
+        (self.node / "idProduct").write_text("8044")
+
+        def touch(port):
+            self.assertEqual(port, self.port)
+            events.append("touch")
+            (self.node / "idProduct").write_text("0045")
+
+        def completed(command, **kwargs):
+            package = Path(command[5])
+            self.assertEqual(command[7], str(self.port))
+            self.assertIn(package, (self.preload_package, self.restore))
+            raw, _ = package_pair.package_payload(package, "application")
+            self.assertEqual(raw, self.compound if package == self.preload_package else self.prefix)
+            events.append(package.name)
+            return argparse.Namespace(returncode=0, stdout=b"Device programmed.\n", stderr=b"")
+
+        def app_ready(role, mode, timeout):
+            self.assertEqual((role, timeout), ("client", 3.0))
+            if mode == lab_device.MODE_BOOT:
+                events.append("boot")
+                return lab_device.resolve(role, mode)
+            events.append("app")
+            (self.node / "idProduct").write_text("8044")
+            return lab_device.resolve("client", lab_device.MODE_APP)
+
+        self.touch.side_effect = touch
+        self.dfu.side_effect = completed
+        self.wait.side_effect = app_ready
+        output = self.invoke()
+        self.assertEqual(events, ["touch", "boot", "compound.zip", "app",
+                                  "touch", "boot", "selected-ordinary.zip", "app"])
+        self.assertEqual(self.dfu.call_count, 2)
+        self.assertIn("installed bytes/SDK extent not yet verified", output)
+        self.power.assert_not_called()
+        self.verified_pair.assert_called_once_with(self.pair, client41=True)
+
+    def test_both_packages_validate_before_any_device_access(self):
+        self.restore.write_bytes(self.restore.read_bytes() + b"changed")
+        with mock.patch.object(lab_device, "resolve") as resolve:
+            self.refuse("immutable approved client41")
+            resolve.assert_not_called()
+        self.write_package(self.restore, "application", self.prefix)
+        for raw in (self.compound[:-4], self.compound[:-1] + b"\x54"):
+            self.write_package(self.preload_package, "application", raw)
+            with mock.patch.object(lab_device, "resolve") as resolve:
+                self.refuse("exact matched")
+                resolve.assert_not_called()
+
+    def test_client_role_serial_and_old_target_commands_remain_separate_authorities(self):
+        for role in ("target", "pine", "other"):
+            args = self.args()
+            args.role = role
+            with mock.patch.object(lab_device, "discover") as discover:
+                self.refuse("client role only", args=args)
+                discover.assert_not_called()
+        for serial in ("77CD44653A967172", "49C5BAF21EEF44A1", "3BE94917B92DC5E9", "other"):
+            with mock.patch.dict(lab_device.os.environ, {"MESHCORE_LAB_CLIENT_SERIAL": serial}), \
+                    mock.patch.object(lab_device, "discover") as discover:
+                self.refuse("literal approved|protected")
+                discover.assert_not_called()
+        for command in (lab_device.cmd_commission_compound, lab_device.cmd_commission_primary,
+                        lab_device.cmd_mount_commission_uf2):
+            with self.assertRaisesRegex(SystemExit, "target role only"):
+                command(self.args())
+        self.dfu.assert_not_called()
+        self.touch.assert_not_called()
+
+    def test_client_wrong_board_role_bsp_fail_offline_before_device_access(self):
+        self.verified_pair.side_effect = self.real_verify_pair
+        header = dict(vendor_pin=package_pair.build.PIN, vendor_release=package_pair.build.RELEASE,
+                      actual_vendor_bsp="xiao_nrf52840_ble_sense", logical_board="xiao_nrf52840", role=0)
+        for field, value in (("role", 1), ("actual_vendor_bsp", "xiao_nrf52840_ble"),
+                             ("logical_board", "pine"), ("vendor_pin", "other")):
+            self.pair_manifest.write_text(json.dumps(dict(header, **{field: value})))
+            with mock.patch.object(lab_device, "resolve") as resolve:
+                self.refuse("genuine pinned Sense BSP")
+                resolve.assert_not_called()
+
+    def test_primary_reads_full_compound_and_full_slot_before_one_boot_only_transfer(self):
+        pread = lab_device.os.pread
+        addresses, events = [], []
+
+        def bounded(fd, count, offset):
+            address = 0x1000 + offset // 512 * 256
+            self.assertGreaterEqual(address, 0x27000)
+            self.assertLess(address, 0xD4000)
+            self.assertEqual(count, 512)
+            addresses.append(address)
+            events.append("read")
+            return pread(fd, count, offset)
+
+        def completed(command, **kwargs):
+            self.assertEqual(command[5], str(self.boot_package))
+            raw, _ = package_pair.package_payload(Path(command[5]), "bootloader")
+            self.assertEqual(raw, self.primary)
+            self.assertEqual(len(raw), 40960)
+            events.append("boot")
+            return argparse.Namespace(returncode=0, stdout=b"Device programmed.\n", stderr=b"")
+
+        self.dfu.side_effect = completed
+        with mock.patch.object(lab_device.os, "pread", side_effect=bounded), \
+                mock.patch.object(lab_device, "cmd_bootloader_port",
+                                  side_effect=AssertionError("primary must not touch")):
+            output = self.invoke(primary=True)
+        self.assertEqual(addresses[:len(range(0x27000, 0x27000 + len(self.compound), 256))],
+                         list(range(0x27000, 0x27000 + len(self.compound), 256)))
+        self.assertEqual(addresses[-256:], list(range(0xC4000, 0xD4000, 256)))
+        self.assertEqual(events[-1], "boot")
+        self.assertEqual(events.count("boot"), 1)
+        self.assertIn("full64KiB", output)
+        self.assertIn("installed primary SHA unverified", output)
+        self.assertIn("27000..31000", output)
+        self.touch.assert_not_called()
+        self.wait.assert_not_called()
+        self.power.assert_not_called()
+
+    def test_actual_baseline_is_required_before_even_device_access(self):
+        for size in (0, 65535, 65537):
+            self.baseline_file.write_bytes(b"\xff" * size)
+            with mock.patch.object(lab_device, "resolve") as resolve:
+                self.refuse("actual full 64KiB", primary=True)
+                resolve.assert_not_called()
+
+    def test_primary_slot_ff_pad_and_unmodified_tail_are_both_checked(self):
+        for address in (0xC805C, 0xC9000, 0xD3FFF):
+            offset = (address - 0x1000) // 256 * 512 + 32 + address % 256
+            with self.current.open("r+b") as stream:
+                stream.seek(offset)
+                old = stream.read(1)
+                stream.seek(offset)
+                stream.write(bytes([old[0] ^ 1]))
+            self.refuse("slot/baseline", primary=True)
+            with self.current.open("r+b") as stream:
+                stream.seek(offset)
+                stream.write(old)
+
+    def test_positive_stock_profile_is_exact_and_not_modern_loader_info(self):
+        for text in (self.stock_info.replace("0.6.1", "0.9.2"),
+                     self.stock_info.replace("7.3.0", "7.0.0"),
+                     self.stock_info.replace("_Sense", ""),
+                     self.stock_info.replace("Nov 12 2021", "May 21 2026")):
+            self.info.write_text(text)
+            self.refuse("stock bootloader|exact observed", primary=True)
+
+    def test_non_sense_boot_or_wrong_identity_msc_mount_refuses_primary(self):
+        for field, value in (("idProduct", "0044"), ("serial", "77CD44653A967172")):
+            old = (self.node / field).read_text()
+            (self.node / field).write_text(value)
+            self.refuse("exact Sense|not attached", primary=True)
+            (self.node / field).write_text(old)
+        (self.msc / "bInterfaceClass").write_text("02")
+        self.refuse("own MSC", primary=True)
+        (self.msc / "bInterfaceClass").write_text("08")
+        for text in ("", self.mount_line.replace(" ro ", " rw "),
+                     self.mount_line.replace("8:48 / ", "8:48 /subtree ")):
+            self.mountinfo.write_text(text)
+            self.refuse("ancestry-matched|read-only", primary=True)
+
+    def test_bad_boot_class_geometry_or_init_never_reaches_current_or_transport(self):
+        for kind, raw, init in (("application", self.primary, {}),
+                                ("bootloader", self.primary[:-4], {}),
+                                ("bootloader", self.primary, {"application_version": 1})):
+            self.write_package(self.boot_package, kind, raw, init_changes=init)
+            with mock.patch.object(lab_device, "resolve") as resolve:
+                self.refuse("bootloader-only|matching RAW|standard init", primary=True)
+                resolve.assert_not_called()
+
+    def test_second_transport_failure_stops_after_first_app_wait_without_retry(self):
+        def app_ready(role, mode, timeout):
+            if mode == lab_device.MODE_APP:
+                (self.node / "idProduct").write_text("8044")
+            return lab_device.resolve(role, mode)
+
+        self.wait.side_effect = app_ready
+        self.touch.side_effect = lambda port: (self.node / "idProduct").write_text("0045")
+        self.dfu.side_effect = [argparse.Namespace(returncode=0, stdout=b"Device programmed.\n", stderr=b""),
+                               argparse.Namespace(returncode=0, stdout=b"Failed to upgrade target.\n", stderr=b"")]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(SystemExit, "transport failure despite exit 0"):
+            lab_device.cmd_client_commission_compound(self.args())
+        self.assertEqual(self.dfu.call_count, 2)
+        self.assertEqual(self.wait.call_args_list, [
+            mock.call("client", lab_device.MODE_APP, 3.0),
+            mock.call("client", lab_device.MODE_BOOT, 3.0)])
+        self.power.assert_not_called()
+
+    def test_first_transport_failure_does_not_restore_wait_or_retry(self):
+        for rc, output in ((1, b"send_init_packet failed\n"),
+                           (0, b"Failed to upgrade target.\n"), (0, b"ACK\n")):
+            self.dfu.reset_mock()
+            self.dfu.return_value = argparse.Namespace(returncode=rc, stdout=output, stderr=b"")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaisesRegex(SystemExit, "nrfutil|transport|completion"):
+                lab_device.cmd_client_commission_compound(self.args())
+            self.dfu.assert_called_once()
+            self.assertEqual(self.dfu.call_args.args[0][5], str(self.preload_package))
+            self.wait.assert_not_called()
+            self.touch.assert_not_called()
+            self.power.assert_not_called()
+
+    def test_literal_client_mount_reuses_ro_or_requests_only_one_initial_ro_mount(self):
+        with self.block_metadata(), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lab_device.cmd_mount_client_commission_uf2(self.args()), 0)
+        self.power.assert_not_called()
+        self.mountinfo.write_text("")
+
+        def mounted(command, timeout):
+            self.assertEqual(command, ["udisksctl", "mount", "--block-device",
+                                       str(self.disk), "--options", "ro"])
+            self.assertEqual(timeout, 3.0)
+            self.mountinfo.write_text(self.mount_line)
+            return 0, "mounted"
+
+        self.power.side_effect = mounted
+        with self.block_metadata(), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lab_device.cmd_mount_client_commission_uf2(self.args()), 0)
+        self.power.assert_called_once()
+        self.dfu.assert_not_called()
+        self.touch.assert_not_called()
+        self.wait.assert_not_called()
+
+    def test_client_mount_rejects_rw_without_unmount_or_remount(self):
+        self.mountinfo.write_text(self.mount_line.replace(" ro ", " rw "))
+        with self.block_metadata(), self.assertRaisesRegex(
+                SystemExit, "existing target mount refused; no automatic unmount/remount"):
+            lab_device.cmd_mount_client_commission_uf2(self.args())
+        self.power.assert_not_called()
+        self.dfu.assert_not_called()
+        self.touch.assert_not_called()
+
+    def test_client_cli_cannot_reuse_target_role_or_request_other_control_actions(self):
+        for command in ("commission-client-compound", "commission-client-primary",
+                        "mount-client-commission-uf2"):
+            for extra in (["target"], ["client", "--reset"], ["client", "--retry"],
+                          ["client", "--options", "rw"]):
+                with mock.patch.object(sys, "argv", ["lab_device.py", command, *extra]), \
+                        mock.patch.object(lab_device, "resolve") as resolve, mock.patch("sys.stderr"):
+                    with self.assertRaises(SystemExit):
+                        lab_device.main()
+                    resolve.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -631,11 +631,96 @@ erasure or resealing proof. No primary, installer, SD, UICR, filesystem,
 shared-power or Pine write was requested.
 
 Source qualification boundary: the reviewed UF2 delta passed the focused
-native cases and actual nRF USB/ESP USB builds. The standard nRF BLE GNU++11
-profile fails both the saved pre-UF2 baseline and the new source, with existing
-OTA aggregate-initialization errors and an excluded ed25519 dependency.
-BLE build compatibility remains a separate whole-feature release gate, not a
-passed outcome or a regression attributed to this UF2 command.
+native cases and actual nRF USB/ESP USB builds. Initial standard nRF BLE
+GNU++11 builds failed on both the saved pre-UF2 baseline and the new source,
+with OTA-only imports and an excluded ed25519 dependency. The compatibility
+repair gates those imports and restores the original bundled library without
+changing the BLE language standard, identity implementation or key formats.
+ROOT's combined prospective tree passed the focused93 native cases,140 host
+cases and actual BLE411160/USB550308 builds. The USB payload matches the
+selected physical550308 image except four RadioLib diagnostic clock digits;
+the selected `9f7f013a...` BIN/`4b9813fd...` ZIP is not replaced. These build
+results do not claim physical BLE qualification.
+
+**Actual read-only41 precommission baseline, `09:45:55Z` Oct. 4, 2026:**
+ROOT captured only the full installer slot, primary and SDK page through the
+exact41 whole-volume read-only mount. Mapping was derived from live stage-only
+FIBMAP and matching CURRENT/raw UF2 anchors; every requested record's address,
+header, family and padding was checked. No filesystem, QSPI, UICR, MBRparams
+or APP payload was read.
+
+| Range | Bytes | Observed SHA256 |
+| --- | ---: | --- |
+| Installer C4000..D4000 | 65536, all FF | `71189f7fb6aed638640078fba3a35fda6c39c8962e74dcc75935aac948da9063` |
+| Primary F4000..FE000 | 40960 | `894f2e6df7663fcc5c398e210db7f2e7f21d3da53036e0a11576909c849f78fb` |
+| SDK FF000..100000 | 4096 | `5c9132fa5a602338c77e0565cfabb48e2823c13237b53be3ef11ae8de25beda8` |
+
+The actual45056-byte C9000..D4000 tail was also all FF, SHA256
+`266a016d62778776d2a2b6750fb8a661b33c2104dc0816760667500cf2900216`.
+SDK fields showed bank0 VALID_APP, size550308, stored CRC0000, bank1 FF,
+zero SD/APP/BOOT update sizes, SDstart0 and an FF tail after28 bytes. These
+are observed fields, not an image-validity or pending-finalization inference;
+the primary hash does not establish its source lineage.
+
+ROOT promptly returned41 to the SAME selected ordinary APP. Complete
+protocol-visible userdata matched, SDK diagnostics were healthy550308/A69D
+with blank marker/CACHE_ONLY, and `09:48:29Z` STATUS retained ABORTED
+generation8, counter1, hash and reported6403 blocks. The measured raw64KiB
+baseline and typed provenance receipt are retained privately with0700/0600
+permissions. No primary or installer write occurred during this capture.
+
+**Supervised client41 paired commissioning:** only the explicit Sense ROLE0
+profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
+helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
+with swapped serials or roles. Build, test and package into new directories:
+
+```sh
+make build-xiao-ota-client41-bootloader-pair \
+  test-xiao-ota-client41-bootloader-pair \
+  package-xiao-ota-client41-bootloader-pair
+make verify-xiao-ota-client41-bootloader-pair-packages
+```
+
+ROOT must first retain actual41 primary/SDK evidence and the raw65536-byte
+installer-slot baseline C4000..D4000, associated with the captured device and
+unchanged read-only USB ancestry. Before primary transfer, arrange ONE
+physical pin reset or an independently qualified target-only reset mechanism.
+The reviewed GP_A8 activation path can remain in unlimited BLE DFU with no
+USB endpoint; 1200-baud/DTR requires an enumerated APP and cannot rescue that
+state. Do not start primary merely because firmware writes are authorized.
+The commands below describe ROOT's reviewed write sequence, not authorization
+for an agent to operate hardware:
+
+```sh
+make commission-xiao-nrf52-client41-preload
+# ROOT: the existing one-shot companion USB request 0x13 + "reboot uf2".
+# Require actual exact41 BOOT2886:0045 with CDC+MSC; ACK alone is insufficient.
+make lab-mount-xiao-nrf52-client41-commission-uf2
+make commission-xiao-nrf52-client41-primary \
+  XIAO_OTA_CLIENT41_BASELINE_SLOT="$actual_precommission_raw_64KiB_slot"
+# ROOT: the coordinated pin reset if GP_A8 remains in BLE; observe actual USB.
+# Restore the SAME selected ordinary APP; do not retry the primary transfer.
+make flash-xiao-nrf52-client \
+  XIAO_NRF52_CLIENT_PACKAGE="$PWD/.tmp/live-app-contract/companion41-uf2-01/app-build/Xiao_nrf52_companion_radio_usb/firmware.zip"
+```
+
+Preload validates both packages before any touch, transfers compound then
+waits for APP, transfers the SAME ordinary550308 APP then waits for APP.
+Do not omit that second transfer: compound659548 makes the SDK extent exceed
+643072 and correctly blocks runtime UF2 readiness. No runtime exception is
+introduced. Explicit local-cache ABORT remains a separate prerequisite where
+the existing request requires it.
+
+The primary command validates the exact matched40KiB BOOT-only package,
+stock Sense0.6.1/S1407.3.0/Nov12 2021 INFO and stable whole-volume read-only
+mount. Before sending, it reads all compound659548 bytes and all slot65536
+bytes: stage16476, FF throughC9000, captured C9000..D4000 unchanged.
+This actual comparison is required because upstream ordinary-erase modelling
+does not establish the installed Seeed fork's behavior. Failed readback stops
+before primary; there are no automatic retries, resets, power-cycles or
+unmount/remount operations. Transport completion does not verify primary SHA
+or activation. Low APP27000..31000 staging means final ordinary APP restoration
+and full userdata comparison remain ROOT's explicit responsibilities.
 
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
