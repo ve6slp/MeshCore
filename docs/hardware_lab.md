@@ -586,6 +586,50 @@ a base-role0 build is not that qualification. Companion command `0x13` is
 CMD_REBOOT, not a text CLI; the current `"reboot"` prefix handler performs an
 ordinary restart and does not provide a `"reboot-uf2"` transition.
 
+**Explicit UF2-entry APP on41, Oct. 4, 2026 UTC:** ROOT subsequently installed
+the reviewed 550,308-byte role0 companion APP using ordinary APP-only DFU.
+BIN SHA256 is
+`9f7f013ad118f501118aea8e7c234e5d989625443e93b5aa3349043588449733`;
+ZIP SHA256 is
+`4b9813fd43489232eaa158f4cda21546bb42e37f17c85595b5e1972f32d8d0d9`.
+Fresh `08:54:36Z` preflight reported healthy stock boot, blank marker,
+SDK550308 / CRC `0000/A69D` and CACHE_ONLY. All four complete contact records,
+all40 channels, identity, self-info and exposed settings matched the private
+pre-update snapshot. Fresh `08:54:38Z` STATUS retained the same sealed
+6,403-block counter1/generation7 cache.
+
+The new maintenance request is exactly companion payload
+`13 72 65 62 6f 6f 74 20 75 66 32` (`0x13` + `"reboot uf2"` without a NUL).
+Only genuine USB reception in the supported USB-only nRF lab profile can
+schedule it. Standard OK acknowledges deferred acceptance, not MSC entry.
+The existing readiness checks, including refusal of CACHE_SEALED, remain;
+ROOT must explicitly abort the local cache before requesting entry.
+The reviewed source and independent exact-tree build alone do not establish
+UF2/MSC entry, INFO metadata or paired installation capability.
+
+**Actual stock UF2 metadata on41, Oct. 4, 2026 UTC:** ROOT explicitly aborted
+the local cache at `09:02:49Z`, producing ABORTED generation8 while retaining
+the manifest hash, counter1 and 6,403-block reported count. The one-shot UF2
+request then produced fresh OK, an observed USB serial disconnect and new
+exact41 Sense BOOT with CDC/data/MSC. ROOT mounted only41's ancestry-matched
+whole `/dev/sde` at `/run/media/slepp/XIAO-SENSE1`, with vfat mount and
+superblock both read-only. It was not77's volume.
+
+Bounded INFO read at `09:03:32Z` reported
+`Board-ID: Seeed_XIAO_nRF52840_Sense`, bootloader0.6.1, S1407.3.0 and build
+date Nov. 12, 2021. INFO SHA256 is
+`78d580460bbea1a33ac78ba3ff0858cf57eb01e858db490b44bec3127e4bd191`.
+This establishes the actual Sense metadata/BSP selection for future role0
+qualification; it does not cryptographically verify the installed primary.
+
+ROOT returned41 to the same verified APP through ordinary APP-only serial
+DFU. Fresh SDK diagnostics again showed healthy550308 / CRC `0000/A69D`,
+blank marker and CACHE_ONLY. Complete protocol-visible userdata still matched;
+`09:05:45Z` cache STATUS retained the intentionally ABORTED generation8,
+counter1, hash and reported6,403 blocks. Reported retained counts are not data
+erasure or resealing proof. No primary, installer, SD, UICR, filesystem,
+shared-power or Pine write was requested.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
