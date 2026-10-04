@@ -531,6 +531,27 @@ This qualifies the actual ABI2 application/local-cache cancellation outcome,
 or full-window duty acceptance. Retained ABORTED block counts are not erasure
 proof.
 
+**Partial signed-cache reboot/resume, Oct. 4, 2026 UTC:** ROOT reused that
+immutable 537,816-byte candidate and canonical hash `8eeecabd...` on approved41.
+Explicit reupload of its matching ABORTED generation6 was stopped by the
+intended 15-second host deadline. A fresh local STATUS at `07:18:07Z` reported
+RECEIVING, 632/6,403 blocks, counter1 and generation7. After an ordinary
+companion-protocol reboot of41 only, fresh `07:18:24Z` STATUS retained the
+exact phase, partial count, hash, counter and generation. The unacknowledged
+last PUT completed before the first STATUS; the timeout log's last
+acknowledged count of631 is not the reboot baseline.
+
+Resume used `reupload=0`, replayed the retained prefix and reached VERIFYING,
+then CACHE_SEALED with 6,403/6,403 blocks and the same generation7 at
+`07:20:36Z`. Final identity, name, path-hash mode and
+907.525 MHz / BW250 / SF7 / CR5 matched the pre-write capture; SDK
+548772 / CRC `0000/45B7` remained healthy and CACHE_ONLY. Private evidence is
+retained under `uploader41-partial-persistence-20261004T071859Z/`.
+This qualifies actual partial local-cache data/journal persistence and host
+resume, not receiver recovery, installation, rollback, duplicate-write counts,
+radio delivery or duty fairness. No primary, SoftDevice, MBR, UICR, shared-power
+or Pine operation was performed;77 remained in USB recovery.
+
 Administrator setup is a separate, explicit **normal MeshCore** operation:
 
 ```sh
