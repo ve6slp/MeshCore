@@ -69,6 +69,15 @@ typedef struct {
   int force_recovery_calls;
   int watchdog_start_calls;
   int qspi_init_calls;
+  bool require_bank_invalidation;
+  bool invalid_bank_readback;
+  bool settings_body_verified;
+  bool settings_erase_acknowledged;
+  int app_erase_calls;
+  int settings_erase_calls;
+  int bank_clear_writes;
+  int bank_clear_readbacks;
+  int settings_valid_writes;
 
   /*
    * Power-loss fault injection: the matching call aborts the in-progress
@@ -89,7 +98,8 @@ typedef struct {
 
   /*
    * Torn-write injection: the matching write call applies only the
-   * first `tear_bytes` of the payload (rest of the destination is left
+   * first `tear_bytes` of the payload (or erases that prefix for an
+   * INTERNAL_ERASE fault; the rest of the destination is left
    * exactly as it was), then returns false -- simulating a write that
    * was interrupted after partially landing on the flash page/sector,
    * distinct from both a clean failure (fail, no effect) and a full

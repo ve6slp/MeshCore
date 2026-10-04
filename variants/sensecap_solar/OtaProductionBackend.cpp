@@ -100,15 +100,13 @@ constexpr uint16_t kExpectedDescriptorFormatId = 1u;
 constexpr uint32_t kExpectedProfileId = 2u;
 
 ota::platform::Nrf52FlashAdapter flash;
-// Full production candidate BANK/staging capacity is 792 KiB (matches the
-// external QSPI candidateRegion() partition), but receiver admission has
-// a fixed 708608-byte application ceiling (0xAD000), enforced by
-// OtaNrf52FirmwareTrustProvider to protect InternalExtraFS at
-// 0xD4000..0xED000. A non-installable local uploader cache instead uses
-// the physical candidate region and generic bitmap capacity bounds.
-// Also note this is not the 16 KiB
-// candidateTestRegion() the lab-only XIAO backend uses for repeated
-// destructive hardware qualification writes.
+// External candidate staging remains 708608 bytes; the 792 KiB bank
+// stride is physical placement, not writable capacity. This is not the
+// 16 KiB candidateTestRegion() used by destructive qualification.
+// OtaNrf52FirmwareTrustProvider limits installable images to 643072 bytes
+// (0x9D000), protecting the fixed installer at 0xC4000..0xD4000 and
+// unchanged InternalExtraFS at 0xD4000..0xED000. A non-installable uploader
+// cache retains external/generic bounds.
 ota::platform::FlashRegion candidate =
     ota::platform::SenseCapQspiLayout::candidateRegion(flash);
 ota::platform::FlashRegion xiao_floor_region =

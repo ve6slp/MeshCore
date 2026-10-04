@@ -18,14 +18,14 @@
 #include "xiao_ota_platform_layout_contract.h"
 #include "xiao_ota_record.h"
 
-#define XIAO_OTA_APP_START             UINT32_C(0x00027000)
+#define XIAO_OTA_APP_START             OTA_NRF52_INTERNAL_IMAGE_OFFSET
 #define XIAO_OTA_APP_END               UINT32_C(0x000ED000)
 #define XIAO_OTA_APP_MAX_SIZE          (XIAO_OTA_APP_END - XIAO_OTA_APP_START)
 
 /*
- * v1.17's actual internal application code region is only
- * 0x27000..0xD4000 (708,608 bytes); 0xD4000..0xED000 is where v1.17's own
- * internal filesystem (LittleFS/ExtraFS) lives today. XIAO_OTA_APP_MAX_SIZE
+ * The paired application slot is 0x27000..0xC4000 (643,072 bytes).
+ * The fixed installer occupies 0xC4000..0xD4000; 0xD4000..0xED000 remains
+ * the existing internal filesystem (LittleFS/ExtraFS). XIAO_OTA_APP_MAX_SIZE
  * intentionally spans the FULL 0x27000..0xED000 internal-flash extent
  * purely so a fresh bank-0 CRC-16 recompute can read (never write) across
  * whatever is genuinely there without an artificial internal-flash bound
@@ -37,23 +37,21 @@
  * active_extent_from_settings() for why a larger bound on either would
  * let a write reach into v1.17's own filesystem region (internal flash)
  * or the external QSPI security-tail regions (candidate/backup banks).
- * XIAO_OTA_INSTALL_MAX_SIZE matches the shared contract's
- * OTA_NRF52_IMAGE_CAPACITY_BYTES exactly (see static assertions below).
+ * XIAO_OTA_INSTALL_MAX_SIZE matches OTA_NRF52_INTERNAL_IMAGE_SIZE, not
+ * the larger unchanged physical external-bank image capacity.
  * This is a safety cap, not a wire-format change: no schema,
  * role/target/format field changes.
  */
-#define XIAO_OTA_INSTALL_ALLOWED_END   UINT32_C(0x000D4000)
-#define XIAO_OTA_INSTALL_MAX_SIZE      \
-  (XIAO_OTA_INSTALL_ALLOWED_END - XIAO_OTA_APP_START)
+#define XIAO_OTA_INSTALL_ALLOWED_END   OTA_NRF52_INTERNAL_INSTALLER_OFFSET
+#define XIAO_OTA_INSTALL_MAX_SIZE      OTA_NRF52_INTERNAL_IMAGE_SIZE
 
 /*
  * XIAO_OTA_CANDIDATE_SIZE/XIAO_OTA_BACKUP_SIZE are the fixed PHYSICAL
  * bank-to-bank placement stride only (matching the shared contract's
  * OTA_NRF52_PHYSICAL_BANK_STRIDE_BYTES) -- NEVER a writable-capacity
- * bound. Each bank's actual writable image capacity is the smaller
- * XIAO_OTA_INSTALL_MAX_SIZE (0xAD000); the remaining
- * (XIAO_OTA_CANDIDATE_SIZE - XIAO_OTA_INSTALL_MAX_SIZE) = 0x19000 bytes
- * at the tail of each bank are a separate, foreign, global identity/
+ * bound. Each bank has physical image capacity 0xAD000, but this installer
+ * admits only XIAO_OTA_INSTALL_MAX_SIZE (0x9D000). The final 0x19000 bytes
+ * of the physical bank remain a separate, foreign, global identity/
  * security store (securityA/securityB in the shared contract) this
  * project must never erase or write into.
  */
@@ -75,10 +73,14 @@
  */
 _Static_assert(XIAO_OTA_APP_START == OTA_NRF52_INTERNAL_IMAGE_OFFSET,
               "app start must match the shared C contract");
-_Static_assert(XIAO_OTA_INSTALL_MAX_SIZE == OTA_NRF52_IMAGE_CAPACITY_BYTES,
+_Static_assert(XIAO_OTA_INSTALL_MAX_SIZE == OTA_NRF52_INTERNAL_IMAGE_SIZE,
               "install/active-extent writable capacity must match the shared C contract");
-_Static_assert(XIAO_OTA_INSTALL_ALLOWED_END == OTA_NRF52_INTERNAL_FS_OFFSET,
-              "internal filesystem start must match the shared C contract");
+_Static_assert(XIAO_OTA_INSTALL_ALLOWED_END ==
+                   XIAO_OTA_APP_START + XIAO_OTA_INSTALL_MAX_SIZE,
+              "installer must immediately follow the installable APP");
+_Static_assert(XIAO_OTA_INSTALL_ALLOWED_END + OTA_NRF52_INTERNAL_INSTALLER_SIZE ==
+                   OTA_NRF52_INTERNAL_FS_OFFSET,
+              "installer must end at the unchanged extra filesystem");
 _Static_assert(XIAO_OTA_APP_END == OTA_NRF52_INTERNAL_FS_OFFSET + OTA_NRF52_INTERNAL_FS_SIZE,
               "internal filesystem end must match the shared C contract");
 _Static_assert(XIAO_OTA_CANDIDATE_BASE == OTA_NRF52_CANDIDATE_OFFSET,
@@ -163,4 +165,3 @@ _Static_assert(XIAO_OTA_FILESYSTEM_SIZE == OTA_NRF52_FILESYSTEM_SIZE,
 #define XIAO_OTA_QSPI_IO1_PIN          24u
 #define XIAO_OTA_QSPI_IO2_PIN          22u
 #define XIAO_OTA_QSPI_IO3_PIN          23u
-

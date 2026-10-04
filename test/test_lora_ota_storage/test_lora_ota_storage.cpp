@@ -1636,8 +1636,8 @@ TEST(XiaoOtaActiveExtentBridgeTest, ValidBank0SettingsAreTrustedForExtent) {
 
 TEST(XiaoOtaActiveExtentBridgeTest, OversizedBank0SizeBeyondInstallCeilingFailsClosedEvenWithinRawMappedRegion) {
   // MAIN's bug #6: a bank0_size beyond the true protocol/install ceiling
-  // (kXiaoOtaAppInstallMaxSize == meshcore::ota::runtime::kOtaMaxImageBytes
-  // == 708608, protecting InternalExtraFS at 0xD4000) must be rejected,
+  // (kXiaoOtaAppInstallMaxSize == 643072, protecting the installer at
+  // 0xC4000 and InternalExtraFS at 0xD4000) must be rejected,
   // even though it is still comfortably within the raw mapped-region size
   // (kXiaoOtaAppMaxSize == 811008) that app_image_len alone would allow --
   // never silently accept an oversized/injected extent just because it
@@ -3661,6 +3661,39 @@ TEST(OtaBoardTrialBootHealthConfirmerTest, DeadlineExpiresWhenNeverContinuouslyH
            mesh::ota::OtaBoardTrialHealthOutcome::DeadlineExpired);
 }
 
+TEST(OtaBoardTrialBootHealthConfirmerTest, WithheldLoopReadinessExpiresWithoutConfirmationDespiteHealthyServices) {
+  FakeNorFlash state_flash(8192, 4096);
+  FakeNorFlash confirm_flash(8192, 4096);
+  ota::platform::FlashRegion state_region(state_flash, 0, 8192);
+  ota::platform::FlashRegion confirm_region(confirm_flash, 0, 8192);
+
+  std::vector<uint8_t> image(256, 0x99);
+  uint8_t hash[32];
+  ota::trust::Sha256::hash(image.data(), image.size(), hash);
+  const auto rec = makeStateRecordBytes(1, 7, XiaoOtaStateReader::kPhaseTrialBoot, 1234, 9, hash, hash);
+  ASSERT_TRUE(ota::platform::isOk(state_region.program(0, rec.data(), static_cast<uint32_t>(rec.size()))));
+
+  CountingFakeActiveImageAccessor fake;
+  fake.image = image.data();
+  fake.extent = static_cast<uint32_t>(image.size());
+  mesh::ota::OtaBoardTrialBootHealthConfirmer confirmer(state_region, confirm_region, fake, /*boot_epoch_ms=*/0);
+
+  constexpr uint32_t deadline = ota::storage::XiaoOtaTrialHealthMonitor::kOverallDeadlineMs;
+  ASSERT_EQ(45000u, deadline);
+  for (uint32_t now_ms = 0; now_ms < deadline; now_ms += 500) {
+    EXPECT_EQ(mesh::ota::OtaBoardTrialHealthOutcome::Pending,
+              confirmer.tick(now_ms, /*radio_ready=*/true, /*filesystem_ready=*/true, /*loop_healthy=*/false));
+  }
+  EXPECT_GT(fake.call_count, 0);
+  EXPECT_EQ(mesh::ota::OtaBoardTrialHealthOutcome::DeadlineExpired,
+            confirmer.tick(deadline, true, true, false));
+  EXPECT_TRUE(confirmer.isTrialActive());
+  EXPECT_EQ(mesh::ota::OtaBoardTrialHealthOutcome::DeadlineExpired,
+            confirmer.tick(deadline + 500, true, true, true));
+  EXPECT_EQ(0u, confirm_flash.eraseOpCount());
+  EXPECT_EQ(0u, confirm_flash.programOpCount());
+}
+
 TEST(OtaBoardTrialBootHealthConfirmerTest, NeverConsultsImageAccessorWhenStateIsNotTrialBootPhase) {
   FakeNorFlash state_flash(8192, 4096);
   FakeNorFlash confirm_flash(8192, 4096);
@@ -3711,7 +3744,7 @@ TEST(OtaBoardTrialBootHealthConfirmerTest, HashMismatchNeverConfirmsAndExpiresAt
 // Bug #3 (MAIN's correction): the monitor's own driveIncrementalHash()
 // must never trust an injected/buggy accessor's reported extent blindly
 // -- defense-in-depth independent of the REAL hardware resolver (which
-// already enforces this bound itself). An extent beyond the 708608-byte
+// already enforces this bound itself). An extent beyond the 643072-byte
 // install ceiling must never be dereferenced/hashed.
 TEST(OtaBoardTrialBootHealthConfirmerTest, OversizedAccessorExtentFailsClosedWithoutHashingAndExpiresAtDeadline) {
   FakeNorFlash state_flash(8192, 4096);
@@ -3731,7 +3764,7 @@ TEST(OtaBoardTrialBootHealthConfirmerTest, OversizedAccessorExtentFailsClosedWit
 
   CountingFakeActiveImageAccessor fake;
   fake.image = small_buffer.data();
-  fake.extent = ::ota::storage::kXiaoOtaAppInstallMaxSize + 4u;  // beyond the 708608-byte ceiling.
+  fake.extent = ::ota::storage::kXiaoOtaAppInstallMaxSize + 4u;  // beyond the 643072-byte ceiling.
   mesh::ota::OtaBoardTrialBootHealthConfirmer confirmer(state_region, confirm_region, fake, /*boot_epoch_ms=*/0);
 
   uint32_t now_ms = 0;

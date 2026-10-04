@@ -103,6 +103,19 @@ Manual USB reboot would be assisted commissioning, not remote-install
 qualification. Firmware must first wire a deferred reboot after a proven,
 durable individual remote COMMIT, never after READY/rejection/uncertain writes.
 
+Explicit commit --expect-rollback instead qualifies a nonconfirming counter2
+candidate over a verified confirmed counter1 running baseline saved in ready.json.
+It requires a fresh candidate-bound radio TRIAL, automatic reboot/reconnects,
+fresh candidate-bound FAILED and the existing qualified restored-original startup
+disposition (state=1 phase=8 decision=0, writes=allowed). FAILED alone, a baseline
+hash alone, or COMMIT ACK cannot qualify. The unchanged image-bound floor tuple
+and that application disposition prove the restored running baseline; the failed
+lifecycle itself intentionally still reports verified=0 image=unknown counter=2.
+rollback.json preserves those actual replies, identity/preferences/ACL and normal
+peer evidence. Floor extent is exposed; saved SDK28/CRC values and full floor-slot
+history are not, and are explicitly unavailable. No reset, rollback command or
+ABORT is sent. Default commit retains its strict confirmed-install qualifier.
+
 Run directed/direct/background sequentially with increasing explicit counters,
 new artifact directories, and separately qualified commits. Background requires
 an EXISTING configured channel index (0..254); no fleet/multihop claim. Direct
@@ -125,7 +138,7 @@ window needs complete periodic coverage of at least a full window; before/after
 totals alone are incomplete. Timeouts, lost accounting and driver failures reject
 qualification. Ordinary peer reception during on-mesh transfer is independently
 bracketed by fresh candidate progress, not inferred from TX totals.
-No multihop, fleet, power-cut, rollback or full-configuration-media qualification.
+No multihop, fleet, power-cut or full-configuration-media qualification.
 MAIN must close the current commissioning/recovery gate and use qualified role
 packages before hardware execution; bench application readbacks are not OTA
 qualification.
@@ -1050,6 +1063,125 @@ def observe_install(pair, uploader, candidate, target_key, evidence, deadline,
     raise TimeoutError("no proven running Installed/counter/floor before deadline")
 
 
+def rollback_diagnostics(target, evidence, deadline, phase):
+    observations = {}
+    for kind in ("preflight", "capability"):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "campaign deadline expired")
+        text = target.command(f"ota {kind}", timeout=min(5, remaining))
+        evidence.log("rollback_diagnostic", phase=phase, kind=kind, text=text, read_only=True)
+        observations[kind] = lab.parse_ota_preflight_diagnostic(text, kind)
+    return observations
+
+
+def rollback_baseline(record, before, candidate, pair, evidence, deadline):
+    saved, current = record["target_status"], before["target_status"]
+    require(candidate.counter == 2 and record["floor"] == before["floor"] == 1,
+            "--expect-rollback requires candidate counter2 over confirmed floor1")
+    for status in (saved, current):
+        require(status["boot"] == "confirmed" and status["verified"] and status["floor"] == 1,
+                "rollback requires a verified confirmed running baseline")
+    require((saved["phase"] == "installed" and saved["counter"] == 1)
+            or (saved["phase"] in ACTIVE_PHASES and saved["counter"] == candidate.counter),
+            "saved READY baseline has no confirmed counter1 installation")
+    require(current["counter"] == candidate.counter and current["image"] == saved["image"]
+            and saved["image"] != candidate.metadata["image_sha256"],
+            "precommit running image differs from the saved baseline or is already the candidate")
+    diagnostics = rollback_diagnostics(pair.target, evidence, deadline, "pre-commit")
+    early, capability = diagnostics["preflight"], diagnostics["capability"]
+    require(early["writes_allowed"] and capability["writes_allowed"]
+            and early["early_proof"] == {"marker": "qualified", "proof": "qualified-state",
+                                        "state": "1", "phase": "6", "decision": "0"},
+            "baseline qualified confirmed startup disposition is unproven")
+    floor = capability["floor"]
+    require(floor["state"] == "present" and floor["ctr"] == 1
+            and floor["sha"].lower() == saved["image"] and 8 <= floor["ext"] <= 0xC6000,
+            "baseline image-bound confirmed floor metadata is unproven")
+    baseline = {"saved_lifecycle": saved, "precommit_lifecycle": current, "diagnostics": diagnostics,
+                "confirmed_floor": floor, "image_sha256": saved["image"], "counter": 1,
+                "image_extent": floor["ext"], "sdk28": None, "sdk_crc": None,
+                "sdk_metadata_scope": "verified_by_application_original_provider_values_not_exposed",
+                "floor_history_scope": "newest_confirmed_tuple_only_not_full_floor_slots"}
+    evidence.summary["measurements"]["rollback_baseline"] = baseline
+    evidence.log("rollback_baseline_verified", **baseline)
+    return baseline
+
+
+def restored_baseline(status, diagnostics, baseline, candidate):
+    require(status["boot"] == "failed" and status["phase"] == "failed"
+            and status["counter"] == candidate.counter and status["floor"] == baseline["counter"]
+            and not status["verified"] and status["image"] == "unknown",
+            "rollback lifecycle does not retain the failed candidate and unchanged confirmed floor")
+    early, capability = diagnostics["preflight"], diagnostics["capability"]
+    # This existing startup disposition is emitted only after the original provider
+    # verifies running SDK/CRC/SHA, saved SDK28, backup SHA and the protected floor.
+    require(early["writes_allowed"] and capability["writes_allowed"]
+            and early["early_proof"] == {"marker": "qualified", "proof": "qualified-state",
+                                        "state": "1", "phase": "8", "decision": "0"},
+            "FAILED alone is not rollback proof; verified restored-original startup disposition missing")
+    require(capability["floor"] == baseline["confirmed_floor"],
+            "rollback changed the confirmed floor sequence/counter/extent/hash")
+
+
+def observe_rollback(pair, uploader, candidate, target_key, baseline, evidence, deadline,
+                     reboot_timeout=120, trial_timeout=30, install_timeout=300):
+    deadline = min(deadline, time.monotonic() + install_timeout)
+    try:
+        pair.reenumerate(min(deadline, time.monotonic() + reboot_timeout))
+    except TimeoutError as exc:
+        evidence.summary["measurements"]["outcome"] = "blocked_remote_commit_did_not_reboot"
+        evidence.log("remote_rollback_blocked", reason="no_observed_remote_commit_reboot",
+                     usb_reset_sent=False, remote_rollback_qualified=False)
+        raise QualificationError("remote rollback blocked: no automatic remote COMMIT reboot; "
+                                 "no USB reset issued") from exc
+    since = time.monotonic()
+    trial = remote_trial(uploader, candidate, target_key, since, min(deadline, since + trial_timeout))
+    require(trial is not None and trial.phase == ota.Phase.TRIAL,
+            "rollback requires an observed fresh candidate-bound remote TRIAL before failure")
+    evidence.summary["measurements"]["trial"] = {"remote": trial.summary(), "candidate": candidate.metadata}
+    evidence.log("fresh_remote_trial_verified", **evidence.summary["measurements"]["trial"])
+    pair.reenumerate(min(deadline, time.monotonic() + reboot_timeout))
+    since = time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            status = target_status(pair.target, evidence, deadline)
+            require(status["floor"] == baseline["counter"], "rollback changed the confirmed floor counter")
+            require(status["phase"] not in ("installed", "aborted"),
+                    "expected rollback, not candidate confirmation or ABORT")
+            diagnostics = None
+            if status["boot"] == "failed" and status["phase"] == "failed":
+                diagnostics = rollback_diagnostics(pair.target, evidence, deadline, "rollback")
+                restored_baseline(status, diagnostics, baseline, candidate)
+        except (ConnectionError, OSError) as exc:
+            if not isinstance(exc, ConnectionError) and exc.errno not in (errno.EIO, errno.ENODEV):
+                raise
+            evidence.log("target_serial_disconnected", error=str(exc))
+            pair.reenumerate(min(deadline, time.monotonic() + reboot_timeout), transport_disconnected=True)
+            since = time.monotonic()
+            continue
+        observed = uploader.status(target_key, timeout=uploader.remaining(deadline))
+        now = time.monotonic()
+        if observed.valid:
+            require(observed.target == target_key and observed.flags & ota.REMOTE,
+                    "rollback status has the wrong remote scope")
+        if observed.fresh_since(since, now):
+            bound_snapshot(observed, candidate, target_key, complete=True)
+            require(observed.phase in (ota.Phase.COMMIT_PENDING, ota.Phase.TRIAL, ota.Phase.FAILED),
+                    "unexpected remote phase during rollback observation")
+            if diagnostics is not None and observed.phase == ota.Phase.FAILED:
+                rollback = {"lifecycle": status, "remote": observed.summary(),
+                            "diagnostics": diagnostics, "baseline": baseline, "remote_trial": trial.summary(),
+                            "restored_running_image_sha256": baseline["image_sha256"],
+                            "restored_confirmed_counter": baseline["counter"],
+                            "running_image_verification_scope":
+                                "application_restored_original_startup_and_unchanged_image_bound_floor"}
+                evidence.summary["measurements"]["rollback"] = rollback
+                evidence.log("running_rollback_verified", **rollback)
+                return status
+        time.sleep(min(max(0.1, observed.retry_after_ms / 1000), max(0, deadline - now)))
+    raise TimeoutError("no fresh bound FAILED and proven restored running baseline before deadline")
+
+
 def commit(pair, uploader, candidate, args, evidence, deadline):
     record = read_record(args.ready_record, "ready")
     require(record["candidate"] == candidate.metadata and record.get("auto_commit") is False,
@@ -1060,6 +1192,7 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
     before = capture(pair, candidate, evidence, deadline)
     preserved(record, before)
     require(before["target_status"]["phase"] == "ready", "explicit commit requires current target READY")
+    baseline = rollback_baseline(record, before, candidate, pair, evidence, deadline) if args.expect_rollback else None
     measurements = lab.read_ota_measurements(pair.client, pair.target, evidence, "pre-commit")
     measurement_health(measurements)
     for role, values in measurements["nodes"].items():
@@ -1075,17 +1208,45 @@ def commit(pair, uploader, candidate, args, evidence, deadline):
     evidence.log("explicit_qualified_commit_requested", target=target_key.hex(), candidate=candidate.metadata)
     reply = uploader.commit(target_key, candidate.canonical, deadline)
     evidence.log("commit_ack_not_install_proof", **reply.summary())
-    installed = observe_install(pair, uploader, candidate, target_key, evidence, deadline,
-                                args.reboot_timeout, args.trial_timeout, args.install_timeout)
+    if args.expect_rollback:
+        installed = observe_rollback(pair, uploader, candidate, target_key, baseline, evidence, deadline,
+                                     args.reboot_timeout, args.trial_timeout, args.install_timeout)
+    else:
+        installed = observe_install(pair, uploader, candidate, target_key, evidence, deadline,
+                                    args.reboot_timeout, args.trial_timeout, args.install_timeout)
     after_client = lab.serializable_app_info(lab.companion_info(pair.client))
     after_target, acl = lab.repeater_info(pair.target), pair.target.get_acl()
     require(after_client == before["client"] and after_target == before["target"],
             "identity/name/radio/path readbacks changed across installation")
     require(acl == before["acl"], "complete ADMIN ACL did not survive installation reboot")
     ordinary_peer(pair, target_key, evidence, min(deadline, time.monotonic() + 30))
-    measurements = lab.read_ota_measurements(pair.client, pair.target, evidence, "installed-end")
+    end_phase = "rollback-end" if args.expect_rollback else "installed-end"
+    measurements = lab.read_ota_measurements(pair.client, pair.target, evidence, end_phase)
     measurement_health(measurements)
-    evidence.summary["measurements"]["installed_end_measurements"] = measurements
+    evidence.summary["measurements"][end_phase.replace("-", "_") + "_measurements"] = measurements
+    if args.expect_rollback:
+        for role, values in measurements["nodes"].items():
+            radio = values["radio"]
+            normal = tuple(before[role][key] for key in ("freq_khz", "bw_hz", "sf", "cr"))
+            require(not radio["a"] and tuple(radio[key] for key in ("f", "b", "s", "c")) == normal,
+                    f"{role}: rollback requires healthy driver-applied restored normal service")
+        final_status = target_status(pair.target, evidence, deadline)
+        diagnostics = rollback_diagnostics(pair.target, evidence, deadline, "rollback-end")
+        restored_baseline(final_status, diagnostics, baseline, candidate)
+        result = "running_baseline_rollback_lifecycle_and_peer_verified"
+        outcome = {"version": RECORD_VERSION, "kind": "rollback", "serials": APPROVED,
+                   "candidate": candidate.metadata, "profile": record["profile"], "lifecycle": final_status,
+                   "rollback": evidence.summary["measurements"]["rollback"], "end_diagnostics": diagnostics,
+                   "outcome": result, "identity_config_acl_preserved": True, "ordinary_peer_received": True,
+                   "preserved_readbacks": {"client": after_client, "target": after_target, "acl": acl},
+                   "trial_observed": True, "remote_trial": evidence.summary["measurements"]["trial"]["remote"],
+                   "remote_rollback_qualified": True, "remote_install_qualified": False,
+                   "usb_reset_sent": False, "measured_duty_evidence_available": False,
+                   "transfer_measurements": record.get("transfer_measurements"),
+                   "multihop_fleet_powercut_qualified": False}
+        write_record(evidence.directory / "rollback.json", outcome)
+        evidence.summary["measurements"]["outcome"] = result
+        return outcome
     trial = evidence.summary["measurements"]["installed"]["remote_trial"]
     qualified = trial is not None
     result = "running_installed_lifecycle_and_peer_verified" if qualified else "remote_trial_not_observed"
@@ -1138,6 +1299,9 @@ def parser():
         else:
             command.add_argument("--ready-record", required=True, type=Path)
             command.add_argument("--qualified-commit", action="store_true", required=True)
+            command.add_argument("--expect-rollback", action="store_true",
+                                 help="require fresh remote TRIAL then verified counter1 baseline restoration "
+                                      "for a nonconfirming counter2 candidate; never assist/reset/ABORT")
             command.add_argument("--reboot-timeout", type=float, default=120)
             command.add_argument("--trial-timeout", type=float, default=30)
             command.add_argument("--install-timeout", type=float, default=300)

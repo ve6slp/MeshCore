@@ -3096,7 +3096,7 @@ TEST(LoraOtaIntegration, ProductionPacketPayloadBoundaryRejectsOversizeAndEncryp
   EXPECT_EQ(before_group, manager.getFreeCount());
 }
 
-TEST(LoraOtaLeanReceiver, NrfApplicationCeilingRejectsOneByteOverBeforeEraseButDoesNotLimitLocalCache) {
+TEST(LoraOtaLeanReceiver, NrfApplicationCeilingRejectsInvalidSizesBeforeAnyMutation) {
   using Result = mesh::ota::OtaLeanReceiver::Result;
   LeanFixture fx;
   mesh::ota::OtaNrf52FirmwareTrustProvider trust(fx.verifier, fx.image_region);
@@ -3107,23 +3107,96 @@ TEST(LoraOtaLeanReceiver, NrfApplicationCeilingRejectsOneByteOverBeforeEraseButD
   const uint8_t image[1] = {0x48};
   auto descriptor = buildProtocolDescriptor(image, sizeof(image), 5);
   const auto maximum = mesh::ota::OtaNrf52FirmwareTrustProvider::kMaximumImageBytes;
+  ASSERT_EQ(643072u, maximum);
   descriptor.exactSizeBytes = maximum;
   EXPECT_TRUE(trust.verifyDescriptorPolicyOnly(descriptor));
-  descriptor.exactSizeBytes = maximum + 1u;
+  uint8_t canonical[59], signature[64];
+  size_t canonical_len = 0;
+  auto& receiver = fx.integration.leanReceiver();
+  const auto image_erases = fx.image_flash.eraseOpCount();
+  const auto image_programs = fx.image_flash.programOpCount();
+  const auto candidate_erases = fx.candidate_flash.eraseOpCount();
+  const auto candidate_programs = fx.candidate_flash.programOpCount();
+  for (uint32_t size : {0u, maximum + 1u, kOtaMaxImageBytes, UINT32_MAX}) {
+    descriptor.exactSizeBytes = size;
+    EXPECT_FALSE(trust.verifyDescriptorPolicyOnly(descriptor));
+    ASSERT_EQ(OtaDescriptorCodecResult::Ok,
+              encodeOtaDescriptorCanonical(descriptor, canonical, sizeof(canonical), canonical_len));
+    owner.sign(canonical, sizeof(canonical), signature);
+    EXPECT_EQ(Result::Denied, receiver.begin(owner.publicKey(), canonical, signature, false, false));
+    EXPECT_EQ(image_erases, fx.image_flash.eraseOpCount());
+    EXPECT_EQ(image_programs, fx.image_flash.programOpCount());
+    EXPECT_EQ(candidate_erases, fx.candidate_flash.eraseOpCount());
+    EXPECT_EQ(candidate_programs, fx.candidate_flash.programOpCount());
+    EXPECT_FALSE(receiver.status().valid);
+  }
+  descriptor.exactSizeBytes = maximum;
+  ASSERT_EQ(OtaDescriptorCodecResult::Ok,
+            encodeOtaDescriptorCanonical(descriptor, canonical, sizeof(canonical), canonical_len));
+  owner.sign(canonical, sizeof(canonical), signature);
+  ASSERT_EQ(Result::Ok, receiver.begin(owner.publicKey(), canonical, signature, false, false));
+  EXPECT_TRUE(receiver.status().valid);
+  EXPECT_FALSE(receiver.status().localCache);
+  EXPECT_EQ((maximum + mesh::ota::kOtaBlockMaxDataBytes - 1) / mesh::ota::kOtaBlockMaxDataBytes,
+            receiver.status().totalBlocks);
+}
+
+TEST(LoraOtaLeanReceiver, NrfInstallationLimitDoesNotShrinkGenericPolicyOrOtherTargetCache) {
+  using Result = mesh::ota::OtaLeanReceiver::Result;
+  LeanFixture fx;
+  mesh::ota::OtaNrf52FirmwareTrustProvider trust(fx.verifier, fx.image_region);
+  mesh::ota::OtaFirmwareTrustProvider generic(fx.verifier, fx.image_region);
+  fx.integration.attachTrustProvider(&trust);
+  uint8_t seed[32] = {0x75};
+  ::ota::test::Ed25519TestSigner owner(seed);
+  fx.admins.add(owner.publicKey());
+  const uint8_t image[1] = {0x48};
+  auto descriptor = buildProtocolDescriptor(image, sizeof(image), 5);
+  descriptor.exactSizeBytes = kOtaMaxImageBytes;
+  ASSERT_EQ(708608u, descriptor.exactSizeBytes);
+  EXPECT_TRUE(generic.verifyDescriptorPolicyOnly(descriptor));
   EXPECT_FALSE(trust.verifyDescriptorPolicyOnly(descriptor));
+  descriptor.boardFamily = 0x4553;
+  descriptor.boardVariant = 0x5033;  // Another target is valid only as non-installable cache.
   uint8_t canonical[59], signature[64];
   size_t canonical_len = 0;
   ASSERT_EQ(OtaDescriptorCodecResult::Ok,
             encodeOtaDescriptorCanonical(descriptor, canonical, sizeof(canonical), canonical_len));
   owner.sign(canonical, sizeof(canonical), signature);
   auto& receiver = fx.integration.leanReceiver();
-  const auto image_erases = fx.image_flash.eraseOpCount();
-  EXPECT_EQ(Result::Denied, receiver.begin(owner.publicKey(), canonical, signature, false, false));
-  EXPECT_EQ(image_erases, fx.image_flash.eraseOpCount());
-  EXPECT_FALSE(receiver.status().valid);
   ASSERT_EQ(Result::Ok, receiver.begin(owner.publicKey(), canonical, signature, false, false, true));
   EXPECT_TRUE(receiver.status().localCache);
+  EXPECT_EQ((kOtaMaxImageBytes + mesh::ota::kOtaBlockMaxDataBytes - 1) / mesh::ota::kOtaBlockMaxDataBytes,
+            receiver.status().totalBlocks);
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Receiving, receiver.status().phase);
+}
+
+TEST(LoraOtaIntegration, NrfLegacyDescriptorEntryPointUsesInternalLimitButGenericEntryPointDoesNot) {
+  LeanFixture fx;
+  uint8_t seed[32] = {0x75};
+  ::ota::test::Ed25519TestSigner signer(seed);
+  mesh::ota::OtaNrf52FirmwareTrustProvider trust(fx.verifier, fx.image_region,
+                                                fx.sig_verifier, signer.publicKey());
+  mesh::ota::OtaFirmwareTrustProvider generic(fx.verifier, fx.image_region,
+                                             fx.sig_verifier, signer.publicKey());
+  const uint8_t image[1] = {0x48};
+  auto descriptor = buildProtocolDescriptor(image, sizeof(image), 5);
+  uint8_t canonical[59], signature[64];
+  size_t canonical_len = 0;
+  for (uint32_t size : {643072u, 643073u, kOtaMaxImageBytes, UINT32_MAX, 0u}) {
+    descriptor.exactSizeBytes = size;
+    ASSERT_EQ(OtaDescriptorCodecResult::Ok,
+              encodeOtaDescriptorCanonical(descriptor, canonical, sizeof(canonical), canonical_len));
+    signer.sign(canonical, sizeof(canonical), signature);
+    EXPECT_EQ(size == 643072u, trust.verifyDescriptor(descriptor, signature, sizeof(signature)));
+    if (size <= kOtaMaxImageBytes) {
+      EXPECT_EQ(size != 0u, generic.verifyDescriptor(descriptor, signature, sizeof(signature)));
+    }
+  }
+  EXPECT_EQ(0u, fx.image_flash.eraseOpCount());
+  EXPECT_EQ(0u, fx.image_flash.programOpCount());
+  EXPECT_EQ(0u, fx.candidate_flash.eraseOpCount());
+  EXPECT_EQ(0u, fx.candidate_flash.programOpCount());
 }
 
 TEST(LoraOtaLeanReceiver, BeginAcceptsOwnerSignedManifestFromRegisteredAdminAndRejectsUnknownSigner) {

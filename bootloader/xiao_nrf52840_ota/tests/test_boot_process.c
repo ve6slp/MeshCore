@@ -162,6 +162,35 @@ static void build_and_write_command(fake_io_state_t *s, uint64_t nonce,
                                     xiao_ota_test_public_key_ed25519);
 }
 
+static void provision_intact_transaction(fake_io_state_t *s, bool unused_crc,
+                                         uint8_t old_hash[32],
+                                         uint8_t candidate_hash[32]) {
+  const uint32_t size = 8192;
+  const uint32_t vectors[2] = {0x20040000, XIAO_OTA_APP_START + 0x101};
+  uint8_t raw[28] = {0};
+  uint16_t crc;
+  fake_io_reset(s);
+  s->require_bank_invalidation = true;
+  fill_pattern(s->internal_flash + XIAO_OTA_APP_START, size, 0x31);
+  memcpy(s->internal_flash + XIAO_OTA_APP_START, vectors, sizeof(vectors));
+  sha256_of(s->internal_flash + XIAO_OTA_APP_START, size, old_hash);
+  crc = crc16_compute(s->internal_flash + XIAO_OTA_APP_START, size, NULL);
+  assert(crc != 0 && (crc >> 8) != 0xFF);
+  if (unused_crc) crc = 0;
+  raw[0] = XIAO_OTA_BANK_VALID_APP;
+  raw[4] = 0xFF;
+  memcpy(raw + 2, &crc, sizeof(crc));
+  memcpy(raw + 8, &size, sizeof(size));
+  fake_io_write_settings_raw(s, raw);
+  write_floor_direct(s, 0, size, old_hash);
+  fill_pattern(s->qspi + XIAO_OTA_CANDIDATE_BASE, size, 0x72);
+  memcpy(s->qspi + XIAO_OTA_CANDIDATE_BASE, vectors, sizeof(vectors));
+  crc = crc16_compute(s->qspi + XIAO_OTA_CANDIDATE_BASE, size, NULL);
+  assert(crc != 0 && (crc >> 8) != 0xFF);
+  sha256_of(s->qspi + XIAO_OTA_CANDIDATE_BASE, size, candidate_hash);
+  build_and_write_command(s, 7100, 1, 1, size, candidate_hash, size, old_hash);
+}
+
 static void write_confirmation(fake_io_state_t *s, uint64_t nonce,
                                uint32_t counter, const uint8_t hash[32]) {
   xiao_ota_confirmation_t confirmation;
@@ -600,15 +629,9 @@ static void test_failed_retry_then_new_nonce(void) {
 /* (d): power loss mid page-write during install is detected fail-closed on
  * the next boot and verifiably restores the OLD image/extent via backup.
  *
- * install copies the candidate IN PLACE over the live app region (the
- * region bank-0 metadata still describes as the OLD image). So an
- * interrupted install always leaves the app region straddling old/new
- * bytes, which means the fresh bank-0 CRC recheck on the very next boot
- * (have_active_extent) can never re-validate against the OLD extent it
- * still records -- by design this makes any resume-after-crash roll back
- * to the QSPI backup rather than blindly continuing the install. That is
- * intentional fail-closed behaviour, not a partial-copy bug: this test
- * exercises exactly that path end to end. */
+ * The SDK extent/CRC remain the frozen original's, but bank0 is durably INVALID
+ * throughout the in-place copy. A partial candidate therefore cannot boot
+ * or qualify as the original, even when the original SDK CRC was unused. */
 static void test_crash_mid_install_then_rollback(bool sdk_crc_unused) {
   fake_io_state_t s;
   uint8_t old_hash[32];
@@ -641,16 +664,15 @@ static void test_crash_mid_install_then_rollback(bool sdk_crc_unused) {
   assert(read_state(&s, &state));
   assert(state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
   assert(state.progress_bytes == XIAO_OTA_QSPI_SECTOR_SIZE);
-  /* Bank-0 metadata must still show the OLD image -- the crash landed
-   * strictly before write_boot_settings() could ever run. */
+  /* The frozen metadata is intact except for the durable invalid flag. */
   assert(read_bank0_size(&s) == old_size);
   fake_io_read_settings_raw(&s, restored_settings);
-  assert(memcmp(original_settings, restored_settings,
-                sizeof(original_settings)) == 0);
+  assert(restored_settings[0] == 0xFF && restored_settings[1] == 0);
+  assert(memcmp(original_settings + 2, restored_settings + 2,
+                sizeof(original_settings) - 2) == 0);
 
-  /* A nonzero SDK CRC rejects the partial candidate by CRC; an unused
-   * zero SDK CRC MUST reject it by the fresh whole-original SHA instead.
-   * Removing that SHA gate makes the zero-CRC case wrongly reach TRIAL. */
+  /* Both original CRC policies retain exact SDK28 restoration. Fresh-original
+   * SHA binding is separately exercised before the invalidation barrier. */
   s.crash.op = FAKE_IO_OP_NONE;
   s.crash.after = -1;
   assert(fake_io_run_boot(&s) == 0);
@@ -1363,18 +1385,8 @@ static void test_qspi_init_failure_force_recovery(void) {
   }
 }
 
-/* Raw bank-0 settings-page torn commit: the settings page is modelled as
- * the real Nordic bootloader_settings_t raw bytes at
- * XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS inside internal flash, written
- * through the SAME production erase/program/verify codec
- * (xiao_ota_settings_set()) every real settings write uses. Tearing that
- * program call after only the VALID_APP flag/CRC bytes land (bank_0_size
- * onward stays at its just-erased 0xFF value) during finalize must be
- * treated exactly like any other finalize failure -- roll back, never
- * silently report installed -- and the ExtraFS region beyond the
- * install/rollback ceiling must survive completely untouched throughout,
- * both across the failed finalize attempt and the subsequent full
- * rollback. */
+/* A torn SDK body never publishes VALID, forces rollback and preserves
+ * ExtraFS. This one-shot IO failure recovers in the same processor call. */
 static void test_torn_settings_commit_during_finalize_forces_rollback(void) {
   fake_io_state_t s;
   uint8_t old_hash[32];
@@ -1396,18 +1408,11 @@ static void test_torn_settings_commit_during_finalize_forces_rollback(void) {
         sizeof(extrafs_sentinel));
 
   s.tear.op = FAKE_IO_OP_INTERNAL_WRITE;
-  s.tear.after = 1;
-  s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+  s.tear.after = 2;
+  s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4;
   s.tear.addr_hi =
       XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
-  /* Real erase-then-program settings write: the page is fully erased
-   * first, then the whole 28-byte raw record is programmed in one call.
-   * Tearing that program call after only the first 4 bytes lands the NEW
-   * bank_0/bank_0_crc fields but leaves bank_0_size (byte offset 8
-   * onward) at its just-erased 0xFF value -- an oversized/implausible
-   * size xiao_ota_resolve_active_extent() must refuse, exactly the
-   * "flag landed, size/CRC describe something else" torn-page outcome
-   * this test exercises. */
+  /* Only bank1/padding land; size and validity remain erased. */
   s.tear_bytes = 4;
   assert(fake_io_run_boot(&s) == 0);
   assert(read_state(&s, &state));
@@ -1437,18 +1442,18 @@ static void test_torn_settings_commit_during_finalize_forces_rollback(void) {
 }
 
 /* Full legal-capacity round trip: both the OLD (backup) and NEW
- * (candidate) images are exactly XIAO_OTA_INSTALL_MAX_SIZE (0xAD000),
+ * (candidate) images are exactly XIAO_OTA_INSTALL_MAX_SIZE (0x9D000),
  * the actual maximum this project will ever sign or install -- not a
  * small 320KiB-500KiB proxy size. A genuine signed install command
  * admits it, backup-copies the old image, installs the new one, then
  * (with no confirmation ever supplied) exhausts every trial boot and
  * genuinely rolls back. Throughout every phase, this asserts ALL bytes
  * of BOTH QSPI physical banks' tail regions past the writable cap --
- * XIAO_OTA_CANDIDATE_BASE+INSTALL_MAX_SIZE..+CANDIDATE_SIZE ("SecA",
- * 0xAD000..0xC6000) and XIAO_OTA_BACKUP_BASE+INSTALL_MAX_SIZE..
+ * the unchanged physical security tails ("SecA",
+ * 0xAD000..0xC6000) and XIAO_OTA_BACKUP_BASE+IMAGE_CAPACITY..
  * +BACKUP_SIZE ("SecB", 0x173000..0x18C000), each exactly 100KiB -- and
- * the internal ExtraFS region (XIAO_OTA_APP_START+INSTALL_MAX_SIZE..
- * 0xED000, also 100KiB at this exact cap) remain byte-for-byte
+ * the internal installer plus ExtraFS region (0xC4000..0xED000,
+ * 164KiB at this exact cap) remain byte-for-byte
  * untouched, and that the rolled-back image, its bank-0 size, and the
  * FULL 28-byte raw settings page (not just bank_0/bank_0_crc) are
  * restored to their exact pre-install originals. */
@@ -1460,15 +1465,15 @@ static void test_full_capacity_backup_install_rollback_preserves_tail_regions(vo
   xiao_ota_floor_t floor;
   uint8_t original_sdk28[28], restored_sdk28[28];
   static uint8_t secA_sentinel[0x19000], secB_sentinel[0x19000];
-  static uint8_t extrafs_sentinel[0x19000];
+  static uint8_t extrafs_sentinel[XIAO_OTA_APP_END - XIAO_OTA_INSTALL_ALLOWED_END];
   uint32_t attempt;
-  const uint32_t size = XIAO_OTA_INSTALL_MAX_SIZE; /* 0xAD000: legal max */
-  const uint32_t secA_offset = XIAO_OTA_CANDIDATE_BASE + size;
-  const uint32_t secB_offset = XIAO_OTA_BACKUP_BASE + size;
+  const uint32_t size = XIAO_OTA_INSTALL_MAX_SIZE; /* 0x9D000: legal max */
+  const uint32_t secA_offset = OTA_NRF52_SECURITY_A_OFFSET;
+  const uint32_t secB_offset = OTA_NRF52_SECURITY_B_OFFSET;
   const uint32_t extrafs_offset = XIAO_OTA_APP_START + size;
 
   _Static_assert(sizeof(secA_sentinel) ==
-                    (XIAO_OTA_CANDIDATE_SIZE - XIAO_OTA_INSTALL_MAX_SIZE),
+                    (XIAO_OTA_CANDIDATE_SIZE - OTA_NRF52_IMAGE_CAPACITY_BYTES),
                 "SecA/SecB tail sentinel size must match the real "
                 "capacity/stride gap (0x19000, 100KiB)");
 
@@ -1525,12 +1530,12 @@ static void test_full_capacity_backup_install_rollback_preserves_tail_regions(vo
 }
 
 /* A genuine, validly-signed command declaring active_image_extent ==
- * 0xAE000 (one word past XIAO_OTA_INSTALL_MAX_SIZE, still %4==0) must be
+ * 0x9E000 (one page past XIAO_OTA_INSTALL_MAX_SIZE, still %4==0) must be
  * refused at admission by the absolute capacity bound in
  * xiao_ota_install_command_static_identity_valid() BEFORE any erase,
  * backup copy, or install copy -- not merely because it happens to
  * mismatch some other unrelated field. The device's own recorded
- * (settings-derived) active extent is ALSO set to 0xAE000 here so the
+ * (settings-derived) active extent is ALSO set to 0x9E000 here so the
  * ordinary active_image_extent-vs-expected-extent equality check would
  * otherwise agree; only the absolute cap defends this. Full internal
  * flash and QSPI images are snapshotted after all command/candidate
@@ -1541,7 +1546,7 @@ static void test_active_extent_above_capacity_refused_before_any_mutation(void) 
   fake_io_state_t s;
   uint8_t old_hash[32], candidate_hash[32];
   uint8_t *internal_snapshot, *qspi_snapshot;
-  const uint32_t size = XIAO_OTA_INSTALL_MAX_SIZE + 0x1000u; /* 0xAE000 */
+  const uint32_t size = XIAO_OTA_INSTALL_MAX_SIZE + 0x1000u; /* 0x9E000 */
 
   internal_snapshot = malloc(FAKE_IO_INTERNAL_SIZE);
   qspi_snapshot = malloc(FAKE_IO_QSPI_SIZE);
@@ -1802,59 +1807,28 @@ static void test_active_transaction_bank0_triad_mismatch_forces_recovery(
   assert(memcmp(&before, &after, sizeof(before)) == 0);
 }
 
-/* REQUIRED RAW FAULT MATRIX (install path): a genuine power-loss cut
- * partway through the settings page's single 28-byte program word-run
- * (finalize_install_and_verify()'s xiao_ota_settings_apply_bank0() call)
- * aborts the ENTIRE boot call (fake processor resets right there, no
- * further code runs, nothing gets persisted past what already landed
- * durably). By this point the candidate has already been fully copied
- * into the live app region, so whether a genuine separate reboot safely
- * resumes FORWARD (finishing the install) or safely rolls ALL THE WAY
- * BACK (to the old image/settings) depends entirely on how much of the
- * new bank_0/bank_0_crc/bank_0_size triad (the only fields
- * active_extent_from_settings() ever reads) had actually landed before
- * the cut -- exactly the real hardware behaviour this fake_io_crash
- * model exists to prove, not a hand-picked single byte count:
- *   - tear_bytes < 12 (fewer than all of bank_0/crc/size's first 12
- *     bytes landed): fresh bank-0 metadata still describes something
- *     other than the already-copied candidate -- correctly detected and
- *     rolled all the way back to the OLD image/settings, matching
- *     test_crash_mid_install_rollback()'s copy-phase safety property.
- *   - tear_bytes >= 12 (the full triad landed, only ancillary/padding
- *     fields at byte 12+ still erased): bank-0 already legitimately
- *     describes the candidate -- correctly resumes FORWARD, re-runs
- *     finalize with the fault cleared (idempotent), and reaches
- *     TRIAL_BOOT, never stranding a genuinely-finished install. */
-static void test_install_settings_write_reboot_resume_matrix(void) {
+/* Cut every byte of the body and final validity word, including fully applied
+ * before acknowledgement. Only a complete publication may execute the APP. */
+static void test_install_settings_write_reboot_resume_matrix(bool publication,
+                                                            bool unused_crc) {
   size_t tear_bytes;
-
-  /* tear_bytes runs 0..RAW_SIZE inclusive: 0..27 are genuine partial
-   * program-word cuts, and RAW_SIZE (28) is the "fully applied before
-   * ack" cut -- the physical write completes correctly but the crash
-   * still lands before any caller ever observes success, exactly like
-   * every other cut here requiring a genuine separate reboot to resume. */
-  for (tear_bytes = 0; tear_bytes <= XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
+  for (tear_bytes = 0; tear_bytes <= (publication ? 4u : 24u);
       ++tear_bytes) {
     fake_io_state_t s;
     uint8_t old_hash[32];
     uint8_t candidate_hash[32];
     uint8_t running_hash[32];
+    uint8_t original[28], observed[28], expected[28];
     xiao_ota_state_t state;
     const uint32_t old_size = 8192;
-    const size_t triad_bytes = 12; /* bank_0(2)+bank_0_crc(2)+bank_1(2)+
-                                    * reserved_pad(2)+bank_0_size(4) */
 
-    fake_io_reset(&s);
-    provision_old_image(&s, old_size, 0xB1, old_hash);
-    write_candidate(&s, old_size, 0xC1, candidate_hash);
-    build_and_write_command(&s, 900 + (uint64_t)tear_bytes, 1, 1, old_size,
-                            candidate_hash, old_size, old_hash);
+    provision_intact_transaction(&s, unused_crc, old_hash, candidate_hash);
+    fake_io_read_settings_raw(&s, original);
 
     s.tear.op = FAKE_IO_OP_INTERNAL_WRITE;
-    s.tear.after = 1;
-    s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
-    s.tear.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS +
-                    XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
+    s.tear.after = 2; /* Skip the INVALID barrier's body/word publication. */
+    s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + (publication ? 0 : 4);
+    s.tear.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + (publication ? 4 : 28);
     s.tear_bytes = tear_bytes;
     s.tear_crash = true;
 
@@ -1863,15 +1837,40 @@ static void test_install_settings_write_reboot_resume_matrix(void) {
     assert(state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
     assert(state.progress_bytes == old_size);
     assert(s.force_recovery_calls == 0);
+    fake_io_read_settings_raw(&s, observed);
+    if (publication) {
+      assert(memcmp(observed + 4, original + 4, 24) == 0 &&
+             "VALID publication requires the complete frozen SDK body");
+      if (tear_bytes == 4) {
+        uint16_t crc = crc16_compute(s.qspi + XIAO_OTA_CANDIDATE_BASE,
+                                     old_size, NULL);
+        memcpy(expected, original, sizeof(expected));
+        memcpy(expected + 2, &crc, sizeof(crc));
+        assert(memcmp(observed, expected, sizeof(expected)) == 0);
+      }
+    } else {
+      assert(!(observed[0] == 1 && observed[1] == 0) &&
+             "A torn SDK body must never expose BANK_VALID_APP");
+    }
+    {
+      xiao_ota_io_t io = fake_io_interface(&s);
+      assert(xiao_ota_app_is_intact(&io) == (publication && tear_bytes == 4));
+    }
+    const int expected_recovery = publication && tear_bytes == 4 ? 0 : 1;
+    s.fail.op = FAKE_IO_OP_QSPI_INIT;
+    s.fail.after = 1;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(s.force_recovery_calls == expected_recovery);
+    s.fail.op = FAKE_IO_OP_NONE;
 
     /* Genuine separate reboot: fault cleared, fresh call. */
     s.tear.after = -1;
     s.tear_crash = false;
     assert(fake_io_run_boot(&s) == 0);
-    assert(s.force_recovery_calls == 0);
+    assert(s.force_recovery_calls == expected_recovery);
     assert(read_state(&s, &state));
     sha256_of(s.internal_flash + XIAO_OTA_APP_START, old_size, running_hash);
-    if (tear_bytes < triad_bytes) {
+    if (!publication || tear_bytes < 4) {
       assert(state.phase == XIAO_OTA_PHASE_FAILED);
       assert(memcmp(running_hash, old_hash, 32) == 0);
       assert(read_bank0_size(&s) == old_size);
@@ -1891,31 +1890,23 @@ static void test_install_settings_write_reboot_resume_matrix(void) {
  * (progress_bytes==active_image_extent, persisted); the cut must leave
  * that intact and NOT mark FAILED until a later, fault-cleared reboot's
  * settings write actually lands and verifies. */
-static void test_rollback_settings_write_reboot_resume_matrix(void) {
+static void test_rollback_settings_write_reboot_resume_matrix(bool publication,
+                                                             bool unused_crc) {
   size_t tear_bytes;
 
-  /* Inclusive of RAW_SIZE (28): "fully applied before ack", see the
-   * install-path matrix above for the same reasoning. */
-  for (tear_bytes = 0; tear_bytes <= XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
+  for (tear_bytes = 0; tear_bytes <= (publication ? 4u : 24u);
       ++tear_bytes) {
     fake_io_state_t s;
     uint8_t old_hash[32];
     uint8_t candidate_hash[32];
     uint8_t running_hash[32];
+    uint8_t original[28], restored[28], observed[28];
     xiao_ota_state_t state;
     uint32_t attempt;
     const uint32_t old_size = 8192;
 
-    fake_io_reset(&s);
-    provision_old_image(&s, old_size, 0xD1, old_hash);
-    write_candidate(&s, old_size, 0xE1, candidate_hash);
-    /* A candidate hash that will never match the actually-installed
-     * image forces every trial boot to keep failing confirmation, so
-     * the retry budget exhausts and rollback runs -- reuse the same
-     * technique as test_stale_confirmation_never_advances_floor()/
-     * test_rollback_restores_settings_raw_verbatim(). */
-    build_and_write_command(&s, 950 + (uint64_t)tear_bytes, 1, 1, old_size,
-                            candidate_hash, old_size, old_hash);
+    provision_intact_transaction(&s, unused_crc, old_hash, candidate_hash);
+    fake_io_read_settings_raw(&s, original);
     assert(fake_io_run_boot(&s) == 0);
     assert(read_state(&s, &state));
     assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
@@ -1928,10 +1919,9 @@ static void test_rollback_settings_write_reboot_resume_matrix(void) {
     }
 
     s.tear.op = FAKE_IO_OP_INTERNAL_WRITE;
-    s.tear.after = 1;
-    s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
-    s.tear.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS +
-                    XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
+    s.tear.after = 2; /* Skip the INVALID barrier's body/word publication. */
+    s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + (publication ? 0 : 4);
+    s.tear.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + (publication ? 4 : 28);
     s.tear_bytes = tear_bytes;
     s.tear_crash = true;
 
@@ -1942,18 +1932,409 @@ static void test_rollback_settings_write_reboot_resume_matrix(void) {
     assert(state.phase == XIAO_OTA_PHASE_ROLLBACK_COPYING);
     assert(state.progress_bytes == state.active_image_extent);
     assert(s.force_recovery_calls == 0);
+    fake_io_read_settings_raw(&s, observed);
+    if (publication) {
+      assert(memcmp(observed + 4, original + 4, 24) == 0 &&
+             "Rollback VALID publication requires the complete frozen SDK body");
+      if (tear_bytes == 4)
+        assert(memcmp(observed, original, sizeof(original)) == 0);
+    } else {
+      assert(!(observed[0] == 1 && observed[1] == 0) &&
+             "A torn rollback SDK body must never expose BANK_VALID_APP");
+    }
     sha256_of(s.internal_flash + XIAO_OTA_APP_START, old_size, running_hash);
     assert(memcmp(running_hash, old_hash, 32) == 0); /* backup already back */
+    {
+      xiao_ota_io_t io = fake_io_interface(&s);
+      assert(xiao_ota_app_is_intact(&io) == (publication && tear_bytes == 4));
+    }
+    const int expected_recovery = publication && tear_bytes == 4 ? 0 : 1;
+    s.fail.op = FAKE_IO_OP_QSPI_INIT;
+    s.fail.after = 1;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(s.force_recovery_calls == expected_recovery);
+    s.fail.op = FAKE_IO_OP_NONE;
 
     s.tear.after = -1;
     s.tear_crash = false;
-    assert(fake_io_run_boot(&s) == 0);
-    assert(s.force_recovery_calls == 0);
+    {
+      int clears = s.bank_clear_writes;
+      assert(fake_io_run_boot(&s) == 0);
+      assert(s.bank_clear_writes > clears); /* Re-invalidate even after restore. */
+    }
+    assert(s.force_recovery_calls == expected_recovery);
     assert(read_state(&s, &state));
     assert(state.phase == XIAO_OTA_PHASE_FAILED);
     sha256_of(s.internal_flash + XIAO_OTA_APP_START, old_size, running_hash);
     assert(memcmp(running_hash, old_hash, 32) == 0);
     assert(read_bank0_size(&s) == old_size);
+    fake_io_read_settings_raw(&s, restored);
+    assert(memcmp(original, restored, sizeof(original)) == 0);
+  }
+}
+
+static void test_intact_qspi_error_fallback(void) {
+  for (unsigned test = 0; test < 4; ++test) {
+    fake_io_state_t s;
+    uint8_t old_hash[32], candidate_hash[32];
+    uint8_t *before = malloc(FAKE_IO_QSPI_SIZE);
+    xiao_ota_io_t io;
+    assert(before);
+    provision_intact_transaction(&s, (test & 1u) != 0,
+                                old_hash, candidate_hash);
+    io = fake_io_interface(&s);
+    assert(xiao_ota_app_is_intact(&io));
+    memcpy(before, s.qspi, FAKE_IO_QSPI_SIZE);
+    s.fail.op = test < 2 ? FAKE_IO_OP_QSPI_INIT : FAKE_IO_OP_QSPI_READ;
+    s.fail.after = 1;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == 0);
+    assert(s.app_erase_calls == 0 && s.bank_clear_writes == 0);
+    assert(memcmp(before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
+    assert(xiao_ota_app_is_intact(&io));
+    free(before);
+  }
+}
+
+static bool unavailable_qspi_init(void *ctx) {
+  (void)ctx;
+  return false;
+}
+
+static void test_qspi_fallback_rejects_unsafe_internal_banks(void) {
+  for (unsigned test = 0; test < 19; ++test) {
+    fake_io_state_t s;
+    uint8_t old_hash[32], candidate_hash[32], raw[28];
+    uint32_t value;
+    provision_intact_transaction(&s, false, old_hash, candidate_hash);
+    fake_io_read_settings_raw(&s, raw);
+    switch (test) {
+      case 0: raw[0] = 0; break;
+      case 1: raw[0] = 0xFF; break;
+      case 2: memset(raw, 0xFF, sizeof(raw)); break;
+      case 3: value = 0; memcpy(raw + 8, &value, 4); break;
+      case 4: value = 7; memcpy(raw + 8, &value, 4); break;
+      case 5: value = XIAO_OTA_INSTALL_MAX_SIZE + 4; memcpy(raw + 8, &value, 4); break;
+      case 6: raw[4] = 0xAA; break;
+      case 7: raw[4] = 0xA5; break;
+      case 8: raw[4] = 0xFF; raw[5] = 0xFF; break;
+      case 9: raw[2] ^= 1; break;
+      case 10: value = 0xFFFFFFFF; memcpy(s.internal_flash + XIAO_OTA_APP_START, &value, 4); break;
+      case 11: s.internal_flash[XIAO_OTA_APP_START + 4] &= ~1u; break;
+      case 12: value = XIAO_OTA_APP_START + 8193; memcpy(s.internal_flash + XIAO_OTA_APP_START + 4, &value, 4); break;
+      case 13: raw[0] = 0xA5; break;
+      case 14: raw[0] = 0xAA; break;
+      case 15: raw[1] = 0xFF; break;
+      default: break;
+    }
+    fake_io_write_settings_raw(&s, raw);
+    if (test == 16) fake_io_poison_settings_tail(&s, 28, 0);
+    s.fail.op = FAKE_IO_OP_QSPI_INIT;
+    s.fail.after = 1;
+    if (test >= 17) {
+      s.crash.op = FAKE_IO_OP_NONE;
+      xiao_ota_io_t io = fake_io_interface(&s);
+      io.qspi_init = unavailable_qspi_init;
+      s.fail.op = FAKE_IO_OP_INTERNAL_READ;
+      s.fail.addr_lo = test == 17 ? XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS
+                                 : XIAO_OTA_APP_START + 256;
+      s.fail.addr_hi = s.fail.addr_lo + 28;
+      xiao_ota_boot_process_io(&io);
+      assert(s.force_recovery_calls == 1 && s.app_erase_calls == 0);
+    } else {
+      assert(fake_io_run_boot(&s) == 0);
+      assert(s.force_recovery_calls == 1 && s.app_erase_calls == 0);
+    }
+  }
+}
+
+static void test_install_barrier_cuts_and_rollback_resumes(void) {
+  for (unsigned cut = 0; cut < 8; ++cut) {
+    fake_io_state_t s;
+    uint8_t old_hash[32], candidate_hash[32], original[28], restored[28];
+    xiao_ota_state_t state;
+    xiao_ota_io_t io;
+    provision_intact_transaction(&s, true, old_hash, candidate_hash);
+    fake_io_read_settings_raw(&s, original);
+    if (cut < 6) {
+      s.tear.op = FAKE_IO_OP_INTERNAL_WRITE;
+      s.tear.after = 1;
+      s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+      s.tear.addr_hi = s.tear.addr_lo + 4;
+      s.tear_bytes = cut == 5 ? 4 : cut;
+      s.tear_crash = true;
+      if (cut == 5) { /* Before the SDK page erase takes effect. */
+        s.tear.op = FAKE_IO_OP_NONE;
+        s.crash = s.tear;
+        s.crash.op = FAKE_IO_OP_INTERNAL_ERASE;
+      }
+    } else {
+      s.crash.op = cut == 6 ? FAKE_IO_OP_INTERNAL_ERASE
+                            : FAKE_IO_OP_INTERNAL_WRITE;
+      s.crash.after = cut == 6 ? 1 : 18;
+      s.crash.addr_lo = XIAO_OTA_APP_START;
+      s.crash.addr_hi = XIAO_OTA_APP_START + 8192;
+    }
+    assert(fake_io_run_boot(&s) == 1);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
+    io = fake_io_interface(&s);
+    assert(xiao_ota_app_is_intact(&io) == (cut == 5));
+    if (cut == 6) assert(s.invalid_bank_readback);
+    s.crash.op = s.tear.op = FAKE_IO_OP_NONE;
+    s.fail.op = FAKE_IO_OP_QSPI_INIT;
+    s.fail.after = 1;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(s.force_recovery_calls == (cut == 5 ? 0 : 1));
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
+    s.fail.op = FAKE_IO_OP_NONE;
+    if (cut != 5) {
+      /* A separate cut in rollback, then another boot with a fresh readback. */
+      s.crash.op = FAKE_IO_OP_INTERNAL_WRITE;
+      s.crash.count = 0;
+      s.crash.after = 3;
+      s.crash.addr_lo = XIAO_OTA_APP_START;
+      s.crash.addr_hi = XIAO_OTA_APP_START + 8192;
+      assert(fake_io_run_boot(&s) == 1);
+      assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_ROLLBACK_COPYING);
+      assert(!xiao_ota_app_is_intact(&io));
+      s.crash.op = FAKE_IO_OP_NONE;
+    }
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state));
+    if (cut == 5) {
+      assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+    } else {
+      assert(state.phase == XIAO_OTA_PHASE_FAILED);
+      fake_io_read_settings_raw(&s, restored);
+      assert(memcmp(original, restored, 28) == 0);
+    }
+  }
+}
+
+static void test_qspi_read_error_after_barrier_and_published_trial(void) {
+  fake_io_state_t s;
+  xiao_ota_state_t before, after;
+  xiao_ota_floor_t floor_before, floor_after;
+  uint8_t old_hash[32], candidate_hash[32];
+  provision_intact_transaction(&s, true, old_hash, candidate_hash);
+  s.fail.op = FAKE_IO_OP_QSPI_READ;
+  s.fail.after = 3; /* Admission, BACKUP_READY recheck, then destructive copy. */
+  s.fail.addr_lo = XIAO_OTA_CANDIDATE_BASE;
+  s.fail.addr_hi = s.fail.addr_lo + 256;
+  assert(fake_io_run_boot(&s) == 0);
+  assert(s.force_recovery_calls == 1);
+  assert(s.bank_clear_writes == 1 && s.app_erase_calls == 1);
+  s.fail.op = FAKE_IO_OP_NONE;
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &after) && after.phase == XIAO_OTA_PHASE_FAILED);
+
+  provision_intact_transaction(&s, true, old_hash, candidate_hash);
+  assert(fake_io_run_boot(&s) == 0);
+  assert(read_state(&s, &before) && before.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(read_floor(&s, &floor_before));
+  int watches = s.watchdog_start_calls;
+  s.fail.op = FAKE_IO_OP_QSPI_INIT;
+  s.fail.after = 1;
+  assert(fake_io_run_boot(&s) == 0);
+  assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == watches);
+  assert(read_state(&s, &after) && memcmp(&before, &after, sizeof(before)) == 0);
+  assert(read_floor(&s, &floor_after) &&
+         memcmp(&floor_before, &floor_after, sizeof(floor_before)) == 0);
+}
+
+static void test_invalidation_readback_cut_and_failure(void) {
+  fake_io_state_t s;
+  uint8_t old_hash[32], candidate_hash[32], digest[32];
+  xiao_ota_state_t state;
+  provision_intact_transaction(&s, true, old_hash, candidate_hash);
+  s.crash.op = FAKE_IO_OP_INTERNAL_WRITE;
+  s.crash.after = 1;
+  s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+  s.crash.addr_hi = s.crash.addr_lo + 4;
+  s.fail.op = FAKE_IO_OP_INTERNAL_READ;
+  s.fail.after = -1;
+  s.fail.addr_lo = s.crash.addr_lo;
+  s.fail.addr_hi = s.crash.addr_hi;
+  assert(fake_io_run_boot(&s) == 1);
+  const int readback_call = s.fail.count + 1;
+  for (unsigned crash = 0; crash < 2; ++crash) {
+    provision_intact_transaction(&s, true, old_hash, candidate_hash);
+    fake_io_fault_t *fault = crash ? &s.crash : &s.fail;
+    fault->op = FAKE_IO_OP_INTERNAL_READ;
+    fault->after = readback_call;
+    fault->addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+    fault->addr_hi = fault->addr_lo + 4;
+    assert(fake_io_run_boot(&s) == (int)crash);
+    assert(s.watchdog_start_calls == 0);
+    if (crash) {
+      assert(!s.invalid_bank_readback && s.app_erase_calls == 0);
+      assert(s.bank_clear_writes == 1);
+      assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
+      s.crash.op = FAKE_IO_OP_NONE;
+      s.fail.op = FAKE_IO_OP_QSPI_INIT;
+      s.fail.after = 1;
+      assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 1);
+      s.fail.op = FAKE_IO_OP_NONE;
+      assert(fake_io_run_boot(&s) == 0);
+    }
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    sha256_of(s.internal_flash + XIAO_OTA_APP_START, 8192, digest);
+    assert(memcmp(digest, old_hash, 32) == 0);
+  }
+}
+
+static void test_sdk_page_invalidation_cut_matrix(bool rollback,
+                                                 bool unused_crc) {
+  const size_t erase_cuts[] = {0, 1, 2, 3, 4, 8, 12, 27, 28, 2048, 4095, 4096};
+  for (unsigned operation = 0; operation < 3; ++operation) {
+    const size_t cuts = operation == 0
+                           ? sizeof(erase_cuts) / sizeof(erase_cuts[0])
+                           : operation == 1 ? 25 : 5;
+    for (size_t cut = 0; cut < cuts; ++cut) {
+      fake_io_state_t s;
+      xiao_ota_state_t state, before, after;
+      uint8_t old_hash[32], candidate_hash[32], digest[32];
+      uint8_t original[28], restored[28], observed[28];
+      provision_intact_transaction(&s, unused_crc, old_hash, candidate_hash);
+      fake_io_read_settings_raw(&s, original);
+      if (rollback) {
+        assert(fake_io_run_boot(&s) == 0);
+        for (unsigned attempt = 0; attempt + 1 < XIAO_OTA_MAX_TRIAL_BOOTS;
+             ++attempt)
+          assert(fake_io_run_boot(&s) == 0);
+      }
+      int erases = s.app_erase_calls;
+      s.tear.op = operation == 0 ? FAKE_IO_OP_INTERNAL_ERASE
+                                 : FAKE_IO_OP_INTERNAL_WRITE;
+      s.tear.after = 1;
+      s.tear.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS +
+                      (operation == 1 ? 4 : 0);
+      s.tear.addr_hi = s.tear.addr_lo + (operation == 1 ? 24 : 4);
+      s.tear_bytes = operation == 0 ? erase_cuts[cut] : cut;
+      s.tear_crash = true;
+      assert(fake_io_run_boot(&s) == 1);
+      assert(s.app_erase_calls == erases);
+      sha256_of(s.internal_flash + XIAO_OTA_APP_START, 8192, digest);
+      assert(memcmp(digest, rollback ? candidate_hash : old_hash, 32) == 0);
+      assert(read_state(&s, &before));
+      assert(before.phase == (rollback ? XIAO_OTA_PHASE_ROLLBACK_COPYING
+                                       : XIAO_OTA_PHASE_INSTALL_COPYING));
+      assert(before.progress_bytes == 0);
+      fake_io_read_settings_raw(&s, observed);
+      if (observed[0] == 1 && observed[1] == 0)
+        assert(memcmp(observed + 4, original + 4, 24) == 0 &&
+               "Bank VALID must never accompany torn SDK size/metadata");
+      const bool intact = operation == 0 && erase_cuts[cut] == 0;
+      xiao_ota_io_t io = fake_io_interface(&s);
+      assert(xiao_ota_app_is_intact(&io) == intact);
+      s.tear.op = FAKE_IO_OP_NONE;
+      s.fail.op = FAKE_IO_OP_QSPI_INIT;
+      s.fail.after = 1;
+      int recoveries = s.force_recovery_calls;
+      assert(fake_io_run_boot(&s) == 0);
+      assert(s.force_recovery_calls == recoveries + (int)!intact);
+      assert(s.app_erase_calls == erases);
+      assert(read_state(&s, &after) &&
+             memcmp(&before, &after, sizeof(before)) == 0);
+      s.fail.op = FAKE_IO_OP_NONE;
+      int settings_erases = s.settings_erase_calls;
+      assert(fake_io_run_boot(&s) == 0);
+      assert(s.force_recovery_calls == recoveries + (int)!intact);
+      if (operation == 0 && erase_cuts[cut] == 4096)
+        assert(s.settings_erase_calls == settings_erases + 2 &&
+               "Erased SDK resume must rebuild INVALID before copy and restore");
+      assert(read_state(&s, &state));
+      if (!rollback && intact) {
+        assert(state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+      } else {
+        assert(state.phase == XIAO_OTA_PHASE_FAILED);
+        fake_io_read_settings_raw(&s, restored);
+        assert(memcmp(original, restored, sizeof(original)) == 0);
+        sha256_of(s.internal_flash + XIAO_OTA_APP_START, 8192, digest);
+        assert(memcmp(digest, old_hash, 32) == 0);
+      }
+    }
+  }
+}
+
+static void test_exact_invalid_resume_and_torn_snapshot_rebuild(void) {
+  for (unsigned changed = 0; changed < 3; ++changed) {
+    fake_io_state_t s;
+    xiao_ota_state_t state;
+    uint8_t old_hash[32], candidate_hash[32], original[28], raw[28];
+    provision_intact_transaction(&s, true, old_hash, candidate_hash);
+    fake_io_read_settings_raw(&s, original);
+    s.crash.op = FAKE_IO_OP_INTERNAL_WRITE;
+    s.crash.after = 3;
+    s.crash.addr_lo = XIAO_OTA_APP_START;
+    s.crash.addr_hi = s.crash.addr_lo + 8192;
+    assert(fake_io_run_boot(&s) == 1);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_INSTALL_COPYING);
+    fake_io_read_settings_raw(&s, raw);
+    assert(raw[0] == 0xFF && raw[1] == 0);
+    assert(memcmp(raw + 2, original + 2, sizeof(raw) - 2) == 0);
+    if (changed) {
+      if (changed == 1) raw[16] ^= 1; /* Same INVALID flag, different body. */
+      else raw[0] = 0; /* Legacy bit-clear marker is not reusable. */
+      fake_io_write_settings_raw(&s, raw);
+    }
+    int erases = s.settings_erase_calls;
+    int publications = s.bank_clear_writes;
+    s.crash.after = 1;
+    s.crash.count = 0;
+    assert(fake_io_run_boot(&s) == 1);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_ROLLBACK_COPYING);
+    assert(s.invalid_bank_readback);
+    assert(s.settings_erase_calls == erases + (int)(changed != 0));
+    assert(s.bank_clear_writes == publications + (int)(changed != 0));
+    fake_io_read_settings_raw(&s, raw);
+    assert(raw[0] == 0xFF && raw[1] == 0);
+    assert(memcmp(raw + 2, original + 2, sizeof(raw) - 2) == 0);
+    s.crash.op = FAKE_IO_OP_NONE;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_FAILED);
+    fake_io_read_settings_raw(&s, raw);
+    assert(memcmp(raw, original, sizeof(raw)) == 0);
+  }
+}
+
+static void test_intact_bank_does_not_relax_pending_records(void) {
+  for (unsigned test = 0; test < 3; ++test) {
+    fake_io_state_t s;
+    uint8_t old_hash[32], candidate_hash[32];
+    xiao_ota_state_t state;
+    provision_intact_transaction(&s, false, old_hash, candidate_hash);
+    assert(fake_io_run_boot(&s) == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+    const uint32_t sidecar_address[] = {XIAO_OTA_SETTINGS_SIDECAR_A,
+                                        XIAO_OTA_SETTINGS_SIDECAR_B};
+    if (test < 2) {
+      for (unsigned slot = 0; slot < 2; ++slot) {
+        xiao_ota_settings_sidecar_t sidecar;
+        memcpy(&sidecar, s.qspi + sidecar_address[slot], sizeof(sidecar));
+        if (test == 0) {
+          memset(s.qspi + sidecar_address[slot], 0xFF, sizeof(sidecar));
+        } else {
+          sidecar.transaction_nonce++;
+          sidecar.crc32 = xiao_ota_crc32(
+              &sidecar, offsetof(xiao_ota_settings_sidecar_t, crc32));
+          memcpy(s.qspi + sidecar_address[slot], &sidecar, sizeof(sidecar));
+        }
+      }
+    } else {
+      memset(s.qspi + XIAO_OTA_STATE_A, 0xFF, sizeof(xiao_ota_state_t));
+      memset(s.qspi + XIAO_OTA_STATE_B, 0xFF, sizeof(xiao_ota_state_t));
+    }
+    xiao_ota_io_t io = fake_io_interface(&s);
+    assert(xiao_ota_app_is_intact(&io));
+    int erases = s.app_erase_calls;
+    assert(fake_io_run_boot(&s) == 0);
+    assert(s.force_recovery_calls == 1 && s.app_erase_calls == erases);
+    xiao_ota_state_t after;
+    if (test < 2)
+      assert(read_state(&s, &after) && memcmp(&state, &after, sizeof(state)) == 0);
+    else
+      assert(!read_state(&s, &after));
   }
 }
 
@@ -2882,8 +3263,8 @@ static void test_install_settings_erase_then_crash_before_write_resumes(void) {
                           old_hash);
 
   s.crash.op = FAKE_IO_OP_INTERNAL_WRITE;
-  s.crash.after = 1;
-  s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+  s.crash.after = 2;
+  s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4;
   s.crash.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS +
                     XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
 
@@ -2938,8 +3319,8 @@ static void test_rollback_settings_erase_then_crash_before_write_resumes(void) {
   }
 
   s.crash.op = FAKE_IO_OP_INTERNAL_WRITE;
-  s.crash.after = 1;
-  s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+  s.crash.after = 2;
+  s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4;
   s.crash.addr_hi = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS +
                     XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE;
 
@@ -3344,9 +3725,16 @@ static void test_signed_zero_crc_candidate_installs_confirms_and_resolves_next_b
 
   fake_io_reset(&s);
   provision_old_image(&s, old_size, 0x11, old_hash);
+  s.require_bank_invalidation = true;
+  s.internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4] = 0xFF;
+  s.internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 5] = 0;
 
   candidate_buffer = (uint8_t *)&s.qspi[XIAO_OTA_CANDIDATE_BASE];
   fill_pattern(candidate_buffer, candidate_size, 0x77);
+  {
+    const uint32_t vectors[2] = {0x20040000, XIAO_OTA_APP_START + 0x101};
+    memcpy(candidate_buffer, vectors, sizeof(vectors));
+  }
   force_crc16_zero(candidate_buffer, candidate_size);
   assert(crc16_compute(candidate_buffer, candidate_size, NULL) == 0);
   sha256_of(candidate_buffer, candidate_size, candidate_hash);
@@ -3368,6 +3756,16 @@ static void test_signed_zero_crc_candidate_installs_confirms_and_resolves_next_b
     fake_io_read_bank0_settings(&s, &settings);
     assert(settings.bank_0 == XIAO_OTA_BANK_VALID_APP);
     assert(settings.bank_0_crc == 0);
+  }
+  {
+    xiao_ota_io_t io = fake_io_interface(&s);
+    assert(xiao_ota_app_is_intact(&io));
+    s.fail.op = FAKE_IO_OP_QSPI_INIT;
+    s.fail.after = 1;
+    assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
+    assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+    assert(state.trial_attempts == 0 && s.watchdog_start_calls == 1);
+    s.fail.op = FAKE_IO_OP_NONE;
   }
 
   /* Boot 2: confirm. active_extent_from_settings() is called again here
@@ -3624,10 +4022,10 @@ static void test_vendor_zero_crc_original_continuation(bool backup_ready,
     s.crash.addr_hi = s.crash.addr_lo + 256;
     s.crash.after = 2;
   } else {
-    /* INSTALL_COPYING is durable but no original bytes are erased yet. */
+    /* INSTALL_COPYING is durable, before its bank-invalidating barrier. */
     s.crash.op = FAKE_IO_OP_INTERNAL_ERASE;
-    s.crash.addr_lo = XIAO_OTA_APP_START;
-    s.crash.addr_hi = s.crash.addr_lo + XIAO_OTA_QSPI_SECTOR_SIZE;
+    s.crash.addr_lo = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
+    s.crash.addr_hi = s.crash.addr_lo + 4;
     s.crash.after = 1;
   }
   assert(fake_io_run_boot(&s) == 1);
@@ -3697,8 +4095,11 @@ static void test_candidate_zero_sdk_crc_mismatch_stays_strict(bool floor_repair)
 
 static void provision_factory_original(fake_io_state_t *s, bool unused_crc,
                                        uint8_t hash[32]) {
+  const uint32_t vectors[2] = {0x20040000, XIAO_OTA_APP_START + 0x101};
   fake_io_reset(s);
   provision_vendor_zero_crc_original(s, 32768, hash);
+  memcpy(s->internal_flash + XIAO_OTA_APP_START, vectors, sizeof(vectors));
+  sha256_of(s->internal_flash + XIAO_OTA_APP_START, 32768, hash);
   if (!unused_crc)
     fake_io_provision_bank0_settings(s, 1, crc16_compute(
         s->internal_flash + XIAO_OTA_APP_START, 32768, NULL), 32768);
@@ -4031,6 +4432,20 @@ static void test_factory_write_cut_matrix(void) {
 int main(void) {
   crypto_sign_keypair(xiao_ota_test_public_key_ed25519, g_test_secret_key);
 
+  for (unsigned policy = 0; policy < 2; ++policy) {
+    test_sdk_page_invalidation_cut_matrix(false, policy != 0);
+    test_sdk_page_invalidation_cut_matrix(true, policy != 0);
+  }
+  test_exact_invalid_resume_and_torn_snapshot_rebuild();
+  printf("168 SDK erase/body/INVALID cuts and exact-snapshot resume passed\n");
+  test_install_barrier_cuts_and_rollback_resumes();
+  printf("durable install barrier cuts, unavailable QSPI and rollback resumes passed\n");
+  test_intact_qspi_error_fallback();
+  test_qspi_fallback_rejects_unsafe_internal_banks();
+  test_qspi_read_error_after_barrier_and_published_trial();
+  test_invalidation_readback_cut_and_failure();
+  test_intact_bank_does_not_relax_pending_records();
+  printf("strict internal fallback and unconfirmed published-trial tradeoff passed\n");
   test_partial_state_marker_conservatively_burns_possible_retry();
   printf("partial state marker conservatively burns possible retry passed\n");
   test_prepared_sidecar_retains_committed_state_pair();
@@ -4102,9 +4517,13 @@ int main(void) {
   printf("active transaction bank0 triad mismatch forces recovery passed\n");
   test_settings_tail_poisoned_refuses_write();
   printf("settings tail poisoned refuses write passed\n");
-  test_install_settings_write_reboot_resume_matrix();
+  for (unsigned variant = 0; variant < 4; ++variant)
+    test_install_settings_write_reboot_resume_matrix((variant & 1u) != 0,
+                                                    (variant & 2u) != 0);
   printf("install settings-write reboot resume matrix passed\n");
-  test_rollback_settings_write_reboot_resume_matrix();
+  for (unsigned variant = 0; variant < 4; ++variant)
+    test_rollback_settings_write_reboot_resume_matrix((variant & 1u) != 0,
+                                                     (variant & 2u) != 0);
   printf("rollback settings-write reboot resume matrix passed\n");
   test_corrupted_committed_newer_state_refuses_stale_fallback();
   printf("corrupted committed newer state refuses stale fallback passed\n");

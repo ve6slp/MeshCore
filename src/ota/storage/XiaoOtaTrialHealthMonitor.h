@@ -340,7 +340,7 @@ private:
       // Fail closed on ANY of: outright Failed, a reported zero extent,
       // (defensively) a null image pointer even if the accessor claims
       // Resolved, an extent beyond kXiaoOtaAppInstallMaxSize (the same
-      // 708608-byte install ceiling enforced elsewhere -- an injected/
+      // 643072-byte install ceiling enforced elsewhere -- an injected/
       // buggy accessor reporting an oversized extent must never be
       // trusted to dereference/hash that many bytes, even though the
       // REAL hardware resolver already enforces this bound itself; this

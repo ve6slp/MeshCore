@@ -29,6 +29,20 @@ static uint8_t io_buffer[COPY_CHUNK] __attribute__((aligned(4)));
  */
 static uint8_t flash_stage_buffer[COPY_CHUNK] __attribute__((aligned(4)));
 static uint8_t verify_buffer[COPY_CHUNK] __attribute__((aligned(4)));
+/* Startup is non-reentrant. Once external reads fail, do not reclassify
+ * unknown history using later successful reads in the same boot. */
+static bool qspi_read_failed;
+
+static void recover_or_boot_intact(const xiao_ota_io_t *io);
+
+static bool checked_qspi_read(void *context, uint32_t address,
+                              void *destination, size_t length) {
+  const xiao_ota_io_t *io = context;
+  if (qspi_read_failed) return false;
+  if (io->qspi_read(io->ctx, address, destination, length)) return true;
+  qspi_read_failed = true;
+  return false;
+}
 
 /*
  * Hardware-independent transaction processor: this whole file has no
@@ -69,7 +83,7 @@ static bool hash_stream(xiao_ota_stream_read_fn read_fn, void *ctx,
 
 static bool hash_qspi(const xiao_ota_io_t *io, uint32_t address,
                       uint32_t length, uint8_t digest[32]) {
-  return hash_stream(io->qspi_read, io->ctx, address, length, digest);
+  return hash_stream(checked_qspi_read, (void *)io, address, length, digest);
 }
 
 static bool hash_internal(const xiao_ota_io_t *io, uint32_t address,
@@ -256,7 +270,7 @@ static bool range_erased(const xiao_ota_io_t *io, uint32_t address,
   uint32_t offset = start;
   while (offset < end) {
     uint32_t n = end - offset > COPY_CHUNK ? COPY_CHUNK : end - offset;
-    if (!io->qspi_read(io->ctx, address + offset, io_buffer, n)) return false;
+    if (!checked_qspi_read((void *)io, address + offset, io_buffer, n)) return false;
     if (!xiao_ota_bytes_erased(io_buffer, n)) *out_blank = false;
     offset += n;
   }
@@ -604,8 +618,8 @@ static xiao_ota_pair_status_t read_pair(const xiao_ota_io_t *io,
                                         const void *binding_ctx) {
   bool a_valid, b_valid, a_safe, b_safe, a_io_error, b_io_error;
   if (out_holder_address) *out_holder_address = b_address;
-  if (!io->qspi_read(io->ctx, a_address, a, size)) return XIAO_OTA_PAIR_IO_ERROR;
-  if (!io->qspi_read(io->ctx, b_address, b, size)) return XIAO_OTA_PAIR_IO_ERROR;
+  if (!checked_qspi_read((void *)io, a_address, a, size)) return XIAO_OTA_PAIR_IO_ERROR;
+  if (!checked_qspi_read((void *)io, b_address, b, size)) return XIAO_OTA_PAIR_IO_ERROR;
   a_valid = valid(a);
   b_valid = valid(b);
 
@@ -1155,7 +1169,7 @@ static xiao_ota_pair_status_t classify_sidecar_slot(
     uint32_t owning_state_sector_base, bool require_unambiguous,
     xiao_ota_settings_sidecar_t *out) {
   bool io_error;
-  if (!io->qspi_read(io->ctx, sidecar_address, out, sizeof(*out))) {
+  if (!checked_qspi_read((void *)io, sidecar_address, out, sizeof(*out))) {
     return XIAO_OTA_PAIR_IO_ERROR;
   }
   if (xiao_ota_settings_sidecar_valid(out)) return XIAO_OTA_PAIR_FOUND;
@@ -1247,7 +1261,7 @@ static bool write_body_then_marker(const xiao_ota_io_t *io, uint32_t target_addr
   memcpy(bytes + crc_offset, &crc, sizeof(crc));
 
   if (!io->qspi_write(io->ctx, target_address, record, commit_offset)) return false;
-  if (!io->qspi_read(io->ctx, target_address, verify_buffer, commit_offset)) return false;
+  if (!checked_qspi_read((void *)io, target_address, verify_buffer, commit_offset)) return false;
   if (memcmp(verify_buffer, record, commit_offset) != 0) return false;
 
   if (!io->qspi_write(io->ctx, target_address + commit_offset, &marker, sizeof(marker))) {
@@ -1255,7 +1269,7 @@ static bool write_body_then_marker(const xiao_ota_io_t *io, uint32_t target_addr
   }
   memcpy(bytes + commit_offset, &marker, sizeof(marker));
 
-  if (!io->qspi_read(io->ctx, target_address, verify_buffer, record_size)) return false;
+  if (!checked_qspi_read((void *)io, target_address, verify_buffer, record_size)) return false;
   if (memcmp(verify_buffer, record, record_size) != 0) return false;
   if (!valid(verify_buffer)) return false;
   return true;
@@ -1385,7 +1399,7 @@ static bool persist_state_or_recover(const xiao_ota_io_t *io,
                                      xiao_ota_settings_sidecar_t *sidecar,
                                      uint32_t *slot_address) {
   if (!persist_state(io, state, sidecar, slot_address)) {
-    io->force_recovery(io->ctx);
+    recover_or_boot_intact(io);
     return false;
   }
   return true;
@@ -1395,7 +1409,7 @@ static bool persist_floor_or_recover(const xiao_ota_io_t *io,
                                      xiao_ota_floor_t *floor,
                                      uint32_t *slot_address) {
   if (!persist_floor(io, floor, slot_address)) {
-    io->force_recovery(io->ctx);
+    recover_or_boot_intact(io);
     return false;
   }
   return true;
@@ -1521,6 +1535,9 @@ bool xiao_ota_settings_get(const xiao_ota_io_t *io,
   return true;
 }
 
+static bool settings_write_raw(const xiao_ota_io_t *io,
+                               const xiao_ota_settings_raw_t *raw);
+
 /*
  * Read-modify-write over the WHOLE real settings page: read the current
  * raw page first (preserving bank_1/sd_image_size/bl_image_size/
@@ -1535,20 +1552,11 @@ bool xiao_ota_settings_get(const xiao_ota_io_t *io,
 bool xiao_ota_settings_set(const xiao_ota_io_t *io, uint16_t bank_0,
                            uint16_t bank_0_crc, uint32_t bank_0_size) {
   xiao_ota_settings_raw_t raw;
-  xiao_ota_settings_raw_t verify;
   if (!settings_read_raw(io, &raw)) return false;
   raw.bank_0 = bank_0;
   raw.bank_0_crc = bank_0_crc;
   raw.bank_0_size = bank_0_size;
-  if (!io->internal_erase_page(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS)) {
-    return false;
-  }
-  if (!io->internal_write(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS, &raw,
-                         sizeof(raw))) {
-    return false;
-  }
-  if (!settings_read_raw(io, &verify)) return false;
-  return memcmp(&verify, &raw, sizeof(raw)) == 0;
+  return settings_write_raw(io, &raw);
 }
 
 /*
@@ -1597,12 +1605,40 @@ static bool settings_write_raw(const xiao_ota_io_t *io,
   if (!io->internal_erase_page(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS)) {
     return false;
   }
-  if (!io->internal_write(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS, raw,
-                         sizeof(*raw))) {
+  if (!io->internal_write(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 4,
+                         (const uint8_t *)raw + 4, sizeof(*raw) - 4)) {
     return false;
   }
+  if (!settings_read_raw(io, &verify) ||
+      verify.bank_0 != UINT16_MAX || verify.bank_0_crc != UINT16_MAX ||
+      memcmp((uint8_t *)&verify + 4, (const uint8_t *)raw + 4,
+             sizeof(verify) - 4) != 0 ||
+      !settings_page_tail_erased(io, &tail_blank) || !tail_blank) return false;
+  /* The validity/CRC word is the publication point, not the first word.
+   * Erased or torn settings must never authorize an APP during body writes. */
+  if (!io->internal_write(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS, raw, 4))
+    return false;
   if (!settings_read_raw(io, &verify)) return false;
   return memcmp(&verify, raw, sizeof(*raw)) == 0;
+}
+
+static bool settings_invalidate_bank0(
+    const xiao_ota_io_t *io,
+    const uint8_t original[XIAO_OTA_BOOTLOADER_SETTINGS_RAW_SIZE]) {
+  xiao_ota_settings_raw_t raw, invalid, verify;
+  bool blank;
+  if (!settings_read_raw(io, &raw) ||
+      !settings_page_tail_erased(io, &blank) || !blank ||
+      raw.bank_0 == 0xA5u || raw.bank_0 == 0xAAu ||
+      raw.bank_1 == 0xA5u || raw.bank_1 == 0xAAu) return false;
+  memcpy(&invalid, original, sizeof(invalid));
+  invalid.bank_0 = XIAO_OTA_BANK_INVALID_APP;
+  /* Re-erasing avoids relying on non-durable NVMC write-pulse counts.
+   * Only the exact, already published sidecar-derived marker may be reused. */
+  if (memcmp(&raw, &invalid, sizeof(raw)) != 0)
+    return settings_write_raw(io, &invalid);
+  return settings_read_raw(io, &verify) &&
+         memcmp(&invalid, &verify, sizeof(invalid)) == 0;
 }
 
 /*
@@ -1669,6 +1705,117 @@ static bool crc16_over_internal(const xiao_ota_io_t *io, uint32_t address,
   }
   *out_crc = running;
   return true;
+}
+
+static bool app_vectors_valid(const xiao_ota_io_t *io, uint32_t extent) {
+  uint32_t vectors[2];
+  return extent >= sizeof(vectors) &&
+         io->internal_read(io->ctx, XIAO_OTA_APP_START, vectors, sizeof(vectors)) &&
+         vectors[0] > UINT32_C(0x20000000) &&
+         vectors[0] <= UINT32_C(0x20040000) && !(vectors[0] & 3u) &&
+         (vectors[1] & 1u) && (vectors[1] & ~1u) >= XIAO_OTA_APP_START &&
+         (vectors[1] & ~1u) < XIAO_OTA_APP_START + extent;
+}
+
+bool xiao_ota_app_is_intact(const xiao_ota_io_t *io) {
+  xiao_ota_settings_raw_t before, after;
+  uint16_t crc;
+  bool blank;
+  if (!settings_read_raw(io, &before) ||
+      before.bank_0 != XIAO_OTA_BANK_VALID_APP ||
+      (before.bank_1 != 0xFEu && before.bank_1 != 0xFFu) ||
+      before.bank_0_size < 8u ||
+      before.bank_0_size > XIAO_OTA_INSTALL_MAX_SIZE ||
+      !settings_page_tail_erased(io, &blank) || !blank ||
+      !app_vectors_valid(io, before.bank_0_size) ||
+      !crc16_over_internal(io, XIAO_OTA_APP_START, before.bank_0_size, &crc) ||
+      (before.bank_0_crc != 0 && before.bank_0_crc != crc) ||
+      !settings_read_raw(io, &after) ||
+      memcmp(&before, &after, sizeof(before)) != 0 ||
+      !settings_page_tail_erased(io, &blank) || !blank) return false;
+  return true;
+}
+
+bool xiao_ota_vendor_prepare(const xiao_ota_io_t *io, uint32_t extent) {
+  xiao_ota_settings_raw_t before, invalid = {0}, verify;
+  bool blank;
+  if (extent < 8u || extent > XIAO_OTA_INSTALL_MAX_SIZE || (extent & 3u) ||
+      !settings_read_raw(io, &before) ||
+      before.bank_0 == 0xA5u || before.bank_0 == 0xAAu ||
+      before.bank_1 == 0xA5u || before.bank_1 == 0xAAu ||
+      !settings_page_tail_erased(io, &blank) || !blank) return false;
+  invalid.bank_0 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_0_crc = before.bank_0_crc;
+  invalid.bank_1 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_0_size = extent;
+  if (memcmp(&before, &invalid, sizeof(invalid)) != 0)
+    return settings_write_raw(io, &invalid);
+  return settings_read_raw(io, &verify) &&
+         memcmp(&invalid, &verify, sizeof(verify)) == 0 &&
+         settings_page_tail_erased(io, &blank) && blank;
+}
+
+bool xiao_ota_vendor_publish(const xiao_ota_io_t *io, uint32_t extent) {
+  xiao_ota_settings_raw_t before, invalid = {0}, verify;
+  uint16_t crc;
+  bool blank;
+  if (extent < 8u || extent > XIAO_OTA_INSTALL_MAX_SIZE || (extent & 3u) ||
+      !settings_read_raw(io, &before)) return false;
+  invalid.bank_0 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_0_crc = before.bank_0_crc;
+  invalid.bank_1 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_0_size = extent;
+  if (memcmp(&before, &invalid, sizeof(before)) != 0 ||
+      !settings_page_tail_erased(io, &blank) || !blank ||
+      !app_vectors_valid(io, extent) ||
+      !crc16_over_internal(io, XIAO_OTA_APP_START, extent, &crc) ||
+      !settings_read_raw(io, &verify) ||
+      memcmp(&before, &verify, sizeof(before)) != 0 ||
+      !settings_page_tail_erased(io, &blank) || !blank) return false;
+  before.bank_0 = XIAO_OTA_BANK_VALID_APP;
+  before.bank_0_crc = crc;
+  return settings_write_raw(io, &before) && xiao_ota_app_is_intact(io);
+}
+
+bool xiao_ota_vendor_settings_write(const xiao_ota_io_t *io, const uint8_t bytes[28]) {
+  xiao_ota_settings_raw_t raw;
+  memcpy(&raw, bytes, sizeof(raw));
+  if (raw.bank_0 == XIAO_OTA_BANK_VALID_APP) {
+    uint16_t crc;
+    if (raw.bank_0_size < 8 || raw.bank_0_size > XIAO_OTA_INSTALL_MAX_SIZE ||
+        !app_vectors_valid(io, raw.bank_0_size) ||
+        !crc16_over_internal(io, XIAO_OTA_APP_START, raw.bank_0_size, &crc) ||
+        (raw.bank_0_crc && raw.bank_0_crc != crc)) return false;
+  }
+  return settings_write_raw(io, &raw);
+}
+
+bool xiao_ota_vendor_pending_settings_write(const xiao_ota_io_t *io, const uint8_t bytes[28]) {
+  xiao_ota_settings_raw_t before, after, raw, expected;
+  bool blank;
+  memcpy(&raw, bytes, sizeof(raw));
+  if (!settings_read_raw(io, &before) ||
+      (before.bank_0 != 0xa5u && before.bank_1 != 0xaau) ||
+      !settings_page_tail_erased(io, &blank) || !blank ||
+      !settings_read_raw(io, &after) || memcmp(&before, &after, sizeof(before))) return false;
+  expected = before;
+  if (before.bank_0 == 0xa5u) {
+    expected.bank_0 = XIAO_OTA_BANK_INVALID_APP;
+    expected.bank_0_crc = 0;
+    expected.bank_0_size = 0;
+  }
+  expected.bank_1 = XIAO_OTA_BANK_INVALID_APP;
+  expected.sd_image_size = 0;
+  expected.bl_image_size = 0;
+  expected.app_image_size = 0;
+  expected.sd_image_start = 0;
+  if (memcmp(&expected, &raw, sizeof(raw))) return false;
+  return settings_write_raw(io, &raw);
+}
+
+static void recover_or_boot_intact(const xiao_ota_io_t *io) {
+  if (qspi_read_failed && xiao_ota_app_is_intact(io)) return;
+  io->force_recovery(io->ctx);
 }
 
 /* Thin wrapper: reads real bank-0 settings and a fresh CRC-16 recompute
@@ -1815,7 +1962,7 @@ static bool copy_internal_to_qspi(const xiao_ota_io_t *io,
                           flash_stage_buffer, n)) {
         return false;
       }
-      if (!io->qspi_read(io->ctx, XIAO_OTA_BACKUP_BASE + offset, io_buffer, n)) {
+      if (!checked_qspi_read((void *)io, XIAO_OTA_BACKUP_BASE + offset, io_buffer, n)) {
         return false;
       }
       if (memcmp(io_buffer, flash_stage_buffer, n) != 0) return false;
@@ -1833,13 +1980,14 @@ static bool copy_qspi_to_internal(const xiao_ota_io_t *io,
                                   uint32_t *state_slot_address,
                                   uint32_t source, uint32_t length) {
   uint32_t offset = state->progress_bytes;
+  if (!settings_invalidate_bank0(io, sidecar->original_settings_raw)) return false;
   while (offset < length) {
     uint32_t end = offset + XIAO_OTA_QSPI_SECTOR_SIZE;
     if (end > length) end = length;
     if (!io->internal_erase_page(io->ctx, XIAO_OTA_APP_START + offset)) return false;
     while (offset < end) {
       uint32_t n = end - offset > COPY_CHUNK ? COPY_CHUNK : end - offset;
-      if (!io->qspi_read(io->ctx, source + offset, io_buffer, n)) return false;
+      if (!checked_qspi_read((void *)io, source + offset, io_buffer, n)) return false;
       if (!io->internal_write(io->ctx, XIAO_OTA_APP_START + offset, io_buffer, n)) {
         return false;
       }
@@ -1929,11 +2077,13 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
    * Upstream consumes and clears these requests in check_dfu_mode(), which runs
    * after this hook. Never let a persistent OTA transaction intercept recovery.
    */
+  qspi_read_failed = false;
   if (io->explicit_dfu_requested(io->ctx)) return;
 
   if (!io->qspi_init(io->ctx)) {
-    /* Unreadable/unresponsive QSPI at bring-up means every read below is
-     * unknown, not "absent" -- fail closed before touching anything. */
+    /* External history is unknown, not absent. Only an intact internal
+     * APP may run; no transaction or floor work is performed. */
+    qspi_read_failed = true;
     goto recover;
   }
   if (factory_floor_initialize(io)) return;
@@ -2652,5 +2802,5 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
   }
   if (state.phase == XIAO_OTA_PHASE_FAILED) return;
 recover:
-  io->force_recovery(io->ctx);
+  recover_or_boot_intact(io);
 }

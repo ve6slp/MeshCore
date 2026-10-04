@@ -95,19 +95,19 @@
 #define OTA_NRF52_CANDIDATE_RECORD_SCRATCH_SIZE    0x2000u   /* 8 KiB (2 sectors) */
 #define OTA_NRF52_CANDIDATE_RECORD_SCRATCH_OFFSET  0x0AB000u /* == MAINTENANCE_SCRATCH end - 8 KiB */
 
-/* Internal nRF52840 flash image slot -- a physically SEPARATE flash device
- * from the external QSPI part above. The running application is installed
- * here; capacity intentionally matches OTA_NRF52_IMAGE_CAPACITY_BYTES
- * exactly, so a candidate/backup external image is always exactly
- * self-install-sized for internal flash. These mirror (do not replace)
- * the independently-pinned copies in ota/storage/XiaoOtaActiveExtentBridge.h
- * (kXiaoOtaAppStart/kXiaoOtaAppInstallMaxSize) and
- * ota/runtime/OtaGeometry.h (kOtaMaxImageBytes) -- all three MUST agree;
- * see SenseCapQspiLayout.h's static_asserts.
+/* Internal nRF52840 installable application slot, on a physically separate
+ * flash device. Its target-specific ceiling is smaller than external
+ * staging capacity: the fixed installer occupies the following 64 KiB.
+ * Generic transport/cache geometry remains 708608 bytes and may stage
+ * another target's image; staging capacity is NOT installation authority.
  */
 #define OTA_NRF52_INTERNAL_IMAGE_OFFSET   0x027000u
-#define OTA_NRF52_INTERNAL_IMAGE_SIZE     OTA_NRF52_IMAGE_CAPACITY_BYTES  /* ends 0x0D4000 */
-#define OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET  0x0D3000u
+#define OTA_NRF52_INTERNAL_IMAGE_SIZE     0x09D000u  /* 643072 bytes, ends 0x0C4000 */
+#define OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET  0x0C3000u
+
+/* Fixed installer, never application image/backup capacity. */
+#define OTA_NRF52_INTERNAL_INSTALLER_OFFSET  0x0C4000u
+#define OTA_NRF52_INTERNAL_INSTALLER_SIZE    0x010000u  /* 64 KiB, ends 0x0D4000 */
 
 /* Existing internal-flash extra filesystem region (InternalExtraFS).
  * UNCHANGED / unmoved by this contract. */

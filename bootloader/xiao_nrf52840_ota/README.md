@@ -1,14 +1,120 @@
 # XIAO nRF52840 external-QSPI OTA bootloader overlay
 
-This directory is a reproducible overlay for Adafruit_nRF52_Bootloader commit
-`c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`. The upstream checkout and all
-build products stay under `.tmp/`; no upstream source is vendored here.
+## Selected exact-OTAFIX primary / fixed installer pair
 
-The preferred no-SWD profile keeps USB UF2 mass storage and USB CDC serial DFU
-recovery, but deliberately omits optional BLE DFU. It adds P25Q16H candidate
-verification, backup, install, trial confirmation, and rollback before the
-upstream boot flow starts. The original larger BLE-enabled profile remains
-available for SWD commissioning.
+The selected source is OTAFIX commit
+`a62825be4733f500271c89b5ec489fd609748e97`,
+`0.9.2-OTAFIX2.3-BP1.4`, **not** the earlier Adafruit 0.11 monolithic overlay.
+The genuine `xiao_nrf52840_ble_sense` BSP retains full vendor USB/serial/BLE
+recovery. Its logical OTA identity is Xiao, ROLE1; the Sense CF2/BSP is not
+substituted with generic Xiao configuration.
+
+Device-free source/build commands, from the repository root:
+
+```sh
+make -f bootloader/xiao_nrf52840_ota/Makefile pair test \
+  BOARD=xiao_nrf52840_sense ROLE=1
+make -f bootloader/xiao_nrf52840_ota/Makefile pair \
+  BOARD=xiao_nrf52840_sense ROLE=1 \
+  OUTPUT="$PWD/.tmp/ota-boot-builds/sense-role1-replay"
+```
+
+`VENDOR` and `PROVENANCE` select an existing, fingerprint-verified exact vendor
+cache. Builds need system `arm-none-eabi-gcc`; native tests also need `cc`.
+All generated sources, maps, scratch files and artifacts stay in the selected
+project-local output. Production compilation uses this directory's live
+core/crypto and reviewed preserving writer patch, not private prototype code.
+
+Outputs are `primary.elf/.hex/.map`, `stage2/stage2.elf/.bin/.hex/.map`,
+`primary-boot-only.bin` and `pair-manifest.json`. The manifest records genuine
+ARM LOAD accounting (including initialized data), source/artifact hashes,
+actual BSP versus logical identity, fixed factory-pair CRC and RAM boundaries.
+The RAW is exactly `0xA000` bytes for `0xF4000..0xFE000`, including the old
+configuration erase page. It excludes SoftDevice, UICR, APP, filesystems,
+MBR parameters and SDK settings.
+
+APP ends at `0xC4000` (643072 bytes); the installer is protected at
+`0xC4000..0xD4000`. Primary data/BSS stays below `0x20020000`; installer
+data/BSS uses `0x20020000..0x20030000`. A returning Thumb service at `0xC4041`
+uses the existing primary MSP/64KiB stack without changing VTOR/S140 ownership.
+The bootmarker remains informational, not a new signing authority.
+
+SDK initialization and original compatible pending finalization precede
+protection and installer entry. A different pending bootloader must finish
+under the old loader before commissioning. Every APP writer is C4000-bounded
+and durably invalidates SDK readiness before destruction, publishes VALID last,
+and invalidates cached execution grants. After vendor DFU return the primary
+resets through a fresh installer gate. Its existing single-tap APP marker is
+preserved across this reset only to avoid repeating the vendor startup window;
+the marker cannot grant execution.
+
+Stage-only forced recovery **returns** to persistent primary UF2 (timeout 0).
+An ordinary APP-request GP57 retains the vendor 3000ms window. Legacy monolithic
+force-recovery still resets GP57. Native tests link the actual adapter, kernel,
+runtime and generated primary caller; the old reset adapter must compile then
+assertion-fail. Native USB/SDK initialization call boundaries are modeled;
+this is not serial/GATT, power-loss, silicon or hardware qualification.
+Optional C1 fault/lockup handlers are excluded.
+
+This is source/artifact-review readiness only, not flashing authorization.
+The selected bench sequence is monitored APP-only compound preload, one
+boot-only serial replacement, final APP-only restore, then the existing signed
+LoRa lifecycle. Host orchestration/readback is separate.
+
+### Offline compound preload / matching boot-only packages
+
+After building the current pair, one package-only endpoint emits both standard
+legacy DFU ZIPs; it does not access a port, probe, filesystem mount or device:
+
+```sh
+make -f bootloader/xiao_nrf52840_ota/Makefile package-pair
+make -f bootloader/xiao_nrf52840_ota/Makefile package-pair VERIFY_ONLY=1
+```
+
+`APP_PACKAGE` defaults to ROOT's immutable CURRENT538360 APP package
+(`69c961ff66602c865a3cf8b3855478a8191cfc605ed4d811e70a7cdcc9f18fd2`
+payload SHA256). The endpoint verifies its original ordinary APP-only v0.5
+manifest, init bytes, CRC and vectors. It retains that standard device/revision/
+APP-version/SoftDevice requirement profile, changing only the CRC for the
+compound payload. Payload is the exact original APP, FF padding to offset
+`0x9D000`, and the **measured** matching installer BIN, with FF word alignment.
+The rounded erase end must remain at or below D4000. It contains no SD, BL,
+UICR or filesystem image. Old boot-only staging subsequently destroys low APP
+pages; this is not an APP-preservation claim and final separate APP restore is
+mandatory.
+
+`PACKAGE_OUTPUT` defaults to `.tmp/ota-boot-builds/sense-role1-packages`; output
+must be fresh and is never overwritten. `compound.bin/.zip` is ordinary
+APP-only; `bootloader.bin/.zip` is the exact matching A000 boot-only RAW with
+compiled version 0x902 and standard init. Creation uses the existing `NRFUTIL`
+tool's offline `dfu genpkg`, never a new transport/programmer.
+
+`package-manifest.json` is the public verification/readback binding endpoint:
+source hashes/release, actual Sense BSP versus logical Xiao ROLE1, existing
+XOBI capability/marker hash, primary code plus initialized-data accounting,
+measured stage extent/entry/CRC, every payload/ZIP hash and exact address/erase
+bounds. Verification checks ELF LOAD/HEX/RAW identity and the primary's
+**compiled** factory stage tuple, not just two supplied filenames. `VERIFY_ONLY`
+rechecks all inputs and both standard ZIPs without device access or writes.
+This manifest is artifact evidence, not a new authority, signing format or
+persistent device ledger. Root owns final readback and hardware sequencing.
+
+`tools/commission_pair.py` provides the explicit host integration seam:
+`validate_compound_preload_package(package: Path, pair_manifest: Path) -> bytes`.
+The second argument is the build **pair-manifest.json**, not the package receipt.
+It reuses the current-source/real-Sense pair verifier and standard APP-only ZIP
+parser, requiring the exact immutable APP prefix, FF gap, measured paired stage
+and word padding. It does **not** relax ordinary APP admission at C4000. Root's
+existing flash command must explicitly opt into commissioning before calling it.
+
+`verify_compound_preload_readback(read_at, expected)` accepts a memory-reader
+callback and the validated bytes. It compares only `27000..compound-end`, in
+at most 4096-byte reads, including the FF gap and actual stage. MBR, SoftDevice,
+filesystems, primary/configuration and SDK settings are never requested.
+Neither function opens a device, selects a programmer or creates a flash archive.
+
+The older monolithic preparation/package targets and historical sections below
+are **not** the selected pair recipe. Do not deploy their output as this pair.
 
 ## Lean simplification: genesis/authority receipt removed
 
@@ -68,6 +174,55 @@ apply to it. `tests/test_source.py` adds a source-level regression check that
 `XIAO_OTA_APP_START`-based pointer. That backup-staging check remains
 source-level; the adapter-only register model below does not execute the
 transaction processor or establish physical EasyDMA behavior.
+
+## APP-copy invalidation and QSPI-error fallback
+
+Before every install/rollback copy entry, including resumed or fully copied
+rollback, the processor erases/rebuilds the SDK page from the exact authenticated
+original sidecar, changing only bank0 to named INVALID `0x00FF`. The body and
+erased publication word are read back before the bank/CRC word is published
+last and the complete SDK record verified. Only an exact already-published
+INVALID snapshot skips the erase on resume; torn or other settings are rebuilt.
+CRC and all other SDK fields are preserved. This avoids relying on non-durable
+NVMC per-word write counts after interrupted bit clearing. Both pinned vendors
+reject this INVALID value; the generated primary gate independently requires
+exact VALID1 and rejects erased `0xFFFF`, including after DFU timeout or hook
+bypass. After fresh whole-image SHA verification, SDK restoration
+writes and verifies the body first, then publishes the validity/CRC word last.
+Rollback still restores the exact original SDK28, including unused CRC0.
+An erased `0xFFFF` SDK after a cut is not a reusable marker: with a validated
+COPYING journal/sidecar and healthy QSPI, authenticated recovery rebuilds and
+verifies INVALID before APP erase instead of unconditionally entering recovery
+DFU. INSTALL_COPYING may conservatively roll back the authenticated backup.
+This custom loader intentionally requires a normally provisioned VALID1 bank
+for APP execution; debugger/SWD images relying on erased-SDK acceptance are
+not eligible. The stock vendor validator and stock-only build are unchanged.
+Publication tests execute the production `settings_write_raw()` callback
+sequence, not a fake SDK-ordering implementation. Raw cut snapshots assert
+that VALID never accompanies a torn size/metadata body; a production-code
+VALID-first mutation compiles and fails the observer assertion.
+
+QSPI init/read failure permits ordinary APP execution only with exact VALID1,
+bounded size, plausible RAM/Thumb vectors, no pending bank, blank SDK tail and
+a successful fresh CRC scan (nonzero stored CRC must match). External read
+failure is latched for the boot; damaged/missing transaction records do not
+gain this fallback without an actual external IO error. This is not admission,
+confirmation or floor trust. An intact published trial may run unconfirmed
+with QSPI absent, without retry counting, rollback or floor advancement.
+
+Optional SDK CRC0 relies on the invalid-before-erase/VALID-last invariant.
+First commissioning must establish intact APP and an empty, confirmed or
+failed journal; a legacy partial copy left VALID with CRC0 cannot be identified
+from internal flash alone when QSPI is absent. No map or authorization changes.
+The hardware return-to-vendor gate is supplied separately in the private F2
+patch while the QSPI adapter is owned independently; integration, review, ARM
+fit and physical recovery qualification remain required before commissioning.
+There is also an uncovered vendor writer: pinned SDK11
+`dfu_single_bank.c:133-172` erases APP before its completed-erase callback
+invalidates SDK bank0 (`bootloader.c:356-363`). Kernel-only barriers do not
+establish the CRC0 invariant across that erase window. Commissioning remains
+blocked until vendor APP erases receive a durable pre-erase barrier, with all
+recovery writers accounted for; the private return gate alone is insufficient.
 
 ## Fixed: QSPI READY was not flash-write completion
 

@@ -447,11 +447,22 @@ static void hw_start_trial_watchdog(void *ctx) {
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 }
 
+#ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
+static bool stage_recovery_requested;
+bool xiao_ota_stage2_recovery_requested(void) {
+  return stage_recovery_requested;
+}
+#endif
+
 static void hw_force_recovery(void *ctx) {
   (void)ctx;
+#ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
+  stage_recovery_requested = true;
+#else
   NRF_POWER->GPREGRET = XIAO_OTA_DFU_MAGIC_UF2;
   NVIC_SystemReset();
   while (true) {}
+#endif
 }
 
 static uint64_t hw_device_address(void *ctx) {
@@ -464,6 +475,15 @@ static bool hw_explicit_dfu_requested(void *ctx) {
   return xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET);
 }
 
+
+const xiao_ota_io_t *xiao_ota_boot_internal_io(void) {
+  static const xiao_ota_io_t internal = {
+      .internal_read = hw_internal_read,
+      .internal_write = hw_internal_write,
+      .internal_erase_page = hw_internal_erase_page,
+  };
+  return &internal;
+}
 
 void xiao_ota_boot_process(void) {
   static const xiao_ota_io_t hardware_io = {
@@ -480,5 +500,12 @@ void xiao_ota_boot_process(void) {
       .start_trial_watchdog = hw_start_trial_watchdog,
       .force_recovery = hw_force_recovery,
   };
+#ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
+  stage_recovery_requested = false;
+#endif
   xiao_ota_boot_process_io(&hardware_io);
+#ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
+  if (!stage_recovery_requested && !xiao_ota_app_is_intact(&hardware_io))
+    hw_force_recovery(NULL);
+#endif
 }

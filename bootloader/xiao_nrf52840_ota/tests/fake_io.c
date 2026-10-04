@@ -6,6 +6,13 @@
 
 #include "xiao_ota_layout.h"
 
+static fake_io_state_t *active_boot;
+static unsigned recovery_calls_at_entry;
+
+static void assert_no_mutation_after_recovery(fake_io_state_t *s) {
+  assert(s != active_boot || s->force_recovery_calls == recovery_calls_at_entry);
+}
+
 /* Real NRF_QSPI hardware (hw_qspi_read()/hw_qspi_write() in
  * xiao_ota_boot.c) programs NRF_QSPI->READ.CNT/WRITE.CNT and the
  * SRC/DST address registers directly from the caller's arguments, with
@@ -44,6 +51,9 @@ static void maybe_crash(fake_io_state_t *s, fake_io_op_t op, uint32_t address,
  * effect, no crash -- caller must apply nothing and return false). */
 static bool maybe_fail(fake_io_state_t *s, fake_io_op_t op, uint32_t address,
                        uint32_t length) {
+  if (op == FAKE_IO_OP_QSPI_WRITE || op == FAKE_IO_OP_QSPI_ERASE ||
+      op == FAKE_IO_OP_INTERNAL_WRITE || op == FAKE_IO_OP_INTERNAL_ERASE)
+    assert_no_mutation_after_recovery(s);
   return fault_matches(&s->fail, op, address, length);
 }
 
@@ -62,6 +72,15 @@ void fake_io_reset(fake_io_state_t *s) {
   s->force_recovery_calls = 0;
   s->watchdog_start_calls = 0;
   s->qspi_init_calls = 0;
+  s->require_bank_invalidation = false;
+  s->invalid_bank_readback = false;
+  s->settings_body_verified = false;
+  s->settings_erase_acknowledged = false;
+  s->app_erase_calls = 0;
+  s->settings_erase_calls = 0;
+  s->bank_clear_writes = 0;
+  s->bank_clear_readbacks = 0;
+  s->settings_valid_writes = 0;
   memset(&s->crash, 0, sizeof(s->crash));
   s->crash.after = -1;
   s->crash.addr_lo = 0;
@@ -152,6 +171,18 @@ static bool fake_internal_read(void *ctx, uint32_t address, void *destination,
   }
   maybe_crash(s, FAKE_IO_OP_INTERNAL_READ, address, (uint32_t)length);
   memcpy(destination, s->internal_flash + address, length);
+  if (address == XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS && length == 28) {
+    uint16_t bank;
+    memcpy(&bank, destination, sizeof(bank));
+    if (bank == XIAO_OTA_BANK_INVALID_APP) {
+      s->invalid_bank_readback = true;
+      s->bank_clear_readbacks++;
+    }
+    s->settings_body_verified =
+        bank == UINT16_MAX &&
+        s->internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 2] == 0xFF &&
+        s->internal_flash[XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS + 3] == 0xFF;
+  }
   return true;
 }
 
@@ -159,6 +190,24 @@ static bool fake_internal_write(void *ctx, uint32_t address,
                                 const void *source, size_t length) {
   fake_io_state_t *s = (fake_io_state_t *)ctx;
   size_t i;
+  if (address == XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS && length == 4) {
+    if (s->require_bank_invalidation)
+      assert(s->settings_erase_acknowledged &&
+             "SDK bank word requires a fresh complete page erase");
+    s->settings_erase_acknowledged = false;
+    uint16_t bank;
+    memcpy(&bank, source, sizeof(bank));
+    if (bank == XIAO_OTA_BANK_INVALID_APP) {
+      if (s->require_bank_invalidation)
+        assert(s->settings_body_verified && "SDK INVALID must publish last");
+      s->bank_clear_writes++;
+    }
+    if (bank == XIAO_OTA_BANK_VALID_APP) {
+      if (s->require_bank_invalidation)
+        assert(s->settings_body_verified && "SDK VALID must publish last");
+      s->settings_valid_writes++;
+    }
+  }
   if (maybe_fail(s, FAKE_IO_OP_INTERNAL_WRITE, address, (uint32_t)length)) {
     return false;
   }
@@ -181,12 +230,39 @@ static bool fake_internal_write(void *ctx, uint32_t address,
 
 static bool fake_internal_erase_page(void *ctx, uint32_t address) {
   fake_io_state_t *s = (fake_io_state_t *)ctx;
+  if (address >= XIAO_OTA_APP_START &&
+      address < XIAO_OTA_APP_START + XIAO_OTA_INSTALL_MAX_SIZE) {
+    if (s->require_bank_invalidation) {
+      uint16_t bank;
+      memcpy(&bank, s->internal_flash + XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS, 2);
+      assert(bank == XIAO_OTA_BANK_INVALID_APP &&
+             "APP erase requires durably INVALID bank0");
+      assert(s->invalid_bank_readback && "APP erase requires bank0 readback");
+    }
+    s->app_erase_calls++;
+  }
+  if (address == XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS) {
+    s->settings_erase_calls++;
+    s->settings_body_verified = false;
+    s->settings_erase_acknowledged = false;
+    s->invalid_bank_readback = false;
+  }
   if (maybe_fail(s, FAKE_IO_OP_INTERNAL_ERASE, address,
                 XIAO_OTA_QSPI_SECTOR_SIZE)) {
     return false;
   }
   maybe_crash(s, FAKE_IO_OP_INTERNAL_ERASE, address, XIAO_OTA_QSPI_SECTOR_SIZE);
+  if (maybe_tear(s, FAKE_IO_OP_INTERNAL_ERASE, address,
+                 XIAO_OTA_QSPI_SECTOR_SIZE)) {
+    size_t applied = s->tear_bytes < XIAO_OTA_QSPI_SECTOR_SIZE
+                         ? s->tear_bytes : XIAO_OTA_QSPI_SECTOR_SIZE;
+    memset(s->internal_flash + address, 0xFF, applied);
+    if (s->tear_crash) longjmp(s->crash_jump, 1);
+    return false;
+  }
   memset(s->internal_flash + address, 0xFF, XIAO_OTA_QSPI_SECTOR_SIZE);
+  if (address == XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS)
+    s->settings_erase_acknowledged = true;
   return true;
 }
 
@@ -263,6 +339,7 @@ void fake_io_poison_settings_tail(fake_io_state_t *s, uint32_t offset_in_page,
 }
 
 static void fake_start_trial_watchdog(void *ctx) {
+  assert_no_mutation_after_recovery(ctx);
   ((fake_io_state_t *)ctx)->watchdog_start_calls++;
 }
 
@@ -289,8 +366,15 @@ xiao_ota_io_t fake_io_interface(fake_io_state_t *s) {
 
 int fake_io_run_boot(fake_io_state_t *s) {
   xiao_ota_io_t io = fake_io_interface(s);
-  if (setjmp(s->crash_jump) != 0) return 1;
+  assert(!active_boot);
+  active_boot = s;
+  recovery_calls_at_entry = s->force_recovery_calls;
+  s->invalid_bank_readback = false;
+  s->settings_body_verified = false;
+  s->settings_erase_acknowledged = false;
+  if (setjmp(s->crash_jump) != 0) { active_boot = NULL; return 1; }
   xiao_ota_boot_process_io(&io);
+  active_boot = NULL;
   return 0;
 }
 

@@ -39,7 +39,13 @@ namespace ota {
 class OtaNrf52FirmwareTrustProvider final : public OtaFirmwareTrustProvider {
 public:
   using OtaFirmwareTrustProvider::OtaFirmwareTrustProvider;
-  static constexpr uint32_t kMaximumImageBytes = 0xAD000u;
+  static constexpr uint32_t kMaximumImageBytes = OTA_NRF52_INTERNAL_IMAGE_SIZE;
+
+  bool verifyDescriptor(const meshcore::ota::protocol::OtaDescriptor& descriptor,
+                        const uint8_t* signature, size_t signature_len) override {
+    return descriptor.exactSizeBytes <= kMaximumImageBytes &&
+           OtaFirmwareTrustProvider::verifyDescriptor(descriptor, signature, signature_len);
+  }
 
   bool verifyDescriptorPolicyOnly(const meshcore::ota::protocol::OtaDescriptor& descriptor) override {
     return descriptor.exactSizeBytes <= kMaximumImageBytes &&

@@ -384,6 +384,18 @@ struct SenseCapQspiLayout {
   static_assert(kJournalTestSize == OTA_NRF52_CANDIDATE_RECORD_SCRATCH_SIZE, "relocated legacy journal-test size must match the shared C contract");
   static_assert(kCandidateLastLegalSectorOffset == OTA_NRF52_CANDIDATE_LAST_LEGAL_SECTOR_OFFSET, "candidate last legal sector must match the shared C contract");
   static_assert(kBackupLastLegalSectorOffset == OTA_NRF52_BACKUP_LAST_LEGAL_SECTOR_OFFSET, "backup last legal sector must match the shared C contract");
+  static_assert(OTA_NRF52_INTERNAL_IMAGE_OFFSET + OTA_NRF52_INTERNAL_IMAGE_SIZE ==
+                    OTA_NRF52_INTERNAL_INSTALLER_OFFSET, "application must end at the fixed installer");
+  static_assert(OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET + kEraseUnitBytes ==
+                    OTA_NRF52_INTERNAL_INSTALLER_OFFSET, "last application sector must not reach the installer");
+  static_assert(OTA_NRF52_INTERNAL_INSTALLER_OFFSET + OTA_NRF52_INTERNAL_INSTALLER_SIZE ==
+                    OTA_NRF52_INTERNAL_FS_OFFSET, "installer must end at unchanged InternalExtraFS");
+  static_assert(OTA_NRF52_INTERNAL_IMAGE_SIZE <= kCandidateSize &&
+                    OTA_NRF52_INTERNAL_IMAGE_SIZE <= kBackupSize, "external banks must fit an installable application");
+  static_assert(OTA_NRF52_INTERNAL_IMAGE_OFFSET % kEraseUnitBytes == 0 &&
+                    OTA_NRF52_INTERNAL_IMAGE_SIZE % kEraseUnitBytes == 0 &&
+                    OTA_NRF52_INTERNAL_INSTALLER_OFFSET % kEraseUnitBytes == 0 &&
+                    OTA_NRF52_INTERNAL_INSTALLER_SIZE % kEraseUnitBytes == 0, "internal partitions must be sector aligned");
 };
 
 }  // namespace platform

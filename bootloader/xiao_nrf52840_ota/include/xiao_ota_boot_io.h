@@ -44,6 +44,7 @@ typedef struct {
  * native host test build.
  */
 #define XIAO_OTA_BANK_VALID_APP 0x01u
+#define XIAO_OTA_BANK_INVALID_APP 0x00FFu
 
 typedef struct {
   void *ctx;
@@ -96,6 +97,11 @@ typedef struct {
 
 void xiao_ota_boot_process_io(const xiao_ota_io_t *io);
 
+/* Ordinary APP execution only, never admission, confirmation or floor trust.
+ * CRC0 is optional here only under this loader's durable invalid-before-erase
+ * and VALID-last contract. Commissioning must exclude legacy active copies. */
+bool xiao_ota_app_is_intact(const xiao_ota_io_t *io);
+
 /*
  * Shared, hardware-independent bank-0 settings codec. Both the real
  * hardware adapter (xiao_ota_boot.c) and native host tests (fake_io.c)
@@ -116,3 +122,10 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io);
 bool xiao_ota_settings_get(const xiao_ota_io_t *io, xiao_ota_bank0_settings_t *out);
 bool xiao_ota_settings_set(const xiao_ota_io_t *io, uint16_t bank_0,
                            uint16_t bank_0_crc, uint32_t bank_0_size);
+
+const xiao_ota_io_t *xiao_ota_boot_internal_io(void);
+bool xiao_ota_vendor_prepare(const xiao_ota_io_t *io, uint32_t extent);
+bool xiao_ota_vendor_publish(const xiao_ota_io_t *io, uint32_t extent);
+bool xiao_ota_vendor_settings_write(const xiao_ota_io_t *io, const uint8_t raw[28]);
+bool xiao_ota_vendor_pending_settings_write(const xiao_ota_io_t *io, const uint8_t raw[28]);
+bool xiao_ota_stage2_recovery_requested(void);

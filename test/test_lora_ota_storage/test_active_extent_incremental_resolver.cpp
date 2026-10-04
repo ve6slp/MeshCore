@@ -267,7 +267,7 @@ TEST(XiaoOtaIncrementalExtentResolverTest, DefaultConstructedResolverFailsClosed
 
 namespace {
 // A genuinely full-size (exactly kXiaoOtaAppInstallMaxSize, i.e. the
-// real ~AD000/708608-byte install ceiling used on real hardware) fixture
+// real 0x9D000/643072-byte install ceiling used on real hardware) fixture
 // image, built once and reused by the tests below so they cover the
 // production 1024-byte-per-pass CRC budget across its ENTIRE real range
 // -- not just a handful of bytes -- with measurable, monotonically
@@ -302,7 +302,7 @@ TEST(XiaoOtaIncrementalExtentResolverTest, FullInstallCeilingSizeResolvesWithMea
   // "<=1024 bytes/pass" combined CRC+SHA requirement) -- proves the real
   // full install-ceiling size genuinely requires many bounded passes,
   // not a single one, and that word-aligned per-pass sizing is
-  // consistent with the boot contract's own 708608-byte ceiling.
+  // consistent with the boot contract's own 643072-byte ceiling.
   constexpr uint32_t kBudgetPerPass = 1024;
   XiaoOtaExtentResolutionStep step;
   int pass_count = 0;
@@ -324,7 +324,7 @@ TEST(XiaoOtaIncrementalExtentResolverTest, FullInstallCeilingSizeResolvesWithMea
   EXPECT_EQ(XiaoOtaExtentResolutionStep::Resolved, step);
   EXPECT_EQ(kXiaoOtaAppInstallMaxSize, out_extent);
   EXPECT_EQ(kXiaoOtaAppInstallMaxSize, resolver.bytesProcessedSoFar());
-  // Real 708608-byte ceiling / 1024-byte budget genuinely spans many
+  // Real 643072-byte ceiling / 1024-byte budget genuinely spans many
   // passes (not one, not a trivially small handful) -- proves this test
   // exercises the ENTIRE real range, matching the boot-side ceiling.
   EXPECT_GT(pass_count, 600);
@@ -366,4 +366,3 @@ TEST(XiaoOtaIncrementalExtentResolverTest, FullSizeImageWithGenuineTailMismatchF
   // a real tail-mismatch, not an early bounds rejection).
   EXPECT_EQ(kXiaoOtaAppInstallMaxSize, resolver.bytesProcessedSoFar());
 }
-

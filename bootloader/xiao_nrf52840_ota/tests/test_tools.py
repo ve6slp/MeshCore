@@ -111,6 +111,9 @@ class SenseProfilePreparationTest(unittest.TestCase):
         for board in ("xiao_nrf52840_ble", "xiao_nrf52840_ble_sense"):
             shutil.copytree(PREPARE.DEFAULT_SOURCE / "src/boards" / board,
                             self.source / "src/boards" / board)
+        solar = ROOT / ".tmp/otafix-stage2-prototype/vendor/src/boards/sensecap_solar_p1"
+        if solar.is_dir():
+            shutil.copytree(solar, self.source / "src/boards/sensecap_solar_p1")
 
     def prepare(self, board="xiao_nrf52840_sense", role_id=1, no_ble=True):
         work = self.directory / "ota-boot-builds" / f"{board}-role{role_id}-{no_ble}"
@@ -180,7 +183,7 @@ class SenseProfilePreparationTest(unittest.TestCase):
         symbols = subprocess.check_output(["nm", "--defined-only", str(binary)], text=True)
         line = next(line for line in symbols.splitlines() if line.endswith(PREPARE.VERSION_SYMBOL))
         value, kind, _ = line.split()
-        self.assertEqual((int(value, 16), kind), (0xB00, "A"))
+        self.assertEqual((int(value, 16), kind), (PREPARE.BOOTLOADER_VERSION, "A"))
         self.assertGreater(PREPARE.BOOTLOADER_VERSION, 0x601)
 
     def test_wrong_semantic_release_tag_refuses_preparation_before_source_copy(self):
@@ -227,7 +230,7 @@ class SenseProfilePreparationTest(unittest.TestCase):
             with self.subTest(board=board):
                 work = self.prepare(board=board)
                 text = (work / "Makefile").read_text()
-                self.assertIn("BOARD ?= xiao_nrf52840_ble\n", text)
+                self.assertIn(f"BOARD ?= {PREPARE.UPSTREAM_BOARDS[board]}\n", text)
                 self.assertIn(f"XIAO_OTA_BOARD_TARGET=0x{target}u", text)
                 self.assertIn("BOOTLOADER_REGION_START=0xF4000", text)
 
@@ -317,6 +320,12 @@ static struct { uint32_t CC[1]; } timer;
 #undef APP_ASKS_FOR_SINGLE_TAP_RESET
 #define APP_ASKS_FOR_SINGLE_TAP_RESET() single_tap
 static uint32_t reset_marker, prior_marker;
+enum { BANK_VALID_APP = 1 };
+typedef struct { uint16_t bank_0; } bootloader_settings_t;
+static bootloader_settings_t sdk_settings;
+void bootloader_util_settings_get(bootloader_settings_t const **settings) {
+  *settings = &sdk_settings;
+}
 uint32_t *dbl_reset_mem = &reset_marker;
 bool _ota_dfu, _sd_inited, _ota_was_connected;
 static bool app_valid, pending, single_tap, receive_app, reset_during_swap, must_reenter;
@@ -376,7 +385,10 @@ void bootloader_dfu_start(bool ota, uint32_t timeout, bool cancel) {
   dfu_ota = ota;
   dfu_timeout = timeout;
   cancel_timeout = cancel;
-  if (receive_app) app_valid = true;
+  if (receive_app) {
+    app_valid = true;
+    sdk_settings.bank_0 = BANK_VALID_APP;
+  }
   if (ota && ble_connect) _ota_was_connected = true;
   if (pending_after_dfu) pending = true;
 }
@@ -388,6 +400,7 @@ static void setup(uint32_t reason, uint32_t marker, uint32_t gpregret, bool vali
   reset_marker = prior_marker = marker;
   _ota_dfu = _sd_inited = _ota_was_connected = false;
   app_valid = valid;
+  sdk_settings.bank_0 = valid ? BANK_VALID_APP : 0x00FF;
   pending = single_tap = receive_app = reset_during_swap = must_reenter = false;
   ble_connect = pending_after_dfu = false;
   hooks = swaps = finalizes = usb_calls = dfu_calls = delays = app_queries = 0;
@@ -466,6 +479,25 @@ int main(void) {
   }
   setup(0, 0, DFU_MAGIC_SKIP, true);
   CHECK(boot() == APP && hooks == 1 && dfu_calls == 0);
+  uint16_t const unsafe_banks[] = { 0, 0x00FF, 0xFFFF, 0xFF01, 0x00A5, 0x00AA };
+  for (unsigned i = 0; i < sizeof(unsafe_banks) / sizeof(unsafe_banks[0]); ++i) {
+    /* Model the vendor's permissive erased-settings/vector path as valid. */
+    setup(0, 0, 0, true);
+    sdk_settings.bank_0 = unsafe_banks[i];
+    CHECK(boot() == RESET && hooks == 1);
+    setup(1, 0, 0, true);
+    sdk_settings.bank_0 = unsafe_banks[i];
+    single_tap = true;
+    CHECK(boot() == RESET && hooks == 1 && dfu_timeout == 3000);
+    setup(1, DFU_DBL_RESET_MAGIC, 0, true);
+    sdk_settings.bank_0 = unsafe_banks[i];
+    CHECK(boot() == RESET && hooks == 0 && dfu_timeout == 0);
+    setup(0, 0, XIAO_OTA_DFU_MAGIC_OTA_RESET, true);
+    sdk_settings.bank_0 = unsafe_banks[i];
+    ble_connect = true;
+    CHECK(boot() == RESET && hooks == 0);
+    if (!NO_BLE) CHECK(power.GPREGRET == XIAO_OTA_DFU_MAGIC_OTA_RESET);
+  }
   uint32_t const ble_requests[] = { XIAO_OTA_DFU_MAGIC_OTA_RESET, XIAO_OTA_DFU_MAGIC_OTA_APPJUM };
   for (unsigned i = 0; i < sizeof(ble_requests) / sizeof(ble_requests[0]); ++i) {
     setup(0, 0, ble_requests[i], false);
@@ -500,7 +532,9 @@ int main(void) {
 
     def run_main_harness(self, text, no_ble):
         source = self.directory / "main-sequencing.c"
-        source.write_text(self.main_harness(text))
+        source.write_text(self.main_harness(text).replace(
+            "#define MK_BOOTLOADER_VERSION 0x00000B00u",
+            f"#define MK_BOOTLOADER_VERSION 0x{PREPARE.BOOTLOADER_VERSION:08X}u"))
         binary = self.directory / "main-sequencing"
         compiled = subprocess.run(
             ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -528,6 +562,7 @@ int main(void) {
                 ("    if (ota_reset_pin) *dbl_reset_mem = DFU_DBL_RESET_MAGIC;",
                  "    if (ota_reset_pin) *dbl_reset_mem = ota_prior_reset_marker;"),
                 ("!xiao_ota_explicit_dfu_requested(NRF_POWER->GPREGRET)", "true"),
+                ("ota_sdk_settings->bank_0 == BANK_VALID_APP", "true"),
                 ("if (!double_reset &&", "if (double_reset ||")):
             with self.subTest(mutation=before):
                 self.assertEqual(text.count(before), 1)

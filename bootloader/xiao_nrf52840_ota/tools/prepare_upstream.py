@@ -10,16 +10,16 @@ import struct
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
-PIN = "c67f0bcf0fa8e841426335b1bbde91cda6ca1f50"
-PIN_RELEASE = "0.11.0"
-BOOTLOADER_VERSION = 0x00000B00
+PIN = "a62825be4733f500271c89b5ec489fd609748e97"
+PIN_RELEASE = "0.9.2-OTAFIX2.3-BP1.4"
+BOOTLOADER_VERSION = 0x00000902
 VERSION_SYMBOL = "__meshcore_vendor_bootloader_version"
 DEFAULT_SOURCE = ROOT / ".tmp" / "Adafruit_nRF52_Bootloader"
 OVERLAY = ROOT / "bootloader" / "xiao_nrf52840_ota"
 UPSTREAM_BOARDS = {
     "xiao_nrf52840": "xiao_nrf52840_ble",
     "xiao_nrf52840_sense": "xiao_nrf52840_ble_sense",
-    "sensecap_solar_p1": "xiao_nrf52840_ble",
+    "sensecap_solar_p1": "sensecap_solar_p1",
 }
 
 # ghostfat.c infoUf2File flash-cost patch: named module-level constants (not
@@ -493,7 +493,8 @@ def main(argv=None):
         raise SystemExit("pinned vendor board include changed")
     text = text.replace(
         '#include "boards.h"\n',
-        '#include "boards.h"\n#include "xiao_ota_boot.h"\n#include "xiao_ota_record.h"\n',
+        '#include "boards.h"\n#include "bootloader_settings.h"\n'
+        '#include "xiao_ota_boot.h"\n#include "xiao_ota_record.h"\n',
         1,
     )
     version_store = '  BOOTLOADER_VERSION_REGISTER = (MK_BOOTLOADER_VERSION);\n'
@@ -543,8 +544,11 @@ def main(argv=None):
         raise SystemExit("pinned vendor application-jump gate changed")
     text = text.replace(
         app_gate,
+        '  bootloader_settings_t const * ota_sdk_settings;\n'
+        '  bootloader_util_settings_get(&ota_sdk_settings);\n'
         '  bool const vendor_app_ready =\n'
         '      !bootloader_must_be_reentered &&\n'
+        '      ota_sdk_settings->bank_0 == BANK_VALID_APP &&\n'
         '      bootloader_app_is_valid() &&\n'
         '      !bootloader_dfu_sd_in_progress();\n'
         '  if (ota_hook_ran && vendor_app_ready) {\n',

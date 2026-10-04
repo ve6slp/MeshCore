@@ -180,7 +180,9 @@ resetting with GPREGRET `0x57`. The paired primary interprets that as an
 ordinary app-requested, three-second DFU session, then retries the failing
 installer. Live integration must instead return a stage-only recovery latch
 through the existing runtime ABI; every force-recovery call must stop before
-any subsequent write. This correction remains a first-bench prerequisite.
+any subsequent write. The selected Sense role1 live pair passed the independent
+actual adapter/kernel/runtime/caller replay and compiled old-reset negative
+control. R1 is source-closed; physical recovery remains unqualified.
 
 BLE APP recovery and legitimate pending-update completion must remain
 available in the final primary; the limited serial/UF2 writer proof that
@@ -224,10 +226,29 @@ Use `77CD...` as the canary and leave `4186...` as the working uploader:
 4. Replace the matching primary once through bootloader-only serial DFU.
    Low-APP staging erasure is expected. Its actual erase callback publishes
    bank0 INVALID, CRC0 and size0; the new primary must finalize the identical
-   pending loader before the installer gate and remain in USB recovery.
+   pending loader before the installer gate. The old loader retains GPREGRET
+   `0xA8` across the MBR copy reset, so the first new-primary boot enters BLE
+   advertising without USB. This is expected, not an activation failure.
+   Reset only the canary once, then require persistent R1 UF2 USB recovery.
+   Stop loader writes if USB still does not enumerate after that reset.
 5. Restore the final ordinary APP-only firmware within 643,072 bytes. Verify
    the installed image, configuration, installer capability and genuine
    factory state, then run signed LoRa install/confirmation and rollback.
+
+The corresponding guarded Make entry points are
+`commission-xiao-nrf52-target-preload`,
+`lab-bootloader-uf2-target`,
+`lab-mount-xiao-nrf52-target-commission-uf2`, and
+`commission-xiao-nrf52-target-primary`. Pass the same reviewed
+`XIAO_OTA_PAIR_DIR` and `XIAO_OTA_PAIR_PACKAGE_DIR` throughout. The preload
+target waits for the temporary APP; check its SDK is VALID, size 659,548,
+CRC0, bank1 `FF`, and marker blank before requesting UF2. The primary target
+validates its package and performs live bounded compound readback before
+the one transfer; it deliberately does not wait for an APP or immediate USB.
+After the one physical canary reset, `lab-wait-target-bootloader` and the
+read-only mount command check the recovery USB path before restoring the
+ordinary APP with `flash-xiao-nrf52-target`. No target retries loader writes
+or requests a power cut.
 
 The old serial APP publisher stores SDK CRC0 even when the package/transfer
 CRC is nonzero. Transport completion is not installed-byte evidence. A
@@ -239,9 +260,64 @@ The fresh read-only baseline on October 3 retained both nodes' identities,
 radio preferences and the canary's complete ACL. The canary reported healthy
 bank0 VALID, bank1 `FF`, APP size 538,360, SDK CRC0/computed `B968`, and boot/
 parameter addresses `0xF4000`/`0xFE000`; both nodes still reported CACHE_ONLY.
-This is not an installed custom pair. Actual Sense role1 paired artifacts,
-one focused source-sequence case and final integrated review remain necessary
-before the first new flash.
+This is not an installed custom pair. The selected full-BLE Sense role1
+primary now uses 38,748/38,912 bytes and its installer 16,476/65,536 bytes.
+Independent Make rebuilds produced identical HEX, boot-only RAW and installer
+bytes. The focused old-loader-to-pair sequence passed serial and UF2 restoration;
+review closed its identical pending-finalization dependency and confirmed the
+first-boot BLE/single-reset expectation above. These are source/native results,
+not physical USB/S140/QSPI proof. The compound packager also passed independent
+Make reproduction and source review. Its host-only additions leave all runtime
+source fingerprints and the measured HEX/RAW/installer bytes unchanged.
+The guarded host integration and exact-command review are now source-closed.
+The canary's working APP uses USB PID `8044`, while its Sense recovery loader
+uses `0045`; the host admits that APP-to-loader transition without weakening
+the bootloader identity check. An October 4 read-only preflight found both APPs
+healthy, with blank markers, no pending bank1 and CACHE_ONLY capability.
+
+The first supervised canary attempt then completed the 659,548-byte compound
+preload. Its SDK reported VALID, CRC0/computed `D1B2`, size 659,548, bank1 `FF`
+and blank marker; identity, radio settings, path mode and full ACL were unchanged.
+The complete authorized compound readback matched before the one bootloader-only
+transfer. Recovery USB remained present, and one operator pin reset again
+produced persistent Sense recovery CDC/MSC with an ancestry-matched read-only
+mount. The predicted first-boot BLE-only branch was not observed.
+
+Restoring the ordinary 537,256-byte APP through serial DFU then failed while
+sending the init packet, before image-data progress: the endpoint returned EIO
+and subsequently re-enumerated in recovery mode. The transport tool printed an
+error despite exiting zero; the host's APP wait correctly failed. Recovery USB
+remains accessible. This is a new physical qualification blocker, not a diagnosis
+of the failed original unit. No second primary write, shared-power operation or
+operation on Pine occurred.
+
+The recovery volume's public INFO text matches the selected primary's compiled
+version, board, build date and SoftDevice metadata. That supports activation,
+but is not a full installed-primary hash. The actual ARM return/stack review
+found no ABI defect. Serial transport acknowledges START before its scheduled
+DFU handler runs; a failed START result reaches an explicit reset. Consequently,
+the later INIT-write EIO neither proves successful START processing nor identifies
+which flash operation failed. The SDK/flash diagnosis remains open, and UF2 is
+not an assumed workaround because it shares the preparation barrier.
+
+The reviewed host correction rejects a nonzero transport exit, failure diagnostics
+even with exit zero, and missing vendor completion output. The pinned CLI appends
+`Device programmed.` to its final progress `#` marks, rather than necessarily
+starting a new line. The last nonempty stdout line must contain only those marks
+and the exact completion message. Diagnostic matching does not reject incidental
+words in package or port paths. CLI output is preserved and pre-transfer messages
+are flushed; failure does not proceed to an APP wait or retry. Completion still
+means transport only, not activation or installed-byte verification. This host
+correction does not resolve the firmware failure.
+
+A subsequent guarded read-only capture found all 122 APP pages in
+`0x31000..0xAB000` unchanged from the proven pre-BOOT compound. The lower ten
+pages match the transferred bootloader RAW's staging copy, and no fully erased
+APP page was observed in `0x27000..0xAB000`. The exact 16,476-byte installer
+still matches its reviewed SHA-256. This provides no evidence of a successful
+APP erase, but does not reveal the failed SDK/START predicate or replace a
+post-BOOT, pre-START snapshot. The staging copy is not a readback of the installed
+primary at `0xF4000`; SDK settings remain unavailable through CURRENT.
 
 ## First SWD capture
 

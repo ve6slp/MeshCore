@@ -3,6 +3,14 @@
 #include <nrf_soc.h>  // sd_softdevice_is_enabled / sd_rand_application_vector_get
 #endif
 
+#if defined(XIAO_OTA_LAB_NONCONFIRMING_TRIAL) && XIAO_OTA_LAB_NONCONFIRMING_TRIAL
+#if !defined(MESHCORE_LORA_OTA) || !MESHCORE_LORA_OTA || \
+    !defined(MESHCORE_OTA_LAB_BACKEND) || !MESHCORE_OTA_LAB_BACKEND || \
+    !defined(XIAO_OTA_COMPILED_ROLE_ID) || XIAO_OTA_COMPILED_ROLE_ID != 1
+#error "Nonconfirming trial fixture requires the OTA lab repeater (role 1)"
+#endif
+#endif
+
 #if defined(MESHCORE_OTA_LAB_BACKEND) && MESHCORE_OTA_LAB_BACKEND
 
 #include <cstring>
@@ -86,15 +94,12 @@ constexpr uint32_t kExpectedCapabilityFlags = 1u;
 constexpr uint32_t kExpectedProfileId = 1u;
 
 ota::platform::Nrf52FlashAdapter flash;
-// Real field-use campaigns stage into the full external QSPI candidate
-// BANK/staging region (792 KiB physical placement stride/span -- NOT a
-// writable capacity figure) -- NOT the 16 KiB candidateTestRegion(),
-// which is reserved solely for examples/ota_qspi_hardware_test/main.cpp's
-// destructive qualification harness and cannot hold a real application
-// image. Receiver admission has a fixed 708608-byte application ceiling
-// (0xAD000 / 692 KiB), enforced by OtaNrf52FirmwareTrustProvider to protect
-// InternalExtraFS. A non-installable local uploader cache instead uses the
-// physical candidate region and generic bitmap capacity bounds.
+// External candidate staging remains 708608 bytes; the 792 KiB bank
+// stride is physical placement, not writable capacity. This is not the
+// 16 KiB candidateTestRegion() used by destructive qualification.
+// OtaNrf52FirmwareTrustProvider limits installable images to 643072 bytes
+// (0x9D000), protecting the fixed installer at 0xC4000 and InternalExtraFS.
+// A non-installable uploader cache retains external/generic bounds.
 ota::platform::FlashRegion candidate =
     ota::platform::SenseCapQspiLayout::candidateRegion(flash);
 ota::platform::FlashRegion xiao_floor_region =
@@ -318,6 +323,10 @@ mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(uint32_
   if (!g_qualified) return mesh::ota::OtaBoardTrialHealthOutcome::Pending;  // no bootloader trial concept on this device.
   bootLifecycleObserver().tick(g_qualified);
   if (trial_boot_confirmer_ptr == nullptr) return mesh::ota::OtaBoardTrialHealthOutcome::Pending;  // not yet constructed.
+#if defined(XIAO_OTA_LAB_NONCONFIRMING_TRIAL) && XIAO_OTA_LAB_NONCONFIRMING_TRIAL
+  // Withhold only confirmation readiness; keep real services and the trial deadline running.
+  loop_healthy = false;
+#endif
   return trial_boot_confirmer_ptr->tick(now_ms, radio_ready, filesystem_ready, loop_healthy);
 }
 

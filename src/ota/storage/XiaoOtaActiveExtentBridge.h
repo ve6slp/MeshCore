@@ -60,34 +60,22 @@
 #include <string.h>
 
 #include "ota/platform/FlashRegion.h"
+#include "ota/platform/Nrf52FlashLayoutContract.h"
 #include "ota/storage/Crc32.h"
 #include "ota/trust/Sha256.h"
-#include "ota/runtime/OtaGeometry.h"
 
 namespace ota {
 namespace storage {
 
-// Fixed nRF52840 memory map constants (bootloader/xiao_nrf52840_ota/include/
-// xiao_ota_layout.h is the authoritative, boot-Hydra-owned copy of these;
-// duplicated here as plain constants -- not a build dependency on the
-// bootloader tree -- because this app-side header must build standalone).
-inline constexpr uint32_t kXiaoOtaAppStart = 0x00027000u;
+// The mapped read range is wider than the installable application slot.
+// Neither a readable address nor external staging capacity grants writes.
+inline constexpr uint32_t kXiaoOtaAppStart = OTA_NRF52_INTERNAL_IMAGE_OFFSET;
 inline constexpr uint32_t kXiaoOtaAppEnd = 0x000ED000u;
 inline constexpr uint32_t kXiaoOtaAppMaxSize = kXiaoOtaAppEnd - kXiaoOtaAppStart;  // 811008 (raw mapped region).
 
-// The TRUE trusted/acceptable bank_0_size ceiling is tighter than the raw
-// mapped-region size above: `InternalExtraFS` starts at 0x000D4000, so
-// any bank_0_size between meshcore::ota::runtime::kOtaMaxImageBytes
-// (708608, i.e. 0xD4000 - kXiaoOtaAppStart) and kXiaoOtaAppMaxSize would
-// be memory-safe to *read* (still inside the mapped region) but would
-// claim/represent an image that overlaps the reserved filesystem region
-// -- not a value any genuine install could have produced. An injected or
-// corrupted bank0 record reporting such a size must be rejected before
-// being trusted for hashing/install, not merely bounds-checked against
-// the larger physical mapping. This is intentionally the SAME constant
-// the runtime/install-command path already treats as the protocol-true
-// image size ceiling (see OtaGeometry.h), so both layers agree.
-inline constexpr uint32_t kXiaoOtaAppInstallMaxSize = meshcore::ota::runtime::kOtaMaxImageBytes;  // 708608
+// A trusted active/backup extent must end before the fixed installer at
+// 0xC4000, even though reads beyond it would still be memory-safe.
+inline constexpr uint32_t kXiaoOtaAppInstallMaxSize = OTA_NRF52_INTERNAL_IMAGE_SIZE;  // 643072
 
 // Standard Nordic nRF5 SDK `bootloader_settings_t` bank-0 fields (bank_0,
 // bank_0_crc, bank_0_size) as consumed by xiao_ota_boot.c's own
@@ -108,7 +96,7 @@ struct XiaoOtaActiveExtentInfo {
 
 // Result of one bounded step of incremental extent resolution (see
 // XiaoOtaIncrementalExtentResolver below): resolving the extent itself
-// (a fresh CRC-16 over up to the whole ~811 KiB image) is exactly the
+// (a fresh CRC-16 over up to the whole 628 KiB installable image) is exactly the
 // same kind of potentially-large synchronous cost as an image SHA-256
 // hash, so per-tick callers (XiaoOtaTrialHealthMonitor) must drive it in
 // bounded steps rather than one blocking whole-image call.
@@ -269,7 +257,7 @@ public:
 // resolveExtentFromBank0()/resolveCurrent() remain correct for genuinely
 // one-time-per-install-command callers (e.g. building an install command
 // itself), but a PER-TICK caller such as XiaoOtaTrialHealthMonitor must
-// never pay a single synchronous ~811 KiB CRC in one call during a live
+// never pay a single synchronous 628 KiB CRC in one call during a live
 // trial-boot window. Stateful and single-use: construct one instance per
 // boot's resolution attempt (matching the monitor's own "resolved/failed
 // exactly once" contract).

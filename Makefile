@@ -44,6 +44,13 @@ XIAO_OTA_UPSTREAM ?= $(TMPDIR)/Adafruit_nRF52_Bootloader
 XIAO_OTA_WORK ?= $(TMPDIR)/ota-boot-builds/$(XIAO_OTA_BOARD)_ota$(XIAO_OTA_ROLE_SUFFIX)_upstream
 XIAO_OTA_NOSWD_WORK ?= $(TMPDIR)/ota-boot-builds/$(XIAO_OTA_BOARD)_ota$(XIAO_OTA_ROLE_SUFFIX)_noswd_upstream
 XIAO_OTA_ARTIFACTS ?= $(TMPDIR)/$(XIAO_OTA_BOARD)_ota$(XIAO_OTA_ROLE_SUFFIX)_artifacts
+XIAO_OTA_PAIR_BOARD ?= xiao_nrf52840_sense
+XIAO_OTA_PAIR_ROLE_ID ?= 1
+XIAO_OTA_PAIR_DIR ?= $(TMPDIR)/ota-boot-builds/$(XIAO_OTA_PAIR_BOARD)-role$(XIAO_OTA_PAIR_ROLE_ID)-pair
+XIAO_OTA_PAIR_APP_PACKAGE ?=
+XIAO_OTA_PAIR_PACKAGE_DIR ?= $(XIAO_OTA_PAIR_DIR)-packages
+XIAO_OTA_PAIR_VERIFY_ONLY ?= 0
+XIAO_OTA_PAIR_TIMEOUT ?= 120
 XIAO_OTA_PIN ?= c67f0bcf0fa8e841426335b1bbde91cda6ca1f50
 XIAO_OTA_SOURCE_DATE_EPOCH ?= 1779344629
 XIAO_OTA_PRIVATE_KEY ?=
@@ -116,6 +123,7 @@ OTA_SIGNED_LAB_TIMEOUT ?= 259200
 OTA_SIGNED_LAB_REBOOT_TIMEOUT ?= 120
 OTA_SIGNED_LAB_TRIAL_TIMEOUT ?= 30
 OTA_SIGNED_LAB_INSTALL_TIMEOUT ?= 300
+OTA_SIGNED_LAB_EXPECT_ROLLBACK ?= 0
 OTA_SIGNED_LAB_IMAGE_SHA256 ?=
 OTA_SIGNED_LAB_PROVENANCE ?=
 OTA_SIGNED_LAB_COMMISSIONING ?=
@@ -138,7 +146,7 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         lab-devices lab-doctor lab-reset-client lab-reset-target lab-reset-all \
         lab-bootloader-client lab-bootloader-target lab-bootloader-uf2-target lab-inspect-stock-bootloader-target \
         lab-power-cycle-client lab-power-cycle-target lab-power-cycle-all \
-        lab-wait-client lab-wait-target \
+        lab-wait-client lab-wait-target lab-wait-target-bootloader \
         test-xiao-nrf52-swd-diagnosis diagnose-xiao-nrf52-target-swd \
         build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets build-ota-baseline-targets build-non-ota-targets \
         inspect-xiao-s3-ota-bootloader \
@@ -147,6 +155,10 @@ ESP32_OTA_BUILD_DIR ?= $(if $(PLATFORMIO_BUILD_DIR),$(PLATFORMIO_BUILD_DIR),.pio
         enter-xiao-nrf52-target-bootloader \
         install-xiao-nrf52-target-ota-bootloader flash-xiao-nrf52-target-ota-bootloader \
         package-xiao-ota-bootloader-serial flash-xiao-nrf52-target-ota-bootloader-serial \
+        build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair \
+        package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages \
+        commission-xiao-nrf52-target-preload lab-mount-xiao-nrf52-target-commission-uf2 \
+        commission-xiao-nrf52-target-primary \
         configure-xiao-nrf52-ota-lab configure-xiao-nrf52-ota-client grant-xiao-nrf52-ota-client-admin inspect-xiao-nrf52-ota-preflight inspect-xiao-nrf52-ota-configuration inspect-xiao-nrf52-channels \
         inspect-xiao-nrf52-ota-client-configuration inspect-xiao-nrf52-ota-client-preflight \
         inspect-xiao-nrf52-ota-measurements inspect-xiao-nrf52-ota-client-measurements \
@@ -319,6 +331,9 @@ lab-wait-client:
 lab-wait-target:
 	@$(LAB_DEVICE) wait target
 
+lab-wait-target-bootloader:
+	@$(LAB_DEVICE) wait target --mode bootloader --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"
+
 ## Compile the XIAO nRF52840 + SX1262 lab firmware with OTA enabled.
 clean-xiao-nrf52-lab: tmpdir
 	@for env in $(XIAO_NRF52_LAB_ENVS); do \
@@ -376,6 +391,30 @@ flash-xiao-nrf52-target: tmpdir
 	  result=$$?; cat $(OTA_LAB_ARTIFACT_DIR)/flash-target.log; exit $$result
 
 flash-xiao-nrf52-lab: flash-xiao-nrf52-client flash-xiao-nrf52-target
+
+## Supervised Sense role1 pair only; ordinary flash retains its APP-only ceiling.
+commission-xiao-nrf52-target-preload: tmpdir
+	@mkdir -p -- "$(OTA_LAB_ARTIFACT_DIR)"
+	@{ $(LAB_DEVICE) commission-compound target \
+	    --package "$(XIAO_OTA_PAIR_PACKAGE_DIR)/compound.zip" \
+	    --pair-manifest "$(XIAO_OTA_PAIR_DIR)/pair-manifest.json" \
+	    --timeout "$(XIAO_OTA_PAIR_TIMEOUT)" && \
+	  $(LAB_DEVICE) wait target --mode app --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"; \
+	  } > "$(OTA_LAB_ARTIFACT_DIR)/commission-preload.log" 2>&1; \
+	  result=$$?; cat "$(OTA_LAB_ARTIFACT_DIR)/commission-preload.log"; exit $$result
+
+lab-mount-xiao-nrf52-target-commission-uf2:
+	@$(LAB_DEVICE) mount-commission-uf2 target --timeout "$(XIAO_OTA_PAIR_TIMEOUT)"
+
+commission-xiao-nrf52-target-primary: tmpdir
+	@mkdir -p -- "$(OTA_LAB_ARTIFACT_DIR)"
+	@$(LAB_DEVICE) commission-primary target \
+	  --package "$(XIAO_OTA_PAIR_PACKAGE_DIR)/bootloader.zip" \
+	  --preload-package "$(XIAO_OTA_PAIR_PACKAGE_DIR)/compound.zip" \
+	  --pair-manifest "$(XIAO_OTA_PAIR_DIR)/pair-manifest.json" \
+	  --timeout "$(XIAO_OTA_PAIR_TIMEOUT)" \
+	  > "$(OTA_LAB_ARTIFACT_DIR)/commission-primary.log" 2>&1; \
+	  result=$$?; cat "$(OTA_LAB_ARTIFACT_DIR)/commission-primary.log"; exit $$result
 
 enter-xiao-nrf52-target-bootloader: tmpdir
 	@$(LAB_DEVICE) bootloader target
@@ -501,7 +540,8 @@ qualify-xiao-nrf52-signed-commit: tmpdir
 	  --commissioning-evidence "$(OTA_SIGNED_LAB_COMMISSIONING)" \
 	  --reboot-timeout "$(OTA_SIGNED_LAB_REBOOT_TIMEOUT)" \
 	  --trial-timeout "$(OTA_SIGNED_LAB_TRIAL_TIMEOUT)" \
-	  --install-timeout "$(OTA_SIGNED_LAB_INSTALL_TIMEOUT)"
+	  --install-timeout "$(OTA_SIGNED_LAB_INSTALL_TIMEOUT)" \
+	  $(if $(filter 1,$(OTA_SIGNED_LAB_EXPECT_ROLLBACK)),--expect-rollback)
 
 build-xiao-nrf52-qspi-test: tmpdir
 	$(PLATFORMIO) run -e $(XIAO_NRF52_QSPI_TEST_ENV)
@@ -762,6 +802,26 @@ build-xiao-stock-bootloader: validate-xiao-stock-source
 	  "$(XIAO_OTA_ARTIFACTS)/stock/xiao_nrf52840_ble_stock_$(XIAO_OTA_PIN)_nosd.hex"
 	@cp "$$(find "$(XIAO_OTA_UPSTREAM)/_build/build-xiao_nrf52840_ble" -maxdepth 1 -name 'update-*_nosd.uf2' | head -1)" \
 	  "$(XIAO_OTA_ARTIFACTS)/stock/xiao_nrf52840_ble_stock_$(XIAO_OTA_PIN)_update.uf2"
+
+## Exact OTAFIX primary and fixed installer; Sense role1 is the first bench pair.
+build-xiao-ota-bootloader-pair: tmpdir
+	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile pair \
+	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)"
+
+test-xiao-ota-bootloader-pair: tmpdir
+	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile test \
+	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)"
+
+verify-xiao-ota-bootloader-pair-packages: XIAO_OTA_PAIR_VERIFY_ONLY = 1
+verify-xiao-ota-bootloader-pair-packages: package-xiao-ota-bootloader-pair
+
+package-xiao-ota-bootloader-pair: tmpdir
+	@test -n "$(XIAO_OTA_PAIR_APP_PACKAGE)" || \
+	  { echo "Set XIAO_OTA_PAIR_APP_PACKAGE to the saved working application-only package." >&2; exit 1; }
+	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile package-pair \
+	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)" \
+	  APP_PACKAGE="$(XIAO_OTA_PAIR_APP_PACKAGE)" PACKAGE_OUTPUT="$(XIAO_OTA_PAIR_PACKAGE_DIR)" \
+	  VERIFY_ONLY="$(XIAO_OTA_PAIR_VERIFY_ONLY)"
 
 build-xiao-ota-bootloader: fetch-xiao-ota-bootloader
 	python3 bootloader/xiao_nrf52840_ota/tools/prepare_upstream.py --board "$(XIAO_OTA_BOARD)" --role-id "$(XIAO_OTA_ROLE_ID)" --source-dir "$(XIAO_OTA_UPSTREAM)" --work-dir "$(XIAO_OTA_WORK)"

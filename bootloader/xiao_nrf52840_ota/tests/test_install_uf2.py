@@ -717,12 +717,13 @@ class GuardedInstallerTest(unittest.TestCase):
         raw, version = INSTALLER.serial_payload(self.serial_args())
         self.assertEqual(len(raw), 40192)
         self.assertEqual(raw, (self.package_zip.parent / "bootloader.bin").read_bytes())
-        self.assertEqual(version, 0xB00)
+        self.assertEqual(version, INSTALLER.preparation.BOOTLOADER_VERSION)
         INSTALLER.validate_serial_package(self.package_zip, raw, version)
         with zipfile.ZipFile(self.package_zip) as archive:
             self.assertEqual(set(archive.namelist()), {"bootloader.bin", "bootloader.dat", "manifest.json"})
             self.assertEqual(struct.unpack("<HHIHHH", archive.read("bootloader.dat")),
-                             (0x0052, 52840, 0xB00, 1, 0x0123, binascii.crc_hqx(raw, 0xFFFF)))
+                             (0x0052, 52840, INSTALLER.preparation.BOOTLOADER_VERSION, 1, 0x0123,
+                              binascii.crc_hqx(raw, 0xFFFF)))
         # The transmitted bin contains neither source MBR nor source UICR bytes.
         self.assertEqual(raw[:8], struct.pack("<II", 0x20040000, 0xF4081))
         self.assertEqual(raw[0xD000 - 0xC000:0xD000 - 0xC000 + 8], b"\xff" * 8)
@@ -741,7 +742,7 @@ class GuardedInstallerTest(unittest.TestCase):
             INSTALLER.validate_artifact(uf2, "xiao_nrf52840_sense", None, 1)
             raw, version = INSTALLER.serial_payload(argparse.Namespace(
                 artifact=uf2, hex_artifact=hex_path, elf_artifact=elf))
-            self.assertEqual(version, 0xB00)
+            self.assertEqual(version, INSTALLER.preparation.BOOTLOADER_VERSION)
             self.assertEqual(len(raw), 40192)
             self.assertEqual(raw, raw_path.read_bytes())
             INSTALLER.validate_serial_package(package, raw, version)
@@ -757,7 +758,12 @@ class GuardedInstallerTest(unittest.TestCase):
         subprocess.run(["arm-none-eabi-objcopy", f"--add-symbol={symbol}=0xB00,global",
                         str(elf), str(copied)], check=True, capture_output=True)
         with mock.patch.object(INSTALLER.preparation, "VERSION_SYMBOL", symbol):
-            raw, version = INSTALLER.compiled_boot_span(copied)
+            with self.assertRaisesRegex(ValueError, "version symbol"):
+                INSTALLER.compiled_boot_span(copied)
+            # Preserve the old real padding/LMA fixture without relabeling
+            # its 0.11 code as the selected OTAFIX source.
+            with mock.patch.object(INSTALLER.preparation, "BOOTLOADER_VERSION", 0xB00):
+                raw, version = INSTALLER.compiled_boot_span(copied)
         self.assertEqual(version, 0xB00)
         self.assertEqual(raw, BOOT_INFO.read_uf2_bytes(uf2, INSTALLER.BOOT_START, INSTALLER.BOOT_BYTES))
         self.assertEqual(raw, BOOT_INFO.read_intel_hex_bytes(hex_path, INSTALLER.BOOT_START, INSTALLER.BOOT_BYTES))
@@ -847,7 +853,8 @@ class GuardedInstallerTest(unittest.TestCase):
 
         def vendor(command, environment):
             self.assertEqual(Path(command[5]).read_bytes(), self.package_zip.read_bytes())
-            INSTALLER.validate_serial_package(command[5], self.package_raw, 0xB00)
+            INSTALLER.validate_serial_package(command[5], self.package_raw,
+                                              INSTALLER.preparation.BOOTLOADER_VERSION)
 
         with mock.patch.object(INSTALLER, "validate_public_identity", side_effect=mutate_after_validation), \
                 mock.patch.object(INSTALLER, "run_vendor_serial", side_effect=vendor) as run:

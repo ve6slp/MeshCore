@@ -165,25 +165,30 @@ and [CustomLFS implementation](https://github.com/oltaco/CustomLFS/blob/0.2.3/sr
 
 ## Fixed memory map
 
-This is the existing live contract, before integration of the approved
-primary/installer reservation above. Neither table is evidence of an installed
-custom loader; the replacement still runs the official vendor loader.
+The live OTA application contract reserves the following installer region;
+paired-primary integration and hardware commissioning remain separate gates.
+Neither table is evidence of an installed custom loader: the replacement
+still runs the official vendor loader.
 
 ### Internal nRF52840 flash
 
 | Range | Size | Owner |
 | --- | ---: | --- |
 | `0x00000..0x27000` | 156 KiB | unchanged MBR and S140 v7 |
-| `0x27000..0xD4000` | 692 KiB | active MeshCore application |
+| `0x27000..0xC4000` | 628 KiB | active OTA MeshCore application |
+| `0xC4000..0xD4000` | 64 KiB | fixed internal installer |
 | `0xD4000..0xED000` | 100 KiB | preserved `InternalExtraFS` |
 | `0xED000..0xF4000` | 28 KiB | preserved `InternalFS` |
-| `0xF4000..0xFD800` | 38 KiB | QSPI-aware bootloader code and flash loads |
+| `0xF4000..0xFD800` | 38 KiB | recovery primary code and flash loads |
 | `0xFD800..0xFE000` | 2 KiB | fixed bootloader configuration |
 | `0xFE000..0xFF000` | 4 KiB | MBR parameters |
 | `0xFF000..0x100000` | 4 KiB | upstream bootloader settings |
 
-The OTA application limit is **708,608 bytes**, not the stock linker's
-larger `0x27000..0xED000` span. OTA must preserve MeshCore's ExtraFS.
+The nRF OTA installation limit is **643,072 bytes**, selected only by OTA
+application profiles. The ordinary shared linker is unchanged. External
+candidate/backup regions and generic/ESP transfer limits remain **708,608
+bytes**; those physical sizes do not authorize installing across the fixed
+internal installer or MeshCore's ExtraFS.
 
 Bootloader commissioning must preserve these filesystems too. The retained
 vendor UF2 self-update implementation stages its payload at
@@ -194,7 +199,7 @@ uses application staging instead and requires a separate qualified
 application restore before healthy boot and genesis-floor acceptance.
 See the [hardware workflow](hardware_lab.md#bootloader-commissioning)
 for the current commissioning gate and evidence limits.
-The source contracts are `boards/nrf52840_s140_v7_extrafs.ld` and
+The OTA source contracts are `boards/nrf52840_s140_v7_ota.ld` and
 `src/ota/platform/Nrf52FlashLayoutContract.h`.
 
 The USB-recoverable bootloader keeps the stock `0xF4000` start address.
@@ -390,8 +395,32 @@ that stopped re-enumerating after commissioning.
 
 ## Reproducible qualification and installation gates
 
-The overlay is pinned to Adafruit_nRF52_Bootloader commit
-`c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`. Use repository Make targets:
+The selected Sense role1 commissioning pair uses the OTAFIX 2.3 source at
+`oltaco/Adafruit_nRF52_Bootloader_OTAFIX` commit
+`a62825be4733f500271c89b5ec489fd609748e97`, with its preserving recovery
+primary and the fixed installer. Use the qualified local vendor checkout and
+provenance inputs; these bench targets do not yet provide a clean-checkout
+vendor fetch workflow.
+
+```sh
+make build-xiao-ota-bootloader-pair
+make test-xiao-ota-bootloader-pair
+make package-xiao-ota-bootloader-pair \
+  XIAO_OTA_PAIR_APP_PACKAGE=/path/to/saved-working-application.zip
+make verify-xiao-ota-bootloader-pair-packages \
+  XIAO_OTA_PAIR_APP_PACKAGE=/path/to/saved-working-application.zip
+```
+
+The compound constructor requires the canary's saved 538,360-byte working APP,
+not a newly built replacement. It validates the exact prefix, erased-byte gap,
+matching installer, source/artifact binding and standard application-only DFU
+package. Package verification is offline, not installed-byte evidence. Bounded
+APP/installer readback and final host-command review still precede the primary
+replacement; see [the selected sequence](lora_ota_bootloader_failure_notes.md#selected-development-commissioning-sequence).
+
+The older monolithic overlay remains pinned to Adafruit_nRF52_Bootloader commit
+`c67f0bcf0fa8e841426335b1bbde91cda6ca1f50`. Its legacy qualification targets
+remain available, but are **not the selected canary commissioning route**:
 
 ```sh
 make test-xiao-ota-bootloader

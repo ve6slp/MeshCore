@@ -18,6 +18,8 @@
 #include "ota/platform/FlashTypes.h"
 #include "ota/platform/SenseCapQspiLayout.h"
 #include "ota/platform/Nrf52FlashLayoutContract.h"
+#include "ota/runtime/OtaGeometry.h"
+#include "ota/storage/XiaoOtaActiveExtentBridge.h"
 
 #include "../test_lora_ota_storage/FakeNorFlash.h"
 
@@ -110,7 +112,7 @@ TEST(NrfLayoutBoundaries, SecurityTailsAreWholeHundredKibEachAndBackToBackWithIm
 TEST(NrfLayoutBoundaries, LastLegalImageSectorOffsetsMatchApprovedBoundaries) {
   EXPECT_EQ(SenseCapQspiLayout::kCandidateLastLegalSectorOffset, 0x0AC000u);
   EXPECT_EQ(SenseCapQspiLayout::kBackupLastLegalSectorOffset, 0x172000u);
-  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET, 0x0D3000u);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET, 0x0C3000u);
   // Exactly one erase unit before the corresponding security tail start.
   EXPECT_EQ(SenseCapQspiLayout::kCandidateLastLegalSectorOffset + SenseCapQspiLayout::kEraseUnitBytes,
             SenseCapQspiLayout::kSecurityAOffset);
@@ -365,15 +367,25 @@ TEST(NrfLayoutBoundaries, LegacyJournalTestAliasIsRelocatedInsideCandidateScratc
 }
 
 // -----------------------------------------------------------------------
-// Internal nRF52840 flash image-slot capacity, mirrored from the shared C
-// contract header (OtaGeometry.h / XiaoOtaActiveExtentBridge.h independently
-// pin the same values; this asserts they all agree with the new map).
+// Internal install capacity is target-specific, not generic staging capacity.
 // -----------------------------------------------------------------------
 
-TEST(NrfLayoutBoundaries, InternalImageCapacityMatchesExternalImageCapacityExactly) {
+TEST(NrfLayoutBoundaries, InternalImageReservesFixedInstallerWithoutShrinkingExternalCapacity) {
   EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_OFFSET, 0x027000u);
-  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_SIZE, SenseCapQspiLayout::kCandidateSize);
-  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_OFFSET + OTA_NRF52_INTERNAL_IMAGE_SIZE, 0x0D4000u);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_SIZE, 643072u);
+  EXPECT_EQ(ota::storage::kXiaoOtaAppInstallMaxSize, OTA_NRF52_INTERNAL_IMAGE_SIZE);
+  EXPECT_EQ(ota::storage::kXiaoOtaAppStart, OTA_NRF52_INTERNAL_IMAGE_OFFSET);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_OFFSET + OTA_NRF52_INTERNAL_IMAGE_SIZE, 0x0C4000u);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_INSTALLER_OFFSET, 0x0C4000u);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_INSTALLER_SIZE, 64u * 1024u);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_IMAGE_LAST_LEGAL_SECTOR_OFFSET + SenseCapQspiLayout::kEraseUnitBytes,
+            OTA_NRF52_INTERNAL_INSTALLER_OFFSET);
+  EXPECT_EQ(OTA_NRF52_INTERNAL_INSTALLER_OFFSET + OTA_NRF52_INTERNAL_INSTALLER_SIZE,
+            OTA_NRF52_INTERNAL_FS_OFFSET);
+  EXPECT_LT(OTA_NRF52_INTERNAL_IMAGE_SIZE, SenseCapQspiLayout::kCandidateSize);
+  EXPECT_EQ(meshcore::ota::runtime::kOtaMaxImageBytes, 708608u);
+  EXPECT_EQ(meshcore::ota::runtime::kOtaMaxChunkCount, 5536u);
+  EXPECT_EQ(SenseCapQspiLayout::kCandidateSize, meshcore::ota::runtime::kOtaMaxImageBytes);
   EXPECT_EQ(OTA_NRF52_INTERNAL_FS_OFFSET, 0x0D4000u);
   EXPECT_EQ(OTA_NRF52_INTERNAL_FS_SIZE, 0x019000u);
   // 100 KiB, unmoved.

@@ -11,6 +11,9 @@ escalation order instead of ad-hoc commands.
   ./scripts/lab_device.py reset target --protocol repeater
   ./scripts/lab_device.py bootloader target
   ./scripts/lab_device.py bootloader-uf2 target
+  ./scripts/lab_device.py mount-commission-uf2 target
+  ./scripts/lab_device.py commission-compound target --package compound.zip --pair-manifest pair-manifest.json
+  ./scripts/lab_device.py commission-primary target --package bootloader.zip --preload-package compound.zip --pair-manifest pair-manifest.json
   ./scripts/lab_device.py power-cycle target
   ./scripts/lab_device.py wait target --mode app
 
@@ -27,7 +30,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -39,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(os.environ.get("MESHCORE_LAB_CONFIG", REPO_ROOT / "lab" / "devices.ini"))
 
 BY_ID_DIR = Path("/dev/serial/by-id")
+DEV_DIR = Path("/dev")
 USB_DEVICES = Path("/sys/bus/usb/devices")
 MOUNTINFO = Path("/proc/self/mountinfo")
 SYS_DEV_CHAR = Path("/sys/dev/char")
@@ -448,54 +454,86 @@ class _StockInfoSnapshot:
         return "bounded INFO_UF2.TXT snapshot"
 
 
-def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
-    """Read public stock Sense boot metadata; never enter or install a loader."""
-    if args.role != "target":
-        raise SystemExit("stock bootloader inspection is authorized for the target role only")
+def _sense_target_device(mode: str = MODE_BOOT) -> Device:
     tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
     sys.path.insert(0, str(tools))
     import install_uf2
 
+    device = resolve("target", mode)
+    serial = APPROVED_ADMIN_PAIR["target"]
+    _validate_uf2_identity(device, serial)
+    matches = [candidate for candidate in discover() if candidate.serial == serial]
+    if len(matches) != 1 or matches[0] != device:
+        raise ValueError("target requires one unique unchanged discovered target identity")
+    tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
+    if (not tty_link.exists() or install_uf2.usb_serial_ancestor(tty_link) != serial
+            or device.sysfs.resolve() not in tty_link.resolve().parents):
+        raise ValueError("target tty ancestry does not match the approved target USB node")
+    vendor = int((device.sysfs / "idVendor").read_text().strip(), 16)
+    product_id = int((device.sysfs / "idProduct").read_text().strip(), 16)
+    # The approved Sense target's immutable working APP advertises base-Xiao PID 8044.
+    expected_pids = (0x8044, 0x8045) if device.mode == MODE_APP else (0x0045,)
+    if vendor != SEEED_VID or product_id not in expected_pids:
+        profile = ("approved APP USB 2886:8044 or 2886:8045" if device.mode == MODE_APP
+                   else "exact Sense USB 2886:0045")
+        raise ValueError(f"target requires {profile}")
+    return device
+
+
+@dataclass(frozen=True)
+class _ReadOnlyTargetVolume:
+    path: Path
+    mount_text: str
+    options: list[str]
+    super_options: list[str]
+    block_link: Path
+
+
+def _read_only_target_volume(device: Device) -> _ReadOnlyTargetVolume:
+    import install_uf2
+
+    serial = APPROVED_ADMIN_PAIR["target"]
+    if not _has_msc_interface(device):
+        raise ValueError("approved target bootloader must expose its own MSC class08 interface")
+    volumes = install_uf2.matching_mounts(serial, MOUNTINFO, SYS_DEV_BLOCK)
+    if len(volumes) != 1:
+        raise ValueError(f"expected exactly one ancestry-matched mounted target volume, found {len(volumes)}")
+    volume = volumes[0]
+    mount_text = MOUNTINFO.read_text(encoding="utf-8")
+    rows = [fields for line in mount_text.splitlines()
+            if len(fields := line.split()) >= 10 and "-" in fields
+            and Path(install_uf2.decode_mount_field(fields[4])) == volume]
+    if len(rows) != 1:
+        raise ValueError("target volume must have exactly one unambiguous mount record")
+    fields = rows[0]
+    separator = fields.index("-")
+    if separator < 6 or len(fields) != separator + 4:
+        raise ValueError("malformed target mount record")
+    options, super_options = fields[5].split(","), fields[separator + 3].split(",")
+    if (fields[3] != "/" or "ro" not in options or "rw" in options
+            or "ro" not in super_options or "rw" in super_options):
+        raise ValueError("target requires a whole-volume read-only mount and read-only superblock")
+    block_link = SYS_DEV_BLOCK / fields[2]
+    if (install_uf2.usb_serial_ancestor(block_link) != serial
+            or device.sysfs.resolve() not in block_link.resolve().parents):
+        raise ValueError("mounted target volume ancestry does not match the approved target USB node")
+    return _ReadOnlyTargetVolume(volume, mount_text, options, super_options, block_link)
+
+
+def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
+    """Read public stock Sense boot metadata; never enter or install a loader."""
+    if args.role != "target":
+        raise SystemExit("stock bootloader inspection is authorized for the target role only")
     try:
-        device = resolve("target", MODE_BOOT)
+        device = _sense_target_device()
+        import install_uf2
+
         serial = APPROVED_ADMIN_PAIR["target"]
-        _validate_uf2_identity(device, serial)
-        matches = [candidate for candidate in discover() if candidate.serial == serial]
-        if len(matches) != 1 or matches[0] != device:
-            raise ValueError("stock bootloader requires one unique unchanged discovered target identity")
-        tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
-        if (not tty_link.exists() or install_uf2.usb_serial_ancestor(tty_link) != serial
-                or device.sysfs.resolve() not in tty_link.resolve().parents):
-            raise ValueError("stock bootloader tty ancestry does not match the approved target USB node")
         vendor = (device.sysfs / "idVendor").read_text().strip().lower()
         product_id = (device.sysfs / "idProduct").read_text().strip().lower()
         board = "xiao_nrf52840_sense"
-        if (int(vendor, 16) << 16 | int(product_id, 16)) != install_uf2.USB_BOARD_IDS[board]:
-            raise ValueError("stock bootloader inspection requires exact Sense USB 2886:0045")
-        if not _has_msc_interface(device):
-            raise ValueError("approved stock bootloader must expose its own MSC class08 interface")
-        volumes = install_uf2.matching_mounts(serial, MOUNTINFO, SYS_DEV_BLOCK)
-        if len(volumes) != 1:
-            raise ValueError(f"expected exactly one ancestry-matched mounted target volume, found {len(volumes)}")
-        volume = volumes[0]
-        mount_text = MOUNTINFO.read_text(encoding="utf-8")
-        rows = [fields for line in mount_text.splitlines()
-                if len(fields := line.split()) >= 10 and "-" in fields
-                and Path(install_uf2.decode_mount_field(fields[4])) == volume]
-        if len(rows) != 1:
-            raise ValueError("target volume must have exactly one unambiguous mount record")
-        fields = rows[0]
-        separator = fields.index("-")
-        if separator < 6 or len(fields) != separator + 4:
-            raise ValueError("malformed target mount record")
-        options, super_options = fields[5].split(","), fields[separator + 3].split(",")
-        if (fields[3] != "/" or "ro" not in options or "rw" in options
-                or "ro" not in super_options or "rw" in super_options):
-            raise ValueError("target INFO requires a whole-volume read-only mount and read-only superblock")
-        block_link = SYS_DEV_BLOCK / fields[2]
-        if (install_uf2.usb_serial_ancestor(block_link) != serial
-                or device.sysfs.resolve() not in block_link.resolve().parents):
-            raise ValueError("mounted target volume ancestry does not match the approved target USB node")
+        mounted = _read_only_target_volume(device)
+        volume = mounted.path
         info_path = volume / "INFO_UF2.TXT"
         descriptor = os.open(info_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
@@ -515,7 +553,7 @@ def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
         if actual_board_id not in install_uf2.BOARD_IDS[board]:
             raise ValueError("stock INFO Board-ID does not match the Sense profile")
         install_uf2.validate_stock_info(snapshot)
-        if MOUNTINFO.read_text(encoding="utf-8") != mount_text:
+        if MOUNTINFO.read_text(encoding="utf-8") != mounted.mount_text:
             raise ValueError("mount records changed during stock INFO inspection")
     except (OSError, ValueError) as exc:
         raise SystemExit(f"refusing read-only stock bootloader inspection: {exc}") from exc
@@ -525,7 +563,8 @@ def cmd_inspect_stock_bootloader(args: argparse.Namespace) -> int:
         "role": "target", "serial": serial, "by_id": str(device.by_id),
         "sysfs": str(device.sysfs), "usb_vid": vendor, "usb_pid": product_id,
         "product": device.product, "board_id": actual_board_id, "vendor_info": text,
-        "mountpoint": str(volume), "mount_options": options, "superblock_options": super_options,
+        "mountpoint": str(volume), "mount_options": mounted.options,
+        "superblock_options": mounted.super_options,
         "stock_bootloader_version": "0.6.1", "softdevice": "S140", "softdevice_version": "7.3.0",
         "read_only": True, "public_only": True, "serial_opened": False, "writes": False,
         "cryptographic_installed_bytes_proof": False, "custom_loader_qualified": False,
@@ -587,9 +626,16 @@ def cmd_bootloader_uf2(args: argparse.Namespace) -> int:
 def validate_application_package(package: Path) -> bytes:
     tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
     sys.path.insert(0, str(tools))
-    from xiao_ota_descriptor import assert_matches_canonical_layout_contract, validate_image_geometry
+    from xiao_ota_descriptor import (
+        CANONICAL_LAYOUT_CONTRACT, _canonical_hex_define,
+        assert_matches_canonical_layout_contract, validate_image_geometry,
+    )
 
     assert_matches_canonical_layout_contract()
+    app_limit = _canonical_hex_define(CANONICAL_LAYOUT_CONTRACT.read_text(),
+                                      "OTA_NRF52_INTERNAL_IMAGE_SIZE")
+    if app_limit != 643072:
+        raise SystemExit("ordinary DFU application ceiling must remain 643072 bytes (0x27000..0xC4000)")
     try:
         with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
@@ -609,6 +655,8 @@ def validate_application_package(package: Path) -> bytes:
                 raise SystemExit("DFU package is missing its application binary or init packet")
             image = archive.read(binary)
             validate_image_geometry(image, "DFU application")
+            if len(image) > app_limit:
+                raise SystemExit(f"DFU application exceeds {app_limit} bytes; fixed installer is out of bounds")
             if not archive.read(init_packet):
                 raise SystemExit("DFU application init packet is empty")
             return image
@@ -629,39 +677,280 @@ def cmd_extract_application(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_flash(args: argparse.Namespace) -> int:
-    """Flash a DFU package to a role.
-
-    PlatformIO's own uploader is not used here: it always issues a 1200-baud
-    touch and then rediscovers the port by scanning, which fails whenever the
-    board is already in DFU or when ttyACM numbering shifts mid-upload. Driving
-    adafruit-nrfutil against an already-resolved DFU port is deterministic.
-    """
-    package = Path(args.package)
-    if not package.is_file():
-        raise SystemExit(f"DFU package not found: {package}\nbuild it first (make build-xiao-nrf52-lab)")
-    validate_application_package(package)
-
+def _nrfutil_script() -> Path:
     nrfutil = Path(os.environ.get("ADAFRUIT_NRFUTIL",
                                   Path.home() / ".platformio/packages/tool-adafruit-nrfutil"))
     script = nrfutil / "adafruit-nrfutil.py" if nrfutil.is_dir() else nrfutil
     if not script.is_file():
         raise SystemExit(f"adafruit-nrfutil not found at {script}; set ADAFRUIT_NRFUTIL")
+    return script
 
-    port = cmd_bootloader_port(args.role, args.timeout)
-    print(f"flashing {args.role} ({package}) via {port}")
 
+def _echo_dfu_output(stdout: bytes, stderr: bytes) -> None:
+    for stream, data in ((sys.stdout, stdout), (sys.stderr, stderr)):
+        if hasattr(stream, "buffer"):
+            stream.buffer.write(data)
+        else:
+            stream.write(data.decode("utf-8", errors="replace"))
+        stream.flush()
+
+
+def _serial_dfu(package: Path, port: Path, script: Path, *, timeout: float | None = None) -> None:
+    """Require vendor transport completion, not activation or installed-byte proof."""
     env = dict(os.environ)
     site = script.parent / "site-packages"
     if site.is_dir():
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site), env.get("PYTHONPATH", "")]))
-    proc = subprocess.run([sys.executable, str(script), "dfu", "serial",
-                           "-pkg", str(package), "-p", str(port),
-                           "-b", "115200", "--singlebank"], env=env)
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        proc = subprocess.run([sys.executable, str(script), "dfu", "serial",
+                               "-pkg", str(package), "-p", str(port),
+                               "-b", "115200", "--singlebank"], env=env, capture_output=True, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        _echo_dfu_output(exc.stdout or b"", exc.stderr or b"")
+        raise SystemExit("adafruit-nrfutil transport timed out; outcome unverified; no automatic retry") from exc
+    _echo_dfu_output(proc.stdout, proc.stderr)
     if proc.returncode != 0:
         raise SystemExit(f"adafruit-nrfutil failed with exit {proc.returncode}")
+    # Legacy nrfutil can exit zero after failures; path words are not diagnostics.
+    if re.search(rb"(?im)^[ \t]*(?:failed to upgrade target\b|"
+                 rb"traceback(?:[ \t]*[:(]|[ \t]*\r?$)|"
+                 rb"(?:[\w.]*error|[\w.]*exception)[ \t]*:|false[ \t]*\r?$)",
+                 proc.stdout + b"\n" + proc.stderr):
+        raise SystemExit("adafruit-nrfutil reported transport failure despite exit 0; "
+                         "outcome unverified; no automatic retry")
+    # The final progress hashes have no newline before click's completion message.
+    last_line = next((line for line in reversed(proc.stdout.splitlines()) if line), b"")
+    if re.fullmatch(rb"#*Device programmed\.", last_line) is None:
+        raise SystemExit("adafruit-nrfutil did not prove transport completion: "
+                         "missing 'Device programmed.' (exit 0); outcome unverified; no automatic retry")
 
+
+def cmd_flash(args: argparse.Namespace) -> int:
+    """Flash an ordinary application through the resolved, pinned DFU port."""
+    package = Path(args.package)
+    if not package.is_file():
+        raise SystemExit(f"DFU package not found: {package}\nbuild it first (make build-xiao-nrf52-lab)")
+    validate_application_package(package)
+    script = _nrfutil_script()
+    port = cmd_bootloader_port(args.role, args.timeout)
+    print(f"flashing {args.role} ({package}) via {port}", flush=True)
+    _serial_dfu(package, port, script)
     print(wait_for(args.role, MODE_APP, args.timeout).by_id)
+    return 0
+
+
+def _commission_guard(args: argparse.Namespace) -> None:
+    if args.role != "target":
+        raise SystemExit("paired commissioning is authorized for the target role only")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise SystemExit("paired commissioning timeout must be finite and positive")
+    if load_roles().get("target") != APPROVED_ADMIN_PAIR["target"]:
+        raise SystemExit("paired commissioning requires the literal approved target serial 77CD44653A967172")
+
+
+def _commission_preload(args: argparse.Namespace, package: Path) -> bytes:
+    tools = REPO_ROOT / "bootloader" / "xiao_nrf52840_ota" / "tools"
+    sys.path.insert(0, str(tools))
+    from commission_pair import validate_compound_preload_package
+
+    return validate_compound_preload_package(package, Path(args.pair_manifest))
+
+
+def cmd_commission_compound(args: argparse.Namespace) -> int:
+    """Explicitly preload only the verified CURRENT prefix + gap + matched stage."""
+    _commission_guard(args)
+    try:
+        package = Path(args.package)
+        expected = _commission_preload(args, package)
+        script = _nrfutil_script()
+        _sense_target_device("any")
+        port = cmd_bootloader_port("target", args.timeout)
+        if _sense_target_device().by_id != port:
+            raise ValueError("target DFU port changed before compound transfer")
+        print("WARNING: temporary compound prefix; no OTA/RF until ordinary APP restoration.",
+              file=sys.stderr, flush=True)
+        _serial_dfu(package, port, script, timeout=args.timeout)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, struct.error) as exc:
+        raise SystemExit(f"refusing paired compound commissioning: {exc}") from exc
+    print(f"compound preload transport complete ({len(expected)} bytes); installed bytes not yet verified. "
+          "Enter UF2 and arrange an ancestry-matched read-only mount before commission-primary.")
+    return 0
+
+
+def _identity_token(path: Path, *, follow: bool = True) -> tuple[int, int, int, int]:
+    metadata = path.stat() if follow else path.lstat()
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_rdev
+
+
+def _volume_identity(device: Device, mounted: _ReadOnlyTargetVolume) -> tuple:
+    import install_uf2
+
+    tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
+    return tuple((_identity_token(path, follow=False), _identity_token(path),
+                  str(path.resolve(strict=True)))
+                 for path in (device.sysfs, device.by_id, tty_link,
+                              mounted.block_link, mounted.path))
+
+
+def _commission_block_device(device: Device) -> tuple[Path, Path]:
+    import install_uf2
+
+    if not _has_msc_interface(device):
+        raise ValueError("approved target bootloader must expose its own MSC class08 interface")
+    node = device.sysfs.resolve(strict=True)
+    links = [link for link in SYS_DEV_BLOCK.iterdir()
+             if node in link.resolve(strict=True).parents]
+    if len(links) != 1:
+        raise ValueError(f"expected one unambiguous target USB block device, found {len(links)}")
+    link = links[0]
+    if install_uf2.usb_serial_ancestor(link) != APPROVED_ADMIN_PAIR["target"]:
+        raise ValueError("block device ancestry does not match the approved target serial")
+    block = link.resolve(strict=True)
+    fields = {}
+    for line in (block / "uevent").read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in fields:
+            raise ValueError("malformed target block uevent")
+        fields[key] = value
+    name = fields.get("DEVNAME", "")
+    if (fields.get("DEVTYPE") != "disk" or (block / "partition").exists()
+            or not name.isascii() or not name.isalnum() or name != block.name
+            or (block / "dev").read_text().strip() != link.name):
+        raise ValueError("target must expose exactly one whole USB disk with a safe kernel device name")
+    major, minor = (int(value) for value in link.name.split(":"))
+    path = DEV_DIR / name
+    metadata = path.lstat()
+    if not stat.S_ISBLK(metadata.st_mode) or metadata.st_rdev != os.makedev(major, minor):
+        raise ValueError("target device path must be a real matching block node, not a symlink")
+    return path, link
+
+
+def cmd_mount_commission_uf2(args: argparse.Namespace) -> int:
+    """Mount only the approved already-BOOT+MSC target read-only; never remount."""
+    _commission_guard(args)
+    try:
+        device = _sense_target_device()
+        import install_uf2
+
+        block, link = _commission_block_device(device)
+        tty_link = install_uf2.device_sysfs_link(device.by_id, SYS_DEV_CHAR)
+        paths = (device.sysfs, device.by_id, tty_link, link, block)
+        identity = tuple((_identity_token(path, follow=False), _identity_token(path))
+                         for path in paths)
+        mounts = install_uf2.matching_mounts(
+            APPROVED_ADMIN_PAIR["target"], MOUNTINFO, SYS_DEV_BLOCK)
+        existing = None
+        if mounts:
+            try:
+                existing = _read_only_target_volume(device)
+            except ValueError as exc:
+                raise ValueError(f"existing target mount refused; no automatic unmount/remount: {exc}") from exc
+        else:
+            rc, output = _run(["udisksctl", "mount", "--block-device", str(block),
+                              "--options", "ro"], args.timeout)
+            if rc != 0:
+                raise ValueError(f"udisksctl read-only mount failed (exit {rc}); "
+                                 f"no retry or remount: {output}")
+        final_device = _sense_target_device()
+        if (final_device != device or _commission_block_device(final_device) != (block, link)
+                or tuple((_identity_token(path, follow=False), _identity_token(path))
+                         for path in paths) != identity):
+            raise ValueError("target USB/block identity changed during read-only mounting")
+        mounted = _read_only_target_volume(final_device)
+        if existing is not None and mounted != existing:
+            raise ValueError("existing read-only target mount records changed")
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"refusing target read-only commissioning mount: {exc}") from exc
+    print(mounted.path)
+    return 0
+
+
+def _read_compound_current(expected: bytes) -> Device:
+    """Seek only to APP/installer UF2 blocks; never read the virtual filesystem spans."""
+    from commission_pair import APP_START, STAGE_END, verify_compound_preload_readback
+    import install_uf2
+
+    device = _sense_target_device()
+    mounted = _read_only_target_volume(device)
+    identity = _volume_identity(device, mounted)
+    current = mounted.path / "CURRENT.UF2"
+    descriptor = os.open(current, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        blocks = (0xEA000 - 0x1000) // 256
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != blocks * 512:
+            raise ValueError("CURRENT.UF2 must be a regular file with exact virtual 0x1000..0xEA000 geometry")
+
+        def read_at(address: int, count: int) -> bytes:
+            if (type(address) is not int or type(count) is not int or not 0 < count <= 4096
+                    or address < APP_START or address + count > APP_START + len(expected)
+                    or address + count > STAGE_END):
+                raise ValueError("CURRENT.UF2 callback exceeds authorized bounded APP/installer read")
+            result = bytearray()
+            stop = address + count
+            for target in range(address & ~255, stop, 256):
+                index = (target - 0x1000) // 256
+                block = os.pread(descriptor, 512, index * 512)
+                if len(block) != 512:
+                    raise ValueError(f"short CURRENT.UF2 block at 0x{target:05X}")
+                header = struct.unpack_from("<8I", block)
+                if (header != (install_uf2.UF2_MAGIC_START0, install_uf2.UF2_MAGIC_START1,
+                               install_uf2.UF2_FLAG_FAMILY_ID_PRESENT, target, 256,
+                               index, blocks, install_uf2.USB_BOARD_IDS["xiao_nrf52840_sense"])
+                        or struct.unpack_from("<I", block, 508)[0] != install_uf2.UF2_MAGIC_END):
+                    raise ValueError(f"invalid CURRENT.UF2 magic/flags/address/block/family at 0x{target:05X}")
+                first, last = max(address, target) - target, min(stop, target + 256) - target
+                result.extend(block[32 + first:32 + last])
+            return bytes(result)
+
+        verify_compound_preload_readback(read_at, expected)
+        if MOUNTINFO.read_text(encoding="utf-8") != mounted.mount_text:
+            raise ValueError("mount records changed during compound readback")
+        final_device = _sense_target_device()
+        final_mount = _read_only_target_volume(final_device)
+        if (final_device != device or final_mount != mounted
+                or _volume_identity(final_device, final_mount) != identity
+                or _identity_token(current, follow=False) != (
+                    metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_rdev)
+                or os.fstat(descriptor).st_size != metadata.st_size):
+            raise ValueError("mount/device/CURRENT identity changed during compound readback")
+    finally:
+        os.close(descriptor)
+    return device
+
+
+def cmd_commission_primary(args: argparse.Namespace) -> int:
+    """Verify the live compound, then transfer its exact bootloader-only primary."""
+    _commission_guard(args)
+    try:
+        package = Path(args.package)
+        expected = _commission_preload(args, Path(args.preload_package))
+        import package_pair
+
+        pair_manifest = Path(args.pair_manifest)
+        primary, stage, _ = package_pair.verify_pair(pair_manifest.parent)
+        if package_pair.compound_payload(expected[:package_pair.CURRENT_APP_BYTES], stage) != expected:
+            raise ValueError("verified pair stage changed since compound package validation")
+        if len(primary) != 40960:
+            raise ValueError("matched primary RAW must be exactly 40960 bytes")
+        _, init = package_pair.package_payload(package, "bootloader", primary)
+        if init["application_version"] != 0x902 or init["device_revision"] != 52840:
+            raise ValueError("bootloader standard init does not match the Sense ROLE1 pair")
+        script = _nrfutil_script()
+        device = _read_compound_current(expected)
+        print(f"live compound CURRENT.UF2 readback verified ({len(expected)} bytes); "
+              "transferring matched bootloader-only primary.", flush=True)
+        _serial_dfu(package, device.by_id, script, timeout=args.timeout)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, struct.error) as exc:
+        raise SystemExit(f"refusing paired primary commissioning: {exc}") from exc
+    print("bootloader-only transport complete; activation not yet verified. "
+          "Expected E1: first new-primary boot may advertise BLE indefinitely WITHOUT USB. "
+          "ROOT: request ONE physical pin reset, then check persistent R1 UF2 USB. "
+          "Do not retry loader writes or power-cycle. "
+          "CURRENT.UF2 and ACK/INFO do not expose the installed-primary SHA-256.")
     return 0
 
 
@@ -810,6 +1099,11 @@ def main() -> int:
     uf2.add_argument("role", choices=["target"])
     uf2.add_argument("--timeout", type=float, default=30.0)
     uf2.set_defaults(func=cmd_bootloader_uf2)
+    mount = sub.add_parser("mount-commission-uf2",
+                           help="mount only approved already-BOOT+MSC target read-only via udisksctl; existing RW mount refused")
+    mount.add_argument("role", choices=["target"])
+    mount.add_argument("--timeout", type=float, default=30.0)
+    mount.set_defaults(func=cmd_mount_commission_uf2)
     stock = sub.add_parser("inspect-stock-bootloader",
                            help="read approved target stock Sense INFO from an already read-only mounted MSC; no serial or writes")
     stock.add_argument("role", choices=["target"])
@@ -817,6 +1111,19 @@ def main() -> int:
     flash = add_role_command("flash", cmd_flash, mode_default=MODE_APP,
                              help_text="flash a DFU package and return to the application")
     flash.add_argument("--package", required=True, help="path to firmware.zip")
+    for name, handler, help_text in (
+            ("commission-compound", cmd_commission_compound,
+             "explicit matched Sense ROLE1 compound preload; ordinary flash gate unchanged"),
+            ("commission-primary", cmd_commission_primary,
+             "live bounded compound readback on already read-only MSC, then matched boot-only DFU; no APP/USB wait")):
+        commission = sub.add_parser(name, help=help_text)
+        commission.add_argument("role", choices=["target"])
+        commission.add_argument("--package", required=True)
+        commission.add_argument("--pair-manifest", required=True)
+        commission.add_argument("--timeout", type=float, default=120.0)
+        if name == "commission-primary":
+            commission.add_argument("--preload-package", required=True)
+        commission.set_defaults(func=handler)
     cycle = add_role_command("power-cycle", cmd_power_cycle, mode_default=MODE_APP,
                              help_text="cut and restore USB port power")
     cycle.add_argument("--delay", type=int, default=3, help="seconds to stay powered down")

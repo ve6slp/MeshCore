@@ -1036,12 +1036,14 @@ class ApplicationPackageTests(unittest.TestCase):
                         mock.patch.object(lab_device, "_touch_1200") as touch, \
                         mock.patch.object(lab_device, "wait_for", return_value=device) as wait, \
                         mock.patch.object(lab_device.subprocess, "run",
-                                          return_value=argparse.Namespace(returncode=0)) as run, \
-                        mock.patch("builtins.print"):
+                                          return_value=argparse.Namespace(
+                                              returncode=0, stdout=b"#\n#########Device programmed.\n", stderr=b"")) as run, \
+                        mock.patch("builtins.print"), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(lab_device.cmd_flash(args), 0)
                     run.assert_called_once_with(
                         [sys.executable, str(script), "dfu", "serial", "-pkg", str(self.package),
-                         "-p", device.by_id, "-b", "115200", "--singlebank"], env=mock.ANY)
+                         "-p", device.by_id, "-b", "115200", "--singlebank"],
+                        env=mock.ANY, capture_output=True)
                     touch.assert_not_called()
                     wait.assert_called_once_with(role, lab_device.MODE_APP, 30)
 
