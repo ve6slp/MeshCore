@@ -726,6 +726,30 @@ enumeration. The verified primary remains intact. Final APP health,
 post-restoration SDK/factoryfloor0 and full userdata/cache preservation are
 still unqualified; this commissioning outcome is not complete.
 
+**Physical recovery and post-restoration SDK on41:** the verified Sense
+primary's existing double-reset entry uses retained RAM marker `005A1AD5`
+at `20007F7C`, recognized before stage2/APP startup. Two quick pin resets in
+its500ms detection window select persistent USB CDC+MSC. The operator performed
+that separate recovery gesture after the stalled APP could not service1200-bps
+entry; ROOT observed exact41 BOOT+MSC, then made a new guarded read-only capture
+at `19:50:59Z` Oct. 4, 2026. No SWD, power operation or primary rewrite was used.
+
+The entire primary and installer slot still matched `fff496...` and
+`91c623...`. The actual post-APP SDK showed bank0 VALID_APP, size550308,
+stored CRC A69D, bank1 FF, zero pending sizes/start and an FF tail; page SHA256
+was `fd7345dd22e9450ca17ab35c167c0422b00153c6ca9762c9bd04415a6c50cd31`.
+Thus ordinary APP publication and independent physical recovery are measured,
+not inferred from enumeration. APP command-loop health and the durable
+floor/transaction/cache state remain separate, unmeasured outcomes.
+
+The existing factory-genesis record is unbound sequence1/counter0/extent0/hash0,
+not a record binding the original9f7 image. With that exact seed and blank
+transaction windows, fresh healthy SDK evidence can admit an ordinary APP-only
+replacement without refreshing the floor, erasing journals or rewriting BOOT.
+Cache ABORTED generation8 alone does not prove those journal conditions.
+Any non-genesis floor or nonterminal transaction evidence must stop the
+ordinary replacement rather than being silently reset.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
