@@ -872,6 +872,14 @@ authorized and must not be opened. APP_START first after ordinary UART settling,
 then DEVICE_QUERY, obtained the public identity/version; BLE PIN and GPS fields
 were neither displayed nor recorded in the public baseline.
 
+**Actual normal radio link,22:54Z:** a single19-byte ordinary raw datagram from
+the unchanged stock companion reached41 with the exact generated payload,
+RSSI-40dBm and SNR12dB.41's actual saved normal profile also read907.525MHz,
+250kHz,SF7,CR5, not the62.5kHz source default. The complete original stock
+SelfInfo and DeviceInfo frames matched again after the normal radio operation.
+Its firmware and2dBm setting were unchanged. This establishes the physical
+stock-to41 radio link, not OTA authorization, image delivery or installation.
+
 The host adapter and distinct, matching ROLE0 companion candidates for41
 are being prepared. ROLE1 images above cannot be
 installed on41's ROLE0 loader. Only an explicit lab-only nonconfirming ROLE0
@@ -909,6 +917,40 @@ blockers. The guarded ROLE0 profiles reuse the existing health callback and
 These are source results. The three integrated baseline/confirm/nonconfirm
 ELFs and actual receiver41/RF qualification remain separate gates. No new USB
 STAGE/reset API or boot-journal erase is introduced.
+
+The three integrated ROLE0 APP-only artifacts are now frozen from the same
+qualified tree, with no SoftDevice/BOOT payload:
+
+| Label | BIN bytes | CRC16 | BIN SHA256 |
+| --- | ---: | --- | --- |
+| `ota-41-base01` | 552740 | `A974` | `484da15d649dd1f60eb61bf88567fcb8c76217ff89ab5dae64e223add4903323` |
+| `ota-41-confirm01` | 552756 | `A967` | `f51bb6c59d1e4d6053058ca1a267f00255b9730b098252cfcc27526aacb05fce` |
+| `ota-41-rollback01` | 552676 | `9F11` | `6d681fb3f500248418cec3259317fd3db2642f3ac9d527671c6c9c9c90c5849f` |
+
+An expanded actual ELF root analysis covers18 OTA-facing ancestor/callee
+chains, including informational signed direct requests omitted from the
+earlier13-path figure. All three bound at3264 bytes including104 bytes of
+exception allowance, with832 bytes of headroom in the unchanged4096-byte
+task. This refines the earlier3032 selected-path bound; it is not a new stack
+allocation or proof weakening. Final independent actual-ELF review found no
+blockers.
+
+**Actual receiver41 baseline,23:06Z:** ROOT installed only the reviewed
+`ota-41-base01` application through ordinary USB DFU. Runtime DeviceInfo
+confirmed that exact label. The bootloader/SoftDevice/installer were not
+updated. Actual early proof remained qualified and INSTALL_CAPABLE, with
+unchanged floor sequence1/counter0/extent0/hash0 and successful floor I/O.
+The sealed generation9 cache survived, and complete private snapshots matched
+identity, settings, SelfInfo, all4 contacts including ACLs, and all40 channels.
+This is receiver preparation, not an OTA installation.
+
+At `23:09:54Z`, ROOT deliberately aborted that old local cache through the
+existing image-bound local API. STATUS reported ABORTED, generation10,
+counter1, the same manifest hash and6403/6403 old cached chunks. Subsequent
+preflight still showed the unchanged qualified floor0. Those cached bytes
+were not promoted into a receiver image; the fresh signed RF descriptor,
+generation-bound REUPLOAD and complete retransmission remain required.
+Actual signed RF confirmation/automatic rollback are still unqualified.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
