@@ -6872,6 +6872,7 @@ TEST(LoraOtaRfProduct, CheckedProfileChangesPhysicalParamsAndRestartsRxRatherTha
   EXPECT_FALSE(wrapper.receiving);
 }
 
+#include "RelayAirtimeTests.h"
 #include "StockBootPreflightTests.h"
 
 namespace {

@@ -319,6 +319,31 @@ APP erase, but does not reveal the failed SDK/START predicate or replace a
 post-BOOT, pre-START snapshot. The staging copy is not a readback of the installed
 primary at `0xF4000`; SDK settings remain unavailable through CURRENT.
 
+The next recovery input was the official
+`Xiao_nrf52_repeater-v1.17.1-d929643` release, not the special OTA APP or
+the Solar/ThinkNode board variants. Publisher digests matched the downloaded
+ZIP (`b71d24fb9fd379207f7d888e1006d315388e0b530138350ff08466c1b6e3529a`)
+and UF2 (`1abc70deec75e375f8e1d1f984ed839b443bbaf6fe03803426a710dd622cef55`).
+All 1,515 UF2 records contain the 387,752-byte APP plus 88 erased padding
+bytes, wholly within `0x27000..0x85B00`; no loader, SoftDevice or filesystem
+image is included. The first host invocation refused before any unmount or
+write because its expected INFO suffix incorrectly included the word
+`version`. The pinned formatter and live INFO both say
+`SoftDevice: S140 7.3.0`. A narrow host correction retained exact metadata
+matching and regenerated a separate proof without changing the official UF2.
+
+The one actual stock UF2 copy then reached the approved read-only-to-read-write
+mount transition but returned EIO. A separate 30-second APP wait failed:
+77 remained in Sense recovery mode. This is not stock restoration or proof
+of a particular SDK failure. After a guarded same-device return to read-only,
+the 05:12 UTC capture found zero of 95 APP chunks matching stock and all
+132 APP page digests unchanged from the immediate pre-copy capture. The exact
+installer hash still matches. The attempted copy left no observed APP change;
+the SDK page and failing preparation predicate remain unobserved. Firmware
+writes are stopped. SWD and additional qualification boards are still
+unavailable, as confirmed by the operator. No additional primary transfer or
+automatic APP retry was made.
+
 ## First SWD capture
 
 The committed helper performs bounded public-metadata acquisition; it does

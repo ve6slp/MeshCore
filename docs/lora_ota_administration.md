@@ -260,6 +260,11 @@ repeater profile is unchanged; USB recovery remains separate.
   time per sliding one-hour window, per transmitter. Short accounting
   buckets retain their latest completion for the full window; allowance
   recovery may therefore be delayed by up to 15 seconds, never advanced.
+- Per-hop airtime qualification requires every participating relay to run
+  firmware with `MESHCORE_LORA_OTA` enabled and its required OTA share
+  configured (2% by default). Stock/OTA-off relays cannot inherit the
+  sender's guarantee. Native forwarding proofs are software-only, not
+  physical airtime qualification.
 - Lab observations report completed on-mesh OTA usage separately from
   all-traffic transmission time. Timeout or failed-accounting observations
   prevent airtime qualification. Check ordinary peer delivery during the
