@@ -291,12 +291,21 @@ make ota-stock-companion \
   OTA_STOCK_ARGS="restore $stock_args --artifacts .tmp/stock-upload"
 ```
 
-The current receiver must also permit idempotent OTA retries through its
-mesh packet duplicate filter. A lost census reply otherwise prevents
-another identical poll from reaching the receiver, including the separate
-COMMIT READY sweep. The actual bench exposed this gate; do not work around
-it by clearing packet caches, inventing a successful receipt or resetting
-the device to claim qualification.
+The corrected source permits already-seen OTA packets with zero path hashes
+to reach the idempotent local receiver without forwarding them again.
+Relayed duplicates, echoes, ordinary traffic and the packet-hash FIFO retain
+their existing filtering. A receiver without this correction can stall after
+a lost census reply or during the separate COMMIT READY sweep. Corrected
+application builds and physical retry qualification remain required; clearing
+packet caches, inventing a successful receipt or resetting the device is not
+a qualification workaround.
+
+This correction covers one-hop retries only. Relays still suppress identical
+forwarded requests until packet-hash eviction. Reliable routed/fleet repair
+therefore needs a protocol-level per-attempt discriminator that preserves
+signed inner authority and same-attempt forwarding deduplication, followed by
+real multihop loss/repair qualification. Do not infer routed readiness from
+the direct-mode source or hardware checks.
 
 ## Control surface
 

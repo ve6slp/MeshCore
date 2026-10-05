@@ -1045,6 +1045,27 @@ phase, progress and RF metadata events, without changing wire requests,
 retry counts, budgets or authority/restore guards. It has not yet been used
 for a new physical transfer.
 
+The guarded receiver correction is now published as `d4f95013`, canonical
+tree `b27ec216f967e24899acc85945a205843c3bebde`. It locally redelivers
+already-seen OTA packets only when their path hash count is zero, then
+releases them without forwarding or remarking the hash. Count-one-or-more
+relayed copies and own-flood echoes remain filtered; ordinary delivery and
+routed next-hop forwarding are unchanged. Nine real-Mesh/SimpleMeshTables
+cases cover lost census replies, repeated READY/COMMIT polling, failed-write
+block retry, duplicate block/COMMIT no-write behaviour, uploader observation
+refresh, echo suppression and unchanged FIFO/ordinary/routed filtering.
+ROOT independently passed all261 integration cases on the exact immutable
+combined tree; bounded Opus5.5 delta review found no blockers.
+
+Three same-source ROLE0 applications (`ota-41-base02`, `ota-41-confirm02`,
+`ota-41-rollback02`) are being built from that qualified tree, with actual
+ELF root bounds rechecked before hardware use. The installed41 baseline is
+still `ota-41-base01`; no new receiver image or RF campaign has run yet.
+This is a one-hop correction, not reliable multihop retransmission: relays
+still retain identical forwarded packets in their160-entry duplicate FIFO.
+A protocol-level attempt discriminator and physical routed/fleet repair
+remain required. Neither cache flushing nor a host nonce workaround is used.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
