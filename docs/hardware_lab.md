@@ -1168,16 +1168,27 @@ bytes. The older3264 figure was not a universal task bound. Published
 commit`3dbd03e4` differs from the exact d303 build source only by the
 Arduino header's final newline; the immutable build provenance is retained.
 
-ROOT remeasured confirmed floor1 and started the LoRa-only counter2
+ROOT remeasured confirmed floor1 and completed the LoRa-only counter2
 confirm04 campaign, canonical59 SHA256
 `eb2cee5e26ab8db26c86b9f20b9644f75fceeedd02bdfe787a775599c274d41a`.
-Real RF reports generation12, Receiving, total6600 blocks. This is still
-legacy250 because the installed confirm02 cannot negotiate500. Both radios
-remain2dBm; the unchanged stock companion and old-firmware USB observer
-own their respective ports. No REUPLOAD, ordinary APP flash or COMMIT was
-used for this admission. Installation,500kHz and reader-free operation
-remain separate milestones. The progressing transfer will not be paused
-for restart qualification; that test is deferred to the next campaign.
+Real RF reported all6600 blocks READY at generation12. The exact private
+receipt was followed by a separate fresh52-window READY sweep and signed
+COMMIT. Actual readback independently reports `ota-41-confirm04`, healthy
+qualified state1/phase6, allowed writes and confirmed floorsequence3/
+counter2/extent554372/hash417a... with IO OK. No host reset or APP reflash
+was used. The full pre-peer snapshot preserved identity, settings, allfive
+contacts including ACLs and all40 channels. One capture during USB
+re-enumeration failed before opening the receiver; the later read-only
+capture passed without setters. Ordinary zero-hop RF advertisements in both
+directions again matched the exact peer keys and Ed25519 signatures, with
+normal-profile/TX2 guards before and after. Stock reported a native contact
+event;41 did not, so native acceptance is not claimed for both directions.
+The transfer used legacy250 because the previous confirm02 could not
+negotiate500. Its old-firmware USB observer exited on the autonomous serial
+disconnect and is released. Both radios remain2dBm. Installed corrected
+diagnostics do not themselves prove reader-free reception: actual500kHz,
+partial Receiving restart/resume and autonomous failed-trial rollback are
+the next separate hardware campaign.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

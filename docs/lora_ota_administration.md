@@ -12,8 +12,8 @@ stock1.17.1 companion. Reader-free operation, autonomous failed-trial rollback,
 physical routed delivery and fleet fairness remain unqualified. Do not use
 these controls to manage a deployed network.
 
-Bench unit41 runs `ota-41-confirm02` and reports qualified `INSTALL_CAPABLE`
-with confirmed counter1 and the expected image hash. Its identity, settings,
+Bench unit41 runs `ota-41-confirm04` and reports qualified `INSTALL_CAPABLE`
+with confirmed counter2 and the expected image hash. Its identity, settings,
 five complete contacts including administrator permissions, and all40
 channels survived installation. Both radios use the authorized2dBm.
 Unit77 still enumerates in a defective modified USB bootloader and requires
@@ -25,9 +25,10 @@ The additional stock1.17.1 companion is a separate signing/radio endpoint,
 not a receiver or locally staged uploader. It has not been flashed.
 The one-hop duplicate-suppression correction is installed on41; repeated
 census, full-image reception, separate signed COMMIT and actual healthy
-confirmation have been observed. That campaign required a continuously
-drained receiver USB observer. Corrected nonblocking diagnostics and500kHz
-negotiation firmware is now being delivered by a second LoRa campaign.
+confirmation have been observed. Both completed campaigns required a
+continuously drained observer for the old receiver's USB diagnostics.
+The second campaign installed corrected nonblocking diagnostics and500kHz
+negotiation. Reader-free operation still requires its own hardware proof.
 
 ## Update policy
 
@@ -347,10 +348,11 @@ Actual target builds and software loss/repair cases passed; real multihop
 loss/repair qualification is still required. Do not infer routed readiness
 from the direct-mode hardware result.
 
-Receiver USB diagnostics must not be required to make RF progress. The current
-bench receiver can stall when its unsolicited OTA event output is not drained;
+Receiver USB diagnostics must not be required to make RF progress. The old
+bench firmware stalled when its unsolicited OTA event output was not drained;
 continuous USB observation restored signed-lease census and block reception.
-That observer is instrumentation, not a production remedy. Reader-free
+That observer was instrumentation, not a production remedy. Corrected
+nonblocking diagnostics are now installed, but reader-free
 operation and automatic rollback remain separate acceptance gates despite
 the completed USB-observed full-image installation.
 

@@ -33,7 +33,7 @@ LoRa OTA is under active development and is **not** a supported way to update
 your node's firmware today. Treat everything below as a preview of an
 in-progress feature, not a how-to.
 
-The supervised nRF unit41 has completed a full signed LoRa update through
+The supervised nRF unit41 has completed two full signed LoRa updates through
 an unchanged stock1.17.1 companion: autonomous reboot, actual new firmware,
 healthy confirmation, confirmed image hash/counter and full settings,
 identity, contact ACL and channel preservation. Both radios used2dBm and
@@ -48,9 +48,10 @@ Software tests cover repeated updates, failed-trial recovery and refusal of
 competing candidates. These results are not physical acceptance.
 
 Hardware qualification remains incomplete despite that supervised install.
-The corrected nonblocking diagnostics and 500 kHz negotiation firmware is
-being delivered to41 over LoRa; neither its installation nor reader-free
-operation is established yet. Unit77 enumerates in its defective modified
+The latest installed `ota-41-confirm04` includes corrected nonblocking
+diagnostics and 500 kHz negotiation. Its independently confirmed image
+hash/counter and complete pre-peer userdata preservation are established;
+reader-free operation and actual 500 kHz transfer are not. Unit77 enumerates in its defective modified
 USB bootloader and still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.
 The 2% airtime policy and ordinary mesh service must still be verified together
