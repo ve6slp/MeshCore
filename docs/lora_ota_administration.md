@@ -43,8 +43,13 @@ Its4900.233-second duration starts from883 persisted blocks, not an empty
 candidate. A separate signed COMMIT followed another fresh52-window READY
 sweep. Stock restoration passed, but the immediate native USB witness timed
 out before observing any trial or return; COMMIT TX is not installation or
-rollback proof. Post-COMMIT state requires read-only diagnosis, not another
-COMMIT or a reset to manufacture evidence. Recovered driver-fault increases
+rollback proof. Separate bounded read-only diagnosis subsequently observed
+confirm04 running with qualified phase8/writes allowed, the original confirmed
+floor unchanged and the exact counter3/generation13 candidate Failed10 with
+6599 blocks retained. Its sampled normal radio profile was healthy. This is
+current-state evidence, not the missing historical trial or autonomous return
+proof; it does not authorize the rollback peer gate. No repeat COMMIT or reset
+was used to manufacture evidence. Recovered driver-fault increases
 are explicitly reported as degradation, not continuous fault-free radio
 qualification; their cause and operational impact remain unresolved.
 

@@ -1265,7 +1265,30 @@ installation or rollback proof; neither the failure reason nor the lack of
 samples proves a radio fault or a failed boot. No second COMMIT, host reset,
 reflash or reboot was used to manufacture a result. The last independently
 confirmed baseline remains confirm04/floorsequence3/counter2/hash417a...;
-post-COMMIT state needs separate read-only diagnosis.
+the immediate witness did not establish post-COMMIT state.
+
+**Late read-only current-state diagnosis:** a separate, once-only bounded
+capture subsequently read all eight native responses from exact unit41 in
+0.164 seconds, with no timeout, RF transmission, reset or repeated COMMIT.
+The first historical timeout was the one-second driver-applied radio request
+`42 00 03`, issued before identity/version; its hardware or transport cause
+remains unproved. The late capture found `ota-41-confirm04`, qualified state1/
+phase8/decision0 with writes allowed, and the unchanged confirmed floor:
+sequence3/counter2/extent554372/hash
+`417a6228926fdd531d8a388c516c7bbc8255352b97132aaa3ea26ddd6d09be56`.
+The exact counter3/generation13/manifest candidate reported Failed10 with all
+6599 blocks retained; native lifecycle still reported `verified=0 image=unknown`.
+Normal907525kHz/BW250000/SF7/CR5/TX2, current driver health, valid profile and
+zero apply failures were observed. The current boot reported1088 seconds
+uptime, zero error flags and zero lifetime driver faults; this does not erase
+the earlier boot's recovered fault growth or prove continuous radio health.
+
+The returned baseline and failed candidate are now observed current state,
+not reconstructed trial history. This sequential snapshot cannot supply the
+missing trial/disconnect/reconnect evidence, qualify autonomous rollback, or
+authorize the phase8 rollback peer gate. The original incomplete witness and
+its authority remain unchanged; future observation must tolerate explicit
+bounded transient read gaps without promoting missing evidence.
 
 Full reader-free reception is now qualified for this bench campaign.
 Autonomous failed-trial rollback, unattended installation and continuous

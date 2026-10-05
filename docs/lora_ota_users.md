@@ -64,7 +64,10 @@ A separate signed COMMIT was sent after a fresh complete READY census. Its
 immediate USB witness timed out before observing a trial or return, so neither
 installation nor autonomous failed-trial rollback is proved by that attempt.
 The last independently confirmed baseline remains `ota-41-confirm04`; current
-post-COMMIT state needs separate read-only diagnosis.
+post-COMMIT read-only diagnosis subsequently found that baseline running again,
+the original confirmed floor unchanged, the candidate marked failed, and a
+healthy sampled normal radio profile. This late snapshot does not recover the
+missing trial history or qualify autonomous rollback.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.
