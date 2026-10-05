@@ -1022,7 +1022,7 @@ and6581 total blocks. This proves that the signed authorization had
 prepared the new receiver descriptor and that the corrected flood decoder
 works. It is not receiver activation or image delivery.
 
-The concrete remaining failure is mesh-level duplicate suppression:
+The concrete failure in those attempts was mesh-level duplicate suppression:
 `Packet::calculatePacketHash` hashes payload type plus payload, and
 `SimpleMeshTables` retains160 hashes without expiry. `Mesh::onRecvPacket`
 discards identical OTA packets before the receiver sees them. The first
@@ -1031,8 +1031,8 @@ regenerating its discarded reply. A final READY sweep followed by a
 separate COMMIT sweep would encounter the same issue. The correction must
 allow idempotent local OTA retries while preserving duplicate suppression
 for forwarding and ordinary traffic. Resetting the device or filling/
-clearing the packet cache is not the fix. The installed baseline still
-contains this defect; corrected application artifacts and real full-image
+clearing the packet cache is not the fix. The then-installed baseline still
+contained this defect; corrected application artifacts and real full-image
 delivery/confirmation/automatic rollback remain separate gates.
 
 After both failed attempts and the distinct-window probe, ROOT again matched
@@ -1042,8 +1042,8 @@ qualified INSTALL_CAPABLE, sequence1/counter0/extent0/hash0 and `io=ok`.
 The diagnostic-only host revision10 is now integrated byte-exact and passed
 81 focused plus75 existing uploader cases. It adds flushed public-only
 phase, progress and RF metadata events, without changing wire requests,
-retry counts, budgets or authority/restore guards. It has not yet been used
-for a new physical transfer.
+retry counts, budgets or authority/restore guards. The subsequent physical
+transfer below uses this revision.
 
 The guarded receiver correction is now published as `d4f95013`, canonical
 tree `b27ec216f967e24899acc85945a205843c3bebde`. It locally redelivers
@@ -1058,13 +1058,55 @@ ROOT independently passed all261 integration cases on the exact immutable
 combined tree; bounded Opus5.5 delta review found no blockers.
 
 Three same-source ROLE0 applications (`ota-41-base02`, `ota-41-confirm02`,
-`ota-41-rollback02`) are being built from that qualified tree, with actual
-ELF root bounds rechecked before hardware use. The installed41 baseline is
-still `ota-41-base01`; no new receiver image or RF campaign has run yet.
+`ota-41-rollback02`) were frozen from that qualified tree. All three fresh
+ELF root bounds remain3264 bytes including104 IRQ allowance, with832 bytes
+headroom in4096; the Mesh caller remains40 bytes. These are static bounds,
+not physical stack high-water measurements.
 This is a one-hop correction, not reliable multihop retransmission: relays
 still retain identical forwarded packets in their160-entry duplicate FIFO.
 A protocol-level attempt discriminator and physical routed/fleet repair
 remain required. Neither cache flushing nor a host nonce workaround is used.
+
+**Corrected baseline and first signed RF data,Oct.5:** ROOT installed
+`ota-41-base02` once through ordinary APP-only USB DFU. Its552804-byte BIN
+SHA256 is `a76288ea84dc2ce0c4dc8f64106db0b7afc650a662b4dd83e8f9eaceadbfe19d`.
+Actual preflight at `01:33:35Z` remained qualified INSTALL_CAPABLE,
+sequence1/counter0/extent0/hash0 and `io=ok`. The complete private
+identity/settings/SelfInfo/five-contact ACL/40-channel snapshots matched.
+BOOT, SoftDevice and installer were not changed.
+
+Host revision10's third real campaign obtained the pending census and
+physically retired the old local cache through signed RF REUPLOAD.
+The receiver entered Receiving generation11, counter1, with the new
+`ota-41-confirm02` manifest
+`894553fbb4886341d8b6a2847b977757980f7d313f1b0e1e5e470c0b202df1ec`,
+zero received and6582 total blocks. The stock companion verified the target's
+full signed direct ACK and switched to the negotiated SF5 profile, but leased
+census timed out before any block was sent. Both radios returned to normal;
+stock firmware and its original profile/TX2 were independently read back.
+There was no READY receipt or COMMIT.
+
+A bounded probe resumed that same generation without another retirement,
+ABORT or reset while ROOT continuously drained receiver USB diagnostics.
+Normal and leased census then returned promptly. Receiver driver-applied
+measurements showed908525 kHz/BW250000 Hz/SF5/CR5 with a healthy driver.
+ROOT sent one genuine compact signed kind01 block over the stock radio;
+the receiver accepted it and a fresh matching RF census reported bit0 set
+and1 of6582 received. The lease expired normally and the receiver's measured
+profile returned to907525/BW250000/SF7/CR5. This proves signed RF data
+reception, not full-image validation or installation.
+
+**Unattended USB blocker:** these observations strongly isolate diagnostic
+backpressure: `ArduinoSerialInterface` reports connected and not busy, while
+`MyMesh::onOtaDataRecv` writes an unsolicited14-byte0x91 event through its
+blocking frame writer. Unread USB can therefore stall the radio loop.
+A continuously drained USB observer is bench instrumentation, not the
+production fix or unattended acceptance. The core diagnostic path must become
+nonblocking without dropping ordinary command responses or truncating frames.
+The fourth campaign resumes the exact same candidate with that explicit
+observer; it does not qualify reader-free operation. Complete-image READY,
+signed COMMIT, healthy trial confirmation, autonomous failed-trial rollback
+and post-install userdata preservation remain unqualified.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77

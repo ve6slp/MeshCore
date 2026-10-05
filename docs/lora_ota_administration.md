@@ -295,8 +295,9 @@ The corrected source permits already-seen OTA packets with zero path hashes
 to reach the idempotent local receiver without forwarding them again.
 Relayed duplicates, echoes, ordinary traffic and the packet-hash FIFO retain
 their existing filtering. A receiver without this correction can stall after
-a lost census reply or during the separate COMMIT READY sweep. Corrected
-application builds and physical retry qualification remain required; clearing
+a lost census reply or during the separate COMMIT READY sweep. Unit41 now
+runs the corrected baseline and has accepted repeated census requests and
+signed RF data. Other receivers still need matching corrected builds; clearing
 packet caches, inventing a successful receipt or resetting the device is not
 a qualification workaround.
 
@@ -306,6 +307,13 @@ therefore needs a protocol-level per-attempt discriminator that preserves
 signed inner authority and same-attempt forwarding deduplication, followed by
 real multihop loss/repair qualification. Do not infer routed readiness from
 the direct-mode source or hardware checks.
+
+Receiver USB diagnostics must not be required to make RF progress. The current
+bench receiver can stall when its unsolicited OTA event output is not drained;
+continuous USB observation restored signed-lease census and block reception.
+That observer is instrumentation, not a production remedy. Reader-free
+operation, full-image installation and automatic rollback remain separate
+acceptance gates.
 
 ## Control surface
 

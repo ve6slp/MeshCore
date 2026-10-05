@@ -38,9 +38,12 @@ implementation. Bench unit41 is healthy and reports qualified
 `INSTALL_CAPABLE`; identity, settings, contact permissions and channels
 survived its receiver preparation. An unchanged stock1.17.1 USB companion
 has physically demonstrated signing, full-size radio transport and the SF5
-profile. The first actual upload attempts exposed host reply decoding and
-receiver duplicate-suppression defects; no new image has been activated or
-installed. Unit77 enumerates in its defective modified USB bootloader and
+profile. Host reply decoding and one-hop duplicate-suppression defects have
+been corrected. The stock companion has now activated a receiver session,
+negotiated a signed SF5 lease and delivered a genuine signed image block.
+Unread receiver USB diagnostics can still stall reception; a USB-observed
+bench transfer is not unattended qualification. No image has completed
+validation or installation. Unit77 enumerates in its defective modified USB bootloader and
 still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.
 The 2% airtime policy and ordinary mesh service must still be verified together
