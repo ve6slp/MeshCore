@@ -1399,6 +1399,26 @@ unlogged exception remain unchanged and historically unrecoverable. Exposed
 userdata equality does not prove hidden storage, private keys, hidden PSK
 halves, atomicity, uninterrupted boot history or autonomous rollback.
 
+**Passive post-peer fault classification (2026-10-05):**
+ONE separately admitted read-only collection freshly qualified the same installed
+diag-conf05 image and floorsequence4/counter4 before reading retained selector5
+details. Both reads reported healthy radio state, lifetime count1 and one
+`ActiveProbe` origin; every other origin count was0. The retained failure reason
+was0x20 (chip-mode mismatch): software expected transmit mode2, while status0x2c
+decoded to STDBY_RC. IRQ flags were0x0001 (TX_DONE), device errors were0, and all
+three checked SPI reads reported success. The passive receipt SHA256 is
+`751f074f2e0705f57d03b458b7cefdb4bfcb75a89c67ce3dd143e01054eba5e8`.
+
+This identifies the retained fault as a checked mode disagreement, not a failed
+SPI read or a retained device-error bit. A latched TX_DONE flag does not establish
+fresh completion, the command that caused it, or whether software serviced that
+completion before the probe. Both sequential reads retained count1; the
+collection requested no active probe, RF transmission, settings write, reset or
+OTA action. It does not establish a shared MCU boot epoch with the prior peer
+session, continuous health, CMD7 causation, or the earlier837-to886 faults'
+cause. Transmit-completion/probe ordering remains a separate source investigation;
+the strict health classifier has not been weakened.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

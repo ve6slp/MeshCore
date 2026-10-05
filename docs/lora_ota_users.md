@@ -97,7 +97,10 @@ companion at2dBm, with native acceptance events and fresh image/floor/profile
 checks before and afterward. This is not complete storage/private-key
 preservation or sustained service qualification. The receiver's fault count
 increased from0 to1 across that peer check despite healthy sampled radio state;
-continuous radio reliability and fault attribution remain open.
+separate passive diagnostics classified the retained fault as an active-probe
+transmit/standby mode mismatch, with successful checked SPI reads and no device
+error bits. Its triggering operation and continuous radio reliability remain
+unqualified; a latched TX_DONE flag is not fresh-completion proof.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.

@@ -1092,8 +1092,11 @@ zero-hop reception at2dBm passed in both directions through the unchanged stock
 companion, with native acceptance events and fresh image/floor/profile checks.
 Those bounded recovery results do not establish full private storage or
 sustained service: the receiver's lifetime radio fault count increased0 to1
-across the peer exchange, so radio-fault attribution and continuous reliability
-remain open. See the hardware lab guide for the actual receipt fingerprints
+across the peer exchange. A separate passive retained-fault read classified an
+ActiveProbe mode mismatch: expected transmit, observed STDBY_RC, latched TX_DONE,
+successful checked SPI reads and no device-error bits. That classifies the
+retained diagnostic, not its triggering command or fresh completion; ordering
+and continuous reliability remain open. See the hardware lab guide for the actual receipt fingerprints
 and the limits of native-event correlation and emission freshness.
 Independent observation of the full internal transition sequence and autonomous
 failed-trial rollback remain acceptance gates.
