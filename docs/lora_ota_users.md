@@ -52,8 +52,14 @@ Hardware qualification remains incomplete despite that supervised install.
 The latest installed `ota-41-confirm04` includes corrected nonblocking
 diagnostics and 500 kHz negotiation. Its independently confirmed image
 hash/counter and complete pre-peer userdata preservation are established;
-partial500kHz reception without a receiver USB reader is now established,
-but a complete reader-free transfer, restart/resume and rollback are not.
+partial500kHz reception without a receiver USB reader is now established.
+A partial campaign also survived one ordinary application restart: the complete
+bitmap, update session, administrator admission and all userdata were preserved,
+and the same reader-free transfer resumed without restarting the campaign.
+Complete reader-free delivery and autonomous failed-trial rollback remain open.
+Recovered driver-fault counter increases were observed during that restart
+proof despite healthy sampled radio state; continuous fault-free radio
+operation and the faults' cause remain unqualified.
 Unit77 enumerates in its defective modified
 USB bootloader and still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.

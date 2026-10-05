@@ -30,8 +30,15 @@ continuously drained observer for the old receiver's USB diagnostics.
 The second campaign installed corrected nonblocking diagnostics and500kHz
 negotiation. A subsequent campaign obtained a target-signed500kHz profile
 ACK and genuine partial Receiving progress with no receiver USB reader.
-Complete reader-free delivery, Receiving restart/resume and autonomous
-failed-trial rollback still require their separate hardware boundaries.
+Receiving restart/resume subsequently passed its physical boundary: one ordinary
+application restart preserved all52 bitmap windows (883/6599 blocks), the same
+generation13/counter3/manifest, full confirmed floor, baseline version and
+functional signed owner admission. Complete userdata matched, and MissingOnly
+reader-free reception resumed on the same campaign without REUPLOAD.
+Complete reader-free delivery and autonomous failed-trial rollback still
+require their separate hardware boundaries. Recovered driver-fault increases
+are explicitly reported as degradation, not continuous fault-free radio
+qualification; their cause and operational impact remain unresolved.
 
 ## Update policy
 
@@ -358,7 +365,11 @@ That observer was instrumentation, not a production remedy. Corrected
 nonblocking diagnostics are now installed and actual partial500kHz RF
 reception has progressed without a receiver USB reader. Complete reader-free
 delivery and automatic rollback remain separate acceptance gates despite
-the completed USB-observed full-image installations.
+the completed USB-observed full-image installations. Partial Receiving restart
+durability and subsequent same-campaign reader-free progress are now established.
+That proof requires healthy sampled driver-applied profiles and preserves the
+full bitmap/session/floor, but does not certify continuous zero-fault radio
+health: each complete census capture observed53 recovered lifetime faults.
 
 ## Control surface
 

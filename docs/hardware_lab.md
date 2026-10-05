@@ -1206,9 +1206,37 @@ boundary; the stock restoration receipt passed and both ports released.
 Subsequent read-only diagnostics showed actual driver-applied normal
 907525kHz/BW250000/SF7/CR5, no active lease, healthy driver and no profile
 apply failures. Complete500kHz READY/installation, measured full-image
-throughput, partial Receiving restart/resume and autonomous failed-trial
-rollback remain separate physical acceptance gates. No REUPLOAD or
+throughput and autonomous failed-trial rollback remain separate physical
+acceptance gates. No REUPLOAD or
 journal clearing was used.
+
+**Actual partial Receiving restart/resume:** after pausing the same campaign,
+ROOT captured all52 RF bitmap windows with a fixed883/6599 received blocks,
+generation13/counter3 and the exact manifest above. Fresh target-signed profile
+ACKs established functional native owner admission, bracketed by local session
+readbacks; generation itself is not signed by that ACK. Exactly one explicitly
+armed ordinary application reboot was written, guarded by a fixed exclusive
+attempt marker. The subsequent native uptime drop and complete identical bitmap
+proved an observed application restart with session persistence. Confirmed
+floorsequence3/counter2/extent554372/hash417a..., `ota-41-confirm04`, healthy
+sampled driver-applied normal PHY and owner admission were preserved.
+Complete before/after userdata matched identity, settings, SelfInfo, allfive
+contacts including ACLs and all40 channels, aggregate SHA256
+`3590661d1dc0a60400f838a7bd53b9e27683fd940bfb9d57fde110dbed0019d6`.
+The same MissingOnly500kHz transfer resumed without REUPLOAD or a receiver USB
+reader; RF census reported1094/6599 at142.966 seconds into that resumed run.
+
+This qualifies restart/session durability, not continuous radio reliability.
+The before capture's lifetime driver-fault count increased86 to139; after the
+observed reboot it increased0 to53. Each complete capture therefore observed53
+recovered faults despite every sampled current health/profile/apply guard and
+final normal restoration passing. Ordered counts and deltas remain in the
+private receipts; positive growth is explicit degradation and
+`continuous_fault_free_radio_verified=false`. No fault cause is inferred.
+Counter decreases within either capture are refused; only the observed reboot
+permits a reset between captures. Unsigned RF census freshness is not
+authenticated. Full reader-free delivery, autonomous failed-trial rollback and
+independent qualification of radio fault origin/recovery impact remain open.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
