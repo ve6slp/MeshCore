@@ -3217,6 +3217,27 @@ void MyMesh::handleOrdinaryCmdFrame(size_t len) {
 #if MESHCORE_LORA_OTA
     uint8_t op = cmd_frame[1];
     if (op == OTA_CTRL_GET_STATUS) {
+      const auto fault_request = mesh::ota::usb::classifyRadioFaultStatusRequest(cmd_frame, len);
+      if (fault_request != mesh::ota::usb::RadioFaultStatusRequest::Other) {
+        if (fault_request == mesh::ota::usb::RadioFaultStatusRequest::InvalidLength) {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        } else {
+#if MESHCORE_OTA_USB_MEASUREMENTS
+          static_assert(mesh::ota::usb::kRadioFaultStatusReplyBytes <= MAX_FRAME_SIZE,
+                        "Fault diagnostic must fit existing serial framing");
+          size_t count = 0;
+          const auto result = mesh::ota::readOtaRadioFaultDiagnostic(_radio, out_frame, sizeof(out_frame), count);
+          if (result == mesh::ota::OtaRadioFaultReplyResult::Unsupported)
+            writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+          else if (result == mesh::ota::OtaRadioFaultReplyResult::BadState)
+            writeErrFrame(ERR_CODE_BAD_STATE);
+          else
+            _serial->writeFrame(out_frame, count);
+#else
+          writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+#endif
+        }
+      } else
       // Optional read-only selectors; the original two-byte status request is unchanged.
 #if MESHCORE_OTA_USB_MEASUREMENTS
       if (len == 3 && (cmd_frame[2] == 3 || cmd_frame[2] == 4)) {

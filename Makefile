@@ -232,6 +232,18 @@ test-ota-boot: tmpdir
 test-ota-integration: tmpdir
 	$(PLATFORMIO) test -e native -f 'test_lora_ota_integration'
 
+OTA_RADIO_FAULT_GTEST ?= .pio/libdeps/native/googletest/googletest
+.PHONY: test-ota-radio-fault-attribution
+## Narrow source-only product gate; uses the existing native GTest dependency, never PlatformIO/SDKs.
+test-ota-radio-fault-attribution: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-radio-fault-attribution"
+	$(CXX) -std=c++17 -pthread -DMESHCORE_LORA_OTA=1 -I src -I test/mocks \
+	  -I "$(OTA_RADIO_FAULT_GTEST)/include" -I "$(OTA_RADIO_FAULT_GTEST)" \
+	  test/test_lora_ota_integration/test_radio_fault_attribution.cpp \
+	  "$(OTA_RADIO_FAULT_GTEST)/src/gtest-all.cc" "$(OTA_RADIO_FAULT_GTEST)/src/gtest_main.cc" \
+	  -o "$(TMPDIR)/ota-radio-fault-attribution/product-test"
+	"$(TMPDIR)/ota-radio-fault-attribution/product-test"
+
 test-ota-lab-host: tmpdir
 	python3 -m unittest discover -s scripts/tests -p '$(OTA_LAB_HOST_TEST_PATTERN)'
 

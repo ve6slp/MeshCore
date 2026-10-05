@@ -33,6 +33,21 @@ namespace usb {
 
 constexpr uint8_t kCommand = 66;
 
+// GET_STATUS selector 4 already carries airtime budgets. Selector 5 is a
+// distinct binary, passive fault-history reply; selectors 0..4 are unchanged.
+constexpr uint8_t kRadioFaultStatusSelector = 5;
+constexpr uint8_t kRadioFaultStatusReplyCode = 29;
+constexpr uint8_t kRadioFaultStatusAbi = 1;
+constexpr size_t kRadioFaultStatusReplyBytes = 57;
+
+enum class RadioFaultStatusRequest : uint8_t { Other, Valid, InvalidLength };
+
+inline RadioFaultStatusRequest classifyRadioFaultStatusRequest(const uint8_t* command, size_t len) {
+  if (!command || len < 3 || command[0] != kCommand || command[1] != 0 ||
+      command[2] != kRadioFaultStatusSelector) return RadioFaultStatusRequest::Other;
+  return len == 3 ? RadioFaultStatusRequest::Valid : RadioFaultStatusRequest::InvalidLength;
+}
+
 // Fixed reply "response code" (byte [0] of every reply to one of the
 // opcodes below) -- RESP_CODE_OTA_USB in the companion response-code
 // space (31 was unused across RESP_CODE_OK..RESP_CODE_OTA_LAB_FLOOR_DATA

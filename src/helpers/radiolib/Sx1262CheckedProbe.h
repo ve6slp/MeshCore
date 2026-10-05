@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "RadioDriverHealthLatch.h"
 
 /**
  * \brief  Turns THREE real, CHECKED SX1262 SPI register reads -- a
@@ -129,4 +130,61 @@ inline bool evaluateSx1262CheckedHealth(const Sx1262CheckedProbeResult& r, Sx126
       // while software believes it is idle is a real disagreement.
       return mode != kSx1262StatusModeRx && mode != kSx1262StatusModeTx;
   }
+
+}
+
+enum Sx1262ProbeFailureReason : uint8_t {
+  kSx1262DeviceErrorsReadFailed = 0x01,
+  kSx1262IrqFlagsReadFailed = 0x02,
+  kSx1262StatusReadFailed = 0x04,
+  kSx1262DeviceErrorsPresent = 0x08,
+  kSx1262UnsupportedMode = 0x10,
+  kSx1262ModeMismatch = 0x20,
+};
+
+// Attribution only: the health decision above remains the authority. Never
+// interpret a decoded field whose checked read failed as independent evidence.
+inline uint8_t sx1262ProbeFailureReasons(const Sx1262CheckedProbeResult& r,
+                                        Sx1262ExpectedChipMode expected) {
+  uint8_t reasons = 0;
+  if (r.device_errors_status != 0) reasons |= kSx1262DeviceErrorsReadFailed;
+  else if (r.device_errors != 0) reasons |= kSx1262DeviceErrorsPresent;
+  if (r.irq_flags_status != 0) reasons |= kSx1262IrqFlagsReadFailed;
+  if (r.status_read_status != 0) reasons |= kSx1262StatusReadFailed;
+  else {
+    const uint8_t mode = r.status_byte & kSx1262StatusModeMask;
+    if (!isSupportedSx1262StatusMode(mode)) reasons |= kSx1262UnsupportedMode;
+    else if ((expected == Sx1262ExpectedChipMode::kReceiving && mode != kSx1262StatusModeRx) ||
+             (expected == Sx1262ExpectedChipMode::kTransmitting && mode != kSx1262StatusModeTx) ||
+             (expected != Sx1262ExpectedChipMode::kReceiving &&
+              expected != Sx1262ExpectedChipMode::kTransmitting &&
+              (mode == kSx1262StatusModeRx || mode == kSx1262StatusModeTx)))
+      reasons |= kSx1262ModeMismatch;
+  }
+  return reasons;
+}
+
+inline void recordSx1262CheckedProbeOutcome(RadioDriverHealthLatch& latch,
+                                           const Sx1262CheckedProbeResult& r,
+                                           Sx1262ExpectedChipMode expected,
+                                           uint8_t software_before, uint8_t software_after) {
+  if (evaluateSx1262CheckedHealth(r, expected)) {
+    latch.recordOutcome(true);
+    return;
+  }
+  mesh::RadioDriverFaultDetails details;
+  details.origin = mesh::RadioDriverFaultOrigin::ActiveProbe;
+  details.driverStatus = r.device_errors_status != 0 ? r.device_errors_status :
+      (r.irq_flags_status != 0 ? r.irq_flags_status : r.status_read_status);
+  details.probeReasons = sx1262ProbeFailureReasons(r, expected);
+  details.expectedMode = static_cast<uint8_t>(expected);
+  details.statusByte = r.status_byte;
+  details.deviceErrors = r.device_errors;
+  details.irqFlags = r.irq_flags;
+  details.deviceErrorsStatus = r.device_errors_status;
+  details.irqFlagsStatus = r.irq_flags_status;
+  details.statusReadStatus = r.status_read_status;
+  details.softwareStateBefore = software_before;
+  details.softwareStateAfter = software_after;
+  latch.recordOutcome(false, details);
 }

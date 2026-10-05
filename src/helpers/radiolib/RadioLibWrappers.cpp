@@ -111,15 +111,18 @@ void RadioLibWrapper::startRecv() {
   #if defined(USE_LR2021)
   _radio->standby(); // without this LR2021 can throw -706 when calling startReceive after hardware CAD when side detectors are enabled
   #endif
+  const uint8_t software_before = state;
   int err = _radio->startReceive();
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_RX;
     _driver_health.recordOutcome(true);
   } else {
     MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
-    _driver_health.recordOutcome(false);
+    _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::StartReceive, err, software_before, state);
   }
 }
+
+uint8_t RadioLibWrapper::driverSoftwareState() const { return state; }
 
 bool RadioLibWrapper::isInRecvMode() const {
   return (state & ~STATE_INT_READY) == STATE_RX;
@@ -135,13 +138,14 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
     len = _radio->getPacketLength();
     if (len > 0) {
       if (len > sz) { len = sz; }
+      const uint8_t software_before = state;
       int err = _radio->readData(bytes, len);
       if (err != RADIOLIB_ERR_NONE) {
         len = 0;
         n_recv_errors++;
         if (radiolib_health::isGenuineRadioDriverFault(err)) {
           MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
-          _driver_health.recordOutcome(false);
+          _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::ReadData, err, software_before, state);
         } else {
           // Expected, ordinary over-the-air PHY decode rejection (e.g.
           // RADIOLIB_ERR_CRC_MISMATCH): the driver call itself completed
@@ -165,13 +169,14 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
   }
 
   if (state != STATE_RX) {
+    const uint8_t software_before = state;
     int err = _radio->startReceive();
     if (err == RADIOLIB_ERR_NONE) {
       state = STATE_RX;
       _driver_health.recordOutcome(true);
     } else {
       MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
-      _driver_health.recordOutcome(false);
+      _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::ReceiveRearm, err, software_before, state);
     }
   }
   return len;
@@ -183,6 +188,7 @@ uint32_t RadioLibWrapper::getEstAirtimeFor(int len_bytes) {
 
 bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
   _board->onBeforeTransmit();
+  const uint8_t software_before = state;
   int err = _radio->startTransmit((uint8_t *) bytes, len);
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_TX_WAIT;
@@ -190,7 +196,7 @@ bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
     return true;
   }
   MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startTransmit(%d)", err);
-  _driver_health.recordOutcome(false);
+  _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::StartTransmit, err, software_before, state);
   idle();   // trigger another startRecv()
   _board->onAfterTransmit();
   return false;

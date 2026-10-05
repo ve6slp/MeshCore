@@ -36,6 +36,7 @@ protected:
 
   void idle();
   void startRecv();
+  uint8_t driverSoftwareState() const;
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();
@@ -72,6 +73,11 @@ public:
   bool isDriverHealthy() const override { return _driver_health.healthy(); }
 
   uint32_t driverFaultCount() const override { return _driver_health.faultCount(); }
+
+  bool getDriverFaultDiagnostic(mesh::RadioDriverFaultDiagnostic& out) const override {
+    _driver_health.getDiagnostic(out);
+    return true;
+  }
 
   // No chip-agnostic active probe exists at this generic RadioLib-wrapper
   // level (only the concrete chip-specific subclass, e.g.

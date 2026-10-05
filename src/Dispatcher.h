@@ -13,6 +13,8 @@
 
 namespace mesh {
 
+struct RadioDriverFaultDiagnostic;
+
 /**
  * \brief  Abstraction of local/volatile clock with Millisecond granularity.
 */
@@ -93,7 +95,7 @@ public:
   virtual bool isDriverHealthy() const { return true; }
 
   /**
-   * \returns  a monotonic, never-decreasing count of every genuine
+   * \returns  a lifetime count, incrementing modulo 2^32, of every recorded
    *           driver-operation failure ever recorded (see
    *           RadioDriverHealthLatch::faultCount()). Comparing two
    *           readings taken at different times tells a caller whether
@@ -106,6 +108,10 @@ public:
    *           unaffected unless they choose to opt in.
   */
   virtual uint32_t driverFaultCount() const { return 0; }
+
+  // Optional passive public history. Unsupported implementations must not
+  // fabricate an empty/healthy diagnostic; the caller maps false to UNSUPPORTED.
+  virtual bool getDriverFaultDiagnostic(RadioDriverFaultDiagnostic&) const { return false; }
 
   /**
    * \returns  true only after a genuine, freshly-taken driver status

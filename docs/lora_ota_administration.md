@@ -382,6 +382,79 @@ The old command-66 mode/duty controls, raw fixed-key sender and binary
 boot-journal cleanup are not an alternative upload workflow; their host
 helpers have been removed.
 
+### Passive radio fault attribution (separately qualified firmware)
+
+On an OTA lab nRF52 USB companion with the diagnostic support compiled in,
+GET_STATUS request bytes `[66, 0, 5]` return a **57-byte binary** payload.
+Selector 4 already reports airtime budgets, so selector 5 is used rather than
+repurposing it. Selectors 0–4, including selector 3's ASCII `h`/`x` profile
+measurement, retain their existing wire behavior. Match all of reply code 29,
+ABI 1, selector 5, and length 57; do not parse this reply as ASCII or as the
+separate ABI2 uploader status. The ordinary serial envelope adds three bytes
+(60 total), within the existing 176-byte payload limit.
+
+| Payload offset | Field |
+| --- | --- |
+| 0, 1, 2 | response code 29, diagnostic ABI 1, selector 5 |
+| 3, 4 | latest driver outcome healthy, any recorded failure (booleans) |
+| 5–8, 9–12 | lifetime fault count `x`, count stamped at last failure |
+| 13, 14–15 | last origin, signed RadioLib status |
+| 16, 17, 18 | probe reason mask, expected mode, raw SX1262 status byte |
+| 19–20, 21–24 | device-error bits, IRQ flags |
+| 25–26, 27–28, 29–30 | checked device-errors / IRQ / status read statuses |
+| 31, 32 | wrapper software state before and after the operation/probe |
+| 33–56 | six lifetime per-origin counters, in origin order |
+
+Multibyte fields are big-endian; signed statuses are 16-bit two's complement.
+Origins are 0 unknown/unattributed, 1 `startRecv` (including CAD re-arm),
+2 `readData`, 3 `recvRaw` RX re-arm, 4 `startTransmit`, 5 active checked probe.
+Probe-only fields are meaningful only for origin 5. Reason bits are `01`
+device-errors read failure, `02` IRQ read failure, `04` status read failure,
+`08` device-error bits present, `10` unsupported chip mode, `20` mode
+disagreement. A decoded register field is evidence only if its corresponding
+checked-read status is zero. The primary driver status is the first failed
+checked read in device-errors / IRQ / status order, or zero for a semantic
+mode/device-error rejection; all three statuses remain available independently.
+Expected modes are 0 idle, 1 RX, 2 TX. Actual chip mode is `status_byte & 0x70`;
+supported encodings are `20` RC standby, `30` XOSC standby, `40` FS, `50` RX,
+`60` TX. Software state is 0 idle, 1 RX, 3 TX-wait, with `10` interrupt-ready
+ORed in (all state/mask values here are hexadecimal).
+
+This bounded record is RAM-only, resets on reboot, and retains the last failure
+and per-origin totals after healthy recovery. Success updates `h` but does not
+erase history. Counts preserve the existing modulo-2^32 increment semantics;
+subtract counts modulo 2^32 only within one boot and fewer than 2^32 failures.
+The explicit any-failure flag distinguishes a wrapped zero from no failure.
+Multiple failures between queries retain only the latest detail; per-origin
+deltas reveal that the interval was not a single attributable event. This is
+not an event log or proof that a latched IRQ is fresh.
+
+The getter and encoder are passive: no new SPI transaction, packet data,
+addresses, keys, GPS, PINs, flash write, or clear-device-errors operation.
+The existing active health probe still performs its same three checked reads.
+Neither this diagnostic nor any reason bit suppresses a fault or changes
+strict trial readiness. Unsupported builds/radios return the existing
+`UNSUPPORTED_CMD` error; malformed selector-5 lengths return `ILLEGAL_ARG`,
+and encoding failure returns `BAD_STATE`, never a success-shaped empty record.
+
+After the current campaign, qualify and install a **separate** diagnostic image
+under the hardware owner's control; this source change is not present in the
+already frozen campaign. In a later authorized bounded observation, obtain a
+passive selector-5 baseline, allow one already-approved control exchange, and
+obtain its post-exchange history plus existing profile guard. Require one
+count increment, one matching origin-counter increment, and a retained last
+count matching the post-exchange count before assigning its reason to that
+interval. A mode-only probe rejection with expected TX, supported standby,
+zero checked-read statuses/device errors, TX_DONE IRQ and software TX-wait
+plus interrupt-ready supports a completion-transition explanation; it does
+not alone prove IRQ freshness or explain the earlier observed 53 faults.
+Other origins/read statuses distinguish operation and checked-read failures;
+a `-705` alone still cannot distinguish chip command status from BUSY timeout.
+Do not run this observation, retune, build a candidate, or add a reader during
+the active immutable transfer. Software-only validation is the focused
+`make test-ota-radio-fault-attribution` gate; MCU linking and physical
+qualification remain separate work.
+
 The repeater's ordinary text CLI remains the way to inspect its full public
 key and existing administrator ACL. Normal permission setup uses
 `setperm <full-companion-public-key> 3`, not a new OTA authority.

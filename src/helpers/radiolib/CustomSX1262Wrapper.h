@@ -83,6 +83,7 @@ public:
   // zero".
   bool probeDriverStatus() override {
     auto* sx = (CustomSX1262 *)_radio;
+    const uint8_t software_before = driverSoftwareState();
     Sx1262CheckedProbeResult r;
     r.device_errors_status = sx->getDeviceErrorsChecked(&r.device_errors);
     r.irq_flags_status = sx->getIrqFlagsChecked(&r.irq_flags);
@@ -92,7 +93,7 @@ public:
     if (isInRecvMode()) expected = Sx1262ExpectedChipMode::kReceiving;
     else if (isTransmitPending()) expected = Sx1262ExpectedChipMode::kTransmitting;
 
-    _driver_health.recordOutcome(evaluateSx1262CheckedHealth(r, expected));
+    recordSx1262CheckedProbeOutcome(_driver_health, r, expected, software_before, driverSoftwareState());
     return _driver_health.healthy();
   }
 };
