@@ -1158,12 +1158,26 @@ The subsequent SDK04 correction removed both blockers and passed bounded
 Opus review. It is integrated together with signed250/500kHz profile
 negotiation and opt-in bounded host bursts/less polling. ROOT independently
 passed306 integration and78 uploader cases on exact combined tree
-`d3031860b5ec508863a68e150b2eb3ab1feaacbf`. Actual fresh ROLE0 images,
-stack/RAM and cross-platform build gates are being prepared. Neither the
-old03 images nor the physically installed confirm02 contain those
-corrections. The first corrected-image upgrade must still use legacy250;
-only afterward can500kHz and reader-free hardware operation be qualified.
-Current old-source transfers still require the USB observer.
+`d3031860b5ec508863a68e150b2eb3ab1feaacbf`. Matching base04/confirm04/
+rollback04 ROLE0 images and allseven actual compatibility builds are now
+frozen. Confirm04 is554372 bytes, SHA256
+`417a6228926fdd531d8a388c516c7bbc8255352b97132aaa3ea26ddd6d09be56`.
+RAM is174260 (+16 versus03). The18 measured roots bound3256 including
+IRQ104; an additional real TX-signing root bounds3340/4096, leaving756
+bytes. The older3264 figure was not a universal task bound. Published
+commit`3dbd03e4` differs from the exact d303 build source only by the
+Arduino header's final newline; the immutable build provenance is retained.
+
+ROOT remeasured confirmed floor1 and started the LoRa-only counter2
+confirm04 campaign, canonical59 SHA256
+`eb2cee5e26ab8db26c86b9f20b9644f75fceeedd02bdfe787a775599c274d41a`.
+Real RF reports generation12, Receiving, total6600 blocks. This is still
+legacy250 because the installed confirm02 cannot negotiate500. Both radios
+remain2dBm; the unchanged stock companion and old-firmware USB observer
+own their respective ports. No REUPLOAD, ordinary APP flash or COMMIT was
+used for this admission. Installation,500kHz and reader-free operation
+remain separate milestones. The progressing transfer will not be paused
+for restart qualification; that test is deferred to the next campaign.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
