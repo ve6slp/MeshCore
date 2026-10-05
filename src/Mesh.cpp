@@ -152,6 +152,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       onOtaDataRecv(pkt);
       return routeRecvPacket(pkt);
     }
+    // Retry only first-hop delivery; relayed copies and echoes stay suppressed.
+    if (pkt->getPathHashCount() == 0) onOtaDataRecv(pkt);
     return ACTION_RELEASE;
   }
   return onRecvOrdinaryPacket(pkt);

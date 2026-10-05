@@ -9,6 +9,7 @@
 
 #include <Dispatcher.h>
 #include <Mesh.cpp>
+#include <helpers/SimpleMeshTables.h>
 #include <helpers/StaticPoolPacketManager.h>
 #include <helpers/StaticPoolPacketManager.cpp>
 #include <helpers/ota/OtaDirectLease.h>
@@ -3659,6 +3660,369 @@ TEST(LoraOtaCacheRetirement, SignedRfReplacementResetsCacheAndRequiresAllFreshBl
   uint32_t floor = 99;
   ASSERT_TRUE(f.fx.counter.currentValue(floor));
   EXPECT_EQ(0u, floor);
+}
+
+namespace {
+class OtaRetryPacketMesh : public ProductionPacketMesh {
+public:
+  using ProductionPacketMesh::ProductionPacketMesh;
+  unsigned ota_deliveries = 0, ack_deliveries = 0, forward_checks = 0;
+  bool forwarding = false, filter_flood = false;
+protected:
+  void onOtaDataRecv(Packet* packet) override {
+    ++ota_deliveries;
+    Mesh::onOtaDataRecv(packet);
+  }
+  void onAckRecv(Packet*, uint32_t) override { ++ack_deliveries; }
+  bool allowPacketForward(const Packet*) override { ++forward_checks; return forwarding; }
+  bool filterRecvFloodPacket(Packet*) override { return filter_flood; }
+  uint32_t getRetransmitDelay(const Packet*) override { return 0; }
+  uint32_t getDirectRetransmitDelay(const Packet*) override { return 0; }
+};
+
+struct OtaMeshRetryFixture {
+  using Phase = ::ota::storage::OtaCandidateStore::Phase;
+  CacheRetirementFixture product;
+  FakeClock clock;
+  PacketCaptureRadio radio;
+  PacketBoundaryRng rng;
+  PacketBoundaryRtc rtc;
+  StaticPoolPacketManager manager{8};
+  SimpleMeshTables tables;
+  OtaRetryPacketMesh mesh{radio, clock, rng, rtc, manager, tables};
+
+  OtaMeshRetryFixture() {
+    mesh.begin();
+    adoptProduct();
+  }
+  void adoptProduct() {
+    mesh.getOtaIntegration() = product.fx.integration;
+    product.manifest(product.remote, product.descriptor());
+  }
+  mesh::ota::OtaFirmwareIntegration& integration() { return mesh.getOtaIntegration(); }
+  mesh::ota::OtaLeanReceiver& receiver() { return integration().leanReceiver(); }
+
+  Packet packet(const uint8_t* frame, size_t len, uint8_t route = ROUTE_TYPE_DIRECT) {
+    Packet out;
+    out.header = route | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
+    out.payload_len = static_cast<uint8_t>(len);
+    std::memcpy(out.payload, frame, len);
+    return out;
+  }
+  Packet authorization() {
+    uint8_t frame[164];
+    const auto len = mesh::ota::encodeOtaTargetAuthorization(product.local.publicKey(), product.remote.publicKey(),
+        product.canonical, product.signature, frame, sizeof(frame));
+    return packet(frame, len);
+  }
+  Packet poll(uint8_t route = ROUTE_TYPE_DIRECT) {
+    uint8_t frame[mesh::ota::kOtaCensusPollBytes];
+    const auto len = mesh::ota::encodeOtaCensusPoll(product.local.publicKey(), product.hash, 0, frame, sizeof(frame));
+    return packet(frame, len, route);
+  }
+  Packet block(uint16_t index) {
+    const size_t offset = index * 84u, len = std::min<size_t>(84, sizeof(product.image) - offset);
+    uint8_t frame[mesh::ota::kOtaOwnerSignedBlockMaxBytes];
+    const auto frame_len = mesh::ota::signAndEncodeOtaBlock(product.hash, index, product.image + offset, len,
+        &product.remote, [](void* ctx, const uint8_t* message, size_t message_len, uint8_t signature[64]) {
+          static_cast<::ota::test::Ed25519TestSigner*>(ctx)->sign(message, message_len, signature);
+        }, frame, sizeof(frame), product.remote.publicKey());
+    return packet(frame, frame_len);
+  }
+  bool takeCensus(mesh::ota::OtaCensusReport& report) {
+    uint8_t reply[mesh::ota::kOtaCensusReportBytes]; size_t len = 0;
+    if (!integration().peekOutboundControlFrame(reply, sizeof(reply), len, clock.now + 250u)) return false;
+    integration().releaseOutboundControlFrame();
+    return mesh::ota::parseOtaCensusReport(reply, len, report);
+  }
+};
+}  // namespace
+
+TEST(LoraOtaMeshRetry, PendingCensusRetriesAfterLostReportExposeGenerationWithoutChangingCache) {
+  using namespace mesh::ota;
+  for (const uint8_t route : {ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD}) {
+    OtaMeshRetryFixture f;
+    f.product.cache(); f.product.abortCache(); f.adoptProduct();
+    const auto cached = f.receiver().status();
+    const auto image_erases = f.product.fx.image_flash.eraseOpCount();
+    const auto metadata_programs = f.product.fx.candidate_flash.programOpCount();
+    auto auth = f.authorization();
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+    ASSERT_EQ(2u, f.mesh.ota_deliveries);
+    auto query = f.poll(route);
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+    OtaCensusReport lost;
+    ASSERT_TRUE(f.takeCensus(lost));
+    EXPECT_EQ(cached.generation, lost.generation);
+    EXPECT_EQ(static_cast<uint8_t>(OtaMeshRetryFixture::Phase::Aborted), lost.phase);
+    EXPECT_EQ(0u, lost.received);
+    EXPECT_EQ(1u, lost.counter);
+    EXPECT_EQ(0, std::memcmp(f.product.hash, lost.manifestHash, 32));
+    for (const uint8_t byte : lost.bitmap) EXPECT_EQ(0u, byte);
+    EXPECT_FALSE(f.takeCensus(lost));
+    for (int retry = 0; retry < 2; ++retry) {
+      f.clock.advance(15000);
+      ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+      OtaCensusReport recovered;
+      ASSERT_TRUE(f.takeCensus(recovered));
+      EXPECT_EQ(lost.generation, recovered.generation);
+      EXPECT_EQ(lost.counter, recovered.counter);
+      EXPECT_EQ(lost.received, recovered.received);
+      EXPECT_EQ(lost.phase, recovered.phase);
+      EXPECT_EQ(0, std::memcmp(lost.manifestHash, recovered.manifestHash, 32));
+      EXPECT_EQ(0, std::memcmp(lost.bitmap, recovered.bitmap, sizeof(lost.bitmap)));
+    }
+    EXPECT_EQ(6u, f.integration().status(f.clock.now).rxFrames);
+    EXPECT_EQ(0u, f.integration().status(f.clock.now).badFrames);
+    EXPECT_EQ(cached.generation, f.receiver().status().generation);
+    EXPECT_TRUE(f.receiver().status().localCache);
+    EXPECT_EQ(cached.phase, f.receiver().status().phase);
+    EXPECT_EQ(image_erases, f.product.fx.image_flash.eraseOpCount());
+    EXPECT_EQ(metadata_programs, f.product.fx.candidate_flash.programOpCount());
+  }
+}
+
+TEST(LoraOtaMeshRetry, ReadyWindowCanBePolledAgainBySeparateCommitCampaignWithoutEvictingHashes) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  auto auth = f.authorization();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  ASSERT_EQ(OtaMeshRetryFixture::Phase::Receiving, f.receiver().status().phase);
+  for (uint16_t index = 0; index < f.receiver().status().totalBlocks; ++index) {
+    auto block = f.block(index);
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+  }
+  f.integration().loop();
+  ASSERT_EQ(OtaMeshRetryFixture::Phase::Ready, f.receiver().status().phase);
+  auto query = f.poll();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+  OtaCensusReport upload_sweep;
+  ASSERT_TRUE(f.takeCensus(upload_sweep));
+  ASSERT_EQ(static_cast<uint8_t>(OtaMeshRetryFixture::Phase::Ready), upload_sweep.phase);
+  ASSERT_EQ(4u, upload_sweep.received);
+  EXPECT_EQ(0x0Fu, upload_sweep.bitmap[0]);
+  EXPECT_FALSE(f.takeCensus(upload_sweep));
+  const auto programs = f.product.fx.candidate_flash.programOpCount();
+  f.clock.advance(120000);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+  OtaCensusReport commit_campaign;
+  ASSERT_TRUE(f.takeCensus(commit_campaign));
+  EXPECT_EQ(upload_sweep.generation, commit_campaign.generation);
+  EXPECT_EQ(upload_sweep.phase, commit_campaign.phase);
+  EXPECT_EQ(upload_sweep.received, commit_campaign.received);
+  EXPECT_EQ(0, std::memcmp(upload_sweep.bitmap, commit_campaign.bitmap, sizeof(upload_sweep.bitmap)));
+  EXPECT_EQ(programs, f.product.fx.candidate_flash.programOpCount());
+  uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
+  usb::buildCommitSignedMessage(f.product.local.publicKey(), f.product.hash, 1, message);
+  f.product.remote.sign(message, sizeof(message), signature);
+  const auto len = encodeOtaCommitFrame(f.product.local.publicKey(), f.product.hash, 1, signature, frame, sizeof(frame));
+  auto commit = f.packet(frame, len);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&commit));
+  ASSERT_EQ(OtaMeshRetryFixture::Phase::Committed, f.receiver().status().phase);
+  const auto committed_programs = f.product.fx.candidate_flash.programOpCount();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&commit));
+  EXPECT_EQ(OtaMeshRetryFixture::Phase::Committed, f.receiver().status().phase);
+  EXPECT_EQ(committed_programs, f.product.fx.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaMeshRetry, IdenticalSignedBlockRetriesStorageFailureAndAcceptedDuplicatesDoNotWriteAgain) {
+  OtaMeshRetryFixture f;
+  auto auth = f.authorization();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  auto block = f.block(0);
+  using Flash = ::ota::test::FakeNorFlash;
+  Flash::FaultSpec fault;
+  fault.kind = Flash::OpKind::Program;
+  fault.timing = Flash::InjectionTiming::Before;
+  fault.trigger_op_count = f.product.fx.image_flash.programOpCount() + 1;
+  f.product.fx.image_flash.armFault(fault);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+  ASSERT_EQ(0u, f.receiver().status().receivedBlocks);
+  ASSERT_EQ(1u, f.integration().status(f.clock.now).badFrames);
+  f.product.fx.image_flash.clearFault();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+  ASSERT_EQ(1u, f.receiver().status().receivedBlocks);
+  const auto image_programs = f.product.fx.image_flash.programOpCount();
+  const auto metadata_programs = f.product.fx.candidate_flash.programOpCount();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+  EXPECT_EQ(1u, f.receiver().status().receivedBlocks);
+  EXPECT_EQ(image_programs, f.product.fx.image_flash.programOpCount());
+  EXPECT_EQ(metadata_programs, f.product.fx.candidate_flash.programOpCount());
+  auto invalid = f.block(1);
+  invalid.payload[invalid.payload_len - 1] ^= 1;
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&invalid));
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&invalid));
+  EXPECT_EQ(3u, f.integration().status(f.clock.now).badFrames);
+  EXPECT_EQ(1u, f.receiver().status().receivedBlocks);
+  EXPECT_EQ(image_programs, f.product.fx.image_flash.programOpCount());
+  EXPECT_EQ(metadata_programs, f.product.fx.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaMeshRetry, ZeroHopFloodRetriesStayLocalWhileRelayedDuplicatesAndFilteringRemainSuppressed) {
+  OtaMeshRetryFixture f;
+  auto auth = f.authorization();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  f.mesh.forwarding = true;
+  auto original = f.poll(ROUTE_TYPE_FLOOD), first = original;
+  EXPECT_EQ(ACTION_RETRANSMIT(mesh::ota::floodPriorityForPayload(PAYLOAD_TYPE_LORA_OTA, 1)),
+            f.mesh.onRecvPacket(&first));
+  EXPECT_EQ(1u, first.getPathHashCount());
+  const auto forward_checks = f.mesh.forward_checks;
+  auto retry = original;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+  EXPECT_EQ(3u, f.mesh.ota_deliveries);
+  retry.setPathHashCount(1); retry.path[0] = 0x55;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+  EXPECT_EQ(3u, f.mesh.ota_deliveries);
+  EXPECT_EQ(2u, f.tables.getNumFloodDups());
+  f.mesh.filter_flood = true;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(3u, f.mesh.ota_deliveries);
+  EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+}
+
+TEST(LoraOtaMeshRetry, IdenticalZeroHopFloodCensusRepliesRefreshNativeUploaderObservationWithoutForwarding) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  f.product.cache(true, 0); f.adoptProduct();
+  f.integration().trackOtaTarget(f.product.remote.publicKey());
+  OtaCensusReport report;
+  std::memcpy(report.reporter, f.product.remote.publicKey(), 32);
+  std::memcpy(report.manifestHash, f.product.hash, 32);
+  report.total = 4; report.counter = 1; report.generation = 10;
+  report.phase = static_cast<uint8_t>(OtaMeshRetryFixture::Phase::Aborted);
+  report.lifecyclePhase = usb::UsbOtaPhase::Aborted;
+  uint8_t frame[kOtaCensusReportBytes];
+  const auto len = encodeOtaCensusReport(report, frame, sizeof(frame));
+  auto reply = f.packet(frame, len, ROUTE_TYPE_FLOOD);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&reply));
+  const auto forward_checks = f.mesh.forward_checks;
+  OtaFirmwareIntegration::TargetObservation observed;
+  ASSERT_TRUE(f.integration().targetObservation(f.product.remote.publicKey(), f.clock.now, observed));
+  ASSERT_TRUE(observed.haveBitmap);
+  EXPECT_EQ(10u, observed.generation);
+  EXPECT_EQ(0u, observed.ageMs);
+  f.clock.advance(15000);
+  ASSERT_TRUE(f.integration().targetObservation(f.product.remote.publicKey(), f.clock.now, observed));
+  ASSERT_EQ(15000u, observed.ageMs);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&reply));
+  ASSERT_TRUE(f.integration().targetObservation(f.product.remote.publicKey(), f.clock.now, observed));
+  EXPECT_EQ(0u, observed.ageMs);
+  EXPECT_EQ(0u, observed.receivedBlocks);
+  EXPECT_EQ(10u, observed.generation);
+  EXPECT_EQ(2u, f.mesh.ota_deliveries);
+  EXPECT_EQ(2u, f.integration().status(f.clock.now).rxFrames);
+  EXPECT_EQ(0u, f.integration().status(f.clock.now).badFrames);
+  EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+  EXPECT_EQ(0u, f.manager.getOutboundTotal());
+}
+
+TEST(LoraOtaMeshRetry, OwnSentFloodEchoWithRelayedPathDoesNotReachReceiverOrForwardAgain) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  f.radio.airtime = 20;
+  f.mesh.forwarding = true;
+  OtaCensusReport report;
+  std::memcpy(report.reporter, f.product.local.publicKey(), 32);
+  std::memcpy(report.manifestHash, f.product.hash, 32);
+  report.total = 4; report.counter = 1;
+  uint8_t frame[kOtaCensusReportBytes];
+  const auto len = encodeOtaCensusReport(report, frame, sizeof(frame));
+  auto* outgoing = f.mesh.createOtaData(frame, len);
+  ASSERT_NE(nullptr, outgoing);
+  ASSERT_TRUE(f.mesh.sendFlood(outgoing));
+  const auto queued = f.manager.getOutboundTotal();
+  auto echo = *outgoing;
+  echo.setPathHashCount(1); echo.path[0] = 0x55;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&echo));
+  EXPECT_EQ(0u, f.mesh.ota_deliveries);
+  EXPECT_EQ(0u, f.mesh.forward_checks);
+  EXPECT_EQ(queued, f.manager.getOutboundTotal());
+  EXPECT_EQ(0u, f.integration().status(f.clock.now).rxFrames);
+  EXPECT_EQ(0u, f.integration().status(f.clock.now).badFrames);
+}
+
+TEST(LoraOtaMeshRetry, ZeroHopDuplicateDoesNotRemarkOrRefreshItsSimpleMeshTablesFifoPosition) {
+  OtaMeshRetryFixture f;
+  auto auth = f.authorization();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  auto query = f.poll();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+  mesh::ota::OtaCensusReport report;
+  ASSERT_TRUE(f.takeCensus(report));
+  for (uint32_t i = 1; i < MAX_PACKET_HASHES; ++i) {
+    Packet ack;
+    ack.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+    ack.payload_len = sizeof(i); std::memcpy(ack.payload, &i, sizeof(i));
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&ack));
+  }
+  ASSERT_TRUE(f.tables.wasSeen(&query));
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+  ASSERT_TRUE(f.takeCensus(report));
+  uint32_t value = MAX_PACKET_HASHES;
+  Packet next;
+  next.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+  next.payload_len = sizeof(value); std::memcpy(next.payload, &value, sizeof(value));
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&next));
+  EXPECT_FALSE(f.tables.wasSeen(&query));
+}
+
+TEST(LoraOtaMeshRetry, RoutedNextHopRetriesRemainDeduplicatedAndDoNotReachReceiverUntilFinalDelivery) {
+  OtaMeshRetryFixture f;
+  auto auth = f.authorization();
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  f.mesh.forwarding = true;
+  auto original = f.poll();
+  original.setPathHashCount(2);
+  original.path[0] = 0; original.path[1] = 0x33;
+  auto first = original;
+  EXPECT_EQ(ACTION_RETRANSMIT(mesh::ota::kOtaForwardPriority), f.mesh.onRecvPacket(&first));
+  EXPECT_EQ(1u, first.getPathHashCount());
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  auto retry = original;
+  retry.path[1] = 0x44;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(2u, retry.getPathHashCount());
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  auto wrong_hop = original;
+  wrong_hop.path[0] = 0x55;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&wrong_hop));
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  auto final = f.poll();
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&final));
+  EXPECT_EQ(2u, f.mesh.ota_deliveries);
+  mesh::ota::OtaCensusReport report;
+  ASSERT_TRUE(f.takeCensus(report));
+  EXPECT_EQ(0u, report.received);
+}
+
+TEST(LoraOtaMeshRetry, OrdinaryDirectAndFloodPacketsKeepDeliveryAndForwardingDeduplication) {
+  for (const uint8_t route : {ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD}) {
+    OtaMeshRetryFixture f;
+    f.mesh.forwarding = true;
+    Packet original;
+    original.header = route | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+    original.payload_len = 4;
+    original.payload[0] = 0x56; original.payload[1] = 0x78;
+    original.payload[2] = 0x9A; original.payload[3] = 0xBC;
+    auto first = original;
+    EXPECT_EQ(route == ROUTE_TYPE_FLOOD ? ACTION_RETRANSMIT(1) : ACTION_RELEASE,
+              f.mesh.onRecvPacket(&first));
+    ASSERT_EQ(1u, f.mesh.ack_deliveries);
+    const auto forward_checks = f.mesh.forward_checks;
+    auto retry = original;
+    retry.header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+    retry.setPathHashCount(1); retry.path[0] = 0x55;
+    f.clock.advance(120000);
+    EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+    EXPECT_EQ(1u, f.mesh.ack_deliveries);
+    EXPECT_EQ(0u, f.mesh.ota_deliveries);
+    EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+  }
 }
 
 TEST(LoraOtaLeanReceiver, SignedBlockFrameRejectsForeignSignatureAndWrongManifestTagHarmlessly) {
