@@ -47,23 +47,21 @@ MeshCore administrator identities rather than a separate OTA signing system.
 Software tests cover repeated updates, failed-trial recovery and refusal of
 competing candidates. These results are not physical acceptance.
 
-Hardware qualification remains incomplete: no node has completed a
-LoRa-delivered install, trial confirmation or rollback with this
-implementation. Bench unit41 is healthy and reports qualified
-`INSTALL_CAPABLE`; identity, settings, contact permissions and channels
-survived its receiver preparation. An unchanged stock1.17.1 USB companion
-has physically demonstrated signing, full-size radio transport and the SF5
-profile. Host reply decoding and one-hop duplicate-suppression defects have
-been corrected. The stock companion has now activated a receiver session,
-negotiated a signed SF5 lease and delivered a genuine signed image block.
-Unread receiver USB diagnostics can still stall reception; a USB-observed
-bench transfer is not unattended qualification. No image has completed
-validation or installation. Unit77 enumerates in its defective modified USB bootloader and
-still needs external repair. See the
+Hardware qualification remains incomplete despite that supervised install.
+The corrected nonblocking diagnostics and 500 kHz negotiation firmware is
+being delivered to41 over LoRa; neither its installation nor reader-free
+operation is established yet. Unit77 enumerates in its defective modified
+USB bootloader and still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.
 The 2% airtime policy and ordinary mesh service must still be verified together
 during an update. Routed delivery through intermediate nodes and fleet
 contention also need hardware beyond the two-node bench.
+
+The native USB uploader has an experimental `--routed-retry` option for
+routed/background campaigns with matching upgraded receivers. The per-attempt
+wrapper preserves signed update authority and same-attempt forwarding
+deduplication; it does not qualify physical multihop recovery. The unchanged
+stock companion adapter remains zero-hop only and refuses this option.
 
 Earlier lab firmware demonstrated radio transfers and external-flash
 staging, but that transport has been retired. Those captures do not qualify

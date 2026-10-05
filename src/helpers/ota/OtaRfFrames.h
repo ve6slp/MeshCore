@@ -272,6 +272,70 @@ static constexpr size_t kOtaAbortFrameBytes = 1u + 32u + 32u + 32u + 4u + 64u;  
 static constexpr size_t kOtaStatusReportFrameBytes = 1u + 32u + 4u + 2u + 2u + 1u;  // 42
 static constexpr size_t kOtaStatusPollFrameBytes = 1u + kOtaManifestTagBytes;       // 5
 
+// Authority-free attempt identity, outside the unchanged signed inner frame.
+// Relays hash the entire payload: one attempt deduplicates, a new one does not.
+// Lease negotiation is zero-hop-only and already fills the 171-byte ceiling.
+static constexpr uint8_t kOtaRetryAttemptKind = 0x11u;
+static constexpr uint8_t kOtaRetryRepairAttemptKind = 0x12u;
+static constexpr size_t kOtaRetryAttemptHeaderBytes = 5;
+static constexpr size_t kOtaRetryAttemptMaxBytes = 171;
+
+inline bool isOtaRetryAttempt(uint8_t kind) {
+  return kind == kOtaRetryAttemptKind || kind == kOtaRetryRepairAttemptKind;
+}
+
+inline bool validOtaRetryInner(const uint8_t* frame, size_t len) {
+  if (!frame || !len) return false;
+  switch (frame[0]) {
+    case kOtaSignedBlockKind:
+      return len >= kOtaSignedBlockMinBytes && len <= kOtaSignedBlockMaxBytes;
+    case kOtaAuthorizationKind: return len == kOtaAuthorizationFrameBytes;
+    case kOtaTargetAuthorizationKind: return len == 164;
+    case kOtaCommitKind: return len == kOtaCommitFrameBytes;
+    case kOtaAbortKind: return len == kOtaAbortFrameBytes;
+    case kOtaReuploadKind: return len == kOtaReuploadFrameBytes;
+    case kOtaStatusPollKind: return len == kOtaStatusPollFrameBytes;
+    case kOtaStatusReportKind: return len == kOtaStatusReportFrameBytes;
+    case kOtaCensusPollKind: return len == kOtaCensusPollBytes;
+    case kOtaCensusReportKind:
+      return len == kOtaCensusReportBytes || len == kOtaLegacyCensusReportBytes;
+    default: return false;
+  }
+}
+
+inline bool parseOtaRetryAttempt(const uint8_t* frame, size_t len, uint32_t& attempt,
+                                 const uint8_t*& inner, size_t& inner_len) {
+  if (!frame || len <= kOtaRetryAttemptHeaderBytes || len > kOtaRetryAttemptMaxBytes ||
+      !isOtaRetryAttempt(frame[0])) return false;
+  attempt = usb::getBE32(frame + 1);
+  inner = frame + kOtaRetryAttemptHeaderBytes;
+  inner_len = len - kOtaRetryAttemptHeaderBytes;
+  return attempt != 0 && validOtaRetryInner(inner, inner_len) &&
+         (frame[0] != kOtaRetryRepairAttemptKind || inner[0] == kOtaSignedBlockKind);
+}
+
+inline size_t encodeOtaRetryAttempt(uint32_t attempt, const uint8_t* inner, size_t len,
+                                    uint8_t* out, size_t capacity, bool repair = false) {
+  if (!attempt || !out || !validOtaRetryInner(inner, len) ||
+      len > kOtaRetryAttemptMaxBytes - kOtaRetryAttemptHeaderBytes ||
+      capacity < len + kOtaRetryAttemptHeaderBytes ||
+      (repair && inner[0] != kOtaSignedBlockKind)) return 0;
+  std::memmove(out + kOtaRetryAttemptHeaderBytes, inner, len);
+  out[0] = repair ? kOtaRetryRepairAttemptKind : kOtaRetryAttemptKind;
+  usb::putBE32(out + 1, attempt);
+  return len + kOtaRetryAttemptHeaderBytes;
+}
+
+// Shared transport check, including encoded hash width and transport codes.
+inline bool otaRfPathFits(size_t payload_len, uint8_t path_len, bool transport_codes = false,
+                           size_t raw_ceiling = 255) {
+  const size_t width = (path_len >> 6) + 1u;
+  const size_t bytes = width * (path_len & 63u);
+  const size_t overhead = 2u + (transport_codes ? 4u : 0u) + bytes;
+  return width <= 3 && bytes <= 64 && payload_len > 0 && payload_len <= 184 &&
+         overhead < raw_ceiling && payload_len <= raw_ceiling - overhead;
+}
+
 struct OtaAuthorizationFrame {
   uint8_t ownerPublicKey[32] = {0};
   uint8_t canonical[kOtaCanonicalManifestBytes] = {0};

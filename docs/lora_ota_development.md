@@ -324,6 +324,105 @@ python3 -m pip install -r requirements-ota.txt   # cryptography>=43.0, pyserial>
 
 ## Signed companion USB ABI
 
+### Opt-in routed retry attempts
+
+Legacy RF bytes, 14-byte START, direct 15-byte profile START, lease negotiation
+`0x0C/0x0D` and `0x0F/0x10`, and REUPLOAD `0x0E` remain unchanged by default.
+New directed/background campaigns may request a **16-byte START**: the original
+14 bytes followed by profile `0` (legacy) and flags `1` (retry attempts).
+Unknown flags/profiles and direct-mode 16-byte requests return `BadRequest`.
+The PC adapter exposes this as `ota_uploader.py upload --routed-retry`;
+`--lab-fast` and direct mode cannot be combined with it. Other orchestration
+adapters continue sending legacy START; they do not silently enable retries.
+Matching upgraded receiving firmware is required. Old relays can forward the
+unchanged outer Mesh payload type; old OTA receivers reject the new inner kind.
+START queue acceptance is not remote admission or installation evidence.
+
+RF retry encoding is `[kind:u8][attempt:BE32][original inner frame]`.
+Kind `0x11` is a control/initial-data attempt; `0x12` is a repair-data attempt,
+restricted to compact signed block kind `0x01`. The outer identifier is
+authority-free and never enters a signing domain. The original canonical
+manifest and every signed owner/target/full hash/index/counter/generation/data
+byte remain intact and independently verified. The native uploader uses the
+existing compact signed construction in this mode (155 bytes for 84 data
+bytes, 160 with wrapper); the final short block keeps its exact length.
+Legacy mode still uses the full-owner `0x09` frame and its original domain.
+
+Each originator uses a volatile incrementing nonzero BE32 attempt sequence,
+randomly seeded by firmware's existing RNG token at the first retry START.
+START/stop do not reset that sequence; exhaustion at `UINT32_MAX` refuses
+further new attempts rather than wrapping. Boot reseeding gives probabilistic,
+not durable globally unique identity. Preparing a frame only peeks the current
+identifier: it advances exactly once after send/queue admission succeeds,
+never on budget, busy, pool or queue refusal. Passing an already-wrapped frame
+through another sender boundary does not advance it again. Actual TX completion
+still charges airtime independently. After the final identifier is admitted,
+the uploader stops at its next pump; another retry START fails with the existing
+`BadRequest` result, without reseeding or falling back. A pending reply retains
+its identifier across local queue pressure.
+Census/status/commit replies reflect the soliciting attempt identifier, so a
+new poll produces a different native hash even when progress is unchanged.
+That reflection is correlation/diversity only, **not authenticated receipt
+evidence**; census and status remain unsigned.
+
+The retry flag and attempt sequence are RAM-only, not a durable campaign
+setting. After sender restart, a separate COMMIT is unwrapped unless a new
+directed/background retry START enables wrapping again. Do not treat restart
+or reboot as an exhaustion recovery or dedup workaround: this change adds no
+durable sequence or retry-flag storage.
+
+The codec caps wrappers at 171 bytes and rejects zero attempts, nested or
+unknown kinds, bad fixed lengths, full-owner blocks, and lease negotiation
+frames. Authorization is 164+5=169; COMMIT 133+5=138; ABORT/REUPLOAD
+165+5=170; census poll/report 67/102+5=72/107. A 171-byte signed lease frame
+cannot be wrapped without exceeding this ceiling, so reliable relayed lease
+negotiation is explicitly unsupported, not truncated or re-signed.
+
+Mesh hashes type plus the entire payload, not route/path. A relay inserts one
+hash per actual new received attempt through its existing 160-entry FIFO,
+with no TTL, flush, refresh or dedup bypass. Forwarding copies of the same
+attempt remain suppressed; wrapped zero-hop duplicates also remain suppressed
+locally. The existing legacy-only zero-hop idempotent delivery exception stays
+unchanged. An unauthenticated nonce cannot grant OTA authority, but, like other
+new Mesh payloads, a malicious fresh-nonce stream can churn native dedup; no
+anti-flooding or durable nonce registry is claimed here.
+
+Path validation includes hash width/count and optional four-byte transport
+codes: raw length is `2 + width*count + payload + transport_codes`.
+Native limits remain 184 payload, 64 path bytes (widths 1..3), 255 raw.
+All legal native paths fit the largest 170-byte retry control frame, including
+transport codes (240 raw bytes maximum). Invalid paths fail START with
+`BadRequest`; malformed injected wrappers fail CMD65 with the existing
+`ERR_CODE_ILLEGAL_ARG`, before queueing. Truncated/overflow input is rejected
+before dispatch/forwarding; a syntactically short compact block still has to
+pass the original signature and exact candidate geometry checks at reception.
+
+Stock RAW notifications are **at most 176 bytes**, including three notification
+bytes and two packet-header/path-length bytes. Thus their observable path
+allowance is `171 - payload_length`: wrapped block=11 bytes, authorization=2,
+ABORT/REUPLOAD=1, census report=64 (native path maximum), signed lease=0.
+CMD65 also includes two command bytes; its independent bound is
+`payload + path_bytes + 4 <= 176`. No path is stripped to meet either bound.
+The existing stock adapter has no routed sender/ordinary-queue-priority
+contract, and remains zero-hop only: `--routed-retry` explicitly refuses
+**before any binding, USB or hardware access**, with no legacy-success
+fallback. This outcome does not modify stock signing/radio firmware.
+
+Normal traffic queue/pool reserves and priority 250 remain unchanged. Actual
+Dispatcher TX completion charges wrapped control, initial data and repair to
+Control/Relay/Repair respectively under the same default 2% shared on-mesh
+budget; unsigned category hints confer no exemption. Direct 250/500 behavior
+and its bounded off-frequency lease accounting remain legacy-only.
+
+Validation uses existing `test-ota-integration`, `test-ota-native`, and
+`test-ota-lab-host` Make targets. New native cases exercise actual
+`Packet::calculatePacketHash`, `Mesh::onRecvPacket`, two real
+`SimpleMeshTables` relays, same-attempt dedup, last-mile admission/data loss,
+return census, and byte-exact verified receiver storage. A legacy negative
+control demonstrably stalls with fewer than 160 unique FIFO entries.
+This is native/modelled RF evidence, **not physical routed qualification**;
+no relay hardware, ARM image build, installation or throughput claim follows.
+
 `src/helpers/ota/OtaUsbProtocol.h` is the authoritative contract.
 Companion requests use `<`, a little-endian 16-bit payload length, then
 command 66 and an operation byte. Replies use `>` and the same outer

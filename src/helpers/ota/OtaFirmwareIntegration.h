@@ -115,6 +115,44 @@ public:
       : airtime_(meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultWindowMs,
                  meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultBudgetMs) {}
 
+  bool retryAttemptsEnabled() const { return retry_attempts_enabled_; }
+  bool retryAttemptsExhausted() const { return retry_attempts_exhausted_; }
+  bool setRetryAttempts(bool enabled, uint32_t first_attempt = 1) {
+    if (enabled && !first_attempt) return false;
+    retry_attempts_enabled_ = enabled;
+    // Never reset a live sequence on START/stop. A fresh boot uses a random seed.
+    if (enabled && retry_next_attempt_ == 0 && !retry_attempts_exhausted_)
+      retry_next_attempt_ = first_attempt;
+    return !enabled || !retry_attempts_exhausted_;
+  }
+  size_t prepareRfTransmit(const uint8_t* frame, size_t len, uint8_t* out, size_t capacity,
+                           meshcore::ota::protocol::OtaAirtimeCategory category =
+                               meshcore::ota::protocol::OtaAirtimeCategory::Control) const {
+    if (!frame || !len || !out) return 0;
+    if (isOtaRetryAttempt(frame[0])) {
+      uint32_t attempt; const uint8_t* inner; size_t inner_len;
+      if (!parseOtaRetryAttempt(frame, len, attempt, inner, inner_len)) return 0;
+    } else if (retry_attempts_enabled_) {
+      if (retry_attempts_exhausted_ || !retry_next_attempt_) return 0;
+      return encodeOtaRetryAttempt(retry_next_attempt_, frame, len, out, capacity,
+          category == meshcore::ota::protocol::OtaAirtimeCategory::Repair);
+    }
+    if (len > capacity) return 0;
+    std::memmove(out, frame, len);
+    return len;
+  }
+  // Only the boundary that prepared a new local attempt acknowledges admission.
+  // Passing an already-wrapped frame through another boundary must not count twice.
+  bool acceptRfTransmit(const uint8_t* frame, size_t len) {
+    uint32_t attempt; const uint8_t* inner; size_t inner_len;
+    if (!retry_attempts_enabled_ || retry_attempts_exhausted_ ||
+        !parseOtaRetryAttempt(frame, len, attempt, inner, inner_len) ||
+        attempt != retry_next_attempt_) return false;
+    if (retry_next_attempt_ == UINT32_MAX) retry_attempts_exhausted_ = true;
+    else ++retry_next_attempt_;
+    return true;
+  }
+
   FirmwareOtaMode mode() const { return mode_; }
   void setMode(FirmwareOtaMode mode) { mode_ = mode; }
 
@@ -609,6 +647,29 @@ public:
 
   __attribute__((noinline)) bool handleReceivedFrame(
       const uint8_t* frame, size_t frame_len, uint32_t now_ms = 0) {
+    uint32_t attempt = 0;
+    if (frame && frame_len && isOtaRetryAttempt(frame[0])) {
+      const uint8_t* inner; size_t inner_len;
+      if (!parseOtaRetryAttempt(frame, frame_len, attempt, inner, inner_len)) {
+        ++bad_frames_;
+        return false;
+      }
+      frame = inner; frame_len = inner_len;
+    }
+    const bool was_pending = pending_control_frame_valid_;
+    const bool accepted = handleReceivedInnerFrame(frame, frame_len, now_ms);
+    if (accepted && attempt && (!was_pending || frame[0] == kOtaCommitKind) &&
+        pending_control_frame_valid_) {
+      pending_control_frame_len_ = encodeOtaRetryAttempt(attempt, pending_control_frame_,
+          pending_control_frame_len_, pending_control_frame_, sizeof(pending_control_frame_));
+      pending_control_frame_valid_ = pending_control_frame_len_ != 0;
+    }
+    return accepted;
+  }
+
+private:
+  __attribute__((noinline)) bool handleReceivedInnerFrame(
+      const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
     using namespace meshcore::ota::protocol;
     using namespace meshcore::ota::runtime;
 
@@ -643,6 +704,8 @@ public:
   }
 
 private:
+  bool retry_attempts_enabled_ = false, retry_attempts_exhausted_ = false;
+  uint32_t retry_next_attempt_ = 0;
   __attribute__((noinline)) bool handleDecodedEnvelope(
       const meshcore::ota::protocol::OtaEnvelopeHeader& hdr, const uint8_t* payload, size_t payload_len) {
     using namespace meshcore::ota::protocol;

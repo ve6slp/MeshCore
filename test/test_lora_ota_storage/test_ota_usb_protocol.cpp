@@ -11,6 +11,36 @@
 #include "helpers/ota/OtaUsbProtocol.h"
 
 using namespace mesh::ota::usb;
+using mesh::ota::OtaDirectProfile;
+
+TEST(OtaUsbProtocolTest, RetryStartIsExplicitAndCannotReplaceLegacyOr500ProfileShape) {
+  uint8_t command[kStartRetryTotalBytes] = {kCommand, static_cast<uint8_t>(UsbOtaOp::Start),
+      kStartModeDirected, 255};
+  OtaDirectProfile profile;
+  bool retry;
+  ASSERT_TRUE(parseStartOptions(command, kStartTotalBytes, profile, retry));
+  EXPECT_EQ(OtaDirectProfile::Legacy250, profile);
+  EXPECT_FALSE(retry);
+  command[15] = kStartFlagRetryAttempts;
+  ASSERT_TRUE(parseStartOptions(command, sizeof(command), profile, retry));
+  EXPECT_TRUE(retry);
+  EXPECT_FALSE(parseStartProfile(command, sizeof(command), profile));
+  command[2] = kStartModeBackground;
+  EXPECT_TRUE(parseStartOptions(command, sizeof(command), profile, retry));
+  for (uint8_t flags : {uint8_t(0), uint8_t(2), uint8_t(3), uint8_t(255)}) {
+    command[15] = flags;
+    EXPECT_FALSE(parseStartOptions(command, sizeof(command), profile, retry));
+  }
+  command[15] = 1; command[14] = 2;
+  EXPECT_FALSE(parseStartOptions(command, sizeof(command), profile, retry));
+  command[2] = kStartModeDirect;
+  EXPECT_TRUE(parseStartOptions(command, kStartProfileTotalBytes, profile, retry));
+  EXPECT_EQ(OtaDirectProfile::Bw500, profile);
+  EXPECT_FALSE(retry);
+  EXPECT_FALSE(parseStartOptions(command, sizeof(command), profile, retry));
+  for (size_t len : {size_t(0), size_t(13), size_t(17)})
+    EXPECT_FALSE(parseStartOptions(command, len, profile, retry));
+}
 
 TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed90ByteAbi2Contract) {
   UsbOtaReply reply;

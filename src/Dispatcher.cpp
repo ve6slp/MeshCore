@@ -160,6 +160,7 @@ void Dispatcher::loop() {
 }
 
 bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
+  if (!raw || len < 2 || len > MAX_TRANS_UNIT) return false;
   int i = 0;
 
   pkt->header = raw[i++];
@@ -169,6 +170,7 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
   }
 
   if (pkt->hasTransportCodes()) {
+    if (len < 6) return false;
     memcpy(&pkt->transport_codes[0], &raw[i], 2); i += 2;
     memcpy(&pkt->transport_codes[1], &raw[i], 2); i += 2;
   } else {
@@ -190,6 +192,9 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
 
   memcpy(pkt->path, &raw[i], path_byte_len); i += path_byte_len;
 
+#if MESHCORE_LORA_OTA
+  if (mesh::ota::isOtaPacket(pkt) && i >= len) return false;
+#endif
   pkt->payload_len = len - i;  // payload is remainder
   if (pkt->payload_len > sizeof(pkt->payload)) {
     MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): packet payload too big, payload_len=%d", getLogDateTime(), (uint32_t)pkt->payload_len);
@@ -197,6 +202,15 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
   }
 
   memcpy(pkt->payload, &raw[i], pkt->payload_len);
+#if MESHCORE_LORA_OTA
+  if (mesh::ota::isOtaPacket(pkt) && pkt->payload_len &&
+      mesh::ota::isOtaRetryAttempt(pkt->payload[0])) {
+    uint32_t attempt; const uint8_t* inner; size_t inner_len;
+    if (!mesh::ota::parseOtaRetryAttempt(pkt->payload, pkt->payload_len, attempt, inner, inner_len) ||
+        !mesh::ota::otaRfPathFits(pkt->payload_len, pkt->path_len, pkt->hasTransportCodes()))
+      return false;
+  }
+#endif
 
   return true;  // success
 }
@@ -399,6 +413,19 @@ void Dispatcher::checkSend() {
         using meshcore::ota::protocol::OtaMessageType;
         using meshcore::ota::protocol::OtaAirtimeCategory;
         outbound_ota_category = OtaAirtimeCategory::Control;
+        if (outbound->payload_len && mesh::ota::isOtaRetryAttempt(outbound->payload[0])) {
+          uint32_t attempt; const uint8_t* inner; size_t inner_len;
+          if (!mesh::ota::parseOtaRetryAttempt(outbound->payload, outbound->payload_len, attempt, inner, inner_len)) {
+            _mgr->free(outbound);
+            outbound = NULL;
+            outbound_is_ota = false;
+            return;
+          }
+          if (outbound->payload[0] == mesh::ota::kOtaRetryRepairAttemptKind)
+            outbound_ota_category = OtaAirtimeCategory::Repair;
+          else if (inner[0] == mesh::ota::kOtaSignedBlockKind)
+            outbound_ota_category = OtaAirtimeCategory::Relay;
+        }
         if (outbound->payload_len >= 4 && outbound->payload[0] == 0x4F && outbound->payload[1] == 0x54) {
           uint8_t raw_type = outbound->payload[3];
           if (meshcore::ota::protocol::isKnownOtaMessageType(raw_type)) {

@@ -581,6 +581,16 @@ class PathBindingTests(Scratch):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_routed_retry_explicitly_refused_before_binding_or_transport_access(self):
+        argv = ["upload", "--routed-retry", "--serial", BINDING.serial,
+                "--by-id", "/dev/serial/by-id/NOT_OPENED", "--sender-key", OWNER.hex(),
+                "--target", TARGET.hex(), "--binding", "NOT_READ", "--artifacts", "NOT_CREATED"]
+        with patch.object(ota.Binding, "load") as load, patch.object(ota, "validated_stock_uart") as uart, \
+                self.assertRaisesRegex(ota.Error, "no legacy fallback"):
+            ota.main(argv)
+        load.assert_not_called()
+        uart.assert_not_called()
+
     def test_frame_boundaries_and_zero_hop_rx(self):
         rf = bytes([13]) + bytes(170)
         self.assertEqual(len(b"\x41\x00" + ota.packet(rf)), 175)

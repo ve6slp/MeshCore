@@ -110,6 +110,17 @@ class ReplyTests(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
+    def test_routed_retry_is_explicit_on_mesh_only_and_leaves_defaults_identical(self):
+        for mode, channel in (("directed", 255), ("background", 2)):
+            legacy = struct.pack(">BBIHI", ota.MODES[mode], channel, 0, 0, 2000)
+            self.assertEqual(ota.start_body(mode, channel, 0, 0, 2000), legacy)
+            self.assertEqual(ota.start_body(mode, channel, 0, 0, 2000, routed_retry=True),
+                             legacy + b"\x00\x01")
+        for kwargs in ({"routed_retry": 1}, {"routed_retry": True},
+                       {"routed_retry": True, "lab_fast": True}):
+            with self.assertRaises(ValueError):
+                ota.start_body("direct", 255, 908525, 60000, 2000, **kwargs)
+
     def test_lab_fast_is_direct_only_appends_explicit_profile_without_changing_legacy_body(self):
         legacy = struct.pack(">BBIHI", 0, 255, 908525, 60000, 2000)
         self.assertEqual(ota.start_body("direct", 255, 908525, 60000, 2000), legacy)

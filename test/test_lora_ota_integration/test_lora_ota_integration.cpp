@@ -4144,13 +4144,13 @@ struct OtaMeshRetryFixture {
     const auto len = mesh::ota::encodeOtaCensusPoll(product.local.publicKey(), product.hash, 0, frame, sizeof(frame));
     return packet(frame, len, route);
   }
-  Packet block(uint16_t index) {
+  Packet block(uint16_t index, bool compact = false) {
     const size_t offset = index * 84u, len = std::min<size_t>(84, sizeof(product.image) - offset);
     uint8_t frame[mesh::ota::kOtaOwnerSignedBlockMaxBytes];
     const auto frame_len = mesh::ota::signAndEncodeOtaBlock(product.hash, index, product.image + offset, len,
         &product.remote, [](void* ctx, const uint8_t* message, size_t message_len, uint8_t signature[64]) {
           static_cast<::ota::test::Ed25519TestSigner*>(ctx)->sign(message, message_len, signature);
-        }, frame, sizeof(frame), product.remote.publicKey());
+        }, frame, sizeof(frame), compact ? nullptr : product.remote.publicKey());
     return packet(frame, frame_len);
   }
   bool takeCensus(mesh::ota::OtaCensusReport& report) {
@@ -4480,6 +4480,447 @@ TEST(LoraOtaMeshRetry, OrdinaryDirectAndFloodPacketsKeepDeliveryAndForwardingDed
     EXPECT_EQ(1u, f.mesh.ack_deliveries);
     EXPECT_EQ(0u, f.mesh.ota_deliveries);
     EXPECT_EQ(forward_checks, f.mesh.forward_checks);
+  }
+}
+
+namespace {
+Packet attemptPacket(const Packet& original, uint32_t attempt, bool repair = false) {
+  Packet out = original;
+  out.payload_len = mesh::ota::encodeOtaRetryAttempt(attempt, original.payload, original.payload_len,
+      out.payload, sizeof(out.payload), repair);
+  EXPECT_NE(0u, out.payload_len);
+  return out;
+}
+}
+
+TEST(LoraOtaRoutedRetry, CodecPreservesAllInnerBytesAndRejectsUnsupportedOverflowAndNestedShapes) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  for (auto original : {f.authorization(), f.poll(), f.block(0, true), f.block(3, true)}) {
+    auto wire = attemptPacket(original, 0x12345678u);
+    EXPECT_LE(wire.payload_len, 171u);
+    uint32_t attempt; const uint8_t* inner; size_t len;
+    ASSERT_TRUE(parseOtaRetryAttempt(wire.payload, wire.payload_len, attempt, inner, len));
+    EXPECT_EQ(0x12345678u, attempt);
+    EXPECT_EQ(original.payload_len, len);
+    EXPECT_EQ(0, std::memcmp(original.payload, inner, len));
+  }
+  uint8_t out[184];
+  const auto compact = f.block(0, true), owner = f.block(0);
+  EXPECT_EQ(155u, compact.payload_len);
+  EXPECT_EQ(183u, owner.payload_len);
+  EXPECT_EQ(0u, encodeOtaRetryAttempt(1, owner.payload, owner.payload_len, out, sizeof(out)));
+  EXPECT_EQ(0u, encodeOtaRetryAttempt(0, compact.payload, compact.payload_len, out, sizeof(out)));
+  EXPECT_EQ(0u, encodeOtaRetryAttempt(1, compact.payload, compact.payload_len, out, 159));
+  auto nested = attemptPacket(compact, 1);
+  EXPECT_EQ(0u, encodeOtaRetryAttempt(2, nested.payload, nested.payload_len, out, sizeof(out)));
+  for (const auto kind : {kOtaDirectRequestKind, kOtaDirectAckKind,
+                          kOtaDirectProfileRequestKind, kOtaDirectProfileAckKind}) {
+    uint8_t lease[171] = {}; lease[0] = kind;
+    EXPECT_EQ(0u, encodeOtaRetryAttempt(1, lease, sizeof(lease), out, sizeof(out)));
+  }
+  const auto poll = f.poll();
+  EXPECT_EQ(0u, encodeOtaRetryAttempt(1, poll.payload, poll.payload_len, out, sizeof(out), true));
+  for (size_t len : {size_t(0), size_t(1), size_t(5), size_t(6), size_t(172), size_t(184)}) {
+    uint32_t attempt; const uint8_t* inner; size_t inner_len;
+    out[0] = kOtaRetryAttemptKind;
+    EXPECT_FALSE(parseOtaRetryAttempt(out, len, attempt, inner, inner_len));
+  }
+}
+
+TEST(LoraOtaRoutedRetry, RealTwoRelayLossNewAttemptForwardsSameAttemptAndWrongHopDoNot) {
+  OtaMeshRetryFixture first, second, receiver;
+  first.mesh.self_id.pub_key[0] = 0x31;
+  second.mesh.self_id.pub_key[0] = 0x32;
+  first.mesh.forwarding = second.mesh.forwarding = true;
+  auto original = receiver.authorization();
+  original.setPathHashCount(2);
+  original.path[0] = 0x31; original.path[1] = 0x32;
+  auto wire = attemptPacket(original, 1);
+  uint8_t before[MAX_HASH_SIZE], after[MAX_HASH_SIZE];
+  wire.calculatePacketHash(before);
+  auto lost = wire;
+  ASSERT_EQ(ACTION_RETRANSMIT(mesh::ota::kOtaForwardPriority), first.mesh.onRecvPacket(&lost));
+  ASSERT_EQ(1u, lost.getPathHashCount());
+  lost.calculatePacketHash(after);
+  EXPECT_EQ(0, std::memcmp(before, after, sizeof(before)));
+  // Drop after the first real relay has inserted its native seen hash.
+  auto same = wire;
+  EXPECT_EQ(ACTION_RELEASE, first.mesh.onRecvPacket(&same));
+  EXPECT_FALSE(receiver.receiver().status().valid);
+  auto wrong = attemptPacket(original, 2); wrong.path[0] = 0x39;
+  EXPECT_EQ(ACTION_RELEASE, first.mesh.onRecvPacket(&wrong));
+  EXPECT_FALSE(first.tables.wasSeen(&wrong));
+  auto retry = attemptPacket(original, 2);
+  retry.calculatePacketHash(after);
+  EXPECT_NE(0, std::memcmp(before, after, sizeof(before)));
+  ASSERT_EQ(ACTION_RETRANSMIT(mesh::ota::kOtaForwardPriority), first.mesh.onRecvPacket(&retry));
+  ASSERT_EQ(ACTION_RETRANSMIT(mesh::ota::kOtaForwardPriority), second.mesh.onRecvPacket(&retry));
+  ASSERT_EQ(0u, retry.getPathHashCount());
+  ASSERT_EQ(ACTION_RELEASE, receiver.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(OtaMeshRetryFixture::Phase::Receiving, receiver.receiver().status().phase);
+  EXPECT_EQ(0u, first.mesh.ota_deliveries);
+  EXPECT_EQ(0u, second.mesh.ota_deliveries);
+  const auto programs = receiver.product.fx.candidate_flash.programOpCount();
+  ASSERT_EQ(ACTION_RELEASE, receiver.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(1u, receiver.mesh.ota_deliveries);
+  EXPECT_EQ(programs, receiver.product.fx.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaRoutedRetry, RealFloodNewAttemptsForwardButEchoSameAttemptAndOrdinaryDedupStayNative) {
+  OtaMeshRetryFixture f;
+  f.mesh.forwarding = true;
+  const auto original = f.authorization();
+  auto wire = attemptPacket(original, 1);
+  auto* outbound = f.mesh.createOtaData(wire.payload, wire.payload_len);
+  ASSERT_NE(nullptr, outbound);
+  ASSERT_TRUE(f.mesh.sendFlood(outbound));
+  wire.header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
+  wire.setPathHashCount(1); wire.path[0] = 0x21;
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&wire));
+  EXPECT_EQ(0u, f.mesh.ota_deliveries);
+  auto retry = attemptPacket(original, 2);
+  retry.header = wire.header; retry.path_len = wire.path_len; retry.path[0] = 0x21;
+  ASSERT_EQ(ACTION_RETRANSMIT(mesh::ota::kOtaForwardPriority), f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&retry));
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  Packet ordinary;
+  ordinary.header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+  ordinary.payload_len = 4; std::memset(ordinary.payload, 0x64, 4);
+  EXPECT_EQ(ACTION_RETRANSMIT(1), f.mesh.onRecvPacket(&ordinary));
+  EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&ordinary));
+  EXPECT_EQ(1u, f.mesh.ack_deliveries);
+}
+
+TEST(LoraOtaRoutedRetry, SameAttemptDoesNotRefresh160EntryFifoAndNewAttemptInsertsNormally) {
+  OtaMeshRetryFixture f;
+  auto wire = attemptPacket(f.authorization(), 1);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&wire));
+  for (uint32_t i = 1; i < MAX_PACKET_HASHES; ++i) {
+    Packet ordinary;
+    ordinary.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+    ordinary.payload_len = 4; std::memcpy(ordinary.payload, &i, 4);
+    EXPECT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&ordinary));
+  }
+  f.clock.advance(3600000);
+  ASSERT_TRUE(f.tables.wasSeen(&wire));
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&wire));
+  EXPECT_EQ(1u, f.mesh.ota_deliveries);
+  auto next = attemptPacket(f.authorization(), 2);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&next));
+  EXPECT_FALSE(f.tables.wasSeen(&wire));
+  EXPECT_TRUE(f.tables.wasSeen(&next));
+  EXPECT_EQ(2u, f.mesh.ota_deliveries);
+}
+
+TEST(LoraOtaRoutedRetry, CensusReplyReflectsAttemptAndLostReplyCanBeRetriedAcrossSeenRelay) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f, relay, observer;
+  auto auth = attemptPacket(f.authorization(), 1);
+  f.mesh.onRecvPacket(&auth);
+  const auto gen = f.receiver().status().generation;
+  observer.product.cache(true, 0);
+  observer.adoptProduct();
+  observer.integration().trackOtaTarget(f.product.local.publicKey());
+  relay.mesh.forwarding = true;
+  Packet previous;
+  for (uint32_t attempt : {2u, 3u}) {
+    auto query = attemptPacket(f.poll(), attempt);
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+    uint8_t response[171]; size_t len = 0;
+    ASSERT_TRUE(f.integration().peekOutboundControlFrame(response, sizeof(response), len, 250));
+    f.integration().releaseOutboundControlFrame();
+    uint32_t reflected; const uint8_t* inner; size_t inner_len;
+    ASSERT_TRUE(parseOtaRetryAttempt(response, len, reflected, inner, inner_len));
+    EXPECT_EQ(attempt, reflected);
+    OtaCensusReport report;
+    ASSERT_TRUE(parseOtaCensusReport(inner, inner_len, report));
+    EXPECT_EQ(gen, report.generation);
+    auto packet = f.packet(response, len, ROUTE_TYPE_FLOOD);
+    packet.setPathHashCount(1); packet.path[0] = 0x31;
+    ASSERT_EQ(ACTION_RETRANSMIT(kOtaForwardPriority), relay.mesh.onRecvPacket(&packet));
+    EXPECT_EQ(ACTION_RELEASE, relay.mesh.onRecvPacket(&packet));
+    if (attempt == 2) previous = packet; // First real forwarded reply is lost.
+    else {
+      EXPECT_TRUE(relay.tables.wasSeen(&previous));
+      ASSERT_EQ(ACTION_RELEASE, observer.mesh.onRecvPacket(&packet));
+      OtaFirmwareIntegration::TargetObservation observation;
+      ASSERT_TRUE(observer.integration().targetObservation(f.product.local.publicKey(), observer.clock.now, observation));
+      EXPECT_TRUE(observation.haveBitmap);
+      EXPECT_EQ(gen, observation.generation);
+    }
+  }
+}
+
+TEST(LoraOtaRoutedRetry, SequenceCannotWrapResetOnStartOrAcceptUnsupportedFrames) {
+  using namespace mesh::ota;
+  OtaFirmwareIntegration integration;
+  OtaMeshRetryFixture f;
+  const auto frame = f.poll();
+  uint8_t out[171];
+  ASSERT_TRUE(integration.setRetryAttempts(true, UINT32_MAX - 1));
+  EXPECT_EQ(72u, integration.prepareRfTransmit(frame.payload, frame.payload_len, out, sizeof(out)));
+  EXPECT_EQ(UINT32_MAX - 1, usb::getBE32(out + 1));
+  EXPECT_EQ(72u, integration.prepareRfTransmit(frame.payload, frame.payload_len, out, sizeof(out)));
+  EXPECT_EQ(UINT32_MAX - 1, usb::getBE32(out + 1));
+  ASSERT_TRUE(integration.acceptRfTransmit(out, 72));
+  EXPECT_FALSE(integration.acceptRfTransmit(out, 72));
+  ASSERT_TRUE(integration.setRetryAttempts(false));
+  ASSERT_TRUE(integration.setRetryAttempts(true, 3));
+  EXPECT_EQ(72u, integration.prepareRfTransmit(frame.payload, frame.payload_len, out, sizeof(out)));
+  EXPECT_EQ(UINT32_MAX, usb::getBE32(out + 1));
+  EXPECT_FALSE(integration.retryAttemptsExhausted());
+  ASSERT_TRUE(integration.acceptRfTransmit(out, 72));
+  EXPECT_TRUE(integration.retryAttemptsExhausted());
+  EXPECT_EQ(0u, integration.prepareRfTransmit(frame.payload, frame.payload_len, out, sizeof(out)));
+  EXPECT_FALSE(integration.setRetryAttempts(true, 3));
+  OtaRfUploader uploader;
+  EXPECT_FALSE(uploader.start(integration, usb::kStartModeDirect, f.product.local.publicKey(),
+      1, 908525, 60000, 1, false, OtaDirectProfile::Legacy250, true));
+}
+
+TEST(LoraOtaRoutedRetry, TransportAccountsActualPathWidthsStockNotificationAndNativeCeilings) {
+  using namespace mesh::ota;
+  for (uint8_t width = 1; width <= 3; ++width) {
+    for (uint8_t count = 0; count <= 63; ++count) {
+      const auto path = static_cast<uint8_t>((width - 1) * 64 + count);
+      const bool path_valid = size_t(width) * count <= 64;
+      EXPECT_EQ(path_valid, otaRfPathFits(170, path));
+      EXPECT_EQ(path_valid, otaRfPathFits(170, path, true));
+      EXPECT_EQ(path_valid && width * count <= 1, otaRfPathFits(170, path, false, 173));
+      EXPECT_EQ(path_valid && width * count <= 11, otaRfPathFits(160, path, false, 173));
+    }
+  }
+  EXPECT_FALSE(otaRfPathFits(170, 0xC0));
+  EXPECT_FALSE(otaRfPathFits(SIZE_MAX, 0));
+  EXPECT_FALSE(otaRfPathFits(170, 0, false, 1));
+  EXPECT_TRUE(otaRfPathFits(171, 0, false, 173));
+  EXPECT_FALSE(otaRfPathFits(171, 1, false, 173));
+}
+
+TEST(LoraOtaRoutedRetry, NativeParserRejectsTruncatedUnknownNestedAndUnsupportedPathBeforeDispatch) {
+  OtaMeshRetryFixture f;
+  auto packet = attemptPacket(f.authorization(), 1);
+  uint8_t raw[255]; const auto len = packet.writeTo(raw);
+  Packet parsed;
+  ASSERT_TRUE(f.mesh.tryParsePacket(&parsed, raw, len));
+  for (int short_len : {0, 1, 2, 3, 6, 10, static_cast<int>(len - 1)})
+    EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, short_len));
+  auto invalid = packet;
+  invalid.payload[5] = 0x13;
+  auto bad_len = invalid.writeTo(raw);
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, bad_len));
+  invalid.payload[5] = mesh::ota::kOtaRetryAttemptKind;
+  bad_len = invalid.writeTo(raw);
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, bad_len));
+  packet.writeTo(raw); raw[1] = 0xC0;
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, len));
+  raw[1] = 63;
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, 7));
+  raw[0] = ROUTE_TYPE_TRANSPORT_DIRECT | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, 5));
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, raw, 256));
+  EXPECT_EQ(0u, f.mesh.ota_deliveries);
+}
+
+TEST(LoraOtaRoutedRetry, EmptyOrdinaryPayloadParsingKeepsBaselineBehaviorWhileEmptyOtaIsRejected) {
+  OtaMeshRetryFixture f;
+  Packet parsed;
+  for (const uint8_t type : {PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_TXT_MSG, PAYLOAD_TYPE_TRACE}) {
+    const uint8_t raw[2] = {static_cast<uint8_t>(ROUTE_TYPE_DIRECT | (type << PH_TYPE_SHIFT)), 0};
+    ASSERT_TRUE(f.mesh.tryParsePacket(&parsed, raw, sizeof(raw)));
+    EXPECT_EQ(0u, parsed.payload_len);
+  }
+  const uint8_t ota[2] = {ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT), 0};
+  EXPECT_FALSE(f.mesh.tryParsePacket(&parsed, ota, sizeof(ota)));
+}
+
+TEST(LoraOtaRoutedRetry, DispatcherChargesActualControlDataRepairAttemptsAndYieldsToOrdinaryQueue) {
+  using namespace mesh::ota;
+  using Category = meshcore::ota::protocol::OtaAirtimeCategory;
+  FakeClock clock; PacketCaptureRadio radio; QueuePacketManager manager;
+  TestDispatcher dispatcher(radio, clock, manager);
+  dispatcher.begin();
+  OtaMeshRetryFixture f;
+  EXPECT_FLOAT_EQ(2.0f, dispatcher.getOtaAirtimeDutyCyclePercent());
+  for (const auto category : {Category::Control, Category::Relay, Category::Repair}) {
+    const auto inner = category == Category::Control ? f.poll() : f.block(0, true);
+    const auto wire = attemptPacket(inner, static_cast<uint32_t>(category) + 1, category == Category::Repair);
+    auto* ota = manager.allocNew(); ASSERT_NE(nullptr, ota); *ota = wire;
+    ASSERT_TRUE(dispatcher.sendPacket(ota, kOtaForwardPriority));
+    const auto previous_sends = radio.sends;
+    clock.advance(1); dispatcher.loop();
+    EXPECT_EQ(previous_sends + 1, radio.sends);
+    clock.advance(2000); dispatcher.loop();
+    EXPECT_EQ(2000u, dispatcher.getDispatcherOtaIntegration().airtimeLimiter().storedUsageMs(clock.now, category));
+  }
+  EXPECT_EQ(6000u, dispatcher.getOtaStatus(clock.now).dutyUsedMs);
+  auto wire = attemptPacket(f.block(0, true), 50, true);
+  auto* ota = manager.allocNew(); ASSERT_NE(nullptr, ota); *ota = wire;
+  ASSERT_TRUE(dispatcher.sendPacket(ota, kOtaForwardPriority));
+  auto* ordinary = manager.allocNew(); ASSERT_NE(nullptr, ordinary);
+  ordinary->header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT);
+  ordinary->payload_len = 4; std::memset(ordinary->payload, 0x77, 4);
+  ASSERT_TRUE(dispatcher.sendPacket(ordinary, 0));
+  const auto previous_sends = radio.sends;
+  clock.advance(1); dispatcher.loop();
+  ASSERT_EQ(previous_sends + 1, radio.sends);
+  EXPECT_EQ(PAYLOAD_TYPE_ACK, (radio.sent[0] >> PH_TYPE_SHIFT) & 15);
+  clock.advance(2000); dispatcher.loop();
+  EXPECT_EQ(6000u, dispatcher.getOtaStatus(clock.now).dutyUsedMs);
+  clock.advance(2000); dispatcher.loop();
+  EXPECT_EQ(6000u, dispatcher.getOtaStatus(clock.now).dutyUsedMs);
+  clock.advance(2000); dispatcher.loop();
+  EXPECT_EQ(8000u, dispatcher.getOtaStatus(clock.now).dutyUsedMs);
+  EXPECT_EQ(4000u, dispatcher.getDispatcherOtaIntegration().airtimeLimiter().storedUsageMs(clock.now, Category::Repair));
+}
+
+TEST(LoraOtaRoutedRetry, WrappedBadAuthorityMetadataAndTruncatedBlocksCannotMutateCandidateOrFloor) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  auto auth = attemptPacket(f.authorization(), 1);
+  ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+  const auto original = f.block(0, true);
+  for (size_t offset : {size_t(1), size_t(5), size_t(7), size_t(154)}) {
+    auto bad = original; bad.payload[offset] ^= 0x40;
+    auto wrapped = attemptPacket(bad, 2 + offset);
+    f.product.fx.integration = f.integration();
+    f.product.expectNoMutation([&] {
+      EXPECT_FALSE(f.product.fx.integration.handleReceivedFrame(wrapped.payload, wrapped.payload_len));
+    });
+  }
+  for (unsigned mismatch = 0; mismatch < 3; ++mismatch) {
+    uint8_t signed_frame[155];
+    const auto index = static_cast<uint16_t>(mismatch == 0 ? 4 : mismatch == 1 ? 3 : 0);
+    auto* signer = mismatch == 2 ? &f.product.local : &f.product.remote;
+    const auto len = signAndEncodeOtaBlock(f.product.hash, index, f.product.image, 84, signer,
+        [](void* ctx, const uint8_t* message, size_t size, uint8_t signature[64]) {
+          static_cast<::ota::test::Ed25519TestSigner*>(ctx)->sign(message, size, signature);
+        }, signed_frame, sizeof(signed_frame));
+    ASSERT_EQ(155u, len);
+    const auto bad = attemptPacket(f.packet(signed_frame, len), 180 + mismatch);
+    f.product.fx.integration = f.integration();
+    f.product.expectNoMutation([&] {
+      EXPECT_FALSE(f.product.fx.integration.handleReceivedFrame(bad.payload, bad.payload_len));
+    });
+  }
+  CacheRetirementFixture cache;
+  cache.cache(true, 0);
+  uint8_t source[84]; size_t source_len = 99;
+  EXPECT_EQ(usb::UsbOtaResult::NotFound, cache.receiver().readBlock(4, source, sizeof(source), source_len));
+  EXPECT_EQ(0u, source_len);
+  EXPECT_EQ(usb::UsbOtaResult::NotFound, cache.receiver().readBlock(UINT16_MAX, source, sizeof(source), source_len));
+  ASSERT_EQ(usb::UsbOtaResult::Ok, cache.receiver().readBlock(3, source, sizeof(source), source_len));
+  EXPECT_EQ(5u, source_len);
+  auto short_block = original; --short_block.payload_len;
+  auto wrapped = attemptPacket(short_block, 200);
+  EXPECT_FALSE(f.integration().handleReceivedFrame(wrapped.payload, wrapped.payload_len));
+  EXPECT_EQ(0u, f.receiver().status().receivedBlocks);
+  auto accepted = attemptPacket(original, 201);
+  EXPECT_TRUE(f.integration().handleReceivedFrame(accepted.payload, accepted.payload_len));
+  EXPECT_EQ(1u, f.receiver().status().receivedBlocks);
+  auto old_counter = f.product.descriptor(0, 0);
+  f.product.manifest(f.product.remote, old_counter);
+  auto bad_auth = attemptPacket(f.authorization(), 202);
+  EXPECT_FALSE(f.integration().handleReceivedFrame(bad_auth.payload, bad_auth.payload_len));
+  uint32_t floor = 99;
+  ASSERT_TRUE(f.product.fx.counter.currentValue(floor));
+  EXPECT_EQ(0u, floor);
+  EXPECT_EQ(1u, f.receiver().status().receivedBlocks);
+}
+
+TEST(LoraOtaRoutedRetry, NewAttemptRetriesStorageFailureButAcceptedRetryNeverWritesTwice) {
+  OtaMeshRetryFixture f;
+  auto auth = attemptPacket(f.authorization(), 1);
+  f.mesh.onRecvPacket(&auth);
+  using Flash = ::ota::test::FakeNorFlash;
+  Flash::FaultSpec fault;
+  fault.kind = Flash::OpKind::Program; fault.timing = Flash::InjectionTiming::Before;
+  fault.trigger_op_count = f.product.fx.image_flash.programOpCount() + 1;
+  f.product.fx.image_flash.armFault(fault);
+  auto first = attemptPacket(f.block(0, true), 2);
+  f.mesh.onRecvPacket(&first);
+  EXPECT_EQ(0u, f.receiver().status().receivedBlocks);
+  f.product.fx.image_flash.clearFault();
+  f.mesh.onRecvPacket(&first);
+  EXPECT_EQ(0u, f.receiver().status().receivedBlocks);
+  auto repair = attemptPacket(f.block(0, true), 3, true);
+  f.mesh.onRecvPacket(&repair);
+  ASSERT_EQ(1u, f.receiver().status().receivedBlocks);
+  const auto programs = f.product.fx.image_flash.programOpCount();
+  const auto metadata = f.product.fx.candidate_flash.programOpCount();
+  auto again = attemptPacket(f.block(0, true), 4, true);
+  f.mesh.onRecvPacket(&again);
+  EXPECT_EQ(programs, f.product.fx.image_flash.programOpCount());
+  EXPECT_EQ(metadata, f.product.fx.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaRoutedRetry, SignedCommitAbortReuploadStillBindOwnerTargetImageGenerationAndCounter) {
+  using namespace mesh::ota;
+  OtaMeshRetryFixture f;
+  auto auth = attemptPacket(f.authorization(), 1);
+  f.mesh.onRecvPacket(&auth);
+  for (uint16_t index = 0; index < 4; ++index) {
+    auto block = attemptPacket(f.block(index, true), 2 + index);
+    f.mesh.onRecvPacket(&block);
+  }
+  f.integration().loop();
+  ASSERT_EQ(OtaMeshRetryFixture::Phase::Ready, f.receiver().status().phase);
+  const auto st = f.receiver().status();
+  uint32_t attempt = 10;
+  auto reject = [&](const uint8_t* frame, size_t len) {
+    uint8_t wire[171];
+    const auto encoded = encodeOtaRetryAttempt(attempt++, frame, len, wire, sizeof(wire));
+    ASSERT_NE(0u, encoded);
+    f.product.fx.integration = f.integration();
+    f.product.expectNoMutation([&] {
+      EXPECT_FALSE(f.product.fx.integration.handleReceivedFrame(wire, encoded));
+    });
+  };
+  uint8_t target[32], hash[32], signature[64], message[160], frame[165];
+  for (unsigned mismatch = 0; mismatch < 5; ++mismatch) {
+    std::memcpy(target, f.product.local.publicKey(), 32);
+    std::memcpy(hash, st.manifestHash, 32);
+    const auto counter = st.counter + (mismatch == 0);
+    if (mismatch == 1) hash[0] ^= 1;
+    if (mismatch == 2) target[0] ^= 1;
+    usb::buildCommitSignedMessage(target, hash, counter, message);
+    (mismatch == 3 ? f.product.local : f.product.remote).sign(message, usb::kCommitSignedBytes, signature);
+    if (mismatch == 4) signature[0] ^= 1;
+    reject(frame, encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame)));
+  }
+  for (unsigned mismatch = 0; mismatch < 4; ++mismatch) {
+    std::memcpy(target, f.product.local.publicKey(), 32);
+    std::memcpy(hash, st.imageHash, 32);
+    const auto generation = st.generation + (mismatch == 0);
+    if (mismatch == 1) hash[0] ^= 1;
+    if (mismatch == 2) target[0] ^= 1;
+    usb::buildAbortSignedMessage(target, hash, generation, message);
+    f.product.remote.sign(message, usb::kAbortSignedBytes, signature);
+    if (mismatch == 3) signature[0] ^= 1;
+    reject(frame, encodeOtaAbortFrame(f.product.remote.publicKey(), target, hash, generation,
+                                     signature, frame, sizeof(frame)));
+  }
+  usb::buildAbortSignedMessage(f.product.local.publicKey(), st.imageHash, st.generation, message);
+  f.product.remote.sign(message, usb::kAbortSignedBytes, signature);
+  auto len = encodeOtaAbortFrame(f.product.remote.publicKey(), f.product.local.publicKey(), st.imageHash,
+                                 st.generation, signature, frame, sizeof(frame));
+  auto aborted = attemptPacket(f.packet(frame, len), attempt++);
+  ASSERT_TRUE(f.integration().handleReceivedFrame(aborted.payload, aborted.payload_len));
+  ASSERT_EQ(OtaMeshRetryFixture::Phase::Aborted, f.receiver().status().phase);
+  for (unsigned mismatch = 0; mismatch < 5; ++mismatch) {
+    frame[0] = kOtaReuploadKind;
+    std::memcpy(frame + 1, mismatch == 3 ? f.product.local.publicKey() : f.product.remote.publicKey(), 32);
+    std::memcpy(frame + 33, f.product.local.publicKey(), 32);
+    std::memcpy(frame + 65, st.manifestHash, 32);
+    usb::putBE32(frame + 97, f.receiver().status().generation + (mismatch == 0));
+    if (mismatch == 1) frame[33] ^= 1;
+    if (mismatch == 2) frame[65] ^= 1;
+    const auto mlen = buildOtaReuploadMessage(frame, message);
+    (mismatch == 3 ? f.product.local : f.product.remote).sign(message, mlen, frame + 101);
+    if (mismatch == 4) frame[101] ^= 1;
+    reject(frame, sizeof(frame));
   }
 }
 
@@ -5125,6 +5566,28 @@ struct RfNode {
   }
 };
 
+struct RealRfPacketNode {
+  class BoundMesh : public OtaRetryPacketMesh {
+  public:
+    using OtaRetryPacketMesh::OtaRetryPacketMesh;
+    OtaFirmwareIntegration* receiver = nullptr;
+  protected:
+    void onOtaDataRecv(Packet* packet) override {
+      ++ota_deliveries;
+      if (receiver) receiver->handleReceivedFrame(packet->payload, packet->payload_len, _ms->getMillis());
+    }
+  };
+  FakeClock clock; PacketCaptureRadio radio; PacketBoundaryRng rng; PacketBoundaryRtc rtc;
+  StaticPoolPacketManager manager{8}; SimpleMeshTables tables;
+  BoundMesh mesh{radio, clock, rng, rtc, manager, tables};
+  RealRfPacketNode(uint8_t hash, OtaFirmwareIntegration* receiver = nullptr) {
+    mesh.self_id.pub_key[0] = hash;
+    mesh.receiver = receiver;
+    mesh.forwarding = !receiver;
+    mesh.begin();
+  }
+};
+
 struct RfProductHarness {
   uint8_t ownerSeed[32] = {1}, seedA[32] = {2}, seedB[32] = {3};
   RfNode sender{ownerSeed}, a{seedA}, b{seedB};
@@ -5143,11 +5606,16 @@ struct RfProductHarness {
   uint32_t authorizationEstimateMs = 0, authorizationCompletedMs = 0;
   uint64_t controlTxMs = 0, dataTxMs = 0;
   bool advanceCompletionClock = false;
+  bool realRelays = false;
+  RealRfPacketNode relay1{0x31}, relay2{0x32};
+  RealRfPacketNode packetA{0x41, &a.fx.integration}, packetB{0x42, &b.fx.integration};
+  RealRfPacketNode packetSender{0x40, &sender.fx.integration};
+  uint32_t relayAttempts = 0, reportAttempts = 0, sameAttemptDrops = 0, repairAttempts = 0;
   int multicastBlocks = 0, directedBlocks = 0, zeroHopBlocks = 0, census = 0;
   std::vector<uint16_t> repairs;
 
   void prepare(size_t size, uint8_t mode, bool reupload = false,
-               OtaDirectProfile profile = OtaDirectProfile::Legacy250) {
+               OtaDirectProfile profile = OtaDirectProfile::Legacy250, bool retry_attempts = false) {
     image.resize(size);
     for (size_t i = 0; i < size; ++i) image[i] = static_cast<uint8_t>(i * 17u);
     uint8_t canonical[59], signature[64];
@@ -5165,7 +5633,7 @@ struct RfProductHarness {
     a.fx.admins.add(sender.signer.publicKey()); b.fx.admins.add(sender.signer.publicKey());
     std::memcpy(targets[0], a.signer.publicKey(), 32); std::memcpy(targets[1], b.signer.publicKey(), 32);
     ASSERT_TRUE(uploader.start(sender.fx.integration, mode, &targets[0][0], mode == 2 ? 2 : 1,
-                               mode == 0 ? 908525 : 0, mode == 0 ? 60000 : 0, 100, reupload, profile));
+                               mode == 0 ? 908525 : 0, mode == 0 ? 60000 : 0, 100, reupload, profile, retry_attempts));
   }
   static void sign(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
     auto& harness = *static_cast<RfProductHarness*>(ctx);
@@ -5174,6 +5642,17 @@ struct RfProductHarness {
   static bool send(void* ctx, OtaRfRoute route, const uint8_t target[32], const uint8_t* frame, size_t len,
                     meshcore::ota::protocol::OtaAirtimeCategory category) {
     auto& h = *static_cast<RfProductHarness*>(ctx);
+    const auto* wire_frame = frame; const auto wire_len = len;
+    if (isOtaRetryAttempt(frame[0])) {
+      uint32_t attempt; const uint8_t* inner; size_t inner_len;
+      EXPECT_TRUE(parseOtaRetryAttempt(frame, len, attempt, inner, inner_len));
+      frame = inner; len = inner_len;
+      EXPECT_LE(wire_len, 171u);
+      if (category == meshcore::ota::protocol::OtaAirtimeCategory::Repair) {
+        EXPECT_EQ(kOtaRetryRepairAttemptKind, wire_frame[0]);
+        ++h.repairAttempts;
+      }
+    }
     if (h.missingAdmissionRouteA && h.lostAuthorization && frame[0] == kOtaTargetAuthorizationKind &&
         !std::memcmp(target, h.targets[0], 32)) return false;
     const bool authorization = frame[0] == kOtaTargetAuthorizationKind;
@@ -5184,6 +5663,8 @@ struct RfProductHarness {
     EXPECT_TRUE(h.sender.fx.integration.recordTransmit(h.now, category, completed));
     if (category == meshcore::ota::protocol::OtaAirtimeCategory::Control) h.controlTxMs += completed;
     else h.dataTxMs += completed;
+    Packet relayed;
+    if (h.realRelays && !h.forward(wire_frame, wire_len, route == OtaRfRoute::Multicast, relayed)) return true;
     if (frame[0] == kOtaCommitKind) ++h.commits;
     if (frame[0] == kOtaTargetAuthorizationKind) {
       EXPECT_EQ(164u, len);
@@ -5205,23 +5686,51 @@ struct RfProductHarness {
       h.lostAuthorization = true; return true;
     }
     if (frame[0] == kOtaCensusPollKind) ++h.census;
-    if (frame[0] == kOtaOwnerSignedBlockKind) {
+    if (frame[0] == kOtaOwnerSignedBlockKind || frame[0] == kOtaSignedBlockKind) {
       if (category == meshcore::ota::protocol::OtaAirtimeCategory::Relay) ++h.initialData;
       if (route == OtaRfRoute::Multicast) ++h.multicastBlocks;
       else if (route == OtaRfRoute::Directed) ++h.directedBlocks;
       else ++h.zeroHopBlocks;
-      if (category == meshcore::ota::protocol::OtaAirtimeCategory::Repair) h.repairs.push_back(usb::getBE16(frame + 33));
+      if (category == meshcore::ota::protocol::OtaAirtimeCategory::Repair)
+        h.repairs.push_back(usb::getBE16(frame + (frame[0] == kOtaSignedBlockKind ? 5 : 33)));
     }
     for (auto* node : {&h.a, &h.b}) {
       if (route != OtaRfRoute::Multicast && std::memcmp(target, node->signer.publicKey(), 32)) continue;
       if (h.sender.frequency != node->frequency || h.sender.bandwidth != node->bandwidth) continue;
-      if (h.loseSparseBlocks && frame[0] == kOtaOwnerSignedBlockKind &&
+      if (h.loseSparseBlocks && (frame[0] == kOtaOwnerSignedBlockKind || frame[0] == kOtaSignedBlockKind) &&
           category == meshcore::ota::protocol::OtaAirtimeCategory::Relay) {
-        const auto index = usb::getBE16(frame + 33);
+        const auto index = usb::getBE16(frame + (frame[0] == kOtaSignedBlockKind ? 5 : 33));
         if (index == 0 || index == 129) continue;
       }
-      node->fx.integration.handleReceivedFrame(frame, len, h.now);
+      if (h.realRelays) {
+        auto& receiver = node == &h.a ? h.packetA : h.packetB;
+        receiver.clock.now = h.now;
+        auto packet = relayed;
+        EXPECT_EQ(ACTION_RELEASE, receiver.mesh.onRecvPacket(&packet));
+      } else node->fx.integration.handleReceivedFrame(wire_frame, wire_len, h.now);
     }
+    return true;
+  }
+  bool forward(const uint8_t* frame, size_t len, bool flood, Packet& out) {
+    out.header = (flood ? ROUTE_TYPE_FLOOD : ROUTE_TYPE_DIRECT) | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
+    out.payload_len = len; std::memcpy(out.payload, frame, len);
+    out.setPathHashCount(flood ? 1 : 2);
+    out.path[0] = flood ? 0x40 : 0x31;
+    if (!flood) out.path[1] = 0x32;
+    for (auto* node : {&relay1, &relay2}) {
+      node->clock.now = now;
+      const auto original = out;
+      const auto action = node->mesh.onRecvPacket(&out);
+      if (action == ACTION_RELEASE) return false;
+      EXPECT_EQ(ACTION_RETRANSMIT(kOtaForwardPriority), action);
+      uint8_t before[MAX_HASH_SIZE], after[MAX_HASH_SIZE];
+      original.calculatePacketHash(before); out.calculatePacketHash(after);
+      EXPECT_EQ(0, std::memcmp(before, after, sizeof(before)));
+      auto same = original;
+      EXPECT_EQ(ACTION_RELEASE, node->mesh.onRecvPacket(&same));
+      ++sameAttemptDrops;
+    }
+    ++relayAttempts;
     return true;
   }
   void step(uint32_t elapsed = 1000) {
@@ -5237,7 +5746,15 @@ struct RfProductHarness {
       if (loseAck && !lostAck && (frame[0] == kOtaDirectAckKind || frame[0] == kOtaDirectProfileAckKind)) {
         lostAck = true; continue;
       }
-      if (node->frequency == sender.frequency) sender.fx.integration.handleReceivedFrame(frame, len, now);
+      if (node->frequency == sender.frequency) {
+        if (realRelays) {
+          Packet response;
+          if (!forward(frame, len, true, response)) continue;
+          ++reportAttempts;
+          packetSender.clock.now = now;
+          EXPECT_EQ(ACTION_RELEASE, packetSender.mesh.onRecvPacket(&response));
+        } else sender.fx.integration.handleReceivedFrame(frame, len, now);
+      }
     }
   }
   bool ready(RfNode& node) const {
@@ -5252,7 +5769,121 @@ struct RfProductHarness {
     EXPECT_EQ(image, received);
   }
 };
+
+struct RetryAdmissionCapture {
+  RfProductHarness& source;
+  bool queueAccepted = false, normalBusy = false;
+  uint64_t calls = 0, changedCandidates = 0;
+  std::vector<uint8_t> candidate, accepted;
+  static void sign(void*, const uint8_t*, size_t, uint8_t[64]) {
+    ADD_FAILURE() << "Admission retry must not sign a data block";
+  }
+  static bool send(void* ctx, OtaRfRoute, const uint8_t[32], const uint8_t* frame, size_t len,
+                    meshcore::ota::protocol::OtaAirtimeCategory category) {
+    auto& capture = *static_cast<RetryAdmissionCapture*>(ctx);
+    ++capture.calls;
+    if (capture.candidate.empty()) capture.candidate.assign(frame, frame + len);
+    else if (capture.candidate.size() != len || std::memcmp(capture.candidate.data(), frame, len))
+      ++capture.changedCandidates;
+    uint8_t forwarded[184];
+    const auto encoded = capture.source.sender.fx.integration.prepareRfTransmit(
+        frame, len, forwarded, sizeof(forwarded), category);
+    if (!encoded || !capture.source.sender.fx.integration.canTransmit(
+        capture.source.now, category, 20, true, capture.normalBusy) || !capture.queueAccepted) return false;
+    capture.accepted.assign(forwarded, forwarded + encoded);
+    return true;
+  }
+  void pump() {
+    source.uploader.pump(source.sender.fx.integration, source.now, this, &sign, &send);
+  }
+};
 }  // namespace
+
+TEST(LoraOtaRoutedRetry, MillionBudgetRefusalsBusyAndFailedSendsKeepCandidateUntilAcceptedOnce) {
+  RfProductHarness h;
+  h.prepare(91, usb::kStartModeDirected, false, OtaDirectProfile::Legacy250, true);
+  RetryAdmissionCapture capture{h};
+  capture.queueAccepted = true;
+  ASSERT_TRUE(h.sender.fx.integration.setDutyCyclePercent(0));
+  for (uint32_t i = 0; i < 1000000; ++i) {
+    h.now = i + 1;
+    capture.pump();
+  }
+  ASSERT_EQ(1000000u, capture.calls);
+  ASSERT_FALSE(capture.candidate.empty());
+  EXPECT_EQ(0u, capture.changedCandidates);
+  EXPECT_TRUE(capture.accepted.empty());
+  EXPECT_TRUE(h.uploader.active());
+  EXPECT_FALSE(h.sender.fx.integration.retryAttemptsExhausted());
+  EXPECT_EQ(100u, usb::getBE32(capture.candidate.data() + 1));
+  EXPECT_EQ(0u, h.sender.fx.integration.status(h.now).dutyUsedMs);
+  ASSERT_TRUE(h.sender.fx.integration.setDutyCyclePercent(2));
+  capture.normalBusy = true;
+  for (int i = 0; i < 16; ++i) { ++h.now; capture.pump(); }
+  capture.normalBusy = false; capture.queueAccepted = false;
+  for (int i = 0; i < 16; ++i) { ++h.now; capture.pump(); }
+  EXPECT_EQ(0u, capture.changedCandidates);
+  EXPECT_TRUE(capture.accepted.empty());
+  capture.queueAccepted = true;
+  ++h.now; capture.pump();
+  ASSERT_EQ(capture.candidate, capture.accepted);
+  uint32_t id; const uint8_t* inner; size_t inner_len;
+  ASSERT_TRUE(parseOtaRetryAttempt(capture.accepted.data(), capture.accepted.size(), id, inner, inner_len));
+  EXPECT_EQ(100u, id);
+  uint8_t retry[171];
+  const auto len = h.sender.fx.integration.prepareRfTransmit(inner, inner_len, retry, sizeof(retry));
+  ASSERT_EQ(capture.accepted.size(), len);
+  EXPECT_EQ(101u, usb::getBE32(retry + 1));
+  EXPECT_EQ(0, std::memcmp(retry + kOtaRetryAttemptHeaderBytes, inner, inner_len));
+  OtaMeshRetryFixture relay;
+  relay.mesh.forwarding = true;
+  auto first = relay.packet(capture.accepted.data(), capture.accepted.size());
+  first.setPathHashCount(1); first.path[0] = 0;
+  const auto original = first;
+  uint8_t first_hash[MAX_HASH_SIZE], retry_hash[MAX_HASH_SIZE];
+  first.calculatePacketHash(first_hash);
+  ASSERT_EQ(ACTION_RETRANSMIT(kOtaForwardPriority), relay.mesh.onRecvPacket(&first));
+  auto same = original;
+  EXPECT_EQ(ACTION_RELEASE, relay.mesh.onRecvPacket(&same));
+  auto next = relay.packet(retry, len);
+  next.path_len = original.path_len; next.path[0] = original.path[0];
+  next.calculatePacketHash(retry_hash);
+  EXPECT_NE(0, std::memcmp(first_hash, retry_hash, sizeof(first_hash)));
+  ASSERT_EQ(ACTION_RETRANSMIT(kOtaForwardPriority), relay.mesh.onRecvPacket(&next));
+  uint8_t unaccepted[171];
+  EXPECT_EQ(len, h.sender.fx.integration.prepareRfTransmit(inner, inner_len, unaccepted, sizeof(unaccepted)));
+  EXPECT_EQ(0, std::memcmp(retry, unaccepted, len));
+  ASSERT_TRUE(h.sender.fx.integration.acceptRfTransmit(retry, len));
+  EXPECT_FALSE(h.sender.fx.integration.acceptRfTransmit(retry, len));
+  EXPECT_EQ(len, h.sender.fx.integration.prepareRfTransmit(inner, inner_len, unaccepted, sizeof(unaccepted)));
+  EXPECT_EQ(102u, usb::getBE32(unaccepted + 1));
+}
+
+TEST(LoraOtaRoutedRetry, ExhaustionHappensOnlyAfterFinalAcceptanceAndTerminatesUploaderWithoutReseeding) {
+  RfProductHarness h;
+  ASSERT_TRUE(h.sender.fx.integration.setRetryAttempts(true, UINT32_MAX));
+  h.prepare(91, usb::kStartModeDirected, false, OtaDirectProfile::Legacy250, true);
+  RetryAdmissionCapture capture{h};
+  for (int i = 0; i < 16; ++i) { ++h.now; capture.pump(); }
+  EXPECT_EQ(0u, capture.changedCandidates);
+  EXPECT_EQ(UINT32_MAX, usb::getBE32(capture.candidate.data() + 1));
+  EXPECT_FALSE(h.sender.fx.integration.retryAttemptsExhausted());
+  EXPECT_TRUE(h.uploader.active());
+  capture.queueAccepted = true;
+  ++h.now; capture.pump();
+  ASSERT_EQ(capture.candidate, capture.accepted);
+  EXPECT_TRUE(h.sender.fx.integration.retryAttemptsExhausted());
+  const auto calls = capture.calls;
+  ++h.now; capture.pump();
+  EXPECT_FALSE(h.uploader.active());
+  EXPECT_EQ(calls, capture.calls);
+  EXPECT_FALSE(h.uploader.start(h.sender.fx.integration, usb::kStartModeDirected,
+      &h.targets[0][0], 1, 0, 0, 1, false, OtaDirectProfile::Legacy250, true));
+  EXPECT_FALSE(h.uploader.active());
+  ASSERT_TRUE(h.sender.fx.integration.setRetryAttempts(false));
+  EXPECT_FALSE(h.sender.fx.integration.setRetryAttempts(true, 3));
+  EXPECT_TRUE(h.sender.fx.integration.retryAttemptsExhausted());
+}
 
 TEST(LoraOtaRfProduct, DirectedDeliveryUsesRoutingAndSelectivelyRepairsSparseHoleNotReceivedCount) {
   RfProductHarness h;
@@ -5271,6 +5902,78 @@ TEST(LoraOtaRfProduct, DirectedDeliveryUsesRoutingAndSelectivelyRepairsSparseHol
                                                                 std::min<size_t>(84, received.size() - offset)));
   }
   EXPECT_EQ(h.image, received);
+}
+
+TEST(LoraOtaRoutedRetry, LegacyNegativeControlReallyStallsBehindSeenRelayAfterLostAdmission) {
+  RfProductHarness h;
+  h.realRelays = true; h.loseAuthorization = true;
+  h.prepare(84 * 18 + 7, usb::kStartModeDirected);
+  for (int i = 0; i < 150; ++i) h.step();
+  ASSERT_TRUE(h.lostAuthorization);
+  EXPECT_FALSE(h.ready(h.a));
+  EXPECT_FALSE(h.a.fx.integration.leanReceiver().status().valid);
+  EXPECT_GT(h.sameAttemptDrops, 0u);
+  EXPECT_LT(h.relayAttempts, MAX_PACKET_HASHES);
+}
+
+TEST(LoraOtaRoutedRetry, AutonomousUploaderActuallyRepairsLossAcrossTwoRealRelaysAtTwoPercent) {
+  for (const uint8_t mode : {usb::kStartModeDirected, usb::kStartModeBackground}) {
+    RfProductHarness h;
+    h.realRelays = true; h.loseAuthorization = true; h.loseSparseBlocks = true;
+    h.prepare(84 * 18 + 7, mode, false, OtaDirectProfile::Legacy250, true);
+    h.normalTrafficActive = true;
+    for (int i = 0; i < 30; ++i) h.step();
+    EXPECT_EQ(0u, h.relayAttempts);
+    EXPECT_EQ(0u, h.sender.fx.integration.status(h.now).dutyUsedMs);
+    h.normalTrafficActive = false;
+    for (int i = 0; i < 800 && h.uploader.active(); ++i) h.step();
+    EXPECT_FALSE(h.uploader.active());
+    ASSERT_TRUE(h.ready(h.a));
+    if (mode == usb::kStartModeBackground) ASSERT_TRUE(h.ready(h.b));
+    h.expectByteExact(h.a);
+    if (mode == usb::kStartModeBackground) h.expectByteExact(h.b);
+    EXPECT_GT(h.repairAttempts, 0u);
+    EXPECT_GT(h.reportAttempts, 0u);
+    EXPECT_EQ(h.relayAttempts * 2, h.sameAttemptDrops);
+    EXPECT_GT(h.authorizations, 1);
+    EXPECT_EQ(h.controlTxMs + h.dataTxMs, h.sender.fx.integration.status(h.now).dutyUsedMs);
+    EXPECT_LE(h.sender.fx.integration.status(h.now).dutyUsedMs, 72000u);
+    EXPECT_FLOAT_EQ(2.0f, h.sender.fx.integration.dutyCyclePercent());
+    EXPECT_EQ(0, h.commits);
+  }
+}
+
+TEST(LoraOtaRoutedRetry, LostRelayedReuploadRetriesApprovedGenerationButCannotOverrideLaterAbort) {
+  RfProductHarness h;
+  h.realRelays = true;
+  h.prepare(84 * 10 + 7, usb::kStartModeBackground, true, OtaDirectProfile::Legacy250, true);
+  for (int i = 0; i < 5; ++i) h.step();
+  auto& receiver = h.a.fx.integration.leanReceiver();
+  auto st = receiver.status();
+  uint8_t message[usb::kAbortSignedBytes], signature[64];
+  usb::buildAbortSignedMessage(h.a.signer.publicKey(), st.imageHash, st.generation, message);
+  h.sender.signer.sign(message, sizeof(message), signature);
+  ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.abort(h.sender.signer.publicKey(), signature, st.imageHash, st.generation));
+  const auto aborted_generation = receiver.status().generation;
+  h.loseReupload = true;
+  for (int i = 0; i < 500 && !(receiver.status().generation > aborted_generation &&
+      receiver.status().phase == ::ota::storage::OtaCandidateStore::Phase::Receiving &&
+      receiver.status().receivedBlocks > 0); ++i) h.step();
+  ASSERT_TRUE(h.lostReupload);
+  ASSERT_GT(receiver.status().receivedBlocks, 0u);
+  ASSERT_GT(receiver.status().generation, aborted_generation);
+  ASSERT_TRUE(h.uploader.active());
+  st = receiver.status();
+  usb::buildAbortSignedMessage(h.a.signer.publicKey(), st.imageHash, st.generation, message);
+  h.sender.signer.sign(message, sizeof(message), signature);
+  ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.abort(h.sender.signer.publicKey(), signature, st.imageHash, st.generation));
+  const auto later_generation = receiver.status().generation;
+  const auto erases = h.a.fx.image_flash.eraseOpCount();
+  for (int i = 0; i < 500; ++i) h.step();
+  EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Aborted, receiver.status().phase);
+  EXPECT_EQ(later_generation, receiver.status().generation);
+  EXPECT_EQ(erases, h.a.fx.image_flash.eraseOpCount());
+  EXPECT_EQ(h.controlTxMs + h.dataTxMs, h.sender.fx.integration.status(h.now).dutyUsedMs);
 }
 
 TEST(LoraOtaRfProduct, BackgroundMulticastsThenCensusesAllTargetsAndRepairsAcrossBitmapWindows) {

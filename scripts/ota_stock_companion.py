@@ -1041,9 +1041,12 @@ def main(argv=None):
     parser.add_argument("--frequency-khz", type=int)
     parser.add_argument("--lease-ms", type=int, default=60000)
     parser.add_argument("--lab-fast", action="store_true", help="upload-only: signed 500kHz/SF5/CR5 profile, bounded 16-block bursts; normal duty unchanged")
+    parser.add_argument("--routed-retry", action="store_true", help="unsupported by this zero-hop-only stock adapter; explicitly refused")
     parser.add_argument("--normal-duty-percent", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
+    if args.routed_retry:
+        raise Error("routed-retry unsupported by the stock zero-hop-only adapter; no legacy fallback")
     if args.lab_fast and args.operation != "upload":
         raise Error("--lab-fast is an upload-only lab opt-in")
     binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)

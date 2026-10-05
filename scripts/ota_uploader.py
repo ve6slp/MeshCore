@@ -154,7 +154,9 @@ def validate_image(canonical, image):
         raise ValueError("image SHA-256 does not match the manifest")
 
 
-def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, lab_fast=False):
+def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, lab_fast=False, routed_retry=False):
+    if type(routed_retry) is not bool or (routed_retry and (mode == "direct" or lab_fast)):
+        raise ValueError("routed-retry requires directed/background mode without lab-fast")
     if type(lab_fast) is not bool or (lab_fast and mode != "direct"):
         raise ValueError("lab-fast requires direct mode")
     if mode not in MODES or not 0 <= channel <= 255:
@@ -169,6 +171,8 @@ def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, lab_f
     elif mode == "background" and channel == 255:
         raise ValueError("background mode requires a configured multicast channel")
     body = struct.pack(">BBIHI", MODES[mode], channel, frequency_khz, lease_ms, duty_milli_percent)
+    if routed_retry:
+        return body + b"\x00\x01"
     return body + b"\x02" if lab_fast else body
 
 
@@ -282,8 +286,9 @@ class Uploader:
             raise ValueError("select 1..32 distinct full target identities")
         if mode != "background" and len(targets) != 1:
             raise ValueError("direct and directed campaigns require exactly one target")
-        if (mode not in MODES or len(body) not in (12, 13) or body[0] != MODES[mode]
-                or (len(body) == 13 and (mode != "direct" or body[12] not in (1, 2)))):
+        if (mode not in MODES or len(body) not in (12, 13, 14) or body[0] != MODES[mode]
+                or (len(body) == 13 and (mode != "direct" or body[12] not in (1, 2)))
+                or (len(body) == 14 and (mode == "direct" or body[12:] != b"\x00\x01"))):
             raise ValueError("campaign mode does not match the START body")
         for target in targets:
             self.require_accepted(self.exchange(Op.ADD_TARGET, target, target, self.remaining(deadline)))
@@ -349,6 +354,7 @@ def parser():
     upload.add_argument("--frequency-khz", type=int, default=0)
     upload.add_argument("--lease-ms", type=int, default=0)
     upload.add_argument("--lab-fast", action="store_true", help="direct-only signed 500kHz/SF5/CR5 negotiation; requires matching receiver")
+    upload.add_argument("--routed-retry", action="store_true", help="opt-in attempt-diverse directed/background RF; requires upgraded receivers")
     upload.add_argument("--duty-milli-percent", type=int, default=2000)
     upload.add_argument("--wait-ready", action="store_true")
     status = commands.add_parser("status")
@@ -382,7 +388,8 @@ def main():
     if args.command in ("upload", "cache"):
         validate_image(canonical, image)
     if args.command == "upload":
-        body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent, args.lab_fast)
+        body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent,
+                          args.lab_fast, args.routed_retry)
         if len(set(args.target)) != len(args.target) or len(args.target) > 32:
             arguments.error("select at most 32 distinct targets")
         if args.mode != "background" and len(args.target) != 1:

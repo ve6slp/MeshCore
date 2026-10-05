@@ -1490,9 +1490,21 @@ bool MyMesh::floodOtaFrame(const uint8_t* frame, size_t frame_len, meshcore::ota
 bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t* frame, size_t frame_len,
                                         meshcore::ota::protocol::OtaAirtimeCategory category) {
   if (_radio == nullptr || frame == nullptr || frame_len == 0) return false;
+  uint8_t wire[MAX_PACKET_PAYLOAD];
+  const bool new_attempt = getOtaIntegration().retryAttemptsEnabled() &&
+                           !mesh::ota::isOtaRetryAttempt(frame[0]);
+  frame_len = getOtaIntegration().prepareRfTransmit(frame, frame_len, wire, sizeof(wire));
+  if (!frame_len) return false;
+  frame = wire;
+  ContactInfo* contact = lookupContactByPubKey(target, PUB_KEY_SIZE);
+  const uint8_t path = !getOtaIntegration().directActive() && contact &&
+      contact->out_path_len != OUT_PATH_UNKNOWN ? contact->out_path_len : 0;
+  if (!mesh::ota::otaRfPathFits(frame_len, path)) return false;
   const uint32_t now_ms = _ms->getMillis();
   if (isSendInProgress() || _mgr->getOutboundTotal() != 0) return false;
-  const uint32_t est_airtime_ms = _radio->getEstAirtimeFor(static_cast<int>(frame_len + 4));
+  const uint32_t est_airtime_ms = _radio->getEstAirtimeFor(static_cast<int>(
+      mesh::ota::isOtaRetryAttempt(frame[0]) ?
+          frame_len + 2 + ((path >> 6) + 1) * (path & 63) : frame_len + 4));
   if (!getOtaIntegration().canTransmit(now_ms, category, est_airtime_ms, /*regulatory_allowed=*/true,
                                       /*normal_traffic_active=*/isSendInProgress())) {
     return false;
@@ -1504,7 +1516,6 @@ bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t
   // identity, never a wire-routing hint -- see OtaLeanReceiver::commit()/
   // abort()'s doc comment), so a known direct path is purely an airtime
   // optimization, never a correctness requirement.
-  ContactInfo* contact = lookupContactByPubKey(target, PUB_KEY_SIZE);
   if (getOtaIntegration().directActive()) {
     sendZeroHop(pkt);
   } else if (contact != nullptr && contact->out_path_len != OUT_PATH_UNKNOWN) {
@@ -1512,7 +1523,8 @@ bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t
   } else if (!sendFlood(pkt, static_cast<uint32_t>(0), _prefs.path_hash_mode + 1)) {
     return false;
   }
-  return true;
+  if (_mgr->getOutboundTotal() == 0) return false;
+  return !new_attempt || getOtaIntegration().acceptRfTransmit(frame, frame_len);
 }
 
 bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore) {
@@ -1677,7 +1689,8 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
     }
     case UsbOtaOp::Start: {
       mesh::ota::OtaDirectProfile profile;
-      if (!parseStartProfile(cmd_frame, len, profile)) {
+      bool retry_attempts;
+      if (!parseStartOptions(cmd_frame, len, profile, retry_attempts)) {
         reply.result = UsbOtaResult::BadRequest;
         break;
       }
@@ -1726,7 +1739,12 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         for (uint8_t i = 0; i < _ota_selected_target_count; ++i) {
           const auto* contact = lookupContactByPubKey(_ota_selected_targets[i], PUB_KEY_SIZE);
           if (!contact || contact->out_path_len == OUT_PATH_UNKNOWN) routable = false;
+          else if (!mesh::ota::otaRfPathFits(retry_attempts ? 170 : 183, contact->out_path_len)) {
+            reply.result = UsbOtaResult::BadRequest;
+            break;
+          }
         }
+        if (reply.result == UsbOtaResult::BadRequest) break;
         if (!routable) { reply.result = UsbOtaResult::Busy; break; }
       }
       if (mode == kStartModeBackground && channel != 0xFF) {
@@ -1749,7 +1767,7 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       _ota_upload_channel = channel;
       _ota_upload_active = _ota_rf_uploader.start(getOtaIntegration(), mode, &_ota_selected_targets[0][0],
                                                   _ota_selected_target_count, frequency_khz, lease_ms,
-                                                  getRNG()->nextInt(1, 0x7FFFFFFF), _ota_cache_reupload, profile);
+                                                  getRNG()->nextInt(1, 0x7FFFFFFF), _ota_cache_reupload, profile, retry_attempts);
       reply.result = _ota_upload_active ? UsbOtaResult::Ok : UsbOtaResult::BadRequest;
       fillLocalSnapshot();
       break;

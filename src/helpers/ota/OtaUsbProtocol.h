@@ -63,7 +63,7 @@ enum class UsbOtaOp : uint8_t {
   CachePut        = 0x11, // blockIndexBE16 + dataLenU8 + data[1..84]      => up to 89B total
   CacheSeal       = 0x12, // no body                                      => 2B total
   AddTarget       = 0x13, // targetPubKey32                                => 34B total
-  Start           = 0x14, // legacy14B; optional profileU8 at byte14 => 15B, direct-only (1=250,2=500/SF5/CR5)
+  Start           = 0x14, // legacy14B; direct profile=>15B; on-mesh profile0/retry flag1=>16B
   Commit          = 0x15, // targetPubKey32 + manifestHash32 + counterBE32 => 70B total
   Abort           = 0x16, // targetPubKey32 + imageHash32 + generationBE32 => 70B total
   Status          = 0x17, // targetPubKey32 (all-zero => local cache)      => 34B total
@@ -106,14 +106,29 @@ constexpr size_t kCacheSealTotalBytes       = 2;                                
 constexpr size_t kAddTargetTotalBytes       = 2 + kPubKeyBytes;                                   // 34
 constexpr size_t kStartTotalBytes           = 2 + 1 + 1 + 4 + 2 + 4;                              // 14
 constexpr size_t kStartProfileTotalBytes    = kStartTotalBytes + 1;                              // 15
+constexpr size_t kStartRetryTotalBytes      = kStartTotalBytes + 2;                              // 16
+constexpr uint8_t kStartFlagRetryAttempts   = 1;
 
-inline bool parseStartProfile(const uint8_t* command, size_t len, OtaDirectProfile& profile) {
-  if (!command || (len != kStartTotalBytes && len != kStartProfileTotalBytes)) return false;
+inline bool parseStartOptions(const uint8_t* command, size_t len,
+                               OtaDirectProfile& profile, bool& retry_attempts) {
+  if (!command || (len != kStartTotalBytes && len != kStartProfileTotalBytes &&
+                    len != kStartRetryTotalBytes)) return false;
+  retry_attempts = false;
   profile = OtaDirectProfile::Legacy250;
   if (len == kStartTotalBytes) return true;
   profile = static_cast<OtaDirectProfile>(command[kStartTotalBytes]);
+  if (len == kStartRetryTotalBytes) {
+    retry_attempts = command[kStartTotalBytes + 1] == kStartFlagRetryAttempts;
+    return retry_attempts && profile == OtaDirectProfile::Legacy250 &&
+           (command[2] == kStartModeDirected || command[2] == kStartModeBackground);
+  }
   return command[2] == kStartModeDirect &&
          (profile == OtaDirectProfile::Bw250 || profile == OtaDirectProfile::Bw500);
+}
+
+inline bool parseStartProfile(const uint8_t* command, size_t len, OtaDirectProfile& profile) {
+  bool retry_attempts;
+  return len != kStartRetryTotalBytes && parseStartOptions(command, len, profile, retry_attempts);
 }
 constexpr size_t kCommitTotalBytes          = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70
 constexpr size_t kAbortTotalBytes           = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70

@@ -6,15 +6,16 @@ This guide explains the update policy and experimental signed host workflow.
 LoRa OTA reuses MeshCore identities and administrator permissions. There is no
 separate OTA authority, signing-key registry or remote commissioning service.
 
-**LoRa OTA is not production-ready.** Historical lab controls and build
-results do not qualify the replacement. No physical node has completed a
-LoRa-delivered firmware install, confirmation or rollback. Do not use these
-controls to manage a deployed network.
+**LoRa OTA is not production-ready.** Bench unit41 completed a supervised
+LoRa-delivered installation and healthy confirmation through an unchanged
+stock1.17.1 companion. Reader-free operation, autonomous failed-trial rollback,
+physical routed delivery and fleet fairness remain unqualified. Do not use
+these controls to manage a deployed network.
 
-Bench unit41 now runs a qualified receiver application and reports
-`INSTALL_CAPABLE` with confirmed floor0. Its old local upload cache was
-explicitly aborted; its identity, settings, five complete contacts including
-administrator permissions, and all40 channels survived ordinary reboot.
+Bench unit41 runs `ota-41-confirm02` and reports qualified `INSTALL_CAPABLE`
+with confirmed counter1 and the expected image hash. Its identity, settings,
+five complete contacts including administrator permissions, and all40
+channels survived installation. Both radios use the authorized2dBm.
 Unit77 still enumerates in a defective modified USB bootloader and requires
 external repair; no blind bootloader retry, unlock or erase is authorized.
 See the [hardware lab guide](hardware_lab.md) and
@@ -22,9 +23,11 @@ See the [hardware lab guide](hardware_lab.md) and
 
 The additional stock1.17.1 companion is a separate signing/radio endpoint,
 not a receiver or locally staged uploader. It has not been flashed.
-Actual stock-signed RF authorization on41 has been observed, but receiver
-duplicate suppression blocks repeated census requests. No OTA image
-installation, confirmation or automatic rollback is qualified yet.
+The one-hop duplicate-suppression correction is installed on41; repeated
+census, full-image reception, separate signed COMMIT and actual healthy
+confirmation have been observed. That campaign required a continuously
+drained receiver USB observer. Corrected nonblocking diagnostics and500kHz
+negotiation firmware is now being delivered by a second LoRa campaign.
 
 ## Update policy
 
@@ -330,19 +333,26 @@ signed RF data. Other receivers still need matching corrected builds; clearing
 packet caches, inventing a successful receipt or resetting the device is not
 a qualification workaround.
 
-This correction covers one-hop retries only. Relays still suppress identical
-forwarded requests until packet-hash eviction. Reliable routed/fleet repair
-therefore needs a protocol-level per-attempt discriminator that preserves
-signed inner authority and same-attempt forwarding deduplication, followed by
-real multihop loss/repair qualification. Do not infer routed readiness from
-the direct-mode source or hardware checks.
+The native USB uploader now has an explicit `upload --routed-retry` opt-in
+for directed/background campaigns with matching upgraded receivers. It adds
+a per-attempt discriminator without changing signed inner authority or native
+same-attempt forwarding deduplication. Budget, busy and queue refusals retain
+the same attempt; only accepted send/queue admission advances it. This option
+cannot be combined with direct mode or `--lab-fast`; the stock zero-hop adapter
+refuses it before hardware access. The retry flag is RAM-only: after a sender
+restart, a separate COMMIT remains unwrapped unless a new routed/background
+retry START has enabled the mode. See the
+[wire contract](lora_ota_development.md#opt-in-routed-retry-attempts).
+Actual target builds and software loss/repair cases passed; real multihop
+loss/repair qualification is still required. Do not infer routed readiness
+from the direct-mode hardware result.
 
 Receiver USB diagnostics must not be required to make RF progress. The current
 bench receiver can stall when its unsolicited OTA event output is not drained;
 continuous USB observation restored signed-lease census and block reception.
 That observer is instrumentation, not a production remedy. Reader-free
-operation, full-image installation and automatic rollback remain separate
-acceptance gates.
+operation and automatic rollback remain separate acceptance gates despite
+the completed USB-observed full-image installation.
 
 ## Control surface
 

@@ -73,6 +73,15 @@ int Mesh::searchChannelsByHash(const uint8_t* hash, GroupChannel channels[], int
 }
 
 DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
+#if MESHCORE_LORA_OTA
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA && pkt->payload_len &&
+      ota::isOtaRetryAttempt(pkt->payload[0])) {
+    uint32_t attempt; const uint8_t* inner; size_t inner_len;
+    if (!ota::parseOtaRetryAttempt(pkt->payload, pkt->payload_len, attempt, inner, inner_len) ||
+        !ota::otaRfPathFits(pkt->payload_len, pkt->path_len, pkt->hasTransportCodes()))
+      return ACTION_RELEASE;
+  }
+#endif
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     if (pkt->path_len < MAX_PATH_SIZE) {
       uint8_t i = 0;
@@ -154,7 +163,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       return routeRecvPacket(pkt);
     }
     // Retry only first-hop delivery; relayed copies and echoes stay suppressed.
-    if (pkt->getPathHashCount() == 0) onOtaDataRecv(pkt);
+    if (pkt->getPathHashCount() == 0 &&
+        (pkt->payload_len == 0 || !ota::isOtaRetryAttempt(pkt->payload[0]))) onOtaDataRecv(pkt);
     return ACTION_RELEASE;
   }
   return onRecvOrdinaryPacket(pkt);

@@ -1179,6 +1179,23 @@ used for this admission. Installation,500kHz and reader-free operation
 remain separate milestones. The progressing transfer will not be paused
 for restart qualification; that test is deferred to the next campaign.
 
+**Routed retry software milestone:** the opt-in per-attempt wrapper preserves
+the signed inner authority and native same-attempt deduplication. Attempts
+advance only after send/queue acceptance, not during budget or queue refusal;
+exhaustion stops the uploader explicitly. All14 owned paths are integrated
+byte-exact. The final focused gate passed27 cases, reusing the prior672 native
+and548 host cases rather than rerunning them.
+Actual XIAO nRF and Solar companion/repeater, XIAO nRF non-OTA and Wio
+companion/repeater compile/link cells passed. The Wio repeater's initially
+missing declared library was restored through PlatformIO without changing
+source, dependency declarations, SDKs or toolchains. Actual nRF ROLE0 RAM
+is174276 (+16 versus04); Wio ROLE1 RAM is56764, with no matching baseline
+delta claimed. Analyzed ARM roots, including IRQ104, bound3348/3456 for
+XIAO ROLE0/ROLE1 and3332/3464 for Solar ROLE0/ROLE1, all within4096.
+These are static analyzed OTA-root and compile results, not runtime stack
+certification, installed routed firmware or physical multihop qualification.
+The current confirm04 RF image and prior frozen04 artifacts are unchanged.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
