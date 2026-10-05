@@ -24,9 +24,10 @@ For supervised lab/development transfers only, the stock PC sender has an
 explicit `--lab-fast` upload option: negotiated 500 kHz/SF5/CR5 with bounded
 bursts. Both ends must support and sign the matching profile; there is no
 silent fallback. It still returns periodically to the original mesh channel
-and requires separate READY and COMMIT. Partial500kHz reader-free reception
-has been observed on the approved bench pair; complete500kHz qualification
-remains open. This is not permission to increase TX power or legal airtime.
+and requires separate READY and COMMIT. Complete500kHz reader-free reception
+to READY has been observed on the approved bench pair; installation, rollback
+and continuous radio reliability remain separate gates. This is not permission
+to increase TX power or legal airtime.
 
 ## Current availability: not ready for production use
 
@@ -39,8 +40,9 @@ an unchanged stock1.17.1 companion: autonomous reboot, actual new firmware,
 healthy confirmation, confirmed image hash/counter and full settings,
 identity, contact ACL and channel preservation. Both radios used2dBm and
 ordinary signed peer traffic worked afterward. That run required a USB
-observer to drain old-firmware diagnostics; unattended operation,
-500kHz hardware performance and failed-trial rollback remain unqualified.
+observer to drain old-firmware diagnostics. A later500kHz campaign completed
+reader-free delivery to READY; unattended installation and failed-trial rollback
+remain unqualified.
 
 The current software implements signed transfer in all three modes, durable
 staging, explicit per-device commit and recoverable installation. It reuses
@@ -49,14 +51,20 @@ Software tests cover repeated updates, failed-trial recovery and refusal of
 competing candidates. These results are not physical acceptance.
 
 Hardware qualification remains incomplete despite that supervised install.
-The latest installed `ota-41-confirm04` includes corrected nonblocking
+The last independently confirmed `ota-41-confirm04` includes corrected nonblocking
 diagnostics and 500 kHz negotiation. Its independently confirmed image
 hash/counter and complete pre-peer userdata preservation are established;
-partial500kHz reception without a receiver USB reader is now established.
+complete500kHz reception without a receiver USB reader is now established.
 A partial campaign also survived one ordinary application restart: the complete
 bitmap, update session, administrator admission and all userdata were preserved,
 and the same reader-free transfer resumed without restarting the campaign.
-Complete reader-free delivery and autonomous failed-trial rollback remain open.
+The resumed transfer reached all6599 blocks READY in81.7 minutes, starting from
+883 persisted blocks; this is not a complete-from-empty transfer-time benchmark.
+A separate signed COMMIT was sent after a fresh complete READY census. Its
+immediate USB witness timed out before observing a trial or return, so neither
+installation nor autonomous failed-trial rollback is proved by that attempt.
+The last independently confirmed baseline remains `ota-41-confirm04`; current
+post-COMMIT state needs separate read-only diagnosis.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.
@@ -90,7 +98,7 @@ or `start ota` over USB/BLE — until this changes.
 
 | Board | LoRa OTA status |
 | --- | --- |
-| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 completed a supervised healthy LoRa installation; unattended operation/rollback remain unqualified; unit77 needs bootloader repair |
+| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 completed healthy LoRa installations and reader-free500kHz delivery to READY; unattended installation/rollback remain unqualified; unit77 needs bootloader repair |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
 | Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
 | Heltec v3/v4 | OTA receivers not qualified; unchanged Heltec v3 USB companion qualified as a signing/radio transport only |

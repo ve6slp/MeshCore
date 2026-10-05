@@ -8,12 +8,14 @@ separate OTA authority, signing-key registry or remote commissioning service.
 
 **LoRa OTA is not production-ready.** Bench unit41 completed a supervised
 LoRa-delivered installation and healthy confirmation through an unchanged
-stock1.17.1 companion. Reader-free operation, autonomous failed-trial rollback,
+stock1.17.1 companion and complete reader-free500kHz delivery to READY.
+Unattended installation, autonomous failed-trial rollback,
 physical routed delivery and fleet fairness remain unqualified. Do not use
 these controls to manage a deployed network.
 
-Bench unit41 runs `ota-41-confirm04` and reports qualified `INSTALL_CAPABLE`
-with confirmed counter2 and the expected image hash. Its identity, settings,
+The last independently confirmed unit41 baseline is `ota-41-confirm04`,
+with qualified `INSTALL_CAPABLE`, confirmed counter2 and the expected image
+hash. Its identity, settings,
 five complete contacts including administrator permissions, and all40
 channels survived installation. Both radios use the authorized2dBm.
 Unit77 still enumerates in a defective modified USB bootloader and requires
@@ -29,14 +31,20 @@ confirmation have been observed. Both completed campaigns required a
 continuously drained observer for the old receiver's USB diagnostics.
 The second campaign installed corrected nonblocking diagnostics and500kHz
 negotiation. A subsequent campaign obtained a target-signed500kHz profile
-ACK and genuine partial Receiving progress with no receiver USB reader.
+ACK and genuine Receiving progress with no receiver USB reader.
 Receiving restart/resume subsequently passed its physical boundary: one ordinary
 application restart preserved all52 bitmap windows (883/6599 blocks), the same
 generation13/counter3/manifest, full confirmed floor, baseline version and
 functional signed owner admission. Complete userdata matched, and MissingOnly
 reader-free reception resumed on the same campaign without REUPLOAD.
-Complete reader-free delivery and autonomous failed-trial rollback still
-require their separate hardware boundaries. Recovered driver-fault increases
+The resumed reader-free transfer subsequently reached6599/6599 READY at
+generation13/counter3 with a complete52-window normal-channel census.
+Its4900.233-second duration starts from883 persisted blocks, not an empty
+candidate. A separate signed COMMIT followed another fresh52-window READY
+sweep. Stock restoration passed, but the immediate native USB witness timed
+out before observing any trial or return; COMMIT TX is not installation or
+rollback proof. Post-COMMIT state requires read-only diagnosis, not another
+COMMIT or a reset to manufacture evidence. Recovered driver-fault increases
 are explicitly reported as degradation, not continuous fault-free radio
 qualification; their cause and operational impact remain unresolved.
 
@@ -296,8 +304,12 @@ The native USB uploader's `scripts/ota_uploader.py upload --mode direct
 --lab-fast` selects the same signed profile, without changing its native
 pump or airtime share. Its receiver must also support this extension.
 Software simulations show reduced elapsed time and fewer census/USB
-operations; actual 500 kHz throughput, driver-applied measurements, mesh
-return reliability and legal RF operation remain separate physical gates.
+operations. The approved stock-to41 resumed run reached complete500kHz READY
+in4900.233 seconds, including repair, signing, lease returns and final normal
+census; it began with883/6599 blocks already persisted. This is a measured
+resumed-transfer result, not a complete-from-empty benchmark or proof of a
+speedup over250kHz. Continuous radio reliability, unattended installation,
+ordinary mesh fairness and legal RF operation remain separate physical gates.
 
 For an already explicitly aborted candidate, the operator may additionally
 approve `allow_reupload:true` and pass `--reupload` to **upload only**.
@@ -362,11 +374,11 @@ Receiver USB diagnostics must not be required to make RF progress. The old
 bench firmware stalled when its unsolicited OTA event output was not drained;
 continuous USB observation restored signed-lease census and block reception.
 That observer was instrumentation, not a production remedy. Corrected
-nonblocking diagnostics are now installed and actual partial500kHz RF
-reception has progressed without a receiver USB reader. Complete reader-free
-delivery and automatic rollback remain separate acceptance gates despite
+nonblocking diagnostics are now installed and actual complete500kHz RF
+reception to READY has passed without a receiver USB reader. Automatic rollback
+and unattended installation remain separate acceptance gates despite
 the completed USB-observed full-image installations. Partial Receiving restart
-durability and subsequent same-campaign reader-free progress are now established.
+durability and subsequent same-campaign reader-free completion are established.
 That proof requires healthy sampled driver-applied profiles and preserves the
 full bitmap/session/floor, but does not certify continuous zero-fault radio
 health: each complete census capture observed53 recovered lifetime faults.

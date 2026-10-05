@@ -1235,8 +1235,42 @@ private receipts; positive growth is explicit degradation and
 `continuous_fault_free_radio_verified=false`. No fault cause is inferred.
 Counter decreases within either capture are refused; only the observed reboot
 permits a reset between captures. Unsigned RF census freshness is not
-authenticated. Full reader-free delivery, autonomous failed-trial rollback and
-independent qualification of radio fault origin/recovery impact remain open.
+authenticated. At this restart boundary, full reader-free delivery,
+autonomous failed-trial rollback and independent qualification of radio fault
+origin/recovery impact were still open.
+
+**Complete500kHz reader-free READY and separate COMMIT:** the same immutable
+counter3/generation13 rollback04 campaign completed without a receiver USB
+reader, replacement counter, REUPLOAD or journal clearing. It started this
+resumed segment at883 persisted blocks. RF first reported Ready5 at4268.692
+seconds; the final complete52-window normal-channel sweep reported all6599
+blocks, including the71-bit tail, and completed READY at4900.233 seconds
+(81.7 minutes). The approved500kHz/908525kHz profile was activated52 times.
+Sender logs contain6957 block transmission events covering5716 distinct
+indices:5716 first attempts and1241 second attempts. These are sender-side
+repair counts, not per-block durable-write or RF-delivery proof; complete
+receiver-reported READY supplies the progress evidence. Timing includes
+signing, repairs, lease returns and normal census, but excludes earlier
+transfer segments and restart qualification. It does not prove complete-from-
+empty throughput or a speedup over250kHz.
+
+The sender exited successfully, stock restoration passed, and both authorized
+UARTs were released. A separate signed COMMIT then followed a fresh complete
+52-window normal READY sweep, again with stock restoration. The native witness
+started0.307 seconds after the production COMMIT invocation returned, but its
+initial USB readback timed out. Its receipt is explicitly **incomplete**:
+no trial, post-trial USB disconnect/reconnect, healthy returned baseline or
+userdata/normal-peer preservation was observed. Aggregate COMMIT TX is not
+installation or rollback proof; neither the failure reason nor the lack of
+samples proves a radio fault or a failed boot. No second COMMIT, host reset,
+reflash or reboot was used to manufacture a result. The last independently
+confirmed baseline remains confirm04/floorsequence3/counter2/hash417a...;
+post-COMMIT state needs separate read-only diagnosis.
+
+Full reader-free reception is now qualified for this bench campaign.
+Autonomous failed-trial rollback, unattended installation and continuous
+fault-free radio operation remain unqualified. The original restart evidence's
+recovered fault growth remains degradation, not a resolved fault cause.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
