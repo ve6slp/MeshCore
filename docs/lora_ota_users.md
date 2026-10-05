@@ -35,14 +35,15 @@ LoRa OTA is under active development and is **not** a supported way to update
 your node's firmware today. Treat everything below as a preview of an
 in-progress feature, not a how-to.
 
-The supervised nRF unit41 has completed two full signed LoRa updates through
-an unchanged stock1.17.1 companion: autonomous reboot, actual new firmware,
-healthy confirmation, confirmed image hash/counter and full settings,
-identity, contact ACL and channel preservation. Both radios used2dBm and
-ordinary signed peer traffic worked afterward. That run required a USB
-observer to drain old-firmware diagnostics. A later500kHz campaign completed
-reader-free delivery to READY; unattended installation and failed-trial rollback
-remain unqualified.
+The supervised nRF unit41 has completed three full signed LoRa updates through
+an unchanged stock1.17.1 companion. The first two established actual new firmware,
+healthy confirmation, confirmed image hash/counter, protocol-visible userdata
+preservation and ordinary signed peer traffic afterward at2dBm. They required
+a USB observer to drain old-firmware diagnostics. The third installed a healthy
+diagnostic image after complete reader-free500kHz reception. Its prearmed
+observer failed during installation, but a separate late read-only capture
+confirmed the new running image, confirmed floor and Installed state. Continuous
+installation observation and autonomous failed-trial rollback remain unqualified.
 
 The current software implements signed transfer in all three modes, durable
 staging, explicit per-device commit and recoverable installation. It reuses
@@ -50,8 +51,8 @@ MeshCore administrator identities rather than a separate OTA signing system.
 Software tests cover repeated updates, failed-trial recovery and refusal of
 competing candidates. These results are not physical acceptance.
 
-Hardware qualification remains incomplete despite that supervised install.
-The last independently confirmed `ota-41-confirm04` includes corrected nonblocking
+Hardware qualification remains incomplete despite those supervised installs.
+The previous baseline `ota-41-confirm04` includes corrected nonblocking
 diagnostics and 500 kHz negotiation. Its independently confirmed image
 hash/counter and complete pre-peer userdata preservation are established;
 complete500kHz reception without a receiver USB reader is now established.
@@ -63,19 +64,30 @@ The resumed transfer reached all6599 blocks READY in81.7 minutes, starting from
 A separate signed COMMIT was sent after a fresh complete READY census. Its
 immediate USB witness timed out before observing a trial or return, so neither
 installation nor autonomous failed-trial rollback is proved by that attempt.
-The last independently confirmed baseline remains `ota-41-confirm04`; current
-post-COMMIT read-only diagnosis subsequently found that baseline running again,
+After that failed-candidate attempt, a separate
+post-COMMIT read-only diagnosis found `ota-41-confirm04` running again,
 the original confirmed floor unchanged, the candidate marked failed, and a
 healthy sampled normal radio profile. This late snapshot does not recover the
 missing trial history or qualify autonomous rollback.
 The subsequent healthy diagnostic image also reached complete reader-free
-READY, with6618 blocks and measured generation14. Its separately prearmed
+READY, with6618 blocks and measured generation14. Its first separately prearmed
 installation attempt was unsuccessful: the stock process exited with an error
 and restored its radio, while the observer continued to see `ota-41-confirm04`,
 the unchanged confirmed floor and the new candidate READY. The wrapper did not
 retain the sender's error output, so the exact failure and whether a COMMIT was
-transmitted are unknown. No retry or host reset was used to manufacture an
-installation result.
+transmitted are unknown. No retry or host reset was used in that attempt.
+
+One subsequently admitted signed COMMIT retry preserved the same candidate,
+counter4 and generation14. The stock process completed a fresh52-window READY
+census, reported aggregate transmission evidence and restored its radio.
+The observer failed shortly after the actual COMMIT interval was sealed.
+A separate late read-only capture found `ota-41-diag-conf05` confirmed and
+Installed, with sequence4/counter4, the exact555876-byte image hash and healthy
+sampled normal907525kHz/BW250000/SF7/CR5/TX2 operation. No additional COMMIT,
+host reset or reflash was needed. This establishes the installation, not the
+missing trial/reset history; the failed observer receipt remains failed.
+Diagnostic post-install userdata and ordinary-peer comparisons remain separate
+gates, as does continuous radio reliability.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.
@@ -109,7 +121,7 @@ or `start ota` over USB/BLE — until this changes.
 
 | Board | LoRa OTA status |
 | --- | --- |
-| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 completed healthy LoRa installations and reader-free500kHz delivery to READY; unattended installation/rollback remain unqualified; unit77 needs bootloader repair |
+| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 completed three healthy LoRa installations, including diagnostic firmware after reader-free500kHz reception; uninterrupted installation observation/rollback remain unqualified; unit77 needs bootloader repair |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
 | Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
 | Heltec v3/v4 | OTA receivers not qualified; unchanged Heltec v3 USB companion qualified as a signing/radio transport only |

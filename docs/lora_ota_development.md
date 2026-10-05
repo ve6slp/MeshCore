@@ -1062,8 +1062,8 @@ administrator must issue an explicit per-device commit for the fully
 validated, ready image. A trusted administrator can abort before commit;
 after committed installation begins, the bootloader completes or rolls back.
 
-**nRF boot-trial and confirmation acceptance criteria — physical
-qualification pending.** The contract for deciding whether a staged
+**nRF boot-trial and confirmation acceptance criteria — healthy XIAO direct
+installation observed; interrupted-trial qualification pending.** The contract for deciding whether a staged
 install becomes "Installed/Confirmed" is:
 health is only considered continuously good after 10 uninterrupted
 seconds following an actual readiness/image check (not a stub); any gap
@@ -1079,8 +1079,15 @@ controlled reboot. The bootloader then persists and verifies the floor
 before the CONFIRMED state, recovering that transaction idempotently after
 interruption. Only once the floor, the state record, and the
 running image hash all subsequently match is an attempt considered
-Installed/Confirmed. None of this sequence has been exercised on
-hardware yet — these are acceptance criteria, not a physical result.
+Installed/Confirmed. Unit41 has now completed three healthy signed direct RF
+installations, including the diagnostic image after reader-free500kHz reception.
+Its current image-bound confirmation is floorsequence4/counter4/extent555876,
+hash7a583..., running `ota-41-diag-conf05` and native Installed8. These are
+physical results, not inferred from a package or a source test. The latest
+prearmed observer failed and a separate late read-only capture established
+confirmation; the missing trial/reset history is not recovered by that capture.
+Independent observation of the full internal transition sequence and autonomous
+failed-trial rollback remain acceptance gates.
 ESP32 uses vendor slot states, an independent RTC watchdog and late
 confirmation rather than the Nordic register and copy/restore sequence.
 
@@ -1089,7 +1096,8 @@ release notes:
 - Full three-mode signed firmware transfer and install on real hardware.
   Historical signed staging and the full stock-only RF harness passed, but
   neither transfers and installs a bootable firmware through all three
-  autonomous modes. No actual device install has passed.
+  autonomous modes. Healthy direct RF installs have passed on XIAO unit41;
+  actual routed/background installation, Solar and ESP32 acceptance remain open.
 - Routed (directed, mesh-relayed) image delivery to an out-of-reach target
   has not been attempted yet; only direct-mode application-layer traffic and
   fleet-mode state probes have been run over real RF so far.
@@ -1097,7 +1105,8 @@ release notes:
   campaign remains unverified. The historical two-board pressure run does
   pass both the quota and ordinary-service witness, but it does not model
   fleet contention, autonomous byte repair or a 24-72-hour campaign.
-- Turning a staged image into a running update is not proven end to end,
+- Turning a staged image into a running update across all required platforms
+  and modes is not proven end to end,
   but the pieces are at different stages, not all "not started":
   - The bootloader's boot marker (at flash offset `0xFDC00`) and a
     distinct SenseCAP flash profile **are implemented and covered by
@@ -1106,28 +1115,29 @@ release notes:
     profiles, in their own board/role-specific output directories. All
     board/role artifacts must pass complete flash-load and marker checks;
     earlier package footprints do not describe a new build. Actual installed
-    bytes and first-boot floor readback remain hardware gates, not deductions
-    from package validation.
+    bytes and first-boot floor readback remain board-specific hardware gates,
+    not deductions from package validation. The supervised unit41 profile has
+    actual installation/floor evidence; Solar does not.
   - The candidate and backup regions each hold at most 708,608 bytes,
     preserving the extra-filesystem range `0xD4000`–`0xED000`.
     The 811,008-byte staging stride includes receiver metadata; it is
     not image capacity. A fresh, live read of `BANK_VALID`, the app
     flag, size and CRC16 is required before destructive installation.
     A stale floor value or a guessed extent is not sufficient.
-  - The application-to-bootloader hand-off, and commissioning/installing
-    that bootloader on physical hardware, are **not qualified**. The target's
-    activation attempt did not return usable USB and does not establish its
-    installed state. Native tests exercise all three transfer modes, but no
-    mode has completed a firmware installation on physical hardware with the
-    replacement.
+  - The application-to-bootloader hand-off and supervised commissioning have
+    physical installation evidence on unit41. Unit77's defective modified
+    recovery loader remains a separate repair issue, not evidence that unit41
+    cannot install. Native tests exercise all three transfer modes; routed and
+    background installations and the other required boards remain unqualified.
   Do not describe the marker or SenseCAP profile as "not implemented" —
   they exist and are tested; the gap is specifically the hand-off and
-  physical hardware qualification.
+  remaining board/mode qualification and observed failed-trial recovery.
 - Anti-rollback has durable implementations: Nordic uses confirmed A/B
   floor records, and ESP32 stores its confirmed numeric floor in NVS.
-  Neither has been qualified through a real install/confirmation cycle.
-  The working client has current application/local-cache evidence; the target
-  remains unavailable. Neither supplies a physical install/floor proof.
+  Unit41 has advanced its confirmed Nordic floor through real healthy
+  installation/confirmation cycles, most recently sequence4/counter4 with an
+  exact verified running-image hash. Interrupted floor transactions, autonomous
+  failed-trial recovery and the ESP32 confirmation cycle remain unqualified.
 - Fleet-state probes and raw QSPI read/write results are evidence of
   protocol and flash-driver correctness — they are **not** evidence of a
   completed firmware installation. Do not conflate the two when reporting

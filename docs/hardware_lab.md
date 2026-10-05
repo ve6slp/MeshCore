@@ -1291,7 +1291,7 @@ its authority remain unchanged; future observation must tolerate explicit
 bounded transient read gaps without promoting missing evidence.
 
 Full reader-free reception is now qualified for this bench campaign.
-Autonomous failed-trial rollback, unattended installation and continuous
+Autonomous failed-trial rollback, uninterrupted installation observation and continuous
 fault-free radio operation remain unqualified. The original restart evidence's
 recovered fault growth remains degradation, not a resolved fault cause.
 
@@ -1328,6 +1328,44 @@ unperformed because their successful-install admission requirement was not met.
 The preparation snapshot covers only protocol-visible userdata; it does not
 establish complete persistent storage or private-key preservation.
 
+**Healthy diagnostic installation independently confirmed (2026-10-05):**
+ROOT admitted one separately observed signed COMMIT retry of the unchanged
+counter4/generation14 candidate. This preserved its native transaction,
+owner and manifest; it did not AUTH, reupload, replace the candidate or reset
+the receiver. The production sender completed all52 fresh READY census
+windows under the unchanged2% normal-channel policy. Its owned process
+exited0 after610.392 seconds, with request, aggregate transmission and result
+events retained, independently verified stock-radio restoration and a genuine
+COMMIT interval seal.
+
+The prearmed observer nevertheless exited2 after613.810 seconds, well before
+its fixed2010-second deadline. Its generic contract-refusal receipt does not
+identify the exact exception. The last retained sample before the seal still
+showed confirm04, floorsequence3/counter2 and all6618 blocks READY. There were
+no recorded trial, disconnect or read-gap events. Recovered radio faults grew
+837 to886 during observation; their cause remains unknown.
+
+ONE separate late read-only capture then found exact41 running
+`ota-41-diag-conf05`, with qualified state1/phase6/decision0, writes allowed,
+confirmed/installed lifecycle, verified running hash and confirmed
+floorsequence4/counter4/extent555876/hash7a583... . The independent current-state
+receipt SHA256 is
+`b428ce66d848256785320fc7e37896569c17a4878e4e71a02f426b564ac1acd9`.
+Native ABI2 reported
+Installed8 for the exact manifest/generation14/all6618 blocks, with age0 and
+retry0. Core error flags were0, uptime132 seconds and normal
+907525kHz/BW250000/SF7/CR5/TX2 operation was healthy. The new application
+reported radio fault count0 in this late sample; that does not erase the
+previous application's fault growth or prove continuous fault-free operation.
+
+This is the third independently established healthy signed RF installation on41.
+No additional COMMIT, host reset or reflash was performed. The original
+observer receipt remains failed: the late image-bound confirmation proves
+current installation, not an uninterrupted trial/reset history or autonomous
+rollback. Diagnostic selector collection, protocol-visible userdata comparison
+and ordinary-peer recovery require separately admitted post-install readbacks;
+full private-key/storage preservation remains outside the exposed snapshot.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;
@@ -1343,7 +1381,9 @@ delta claimed. Analyzed ARM roots, including IRQ104, bound3348/3456 for
 XIAO ROLE0/ROLE1 and3332/3464 for Solar ROLE0/ROLE1, all within4096.
 These are static analyzed OTA-root and compile results, not runtime stack
 certification, installed routed firmware or physical multihop qualification.
-The current confirm04 RF image and prior frozen04 artifacts are unchanged.
+Those routed changes were not included in the confirm04 RF image or prior
+frozen04 artifacts. The installed diagnostic image uses the separately qualified
+passive-diagnostics patch, not the routed-retry changes.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
