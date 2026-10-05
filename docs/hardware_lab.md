@@ -1185,10 +1185,30 @@ normal-profile/TX2 guards before and after. Stock reported a native contact
 event;41 did not, so native acceptance is not claimed for both directions.
 The transfer used legacy250 because the previous confirm02 could not
 negotiate500. Its old-firmware USB observer exited on the autonomous serial
-disconnect and is released. Both radios remain2dBm. Installed corrected
-diagnostics do not themselves prove reader-free reception: actual500kHz,
-partial Receiving restart/resume and autonomous failed-trial rollback are
-the next separate hardware campaign.
+disconnect and is released. Both radios remain2dBm. The full post-peer
+snapshot was also classified: only the existing stock contact's bytes132,
+144 and145 changed, within its advertisement timestamp and lastmod. The
+stored advertisement timestamp1715770360 matches the verified RF summary;
+allACLs, other contact bytes, order, settings, identity and channels remain
+unchanged. This does not add native acceptance or emission-freshness proof.
+
+**First actual500kHz reader-free progress:** ROOT assigned counter3 against
+the independently measured floor2 for exact frozen rollback04 ROLE0 BIN
+`6d81f857a882f7be844a3bbae4d6b7de8608d78a4c0d580c5cf463b7691316a7`
+(554308 bytes,6599 blocks), canonical59 SHA256
+`694fb604b083d527245b6aded840ab64bdc7e4136521e39012f8a8a2999f4966`.
+The unchanged stock companion received the target-signed500kHz/SF5/CR5
+profile ACK at908525kHz. Actual RF census reported partial Receiving at
+generation13,195/6599 blocks at144.372 seconds, without any receiver USB
+reader. This is receiver-reported progress, not a claim based on sender TX
+counts. ROOT gracefully paused the sender for the Receiving restart
+boundary; the stock restoration receipt passed and both ports released.
+Subsequent read-only diagnostics showed actual driver-applied normal
+907525kHz/BW250000/SF7/CR5, no active lease, healthy driver and no profile
+apply failures. Complete500kHz READY/installation, measured full-image
+throughput, partial Receiving restart/resume and autonomous failed-trial
+rollback remain separate physical acceptance gates. No REUPLOAD or
+journal clearing was used.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

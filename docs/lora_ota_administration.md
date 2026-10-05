@@ -28,7 +28,10 @@ census, full-image reception, separate signed COMMIT and actual healthy
 confirmation have been observed. Both completed campaigns required a
 continuously drained observer for the old receiver's USB diagnostics.
 The second campaign installed corrected nonblocking diagnostics and500kHz
-negotiation. Reader-free operation still requires its own hardware proof.
+negotiation. A subsequent campaign obtained a target-signed500kHz profile
+ACK and genuine partial Receiving progress with no receiver USB reader.
+Complete reader-free delivery, Receiving restart/resume and autonomous
+failed-trial rollback still require their separate hardware boundaries.
 
 ## Update policy
 
@@ -352,9 +355,10 @@ Receiver USB diagnostics must not be required to make RF progress. The old
 bench firmware stalled when its unsolicited OTA event output was not drained;
 continuous USB observation restored signed-lease census and block reception.
 That observer was instrumentation, not a production remedy. Corrected
-nonblocking diagnostics are now installed, but reader-free
-operation and automatic rollback remain separate acceptance gates despite
-the completed USB-observed full-image installation.
+nonblocking diagnostics are now installed and actual partial500kHz RF
+reception has progressed without a receiver USB reader. Complete reader-free
+delivery and automatic rollback remain separate acceptance gates despite
+the completed USB-observed full-image installations.
 
 ## Control surface
 

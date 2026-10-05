@@ -24,8 +24,9 @@ For supervised lab/development transfers only, the stock PC sender has an
 explicit `--lab-fast` upload option: negotiated 500 kHz/SF5/CR5 with bounded
 bursts. Both ends must support and sign the matching profile; there is no
 silent fallback. It still returns periodically to the original mesh channel
-and requires separate READY and COMMIT. This is software-tested, not physical
-500 kHz qualification or permission to increase TX power or legal airtime.
+and requires separate READY and COMMIT. Partial500kHz reader-free reception
+has been observed on the approved bench pair; complete500kHz qualification
+remains open. This is not permission to increase TX power or legal airtime.
 
 ## Current availability: not ready for production use
 
@@ -51,7 +52,9 @@ Hardware qualification remains incomplete despite that supervised install.
 The latest installed `ota-41-confirm04` includes corrected nonblocking
 diagnostics and 500 kHz negotiation. Its independently confirmed image
 hash/counter and complete pre-peer userdata preservation are established;
-reader-free operation and actual 500 kHz transfer are not. Unit77 enumerates in its defective modified
+partial500kHz reception without a receiver USB reader is now established,
+but a complete reader-free transfer, restart/resume and rollback are not.
+Unit77 enumerates in its defective modified
 USB bootloader and still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.
 The 2% airtime policy and ordinary mesh service must still be verified together
