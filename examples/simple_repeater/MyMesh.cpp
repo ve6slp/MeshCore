@@ -1084,7 +1084,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // is fail-closed Unavailable) -- this was previously missing entirely.
   getOtaIntegration().setLeanAdminCheck(this, &MyMesh::otaAdminCheckThunk);
   if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
-  getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
+  getOtaIntegration().attachRfProfileIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
   getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
 #if defined(NRF52840_XXAA)
@@ -1401,16 +1401,16 @@ void MyMesh::otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t
   static_cast<MyMesh*>(ctx)->self_id.sign(signature, message, static_cast<int>(len));
 }
 
-bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore) {
+bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore) {
   auto* mesh = static_cast<MyMesh*>(ctx);
   if (!mesh->_radio_available_) return false;
 #if MESHCORE_OTA_USB_MEASUREMENTS
   return mesh->applyMeasuredRadioParams(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
-                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5, !restore);
 #else
   return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
-                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
 #endif
 }

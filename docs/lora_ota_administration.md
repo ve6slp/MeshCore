@@ -256,6 +256,35 @@ All normal-channel transmissions are conservatively paced by
 not subject to that on-mesh share. Regulatory limits still apply. This is
 not qualification of mesh-wide2% fairness or routed/fleet OTA.
 
+### Explicit lab-fast upload
+
+Add **only** `--lab-fast` to the stock sender's `upload` arguments for a
+supervised development transfer. The default remains legacy 250 kHz/SF5/CR5
+and four-block bursts. Lab-fast requires a new, target-signed profile ACK
+before either host radio settings are changed: 500 kHz/SF5/wire CR5 and
+at most sixteen freshly signed blocks between census polls. An old receiver
+times out/refuses; the sender never assumes support or silently falls back.
+The approved example is fast 908525 kHz; normal service remains on the
+ROOT-bound, measured 907525 kHz/250 kHz/SF7/CR5 profile, not a guessed default.
+
+No live lease renewal is attempted. Every bounded lease returns to normal
+service before a fresh signed negotiation; normal pacing remains 2% by
+default. Stock TX power, regulatory allowances, identities, image/owner/
+board/role/counter/generation checks and separate COMMIT are unchanged.
+Fresh census bitmaps, not aggregate TX counts, select bounded repair retries.
+Stock USB signing and TX statistics still limit throughput. USB command
+reads/writes and signing/TX deadlines are bounded; a failed physical-TX
+confirmation must fail closed and retain `original-radio.json` for explicit
+restoration, rather than retuning an unconfirmed active transmission.
+SIGKILL/power loss still requires the documented manual restoration.
+
+The native USB uploader's `scripts/ota_uploader.py upload --mode direct
+--lab-fast` selects the same signed profile, without changing its native
+pump or airtime share. Its receiver must also support this extension.
+Software simulations show reduced elapsed time and fewer census/USB
+operations; actual 500 kHz throughput, driver-applied measurements, mesh
+return reliability and legal RF operation remain separate physical gates.
+
 For an already explicitly aborted candidate, the operator may additionally
 approve `allow_reupload:true` and pass `--reupload` to **upload only**.
 The sender learns the pending generation from a fresh matching RF census,

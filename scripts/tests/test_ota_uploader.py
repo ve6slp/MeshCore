@@ -110,6 +110,16 @@ class ReplyTests(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
+    def test_lab_fast_is_direct_only_appends_explicit_profile_without_changing_legacy_body(self):
+        legacy = struct.pack(">BBIHI", 0, 255, 908525, 60000, 2000)
+        self.assertEqual(ota.start_body("direct", 255, 908525, 60000, 2000), legacy)
+        self.assertEqual(ota.start_body("direct", 255, 908525, 60000, 2000, lab_fast=True), legacy + b"\x02")
+        for mode, channel in (("directed", 255), ("background", 2)):
+            with self.assertRaisesRegex(ValueError, "direct mode"):
+                ota.start_body(mode, channel, 0, 0, 2000, lab_fast=True)
+        with self.assertRaises(ValueError):
+            ota.start_body("direct", 255, 908525, 60000, 2000, lab_fast=1)
+
     def test_manifest_exact_size_and_image_digest_are_checked(self):
         image = b"image" * 20
         canonical = manifest(image)
@@ -334,6 +344,24 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual([call.args[:3] for call in self.uploader.exchange.call_args_list],
                          [(ota.Op.ADD_TARGET, TARGET, TARGET), (ota.Op.ADD_TARGET, OTHER_TARGET, OTHER_TARGET),
                           (ota.Op.START, body)])
+
+    def test_lab_fast_profile_is_forwarded_end_to_end_in_extended_start(self):
+        body = ota.start_body("direct", 255, 908525, 60000, 2000, lab_fast=True)
+        self.uploader.start([TARGET], body, "direct", time.monotonic() + 10)
+        self.assertEqual([call.args[:3] for call in self.uploader.exchange.call_args_list],
+                         [(ota.Op.ADD_TARGET, TARGET, TARGET), (ota.Op.START, body)])
+        self.assertEqual(len(body), 13)
+        self.assertEqual(body[-1], 2)
+
+    def test_unknown_extended_start_selector_length_or_non_direct_fails_before_selection(self):
+        legacy = ota.start_body("direct", 255, 908525, 60000, 2000)
+        for body, mode in ((legacy + b"\x00", "direct"), (legacy + b"\x03", "direct"),
+                           (legacy + b"\xff", "direct"), (legacy + b"\x02\x00", "direct"),
+                           (ota.start_body("directed", 255, 0, 0, 2000) + b"\x02", "directed"),
+                           (ota.start_body("background", 0, 0, 0, 2000) + b"\x02", "background")):
+            with self.subTest(body=body, mode=mode), self.assertRaises(ValueError):
+                self.uploader.start([TARGET], body, mode, time.monotonic() + 10)
+        self.uploader.exchange.assert_not_called()
 
     def test_invalid_selection_fails_before_any_add_target(self):
         for targets, mode in (([], "background"), ([TARGET, TARGET], "background"),

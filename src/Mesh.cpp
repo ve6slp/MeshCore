@@ -32,7 +32,8 @@ __attribute__((noinline)) void Mesh::pumpOtaControl() {
     if (_ota.canTransmit(_ms->getMillis(), category, airtime, true, hasQueuedNormalTraffic())) {
       auto* packet = createOtaData(frame, len);
       if (packet) {
-        if (_ota.directActive() || frame[0] == ota::kOtaDirectAckKind) {
+        if (_ota.directActive() || frame[0] == ota::kOtaDirectAckKind ||
+            frame[0] == ota::kOtaDirectProfileAckKind) {
           sendZeroHop(packet);
           _ota.releaseOutboundControlFrame();
         } else if (sendFlood(packet)) {

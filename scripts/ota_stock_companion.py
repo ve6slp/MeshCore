@@ -95,6 +95,7 @@ MAX_FRAME = 176
 BLOCK = 84
 MIN_LEASE = 30000
 DIRECT_DOMAIN = b"MeshCore/OTA/direct/v1"
+DIRECT_PROFILE_DOMAIN = b"MeshCore/OTA/direct-profile/v2"
 COMMIT_DOMAIN = b"MeshCore/OTA/commit/v1"
 REUPLOAD_DOMAIN = b"MeshCore/OTA/reupload/v1"
 DENIED_SERIALS = {"49C5BAF21EEF44A1", "4186AE911D94CDB1", "77CD44653A967172"}
@@ -302,8 +303,8 @@ def raw_rx(frame):
 def rf_metadata(frame, payload, target, manifest):
     header = frame[3] if len(frame) >= 5 else None
     kind = payload[0] if payload else None
-    target_offset = {11: 1, 13: 33}.get(kind)
-    hash_offset = {11: 33, 13: 65}.get(kind)
+    target_offset = {11: 1, 13: 33, 16: 33}.get(kind)
+    hash_offset = {11: 33, 13: 65, 16: 65}.get(kind)
     return {"usb_length": len(frame), "packet_length": max(0, len(frame) - 3),
             "route": header & 3 if header is not None else None,
             "version": header >> 6 if header is not None else None,
@@ -369,12 +370,15 @@ class Frames:
     def command(self, payload, expected=(0, 1), timeout=3):
         if not 1 <= len(payload) <= MAX_FRAME:
             raise Error("invalid USB command length")
+        deadline = self.clock() + timeout
         self.poll(0)
         self.pending = [(t, f) for t, f in self.pending if f[0] not in expected]
         wire = b"<" + struct.pack("<H", len(payload)) + payload
+        self.stream.write_timeout = max(0, deadline - self.clock())
+        if self.stream.write_timeout <= 0:
+            raise NoUsbResponse("USB write deadline")
         if self.stream.write(wire) != len(wire):
             raise Error("short USB write")
-        deadline = self.clock() + timeout
         while self.clock() < deadline:
             for i, (_, frame) in enumerate(self.pending):
                 if frame[0] in expected:
@@ -469,12 +473,12 @@ class Stock:
         self.tx_power, self.name, self.version, self.identified = power, name, version.decode("ascii"), True
         return profile
 
-    def radio(self, profile):
+    def radio(self, profile, deadline=None):
         validate_profile(profile)
         if self.pending_tx is not None:
-            deadline = self.clock() + 8
-            while self.clock() < deadline:
-                queue, sent, direct, _ = self.stats(deadline)
+            drain_deadline = min(deadline, self.clock() + 8) if deadline is not None else self.clock() + 8
+            while self.clock() < drain_deadline:
+                queue, sent, direct, _ = self.stats(drain_deadline)
                 ds = (sent - self.pending_tx[0]) & 0xFFFFFFFF
                 dd = (direct - self.pending_tx[1]) & 0xFFFFFFFF
                 if ds > 1 or dd > 1:
@@ -485,8 +489,8 @@ class Stock:
                 self.sleep(0.25)
             if self.pending_tx is not None:
                 raise Error("cannot restore/change radio: outstanding physical TX unconfirmed")
-        self.ok(b"\x0b" + struct.pack("<II", *profile[:2]) + bytes(profile[2:]))
-        if self.identify() != tuple(profile):
+        self.ok(b"\x0b" + struct.pack("<II", *profile[:2]) + bytes(profile[2:]), deadline)
+        if self.identify(deadline) != tuple(profile):
             raise Error("stock radio/repeat readback mismatch")
 
     def sign(self, message, deadline):
@@ -501,14 +505,20 @@ class Stock:
         verify(self.key, message, response[1:])
         return response[1:]
 
-    def stats(self, deadline):
+    def stats(self, deadline, include_airtime=True):
         core = self.command(b"\x38\x00", (24, 1), deadline)
         packets = self.command(b"\x38\x02", (24, 1), deadline)
-        radio = self.command(b"\x38\x01", (24, 1), deadline)
         if (len(core) != 11 or core[:2] != b"\x18\x00" or len(packets) != 30
-                or packets[:2] != b"\x18\x02" or len(radio) != 14 or radio[:2] != b"\x18\x01"):
+                or packets[:2] != b"\x18\x02"):
             raise Error("required stock queue/physical TX/radio statistics unavailable")
-        return core[10], struct.unpack_from("<I", packets, 6)[0], struct.unpack_from("<I", packets, 14)[0], struct.unpack_from("<I", radio, 6)[0]
+        air = self.tx_airtime(deadline) if include_airtime else 0
+        return core[10], struct.unpack_from("<I", packets, 6)[0], struct.unpack_from("<I", packets, 14)[0], air
+
+    def tx_airtime(self, deadline):
+        radio = self.command(b"\x38\x01", (24, 1), deadline)
+        if len(radio) != 14 or radio[:2] != b"\x18\x01":
+            raise Error("required stock radio statistics unavailable")
+        return struct.unpack_from("<I", radio, 6)[0]
 
 
 def airtime(raw_length, profile):
@@ -524,17 +534,22 @@ def airtime(raw_length, profile):
 class Sender:
     def __init__(self, stock, binding, candidate, profile, deadline, frequency, lease_ms=60000,
                  duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False,
-                 event_callback=None):
+                 event_callback=None, lab_fast=False):
         if not MIN_LEASE <= lease_ms <= 60000 or not 150000 <= frequency <= 2500000 or frequency == binding.normal[0]:
             raise Error("off-normal frequency and host lease 30000..60000ms required")
         if not math.isfinite(duty) or not 0 < duty <= 1:
             raise Error("normal-channel duty must be in (0,1]")
+        if type(lab_fast) is not bool:
+            raise Error("lab-fast must be an explicit boolean")
         binding.approve(candidate)
         binding.permit_reupload(reupload_generation, reupload)
         self.stock, self.binding, self.candidate = stock, binding, candidate
         self.original, self.normal = tuple(profile), (*binding.normal, 0)
         self.profile, self.deadline = self.normal, deadline
         self.frequency, self.lease_ms, self.duty = frequency, lease_ms, duty
+        self.lab_fast = lab_fast
+        self.direct_bandwidth = 500000 if lab_fast else 250000
+        self.burst_blocks = 16 if lab_fast else 4
         self.clock, self.sleep = clock, sleep
         self.next_normal = clock()
         self.lease_end = 0
@@ -590,19 +605,22 @@ class Sender:
         # CMD65 OK only admits to a queue. Require physical sent + direct TX
         # completion, not merely a drained queue; unexpected activity fails closed.
         while self.clock() < deadline:
-            after = self.stock.stats(deadline)
+            after = self.stock.stats(deadline, include_airtime=False) if self.lab_fast else self.stock.stats(deadline)
             sent = (after[1] - before[1]) & 0xFFFFFFFF
             direct = (after[2] - before[2]) & 0xFFFFFFFF
             if sent > 1 or direct > 1:
                 raise Error("concurrent/unattributable stock radio traffic")
             if not after[0] and sent == direct == 1:
                 self.stock.pending_tx = None
+                actual_air = self.stock.tx_airtime(deadline) if self.lab_fast else after[3]
                 spent = max(estimate, self.clock() - started,
-                            (after[3] - before[3]) & 0xFFFFFFFF)
+                            (actual_air - before[3]) & 0xFFFFFFFF)
                 if normal:
                     self.next_normal = self.clock() + spent * (1 / self.duty - 1)
                 else:
-                    self.sleep(max(0.05, spent))
+                    guard = 0.05 if self.lab_fast else max(0.05, spent)
+                    self.room(guard)
+                    self.sleep(guard)
                 return started
             self.sleep(max(0.05, min(0.25, estimate / 2)))
         raise Error("no measured physical stock TX completion")
@@ -696,13 +714,17 @@ class Sender:
         self.leave_direct()
         c, b = self.candidate, self.binding
         self.room(30)
-        prefix = (b"\x0c" + b.sender + b.target + c.digest
-                  + struct.pack(">IHI", self.frequency, self.lease_ms, secrets.randbits(32)))
-        request = prefix + self.stock.sign(DIRECT_DOMAIN + prefix, self.deadline)
+        kind, ack_kind = (b"\x0f", b"\x10") if self.lab_fast else (b"\x0c", b"\x0d")
+        domain = DIRECT_PROFILE_DOMAIN if self.lab_fast else DIRECT_DOMAIN
+        frequency_word = (2 << 24) | self.frequency if self.lab_fast else self.frequency
+        prefix = (kind + b.sender + b.target + c.digest
+                  + struct.pack(">IHI", frequency_word, self.lease_ms, secrets.randbits(32)))
+        request = prefix + self.stock.sign(domain + prefix, self.deadline)
         observer = self.rf_observer("lease")
         for attempt in range(1, 4):
             self.stock.frames.discard_rf(observer, b.target, c.digest)
-            self.emit("lease_request", attempt=attempt, frequency_khz=self.frequency, lease_ms=self.lease_ms)
+            self.emit("lease_request", attempt=attempt, frequency_khz=self.frequency, lease_ms=self.lease_ms,
+                      bandwidth_hz=self.direct_bandwidth)
             since = self.send(request)
             self.emit("lease_sent", attempt=attempt, tx_evidence="aggregate-counters")
             # A lost ACK may still switch the receiver. Never invent a switch
@@ -710,24 +732,27 @@ class Sender:
             self.target_normal_after = self.clock() + 20 + self.lease_ms / 1000 + 2
             try:
                 timestamp, ack = self.stock.frames.receive(
-                    lambda p: p[:1] == b"\x0d", since, min(self.deadline, self.clock() + 22),
+                    lambda p: p[:1] in (b"\x0d", b"\x10"), since, min(self.deadline, self.clock() + 22),
                     observer, b.target, c.digest)
             except TimeoutError:
                 self.emit("lease_timeout", attempt=attempt)
                 self.wait_until(max(self.target_normal_after, self.next_normal))
                 prefix = prefix[:103] + struct.pack(">I", secrets.randbits(32))
-                request = prefix + self.stock.sign(DIRECT_DOMAIN + prefix, self.deadline)
+                request = prefix + self.stock.sign(domain + prefix, self.deadline)
                 continue
-            if len(ack) != 171 or ack[1:107] != request[1:107]:
+            if len(ack) != 171 or ack[:1] != ack_kind or ack[1:107] != request[1:107]:
                 raise Error("direct ACK target/owner/manifest/profile/token mismatch")
-            verify(b.target, DIRECT_DOMAIN + ack[:107], ack[107:])
+            verify(b.target, domain + ack[:107], ack[107:])
             self.emit("lease_ack_verified", attempt=attempt)
             self.target_normal_after = timestamp + 20 + self.lease_ms / 1000 + 2
             self.wait_until(timestamp + 5.5)
-            self.stock.radio((self.frequency, 250000, 5, 5, 0))
-            self.profile = (self.frequency, 250000, 5, 5, 0)
             self.lease_end = timestamp + 5 + self.lease_ms / 1000 - 2
-            self.emit("lease_active", frequency_khz=self.frequency, lease_ms=self.lease_ms)
+            self.room(9)
+            self.stock.radio((self.frequency, self.direct_bandwidth, 5, 5, 0),
+                             deadline=min(self.deadline, self.lease_end))
+            self.profile = (self.frequency, self.direct_bandwidth, 5, 5, 0)
+            self.emit("lease_active", frequency_khz=self.frequency, lease_ms=self.lease_ms,
+                      bandwidth_hz=self.direct_bandwidth)
             return
         raise Error("signed normal-channel direct ACK retries exhausted")
 
@@ -790,7 +815,7 @@ class Sender:
                     ready_windows.discard(first)
                 missing = [i for i in range(first, min(first + 128, self.candidate.total))
                            if not report["bits"] & (1 << (i - first))]
-                for index in missing[:4]:
+                for index in missing[:self.burst_blocks]:
                     self.room(22)
                     self.attempts[index] = self.attempts.get(index, 0) + 1
                     if self.attempts[index] > 8:
@@ -1015,9 +1040,12 @@ def main(argv=None):
     retirement.add_argument("--reupload-generation", type=int, help="legacy upload-only strict expectation; signing still uses fresh RF-observed generation")
     parser.add_argument("--frequency-khz", type=int)
     parser.add_argument("--lease-ms", type=int, default=60000)
+    parser.add_argument("--lab-fast", action="store_true", help="upload-only: signed 500kHz/SF5/CR5 profile, bounded 16-block bursts; normal duty unchanged")
     parser.add_argument("--normal-duty-percent", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
+    if args.lab_fast and args.operation != "upload":
+        raise Error("--lab-fast is an upload-only lab opt-in")
     binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)
     if (args.reupload or args.reupload_generation is not None) and args.operation != "upload":
         raise Error("explicit REUPLOAD is supported only by upload, never COMMIT/restore")
@@ -1067,7 +1095,7 @@ def main(argv=None):
                     sender = Sender(stock, binding, candidate, profile, time.monotonic() + args.timeout,
                                     args.frequency_khz, args.lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,
-                                    event_callback=public_event)
+                                    event_callback=public_event, lab_fast=args.lab_fast)
                     result = sender.upload() if args.operation == "upload" else sender.commit(receipt)
             if result is not None:
                 private_write(directory / "result.json", result)

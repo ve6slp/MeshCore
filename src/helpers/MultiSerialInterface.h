@@ -177,6 +177,16 @@ public:
     return allSuccessful ? len : 0; 
   }
 
+  size_t tryWriteFrame(const uint8_t src[], size_t len) override {
+    if (!_enabled || !src || !len) return 0;
+    bool anyWritten = false;
+    for (auto iface : _interfaces) {
+      if (iface.instance && iface.instance->isEnabled() &&
+          iface.instance->tryWriteFrame(src, len) == len) anyWritten = true;
+    }
+    return anyWritten ? len : 0;
+  }
+
   size_t checkRecvFrame(uint8_t dest[]) override {
     // don't read when disabled
     if(!_enabled){

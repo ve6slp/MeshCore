@@ -68,6 +68,7 @@ public:
   bool isConnected() const override;
   bool isWriteBusy() const override;
   size_t writeFrame(const uint8_t src[], size_t len) override;
+  size_t tryWriteFrame(const uint8_t src[], size_t len) override { return writeFrame(src, len); }
   size_t checkRecvFrame(uint8_t dest[]) override;
 };
 

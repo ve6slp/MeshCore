@@ -10,6 +10,7 @@
 #include <Dispatcher.h>
 #include <Mesh.cpp>
 #include <helpers/SimpleMeshTables.h>
+#include <helpers/MultiSerialInterface.h>
 #include <helpers/StaticPoolPacketManager.h>
 #include <helpers/StaticPoolPacketManager.cpp>
 #include <helpers/ota/OtaDirectLease.h>
@@ -87,6 +88,424 @@ public:
     return FakeRadio::startSendRaw(data, len);
   }
 };
+
+class DiagnosticUsbStream : public Stream {
+public:
+  bool connected = true, disconnect_on_capacity = false, disconnect_on_write = false;
+  bool disconnect_after_partial = false, allow_reliable_wait = false;
+  int room = 64;
+  size_t max_chunk = SIZE_MAX;
+  unsigned writes = 0, would_block = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<size_t> requested_sizes;
+  int dtr() const { return connected ? 1 : 0; }
+  int availableForWrite() override {
+    const int available = room;
+    if (disconnect_on_capacity) connected = false;
+    return available;
+  }
+  size_t write(const uint8_t* src, size_t len) override {
+    ++writes;
+    requested_sizes.push_back(len);
+    if (!connected || disconnect_on_write) {
+      connected = false;
+      bytes.clear();
+      return 0;
+    }
+    if (len > static_cast<size_t>(room)) {
+      ++would_block;
+      if (!allow_reliable_wait) return 0;
+    }
+    const size_t written = std::min(len, max_chunk);
+    bytes.insert(bytes.end(), src, src + written);
+    room = written > static_cast<size_t>(room) ? 0 : room - written;
+    if (disconnect_after_partial) {
+      connected = false;
+      bytes.clear();
+    }
+    return written;
+  }
+};
+
+class DiagnosticUartStream : public DiagnosticUsbStream {
+public:
+  bool tx_busy = false;
+  int availableForWrite() override { return tx_busy ? 0 : 64; }
+  size_t write(const uint8_t* src, size_t len) override {
+    room = availableForWrite();
+    const size_t written = DiagnosticUsbStream::write(src, len);
+    if (written) tx_busy = true;
+    return written;
+  }
+  void completeTransmit() { tx_busy = false; }
+};
+
+DiagnosticUsbStream Serial;
+#define NRF52_PLATFORM
+#define USE_TINYUSB
+#include <helpers/ArduinoSerialInterface.cpp>
+#undef USE_TINYUSB
+#undef NRF52_PLATFORM
+
+#include <helpers/ethernet/SerialEthernetInterface.cpp>
+
+// Native has no board Ethernet implementation; the test transport supplies connectivity.
+bool SerialEthernetInterface::isConnected() const { return false; }
+
+namespace {
+class DiagnosticEthernetInterface : public SerialEthernetInterface {
+public:
+  bool connected = false;
+  unsigned transport_writes = 0;
+  std::vector<uint8_t> bytes;
+  bool isConnected() const override { return connected; }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  size_t write(const uint8_t* src, size_t len) override {
+    ++transport_writes;
+    bytes.insert(bytes.end(), src, src + len);
+    return len;
+  }
+};
+
+class UnsupportedDiagnosticInterface : public BaseSerialInterface {
+public:
+  bool enabled = false;
+  unsigned reliable_writes = 0;
+  void enable() override { enabled = true; }
+  void disable() override { enabled = false; }
+  bool isEnabled() const override { return enabled; }
+  bool isConnected() const override { return true; }
+  bool isWriteBusy() const override { return false; }
+  size_t writeFrame(const uint8_t*, size_t len) override { ++reliable_writes; return len; }
+  size_t checkRecvFrame(uint8_t*) override { return 0; }
+};
+
+std::vector<uint8_t> diagnosticWireFrame(const std::vector<uint8_t>& payload) {
+  std::vector<uint8_t> frame{'>' , static_cast<uint8_t>(payload.size()), static_cast<uint8_t>(payload.size() >> 8)};
+  frame.insert(frame.end(), payload.begin(), payload.end());
+  return frame;
+}
+}  // namespace
+
+TEST(LoraOtaSerialBackpressure, UnreadUsbDropsWholeDiagnosticsWithoutAnyWriteOrGlobalBusyChange) {
+  Serial = DiagnosticUsbStream();
+  Serial.room = 0;
+  ArduinoSerialInterface usb;
+  usb.begin(Serial); usb.enable();
+  const std::vector<uint8_t> event(14, 0x91);
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+    usb.loop();
+  }
+  EXPECT_TRUE(usb.isConnected());
+  EXPECT_FALSE(usb.isWriteBusy());
+  EXPECT_EQ(0u, Serial.writes);
+  EXPECT_EQ(0u, Serial.would_block);
+  EXPECT_TRUE(Serial.bytes.empty());
+}
+
+TEST(LoraOtaSerialBackpressure, HeaderAndPayloadRequireExactTinyUsbCapacity) {
+  const std::vector<uint8_t> event(14, 0x91);
+  for (const int capacity : {-1, 0, 14, 16, 17, 64}) {
+    Serial = DiagnosticUsbStream();
+    Serial.room = capacity;
+    ArduinoSerialInterface serial;
+    serial.begin(Serial); serial.enable();
+    EXPECT_FALSE(serial.isWriteBusy());
+    EXPECT_EQ(capacity >= 17 ? event.size() : 0u, serial.tryWriteFrame(event.data(), event.size()));
+    EXPECT_EQ(capacity >= 17 ? 1u : 0u, Serial.writes);
+    EXPECT_EQ(0u, Serial.would_block);
+    if (capacity >= 17) EXPECT_EQ(diagnosticWireFrame(event), Serial.bytes);
+    else EXPECT_TRUE(Serial.bytes.empty());
+  }
+}
+
+TEST(LoraOtaSerialBackpressure, Full176ByteUartRawFrameDrainsIn64ByteChunksWithoutPrematureCompletion) {
+  DiagnosticUartStream uart;
+  ArduinoSerialInterface serial;
+  serial.begin(uart); serial.enable();
+  std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88);
+  const auto expected = diagnosticWireFrame(raw);
+  EXPECT_EQ(0u, serial.tryWriteFrame(raw.data(), raw.size()));
+  ASSERT_EQ(64u, uart.bytes.size());
+  std::fill(raw.begin(), raw.end(), 0xFF);
+  const uint8_t event[14] = {0x91};
+  for (int i = 0; i < 50; ++i) {
+    serial.loop();
+    EXPECT_EQ(0u, serial.tryWriteFrame(event, sizeof(event)));
+  }
+  EXPECT_EQ(1u, uart.writes);
+  uart.completeTransmit();
+  serial.loop();
+  EXPECT_EQ(128u, uart.bytes.size());
+  serial.loop();
+  EXPECT_EQ(2u, uart.writes);
+  uart.completeTransmit();
+  serial.loop();
+  EXPECT_EQ(expected, uart.bytes);
+  EXPECT_EQ((std::vector<size_t>{64, 64, 51}), uart.requested_sizes);
+  EXPECT_EQ(0u, uart.would_block);
+  uart.completeTransmit();
+  EXPECT_EQ(sizeof(event), serial.tryWriteFrame(event, sizeof(event)));
+  auto all_expected = expected;
+  const auto event_frame = diagnosticWireFrame(std::vector<uint8_t>(event, event + sizeof(event)));
+  all_expected.insert(all_expected.end(), event_frame.begin(), event_frame.end());
+  EXPECT_EQ(all_expected, uart.bytes);
+}
+
+TEST(LoraOtaSerialBackpressure, BusyUartRetainsOwnedFrameUntilBoundedLoopCanProgress) {
+  DiagnosticUartStream uart;
+  uart.tx_busy = true;
+  ArduinoSerialInterface serial;
+  serial.begin(uart); serial.enable();
+  const std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88);
+  EXPECT_EQ(0u, serial.tryWriteFrame(raw.data(), raw.size()));
+  for (int i = 0; i < 50; ++i) serial.loop();
+  EXPECT_EQ(0u, uart.writes);
+  EXPECT_EQ(0u, uart.would_block);
+  for (int i = 0; i < 3; ++i) {
+    uart.completeTransmit();
+    serial.loop();
+  }
+  EXPECT_EQ(diagnosticWireFrame(raw), uart.bytes);
+  EXPECT_EQ((std::vector<size_t>{64, 64, 51}), uart.requested_sizes);
+  EXPECT_EQ(0u, uart.would_block);
+}
+
+TEST(LoraOtaSerialBackpressure, UartZeroAndShortWritesRetainFrameAndReliableResponsePreservesBoundaries) {
+  const std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88), response{5, 1, 2};
+  for (const size_t first_chunk : {0u, 4u}) {
+    DiagnosticUartStream uart;
+    uart.max_chunk = first_chunk;
+    ArduinoSerialInterface serial;
+    serial.begin(uart); serial.enable();
+    EXPECT_EQ(0u, serial.tryWriteFrame(raw.data(), raw.size()));
+    EXPECT_EQ(first_chunk, uart.bytes.size());
+    EXPECT_EQ((std::vector<size_t>{64}), uart.requested_sizes);
+    EXPECT_EQ(0u, uart.would_block);
+    uart.max_chunk = SIZE_MAX;
+    uart.allow_reliable_wait = true;
+    EXPECT_EQ(response.size(), serial.writeFrame(response.data(), response.size()));
+    auto expected = diagnosticWireFrame(raw);
+    const auto reply = diagnosticWireFrame(response);
+    expected.insert(expected.end(), reply.begin(), reply.end());
+    EXPECT_EQ(expected, uart.bytes);
+  }
+}
+
+TEST(LoraOtaSerialBackpressure, TinyUsbDoesNotChunk176ByteRawFrameIntoUnread64ByteFifo) {
+  Serial = DiagnosticUsbStream();
+  ArduinoSerialInterface usb;
+  usb.begin(Serial); usb.enable();
+  const std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88);
+  EXPECT_EQ(0u, usb.tryWriteFrame(raw.data(), raw.size()));
+  for (int i = 0; i < 50; ++i) usb.loop();
+  EXPECT_EQ(0u, Serial.writes);
+  EXPECT_TRUE(Serial.bytes.empty());
+  Serial.room = MAX_FRAME_SIZE + 3;
+  EXPECT_EQ(raw.size(), usb.tryWriteFrame(raw.data(), raw.size()));
+  EXPECT_EQ((std::vector<size_t>{179}), Serial.requested_sizes);
+  EXPECT_EQ(diagnosticWireFrame(raw), Serial.bytes);
+  EXPECT_EQ(0u, Serial.would_block);
+}
+
+TEST(LoraOtaSerialBackpressure, DisconnectedAndDisconnectAfterPreflightDoNotWriteOrRetainOldSessionTail) {
+  const std::vector<uint8_t> event(14, 0x91), response{5, 1, 2};
+  for (uint8_t where = 0; where < 4; ++where) {
+    Serial = DiagnosticUsbStream();
+    if (where == 0) Serial.connected = false;
+    if (where == 1) Serial.disconnect_on_capacity = true;
+    if (where == 2) Serial.disconnect_on_write = true;
+    if (where == 3) { Serial.max_chunk = 4; Serial.disconnect_after_partial = true; }
+    ArduinoSerialInterface usb;
+    usb.begin(Serial); usb.enable();
+    EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+    EXPECT_TRUE(Serial.bytes.empty());
+    EXPECT_EQ(0u, Serial.would_block);
+    Serial = DiagnosticUsbStream();
+    EXPECT_EQ(response.size(), usb.writeFrame(response.data(), response.size()));
+    EXPECT_EQ(diagnosticWireFrame(response), Serial.bytes);
+  }
+}
+
+TEST(LoraOtaSerialBackpressure, ShortWriteTailProgressIsBoundedAndPreservesFrameBeforeReliableResponse) {
+  const std::vector<uint8_t> event(14, 0x91), response{5, 1, 2};
+  for (const bool reliable_next : {false, true}) {
+    Serial = DiagnosticUsbStream();
+    Serial.max_chunk = 2;
+    ArduinoSerialInterface usb;
+    usb.begin(Serial); usb.enable();
+    EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+    ASSERT_EQ(2u, Serial.bytes.size());
+    Serial.room = 0;
+    const auto calls = Serial.writes;
+    usb.loop();
+    EXPECT_EQ(calls, Serial.writes);
+    EXPECT_EQ(0u, usb.tryWriteFrame(response.data(), response.size()));
+    EXPECT_EQ(calls, Serial.writes);
+    Serial.room = 64; Serial.max_chunk = SIZE_MAX;
+    if (!reliable_next) {
+      usb.loop();
+      EXPECT_EQ(calls + 1u, Serial.writes);
+      EXPECT_EQ(diagnosticWireFrame(event), Serial.bytes);
+    }
+    EXPECT_EQ(response.size(), usb.writeFrame(response.data(), response.size()));
+    auto expected = diagnosticWireFrame(event);
+    const auto reply = diagnosticWireFrame(response);
+    expected.insert(expected.end(), reply.begin(), reply.end());
+    EXPECT_EQ(expected, Serial.bytes);
+    EXPECT_EQ(0u, Serial.would_block);
+  }
+}
+
+TEST(LoraOtaSerialBackpressure, NormalResponsesStillWriteBeyondImmediateCapacityAndUnsupportedDiagnosticsDoNotFallback) {
+  Serial = DiagnosticUsbStream();
+  Serial.allow_reliable_wait = true;
+  ArduinoSerialInterface usb;
+  usb.begin(Serial);
+  const std::vector<uint8_t> response(100, 0x36);
+  EXPECT_EQ(response.size(), usb.writeFrame(response.data(), response.size()));
+  EXPECT_EQ(diagnosticWireFrame(response), Serial.bytes);
+  EXPECT_EQ(1u, Serial.would_block);
+  UnsupportedDiagnosticInterface other;
+  const uint8_t event[14] = {0x91};
+  EXPECT_EQ(0u, other.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(0u, other.reliable_writes);
+  EXPECT_EQ(sizeof(event), other.writeFrame(event, sizeof(event)));
+  EXPECT_EQ(1u, other.reliable_writes);
+}
+
+TEST(LoraOtaSerialBackpressure, InvalidDisabledAndZeroWriteDiagnosticsNeverEmitOrClaimSuccess) {
+  Serial = DiagnosticUsbStream();
+  ArduinoSerialInterface usb;
+  const std::vector<uint8_t> event(14, 0x91), oversized(MAX_FRAME_SIZE + 1, 0x91);
+  EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+  usb.begin(Serial);
+  EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+  usb.enable();
+  EXPECT_EQ(0u, usb.tryWriteFrame(nullptr, event.size()));
+  EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), 0));
+  EXPECT_EQ(0u, usb.tryWriteFrame(oversized.data(), oversized.size()));
+  EXPECT_EQ(0u, Serial.writes);
+  Serial.max_chunk = 0;
+  EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+  EXPECT_TRUE(Serial.bytes.empty());
+  Serial.max_chunk = SIZE_MAX;
+  const std::vector<uint8_t> response{5, 1, 2};
+  EXPECT_EQ(response.size(), usb.writeFrame(response.data(), response.size()));
+  EXPECT_EQ(diagnosticWireFrame(response), Serial.bytes);
+}
+
+TEST(LoraOtaSerialBackpressure, InterruptedPendingTailNeverPrependsGarbageAfterDisconnectOrReliableZeroWrite) {
+  const std::vector<uint8_t> event(14, 0x91), response{5, 1, 2};
+  for (const bool disconnected : {false, true}) {
+    Serial = DiagnosticUsbStream();
+    Serial.max_chunk = 2;
+    ArduinoSerialInterface usb;
+    usb.begin(Serial); usb.enable();
+    EXPECT_EQ(0u, usb.tryWriteFrame(event.data(), event.size()));
+    ASSERT_EQ(2u, Serial.bytes.size());
+    if (disconnected) {
+      Serial.connected = false;
+      Serial.bytes.clear();
+      usb.loop();
+      Serial.connected = true;
+    } else {
+      Serial.max_chunk = 0;
+      EXPECT_EQ(0u, usb.writeFrame(response.data(), response.size()));
+      EXPECT_EQ(2u, Serial.bytes.size());
+    }
+    Serial.max_chunk = SIZE_MAX;
+    EXPECT_EQ(response.size(), usb.writeFrame(response.data(), response.size()));
+    auto expected = disconnected ? std::vector<uint8_t>() : diagnosticWireFrame(event);
+    const auto reply = diagnosticWireFrame(response);
+    expected.insert(expected.end(), reply.begin(), reply.end());
+    EXPECT_EQ(expected, Serial.bytes);
+  }
+}
+
+TEST(LoraOtaSerialBackpressure, ActualMultiSerialFanoutNeverUsesBlockingFallbackAndNormalFanoutIsUnchanged) {
+  Serial = DiagnosticUsbStream();
+  ArduinoSerialInterface usb;
+  usb.begin(Serial);
+  UnsupportedDiagnosticInterface other;
+  MultiSerialInterface manager;
+  ASSERT_TRUE(manager.addInterface(InterfaceType::USB, &usb));
+  ASSERT_TRUE(manager.addInterface(InterfaceType::Bluetooth, &other));
+  const uint8_t event[14] = {0x91}, response[3] = {5, 1, 2};
+  EXPECT_EQ(0u, manager.tryWriteFrame(event, sizeof(event)));
+  manager.enable();
+  Serial.room = 0;
+  EXPECT_EQ(0u, manager.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(0u, Serial.writes);
+  EXPECT_EQ(0u, other.reliable_writes);
+  Serial.room = 64;
+  EXPECT_EQ(sizeof(event), manager.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(0u, other.reliable_writes);
+  EXPECT_EQ(sizeof(response), manager.writeFrame(response, sizeof(response)));
+  EXPECT_EQ(1u, other.reliable_writes);
+  EXPECT_FALSE(manager.isWriteBusy());
+}
+
+TEST(LoraOtaSerialBackpressure, ActualEthernetOptionalApiCopiesIntoBoundedQueueWithoutTransportWrite) {
+  DiagnosticEthernetInterface ethernet;
+  ethernet.enable();
+  BaseSerialInterface& serial = ethernet;
+  std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88);
+  const std::vector<uint8_t> event(14, 0x91), response{5, 1, 2};
+  EXPECT_EQ(0u, serial.tryWriteFrame(raw.data(), raw.size()));
+  ethernet.connected = true;
+  EXPECT_EQ(raw.size(), serial.tryWriteFrame(raw.data(), raw.size()));
+  auto expected = diagnosticWireFrame(raw);
+  std::fill(raw.begin(), raw.end(), 0xFF);
+  EXPECT_EQ(event.size(), serial.tryWriteFrame(event.data(), event.size()));
+  EXPECT_EQ(response.size(), serial.writeFrame(response.data(), response.size()));
+  EXPECT_EQ(event.size(), serial.tryWriteFrame(event.data(), event.size()));
+  EXPECT_EQ(0u, serial.tryWriteFrame(event.data(), event.size()));
+  EXPECT_EQ(0u, ethernet.transport_writes);
+  EXPECT_TRUE(ethernet.bytes.empty());
+  uint8_t received[MAX_FRAME_SIZE];
+  EXPECT_EQ(0u, serial.checkRecvFrame(received));
+  EXPECT_EQ(1u, ethernet.transport_writes);
+  EXPECT_EQ(expected, ethernet.bytes);
+  EXPECT_EQ(response.size(), serial.writeFrame(response.data(), response.size()));
+  for (const auto& payload : {event, response, event, response}) {
+    const auto frame = diagnosticWireFrame(payload);
+    expected.insert(expected.end(), frame.begin(), frame.end());
+    EXPECT_EQ(0u, serial.checkRecvFrame(received));
+    EXPECT_EQ(expected, ethernet.bytes);
+  }
+  EXPECT_EQ(5u, ethernet.transport_writes);
+}
+
+TEST(LoraOtaSerialBackpressure, MultiSerialRetainsQueuedDiagnosticsWhenUsbUnreadAndSkipsDisabledQueue) {
+  Serial = DiagnosticUsbStream();
+  Serial.room = 0;
+  ArduinoSerialInterface usb;
+  usb.begin(Serial);
+  DiagnosticEthernetInterface ethernet;
+  ethernet.connected = true;
+  MultiSerialInterface manager;
+  ASSERT_TRUE(manager.addInterface(InterfaceType::USB, &usb));
+  ASSERT_TRUE(manager.addInterface(InterfaceType::Ethernet, &ethernet));
+  manager.enable();
+  const std::vector<uint8_t> raw(MAX_FRAME_SIZE, 0x88);
+  const uint8_t event[14] = {0x91};
+  EXPECT_EQ(raw.size(), manager.tryWriteFrame(raw.data(), raw.size()));
+  for (int i = 0; i < 3; ++i) EXPECT_EQ(sizeof(event), manager.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(0u, manager.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(0u, Serial.writes);
+  EXPECT_EQ(0u, Serial.would_block);
+  EXPECT_EQ(0u, ethernet.transport_writes);
+  uint8_t received[MAX_FRAME_SIZE];
+  EXPECT_EQ(0u, manager.checkRecvFrame(received));
+  EXPECT_EQ(diagnosticWireFrame(raw), ethernet.bytes);
+  ethernet.disable();
+  EXPECT_EQ(0u, manager.tryWriteFrame(event, sizeof(event)));
+  EXPECT_EQ(1u, ethernet.transport_writes);
+  EXPECT_EQ(0u, Serial.writes);
+}
 
 class PacketBoundaryRng : public RNG {
 public:
@@ -3668,10 +4087,15 @@ public:
   using ProductionPacketMesh::ProductionPacketMesh;
   unsigned ota_deliveries = 0, ack_deliveries = 0, forward_checks = 0;
   bool forwarding = false, filter_flood = false;
+  BaseSerialInterface* diagnostic_serial = nullptr;
 protected:
   void onOtaDataRecv(Packet* packet) override {
     ++ota_deliveries;
     Mesh::onOtaDataRecv(packet);
+    if (diagnostic_serial) {
+      const uint8_t event[14] = {0x91};
+      diagnostic_serial->tryWriteFrame(event, sizeof(event));
+    }
   }
   void onAckRecv(Packet*, uint32_t) override { ++ack_deliveries; }
   bool allowPacketForward(const Packet*) override { ++forward_checks; return forwarding; }
@@ -3737,6 +4161,40 @@ struct OtaMeshRetryFixture {
   }
 };
 }  // namespace
+
+TEST(LoraOtaSerialBackpressure, RealMeshSignedBlocksAndCensusProgressWithUsbUnreadOrDisconnected) {
+  for (const bool connected : {false, true}) {
+    Serial = DiagnosticUsbStream();
+    Serial.connected = connected; Serial.room = 0;
+    ArduinoSerialInterface usb;
+    usb.begin(Serial);
+    MultiSerialInterface interfaces;
+    ASSERT_TRUE(interfaces.addInterface(InterfaceType::USB, &usb));
+    interfaces.enable();
+    OtaMeshRetryFixture f;
+    f.mesh.diagnostic_serial = &interfaces;
+    auto auth = f.authorization();
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&auth));
+    ASSERT_EQ(OtaMeshRetryFixture::Phase::Receiving, f.receiver().status().phase);
+    auto block = f.block(0);
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+    ASSERT_EQ(1u, f.receiver().status().receivedBlocks);
+    ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&block));
+    ASSERT_EQ(1u, f.receiver().status().receivedBlocks);
+    auto query = f.poll();
+    for (int retry = 0; retry < 2; ++retry) {
+      ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&query));
+      mesh::ota::OtaCensusReport report;
+      ASSERT_TRUE(f.takeCensus(report));
+      EXPECT_EQ(1u, report.received);
+      EXPECT_EQ(1u, report.bitmap[0]);
+    }
+    EXPECT_EQ(0u, Serial.writes);
+    EXPECT_EQ(0u, Serial.would_block);
+    EXPECT_EQ(5u, f.integration().status(f.clock.now).rxFrames);
+    EXPECT_EQ(0u, f.integration().status(f.clock.now).badFrames);
+  }
+}
 
 TEST(LoraOtaMeshRetry, PendingCensusRetriesAfterLostReportExposeGenerationWithoutChangingCache) {
   using namespace mesh::ota;
@@ -4640,11 +5098,13 @@ struct RfNode {
   LeanFixture fx;
   ::ota::test::Ed25519TestSigner signer;
   uint32_t frequency = 907525;
+  uint32_t bandwidth = 250000;
+  int fastRetunes = 0;
   int restores = 0, retunes = 0;
   bool failRestore = false;
   explicit RfNode(const uint8_t seed[32]) : signer(seed) {
     fx.integration.setLeanTargetPublicKey(signer.publicKey());
-    fx.integration.attachRfIdentity(this, &RfNode::sign, &RfNode::radio, 907525);
+    fx.integration.attachRfProfileIdentity(this, &RfNode::sign, &RfNode::profileRadio, 907525);
   }
   static void sign(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
     static_cast<RfNode*>(ctx)->signer.sign(message, len, signature);
@@ -4654,6 +5114,13 @@ struct RfNode {
     if (restore && node.failRestore) return false;
     node.frequency = frequency;
     if (restore) ++node.restores; else ++node.retunes;
+    return true;
+  }
+  static bool profileRadio(void* ctx, uint32_t frequency, OtaDirectProfile profile, bool restore) {
+    if (!radio(ctx, frequency, restore)) return false;
+    auto& node = *static_cast<RfNode*>(ctx);
+    node.bandwidth = restore ? 250000 : otaDirectBandwidthHz(profile);
+    if (!restore && profile == OtaDirectProfile::Bw500) ++node.fastRetunes;
     return true;
   }
 };
@@ -4679,7 +5146,8 @@ struct RfProductHarness {
   int multicastBlocks = 0, directedBlocks = 0, zeroHopBlocks = 0, census = 0;
   std::vector<uint16_t> repairs;
 
-  void prepare(size_t size, uint8_t mode, bool reupload = false) {
+  void prepare(size_t size, uint8_t mode, bool reupload = false,
+               OtaDirectProfile profile = OtaDirectProfile::Legacy250) {
     image.resize(size);
     for (size_t i = 0; i < size; ++i) image[i] = static_cast<uint8_t>(i * 17u);
     uint8_t canonical[59], signature[64];
@@ -4697,7 +5165,7 @@ struct RfProductHarness {
     a.fx.admins.add(sender.signer.publicKey()); b.fx.admins.add(sender.signer.publicKey());
     std::memcpy(targets[0], a.signer.publicKey(), 32); std::memcpy(targets[1], b.signer.publicKey(), 32);
     ASSERT_TRUE(uploader.start(sender.fx.integration, mode, &targets[0][0], mode == 2 ? 2 : 1,
-                               mode == 0 ? 908525 : 0, mode == 0 ? 60000 : 0, 100, reupload));
+                               mode == 0 ? 908525 : 0, mode == 0 ? 60000 : 0, 100, reupload, profile));
   }
   static void sign(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
     auto& harness = *static_cast<RfProductHarness*>(ctx);
@@ -4746,7 +5214,7 @@ struct RfProductHarness {
     }
     for (auto* node : {&h.a, &h.b}) {
       if (route != OtaRfRoute::Multicast && std::memcmp(target, node->signer.publicKey(), 32)) continue;
-      if (h.sender.frequency != node->frequency) continue;
+      if (h.sender.frequency != node->frequency || h.sender.bandwidth != node->bandwidth) continue;
       if (h.loseSparseBlocks && frame[0] == kOtaOwnerSignedBlockKind &&
           category == meshcore::ota::protocol::OtaAirtimeCategory::Relay) {
         const auto index = usb::getBE16(frame + 33);
@@ -4766,7 +5234,9 @@ struct RfProductHarness {
       uint8_t frame[kOtaDirectFrameBytes]; size_t len = 0;
       if (!node->fx.integration.peekOutboundControlFrame(frame, sizeof(frame), len, now)) continue;
       node->fx.integration.releaseOutboundControlFrame();
-      if (loseAck && !lostAck && frame[0] == kOtaDirectAckKind) { lostAck = true; continue; }
+      if (loseAck && !lostAck && (frame[0] == kOtaDirectAckKind || frame[0] == kOtaDirectProfileAckKind)) {
+        lostAck = true; continue;
+      }
       if (node->frequency == sender.frequency) sender.fx.integration.handleReceivedFrame(frame, len, now);
     }
   }
@@ -4975,6 +5445,236 @@ TEST(LoraOtaRfProduct, DirectNegotiatesOffFrequencySurvivesLostAckAndMoreThanSix
   EXPECT_EQ(907525u, h.a.frequency);
   EXPECT_GT(h.a.restores, 0);
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, h.a.fx.integration.leanReceiver().status().phase);
+}
+
+TEST(LoraOtaRfProduct, LabFast500NegotiatesBothProfileCallbacksAcrossLostAckLeasesAndPreservesReady) {
+  RfProductHarness h;
+  h.loseAck = true;
+  h.prepare(84 * 130 + 7, usb::kStartModeDirect, false, OtaDirectProfile::Bw500);
+  for (int i = 0; i < 1500 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.lostAck);
+  ASSERT_TRUE(h.ready(h.a));
+  EXPECT_GE(h.a.fastRetunes, 3);
+  EXPECT_GE(h.sender.fastRetunes, 2);
+  EXPECT_EQ(h.sender.retunes, h.sender.fastRetunes);
+  h.expectByteExact(h.a);
+  EXPECT_EQ(0, h.commits);
+  EXPECT_EQ(72000u, h.sender.fx.integration.status(h.now).dutyBudgetMs);
+  h.uploader.stop(h.sender.fx.integration);
+  for (int i = 0; i < 80; ++i) h.step();
+  EXPECT_EQ(907525u, h.sender.frequency); EXPECT_EQ(250000u, h.sender.bandwidth);
+  EXPECT_EQ(907525u, h.a.frequency); EXPECT_EQ(250000u, h.a.bandwidth);
+  EXPECT_FALSE(h.sender.fx.integration.directActive());
+  EXPECT_FALSE(h.a.fx.integration.directActive());
+}
+
+TEST(LoraOtaRfProduct, DirectProfileCodecRejectsReservedSelectorsLengthsBoundsAndKeepsLegacyBytes) {
+  uint8_t owner[32] = {1}, target[32] = {2}, hash[32] = {3}, frame[172] = {};
+  ASSERT_EQ(171u, encodeOtaDirectFrame(kOtaDirectRequestKind, owner, target, hash,
+                                      908525, 60000, 0x12345678, frame, sizeof(frame)));
+  EXPECT_EQ(kOtaDirectRequestKind, frame[0]);
+  EXPECT_EQ(908525u, usb::getBE32(frame + 97));
+  EXPECT_EQ(60000u, usb::getBE16(frame + 101));
+  EXPECT_EQ(0x12345678u, usb::getBE32(frame + 103));
+  uint8_t message[160]; const auto legacyLen = buildOtaDirectMessage(frame, message);
+  const char legacyDomain[] = "MeshCore/OTA/direct/v1";
+  EXPECT_EQ(sizeof(legacyDomain) - 1 + 107, legacyLen);
+  EXPECT_EQ(0, std::memcmp(message, legacyDomain, sizeof(legacyDomain) - 1));
+  EXPECT_EQ(0, std::memcmp(message + sizeof(legacyDomain) - 1, frame, 107));
+  OtaDirectProfile profile; uint32_t freq = 0;
+  ASSERT_TRUE(parseOtaDirectProfile(frame, 171, profile, freq));
+  EXPECT_EQ(OtaDirectProfile::Legacy250, profile); EXPECT_EQ(908525u, freq);
+  for (const auto p : {OtaDirectProfile::Bw250, OtaDirectProfile::Bw500}) {
+    ASSERT_EQ(171u, encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, p, owner, target,
+                                              hash, 908525, 60000, 0x12345678, frame, sizeof(frame)));
+    EXPECT_EQ(0u, frame[171]);
+    EXPECT_EQ(static_cast<uint8_t>(p), frame[97]);
+    ASSERT_TRUE(parseOtaDirectProfile(frame, 171, profile, freq));
+    EXPECT_EQ(p, profile); EXPECT_EQ(908525u, freq);
+    const char domain[] = "MeshCore/OTA/direct-profile/v2";
+    EXPECT_EQ(sizeof(domain) - 1 + 107, buildOtaDirectMessage(frame, message));
+    EXPECT_EQ(0, std::memcmp(message, domain, sizeof(domain) - 1));
+  }
+  for (size_t len : {size_t(0), size_t(107), size_t(170), size_t(172)})
+    EXPECT_FALSE(parseOtaDirectProfile(frame, len, profile, freq));
+  for (uint8_t selector : {0, 3, 0x80, 0xFF}) {
+    frame[97] = selector;
+    EXPECT_FALSE(parseOtaDirectProfile(frame, 171, profile, freq));
+  }
+  for (uint32_t f : {149999u, 2500001u, 0xFFFFFFu}) {
+    usb::putBE32(frame + 97, (2u << 24) | f);
+    EXPECT_FALSE(parseOtaDirectProfile(frame, 171, profile, freq));
+    EXPECT_EQ(0u, encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, OtaDirectProfile::Bw500,
+                                             owner, target, hash, f, 60000, 1, frame, sizeof(frame)));
+  }
+  for (uint32_t f : {150000u, 2500000u}) {
+    ASSERT_EQ(171u, encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, OtaDirectProfile::Bw500,
+                                              owner, target, hash, f, 250, 1, frame, sizeof(frame)));
+    EXPECT_TRUE(parseOtaDirectProfile(frame, 171, profile, freq));
+  }
+  for (uint16_t lease : {0, 249, 60001}) {
+    usb::putBE16(frame + 101, lease);
+    EXPECT_FALSE(parseOtaDirectProfile(frame, 171, profile, freq));
+  }
+  EXPECT_EQ(0u, encodeOtaDirectProfileFrame(kOtaReuploadKind, OtaDirectProfile::Bw500,
+                                           owner, target, hash, 908525, 60000, 1, frame, sizeof(frame)));
+  EXPECT_EQ(0u, encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, OtaDirectProfile::Legacy250,
+                                           owner, target, hash, 908525, 60000, 1, frame, sizeof(frame)));
+  EXPECT_EQ(0u, encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, OtaDirectProfile::Bw500,
+                                           owner, target, hash, 908525, 60000, 1, frame, 170));
+}
+
+TEST(LoraOtaRfProduct, LabFastAckCannotDowngradeProfileKindDomainOrNonceBeforeBothRadiosSwitch) {
+  RfProductHarness h;
+  h.prepare(168, usb::kStartModeDirected);
+  for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.a));
+  auto& sender = h.sender.fx.integration; auto& receiver = h.a.fx.integration;
+  uint8_t request[171], ack[171], message[160];
+  ASSERT_EQ(171u, sender.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 111,
+                                           request, sizeof(request), OtaDirectProfile::Bw500));
+  ASSERT_TRUE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
+  size_t len = 0;
+  ASSERT_TRUE(receiver.peekOutboundControlFrame(ack, sizeof(ack), len, h.now));
+  ASSERT_EQ(171u, len); EXPECT_EQ(kOtaDirectProfileAckKind, ack[0]);
+  receiver.releaseOutboundControlFrame();
+  for (size_t offset : {size_t(0), size_t(1), size_t(33), size_t(65), size_t(97),
+                        size_t(100), size_t(101), size_t(103)}) {
+    uint8_t changed[171]; std::memcpy(changed, ack, sizeof(ack));
+    if (offset == 0) changed[offset] = kOtaDirectAckKind;
+    else if (offset == 97) changed[offset] = static_cast<uint8_t>(OtaDirectProfile::Bw250);
+    else changed[offset] ^= 1;
+    const auto mlen = buildOtaDirectMessage(changed, message);
+    h.a.signer.sign(message, mlen, changed + 107);
+    EXPECT_FALSE(sender.handleReceivedFrame(changed, sizeof(changed), h.now));
+    EXPECT_FALSE(sender.directPending()); EXPECT_FALSE(sender.directActive());
+  }
+  uint8_t wrongDomain[171]; std::memcpy(wrongDomain, ack, sizeof(ack));
+  const char domain[] = "MeshCore/OTA/direct/v1";
+  std::memcpy(message, domain, sizeof(domain) - 1);
+  std::memcpy(message + sizeof(domain) - 1, ack, 107);
+  h.a.signer.sign(message, sizeof(domain) - 1 + 107, wrongDomain + 107);
+  EXPECT_FALSE(sender.handleReceivedFrame(wrongDomain, sizeof(wrongDomain), h.now));
+  ASSERT_TRUE(sender.handleReceivedFrame(ack, sizeof(ack), h.now));
+  sender.tickDirect(h.now + 5000); receiver.tickDirect(h.now);
+  receiver.tickDirect(h.now + 5000);
+  EXPECT_EQ(500000u, h.sender.bandwidth); EXPECT_EQ(500000u, h.a.bandwidth);
+}
+
+TEST(LoraOtaRfProduct, LabFastAuthorityAndUnsupportedCallbackFailClosedWithoutAdmissionMutation) {
+  RfProductHarness h;
+  h.prepare(168, usb::kStartModeDirected);
+  for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.a));
+  auto& receiver = h.a.fx.integration;
+  const auto before = receiver.leanReceiver().status();
+  uint8_t request[171], message[160];
+  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 112,
+                                                            request, sizeof(request), OtaDirectProfile::Bw500));
+  for (size_t offset : {size_t(1), size_t(33), size_t(65), size_t(97), size_t(98)}) {
+    uint8_t changed[171]; std::memcpy(changed, request, sizeof(request));
+    changed[offset] ^= 1;
+    EXPECT_FALSE(receiver.handleReceivedFrame(changed, sizeof(changed), h.now));
+    EXPECT_FALSE(receiver.directPending());
+  }
+  h.a.fx.admins.count = 0;
+  EXPECT_FALSE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
+  h.a.fx.admins.add(h.sender.signer.publicKey());
+  receiver.attachRfIdentity(&h.a, RfNode::sign, RfNode::radio, 907525);
+  EXPECT_FALSE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
+  EXPECT_FALSE(receiver.directPending());
+  EXPECT_EQ(before.generation, receiver.leanReceiver().status().generation);
+  EXPECT_EQ(before.receivedBlocks, receiver.leanReceiver().status().receivedBlocks);
+  EXPECT_TRUE(h.ready(h.a));
+  h.sender.fx.integration.attachRfIdentity(&h.sender, RfNode::sign, RfNode::radio, 907525);
+  EXPECT_FALSE(h.uploader.start(h.sender.fx.integration, usb::kStartModeDirect, &h.targets[0][0],
+                               1, 908525, 60000, 112, false, OtaDirectProfile::Bw500));
+}
+
+TEST(LoraOtaRfProduct, LabFastRestoreFailureKeepsObligationAndRepeatedRequestNeverRenewsLease) {
+  RfProductHarness h;
+  h.prepare(168, usb::kStartModeDirected);
+  for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.a));
+  auto& receiver = h.a.fx.integration;
+  uint8_t request[171], ack[171]; size_t len = 0;
+  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 113,
+                                                            request, sizeof(request), OtaDirectProfile::Bw500));
+  ASSERT_TRUE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
+  ASSERT_TRUE(receiver.peekOutboundControlFrame(ack, sizeof(ack), len, h.now));
+  receiver.releaseOutboundControlFrame(); receiver.tickDirect(h.now);
+  receiver.tickDirect(h.now + 5000);
+  ASSERT_TRUE(receiver.directActive()); EXPECT_EQ(500000u, h.a.bandwidth);
+  ASSERT_TRUE(receiver.handleReceivedFrame(request, sizeof(request), h.now + 6000));
+  h.a.failRestore = true; receiver.tickDirect(h.now + 65000);
+  EXPECT_TRUE(receiver.directActive()); EXPECT_EQ(500000u, h.a.bandwidth);
+  h.a.failRestore = false; receiver.tickDirect(h.now + 65001);
+  EXPECT_FALSE(receiver.directActive()); EXPECT_EQ(250000u, h.a.bandwidth);
+  EXPECT_FALSE(receiver.handleReceivedFrame(request, sizeof(request), h.now + 65002));
+  EXPECT_FALSE(receiver.directPending());
+}
+
+TEST(LoraOtaRfProduct, StartOptionalProfileUsesExplicitLengthSelectorsAndNeverChangesLegacyBody) {
+  uint8_t command[16] = {usb::kCommand, static_cast<uint8_t>(usb::UsbOtaOp::Start),
+                         usb::kStartModeDirect, 255};
+  usb::putBE32(command + 4, 908525); usb::putBE16(command + 8, 60000);
+  usb::putBE32(command + 10, 2000);
+  OtaDirectProfile profile;
+  ASSERT_TRUE(usb::parseStartProfile(command, 14, profile));
+  EXPECT_EQ(OtaDirectProfile::Legacy250, profile);
+  for (uint8_t selector : {1, 2}) {
+    command[14] = selector;
+    ASSERT_TRUE(usb::parseStartProfile(command, 15, profile));
+    EXPECT_EQ(selector, static_cast<uint8_t>(profile));
+    EXPECT_EQ(908525u, usb::getBE32(command + 4));
+    EXPECT_EQ(2000u, usb::getBE32(command + 10));
+  }
+  for (uint8_t selector : {0, 3, 0xFF}) {
+    command[14] = selector; EXPECT_FALSE(usb::parseStartProfile(command, 15, profile));
+  }
+  command[14] = 2;
+  for (uint8_t mode : {usb::kStartModeDirected, usb::kStartModeBackground}) {
+    command[2] = mode; EXPECT_FALSE(usb::parseStartProfile(command, 15, profile));
+  }
+  for (size_t len : {size_t(0), size_t(13), size_t(16)})
+    EXPECT_FALSE(usb::parseStartProfile(command, len, profile));
+}
+
+TEST(LoraOtaRfProduct, ProductionMeshLegacyAndProfileAcksAreZeroHopAndFitStock176ByteRxCeiling) {
+  for (const auto profile : {OtaDirectProfile::Legacy250, OtaDirectProfile::Bw250, OtaDirectProfile::Bw500}) {
+    RfProductHarness h;
+    h.prepare(168, usb::kStartModeDirected);
+    for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
+    ASSERT_TRUE(h.ready(h.a));
+    FakeClock clock; clock.now = h.now;
+    PacketCaptureRadio radio; radio.airtime = 20;
+    StaticPoolPacketManager manager(8);
+    PacketBoundaryRng rng; PacketBoundaryRtc rtc; PacketBoundaryTables tables;
+    ProductionPacketMesh mesh(radio, clock, rng, rtc, manager, tables);
+    mesh.begin(); mesh.getOtaIntegration() = h.a.fx.integration;
+    uint8_t request[171];
+    ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 114,
+                                                              request, sizeof(request), profile));
+    Packet packet = {};
+    packet.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
+    packet.payload_len = sizeof(request); std::memcpy(packet.payload, request, sizeof(request));
+    ASSERT_EQ(ACTION_RELEASE, mesh.onRecvPacket(&packet));
+    for (int i = 0; i < 5 && radio.sent.empty(); ++i) {
+      clock.advance(1); mesh.loop();
+    }
+    ASSERT_EQ(173u, radio.sent.size());
+    EXPECT_EQ(176u, radio.sent.size() + 3);
+    EXPECT_EQ(0x32u, radio.sent[0]); EXPECT_EQ(0u, radio.sent[1]);
+    EXPECT_EQ(profile == OtaDirectProfile::Legacy250 ? kOtaDirectAckKind : kOtaDirectProfileAckKind, radio.sent[2]);
+    EXPECT_EQ(0, std::memcmp(request + 1, radio.sent.data() + 3, 106));
+    uint8_t message[160]; const auto len = buildOtaDirectMessage(radio.sent.data() + 2, message);
+    EXPECT_TRUE(h.a.fx.sig_verifier.verify(radio.sent.data() + 109, 64, message, len, h.a.signer.publicKey(), 32));
+    clock.advance(1); mesh.loop();
+    clock.advance(1); mesh.loop();
+    clock.advance(5000); mesh.loop();
+    EXPECT_TRUE(mesh.getOtaIntegration().directActive());
+    EXPECT_EQ(otaDirectBandwidthHz(profile), h.a.bandwidth);
+  }
 }
 
 TEST(LoraOtaRfProduct, RebootResumesDurableBitmapWithoutErasingAndBadFramesPreserveReady) {

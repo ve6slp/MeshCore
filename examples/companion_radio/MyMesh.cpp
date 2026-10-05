@@ -123,7 +123,7 @@ void MyMesh::onOtaDataRecv(mesh::Packet *packet) {
     out_frame[i++] = after.badFrames != before.badFrames ? 1 : 0;
     memcpy(&out_frame[i], &after.rxFrames, 4); i += 4;
     memcpy(&out_frame[i], &after.badFrames, 4); i += 4;
-    _serial->writeFrame(out_frame, i);
+    _serial->tryWriteFrame(out_frame, i);
   }
 #else
   Mesh::onOtaDataRecv(packet);
@@ -492,7 +492,7 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
     memcpy(&out_frame[i], raw, len);
     i += len;
 
-    _serial->writeFrame(out_frame, i);
+    _serial->tryWriteFrame(out_frame, i);
   }
 }
 
@@ -1231,7 +1231,7 @@ void MyMesh::begin(bool has_display, bool allow_destructive_boot_writes, bool al
   setOtaAirtimeDutyCyclePercent(_prefs.ota_duty_percent);
   getOtaIntegration().setLeanAdminCheck(this, &MyMesh::otaAdminCheckThunk);
   if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
-  getOtaIntegration().attachRfIdentity(this, &MyMesh::otaSelfIdSignThunk, &MyMesh::otaRadioChangeThunk,
+  getOtaIntegration().attachRfProfileIdentity(this, &MyMesh::otaSelfIdSignThunk, &MyMesh::otaRadioChangeThunk,
                                        static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
   getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
   configureCompanionFirmwareOtaBackend(getOtaIntegration());
@@ -1515,15 +1515,15 @@ bool MyMesh::sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t
   return true;
 }
 
-bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore) {
+bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore) {
   auto* mesh = static_cast<MyMesh*>(ctx);
 #if MESHCORE_OTA_USB_MEASUREMENTS
   return mesh->applyMeasuredRadioParams(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
-                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5, !restore);
 #else
   return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
-                         restore ? mesh->_prefs.bw : 250.0f,
+                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
                          restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
 #endif
 }
@@ -1676,7 +1676,8 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       break;
     }
     case UsbOtaOp::Start: {
-      if ((size_t)len != kStartTotalBytes) {
+      mesh::ota::OtaDirectProfile profile;
+      if (!parseStartProfile(cmd_frame, len, profile)) {
         reply.result = UsbOtaResult::BadRequest;
         break;
       }
@@ -1748,7 +1749,7 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       _ota_upload_channel = channel;
       _ota_upload_active = _ota_rf_uploader.start(getOtaIntegration(), mode, &_ota_selected_targets[0][0],
                                                   _ota_selected_target_count, frequency_khz, lease_ms,
-                                                  getRNG()->nextInt(1, 0x7FFFFFFF), _ota_cache_reupload);
+                                                  getRNG()->nextInt(1, 0x7FFFFFFF), _ota_cache_reupload, profile);
       reply.result = _ota_upload_active ? UsbOtaResult::Ok : UsbOtaResult::BadRequest;
       fillLocalSnapshot();
       break;

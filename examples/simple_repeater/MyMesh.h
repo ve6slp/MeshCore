@@ -333,7 +333,7 @@ public:
   void rollbackFirmwareOta();
 #if MESHCORE_LORA_OTA
   static void otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]);
-  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, bool restore);
+  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore);
   static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
   static bool otaBootCandidateThunk(void* ctx, const mesh::ota::OtaBootLifecycleEvidence& boot,
                                     ::ota::storage::OtaCandidateStore::Snapshot& out);

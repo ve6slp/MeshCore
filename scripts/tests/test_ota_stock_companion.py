@@ -85,6 +85,9 @@ class FakeSerial:
         self.profile = NORMAL
         self.target_normal = NORMAL[:4]
         self.direct_frequency = 919000
+        self.direct_bandwidth = 250000
+        self.supports_profile = True
+        self.command_delay = self.sign_delay = 0
         self.tx_power = 2
         self.path_hash_bytes = 2
         self.received = set(received)
@@ -163,6 +166,7 @@ class FakeSerial:
         assert len(payload) <= 176
         self.commands.append(payload)
         cmd = payload[0]
+        self.clock.sleep(self.command_delay + (self.sign_delay if cmd == 35 else 0))
         if cmd == 22:
             frame = bytearray(82)
             frame[:2] = b"\x0d\x0d"
@@ -225,7 +229,7 @@ class FakeSerial:
 
     def remote(self, rf):
         off = self.switch <= self.clock() < self.expiry
-        expected = (self.direct_frequency, 250000, 5, 5) if off else self.target_normal
+        expected = (self.direct_frequency, self.direct_bandwidth, 5, 5) if off else self.target_normal
         if self.profile[:4] != expected:
             return
         c = self.candidate
@@ -259,15 +263,26 @@ class FakeSerial:
                 report = self.activation_reports.pop(0)
             self.last_census = report
             self.schedule(0.1, lambda: self.push(report))
-        elif rf[0] == 12:
+        elif rf[0] in (12, 15):
+            if rf[0] == 15 and not self.supports_profile:
+                return
             assert self.admitted and rf[1:33] == OWNER and rf[33:65] == TARGET and rf[65:97] == c.digest
-            ota.verify(OWNER, ota.DIRECT_DOMAIN + rf[:107], rf[107:])
+            domain = ota.DIRECT_PROFILE_DOMAIN if rf[0] == 15 else ota.DIRECT_DOMAIN
+            ota.verify(OWNER, domain + rf[:107], rf[107:])
+            frequency_word = struct.unpack_from(">I", rf, 97)[0]
+            if rf[0] == 15:
+                assert rf[97] in (1, 2)
+                self.direct_bandwidth = 500000 if rf[97] == 2 else 250000
+                frequency_word &= 0xFFFFFF
+            else:
+                self.direct_bandwidth = 250000
+            assert frequency_word == self.direct_frequency
             token = struct.unpack_from(">I", rf, 103)[0]
             assert token not in self.tokens
             self.tokens.append(token)
-            ack = b"\x0d" + rf[1:107]
+            ack = (b"\x10" if rf[0] == 15 else b"\x0d") + rf[1:107]
             signer = OWNER_PRIVATE if self.bad_ack else TARGET_PRIVATE
-            ack += signer.sign(ota.DIRECT_DOMAIN + ack)
+            ack += signer.sign(domain + ack)
             if self.ack_mutator:
                 ack = self.ack_mutator(ack)
             self.switch = self.clock() + 5
@@ -311,7 +326,7 @@ class FakeSerial:
             raise AssertionError(f"unexpected RF kind {rf[0]}")
 
 
-def setup(c=None, received=(), lease=60000, duty=0.02, reupload_generation=None):
+def setup(c=None, received=(), lease=60000, duty=0.02, reupload_generation=None, lab_fast=False):
     c = c or candidate()
     clock = Clock()
     serial = FakeSerial(clock, c, received)
@@ -321,7 +336,7 @@ def setup(c=None, received=(), lease=60000, duty=0.02, reupload_generation=None)
     if reupload_generation is not None:
         approved = replace(approved, reupload_generation=reupload_generation)
     sender = ota.Sender(stock, approved, c, NORMAL, clock() + 10000, 919000,
-                        lease, duty, clock, clock.sleep, reupload_generation)
+                        lease, duty, clock, clock.sleep, reupload_generation, lab_fast=lab_fast)
     return clock, serial, stock, sender
 
 
@@ -970,6 +985,243 @@ class ProtocolTests(unittest.TestCase):
         message, prefix = ota.block_message(last, 1)
         self.assertEqual(message[35], 4)
         self.assertEqual(len(prefix) - 7, 4)
+
+
+class LabFastTests(unittest.TestCase):
+    def test_signed_profile_matches_receiver_and_retains_stock_usb_ceiling(self):
+        _, stream, _, sender = setup(lab_fast=True)
+        stream.admitted = True
+        sender.negotiate()
+        request = next(rf for _, _, rf in stream.rf_packets if rf[0] == 15)
+        self.assertEqual(len(request), 171)
+        self.assertEqual(len(b"\x41\x00" + ota.packet(request)), 175)
+        self.assertEqual(request[97:101], b"\x02" + (919000).to_bytes(3, "big"))
+        ack = b"\x10" + request[1:]
+        metadata = ota.rf_metadata(b"\x88\x08\x40" + ota.packet(ack), ack, TARGET, sender.candidate.digest)
+        self.assertTrue(metadata["target_match"])
+        self.assertTrue(metadata["manifest_match"])
+        ota.verify(OWNER, ota.DIRECT_PROFILE_DOMAIN + request[:107], request[107:])
+        with self.assertRaises(ota.Error):
+            ota.verify(OWNER, ota.DIRECT_DOMAIN + request[:107], request[107:])
+        self.assertEqual(stream.profile, (919000, 500000, 5, 5, 0))
+        self.assertEqual(stream.direct_bandwidth, 500000)
+        self.assertEqual((sender.burst_blocks, sender.duty), (16, 0.02))
+
+    def test_profile_kind_selector_frequency_and_old_domain_ack_fail_before_switch(self):
+        for fault in ("kind", "selector", "frequency", "domain", "key"):
+            _, stream, _, sender = setup(lab_fast=True)
+            stream.admitted = True
+            def mutate(ack):
+                prefix = bytearray(ack[:107])
+                if fault == "kind":
+                    prefix[0] = 13
+                elif fault == "selector":
+                    prefix[97] = 1
+                elif fault == "frequency":
+                    prefix[100] ^= 1
+                domain = ota.DIRECT_DOMAIN if fault == "domain" else ota.DIRECT_PROFILE_DOMAIN
+                signer = OWNER_PRIVATE if fault == "key" else TARGET_PRIVATE
+                return bytes(prefix) + signer.sign(domain + prefix)
+            stream.ack_mutator = mutate
+            with self.subTest(fault=fault), self.assertRaises(ota.Error):
+                sender.negotiate()
+            self.assertEqual(stream.profile, NORMAL)
+            self.assertFalse(any(cmd[0] == 11 for cmd in stream.commands))
+
+    def test_old_receiver_cannot_silently_accept500_or_trigger_host_fallback(self):
+        clock, stream, _, sender = setup(lab_fast=True)
+        stream.admitted, stream.supports_profile = True, False
+        with self.assertRaisesRegex(ota.Error, "ACK retries"):
+            sender.negotiate()
+        self.assertEqual(stream.profile, NORMAL)
+        requests = [(t, rf) for t, _, rf in stream.rf_packets if rf[0] in (12, 15)]
+        self.assertEqual([rf[0] for _, rf in requests], [15, 15, 15])
+        self.assertTrue(all(requests[i + 1][0] - requests[i][0] >= 82 for i in range(2)))
+        self.assertGreater(clock(), 200)
+
+    def test_lost_ack_returns_to_normal_and_retries_with_fresh_signed_token(self):
+        clock, stream, _, sender = setup(duty=1, lab_fast=True)
+        stream.admitted, stream.drop_ack = True, 1
+        sender.negotiate()
+        self.assertEqual(len(set(stream.tokens)), 2)
+        requests = [t for t, _, rf in stream.rf_packets if rf[0] == 15]
+        self.assertGreaterEqual(requests[1] - requests[0], 82)
+        sender.leave_direct()
+        self.assertEqual(stream.profile, (*NORMAL[:4], 0))
+        self.assertGreaterEqual(clock(), stream.expiry)
+
+    def test_burst_repair_uses_fresh_bitmaps_and_keeps_retries_bounded(self):
+        for drops in (3, 10000):
+            _, stream, _, sender = setup(candidate(84 * 40), lab_fast=True)
+            stream.drop_blocks = drops
+            with self.subTest(drops=drops):
+                if drops == 3:
+                    receipt = sender.upload()
+                    self.assertEqual(stream.received, set(range(40)))
+                    self.assertEqual(receipt["generation"], 10)
+                else:
+                    with self.assertRaisesRegex(ota.Error, "repair retries"):
+                        sender.upload()
+                    self.assertLessEqual(max(sender.attempts.values()), 9)
+                run = 0
+                for _, _, rf in stream.rf_packets:
+                    if rf[0] == 1:
+                        run += 1
+                        self.assertLessEqual(run, 16)
+                    elif rf[0] == 10:
+                        run = 0
+                self.assertEqual(stream.commit_count, 0)
+
+    def test_representative_image_faster_with_same_signatures_ready_and_normal_budget(self):
+        results = []
+        c = candidate(84 * 256)
+        for fast in (False, True):
+            clock, stream, _, sender = setup(c, lab_fast=fast)
+            stream.profile = (907525, 250000, 7, 5, 1)
+            stream.target_normal = stream.profile[:4]
+            sender.binding = replace(sender.binding, normal=stream.target_normal)
+            sender.original = stream.profile
+            sender.normal = (*stream.target_normal, 0)
+            sender.profile = sender.normal
+            # Same synthetic USB/signing/physical-TX latency in both modes.
+            stream.command_delay, stream.sign_delay = 0.015, 0.2
+            stream.drop_blocks = 3
+            receipt = sender.upload()
+            self.assertEqual(stream.received, set(range(c.total)))
+            self.assertFalse(receipt["installation_confirmed"])
+            self.assertEqual(stream.commit_count, 0)
+            self.assertEqual((sender.generation, sender.duty), (10, 0.02))
+            self.assertEqual(stream.profile, (907525, 250000, 7, 5, 0))
+            self.assertTrue(all(len(cmd) <= 176 for cmd in stream.commands))
+            for t, profile, rf in stream.rf_packets:
+                if rf[0] == 1:
+                    self.assertEqual(profile[1:4], (500000 if fast else 250000, 5, 5))
+            results.append((clock(), sum(rf[0] == 10 for _, _, rf in stream.rf_packets), len(stream.commands)))
+        legacy, fast = results
+        self.assertLess(fast[0], legacy[0] * 0.8, results)
+        self.assertLess(fast[1], legacy[1] // 2, results)
+        self.assertLess(fast[2], legacy[2], results)
+        print("LAB_FAST_SIMULATION_256_BLOCKS", json.dumps({"legacy": legacy, "lab_fast": fast,
+              "fields": ["elapsed_s", "census_packets", "usb_commands"], "physical_measurement": False}))
+
+    def test_expiry_guard_prevents_signing_or_tx_near_safe_lease_end(self):
+        clock, stream, stock, sender = setup(lab_fast=True)
+        stream.admitted = True
+        sender.negotiate()
+        before = len(stream.commands)
+        clock.now = sender.lease_end - 8
+        with self.assertRaises(ota.LeaseExpired):
+            sender.send(b"\x07" + sender.candidate.digest[:4])
+        self.assertEqual(len(stream.commands), before)
+        sender.leave_direct()
+        self.assertEqual(stream.profile, (*NORMAL[:4], 0))
+
+
+class LabFastCleanupTests(Scratch):
+    def test_cli_lab_fast_upload_negotiates500_and_restores_original_without_commit(self):
+        c = candidate()
+        clock, stream, _, _ = setup(c)
+        path = self.directory / "binding.json"
+        ota.private_write(path, {"schema": 1, "authorized": True, "serial": BINDING.serial,
+                                 "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "stock_version": "1.17.1", "floor": 4, "min_generation": 10,
+                                 "normal_profile": list(NORMAL[:4]), "image_kind": "ordinary-app",
+                                 "image_sha256": BINDING.image_hash.hex(), "manifest_hash": c.digest.hex()})
+        image, manifest = self.directory / "ordinary.bin", self.directory / "canonical.bin"
+        image.write_bytes(c.image); manifest.write_bytes(c.canonical)
+        @contextmanager
+        def uart(*args):
+            yield stream
+        real_frames, real_stock, real_sender = ota.Frames, ota.Stock, ota.Sender
+        def sender_factory(*args, **kwargs):
+            self.assertTrue(kwargs["lab_fast"])
+            return real_sender(*args, **kwargs, clock=clock, sleep=clock.sleep)
+        directory = self.directory / "run"
+        argv = ["upload", "--lab-fast", "--serial", BINDING.serial,
+                "--by-id", "/dev/serial/by-id/NOT_OPENED", "--sender-key", OWNER.hex(),
+                "--target", TARGET.hex(), "--binding", str(path), "--artifacts", str(directory),
+                "--image", str(image), "--manifest", str(manifest), "--frequency-khz", "919000"]
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: real_frames(port, clock)), \
+                patch.object(ota, "Stock", side_effect=lambda *a, **kw: real_stock(*a, **kw, clock=clock, sleep=clock.sleep)), \
+                patch.object(ota, "Sender", side_effect=sender_factory), redirect_stdout(io.StringIO()):
+            ota.main(argv)
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertEqual(stream.direct_bandwidth, 500000)
+        self.assertEqual(stream.received, set(range(c.total)))
+        self.assertEqual(stream.commit_count, 0)
+        self.assertEqual(stream.tx_power, 2)
+        self.assertTrue(ota.private_read(directory / "restored.json")["restored"])
+        self.assertEqual(ota.private_read(directory / "result.json")["outcome"], "ready-observed-unsigned")
+
+    def test_lab_fast_cli_is_upload_only_and_never_opens_transport_for_other_operations(self):
+        for operation in ("commit", "inspect", "restore"):
+            argv = [operation, "--lab-fast", "--serial", BINDING.serial,
+                    "--by-id", "/dev/serial/by-id/NOT_OPENED", "--sender-key", OWNER.hex(),
+                    "--target", TARGET.hex(), "--binding", str(self.directory / "NOT_READ"),
+                    "--artifacts", str(self.directory / "NOT_CREATED")]
+            with self.subTest(operation=operation), patch.object(ota.Binding, "load") as load, \
+                    patch.object(ota, "validated_stock_uart") as uart, self.assertRaisesRegex(ota.Error, "upload-only"):
+                ota.main(argv)
+            load.assert_not_called()
+            uart.assert_not_called()
+
+    def test_signing_read_and_write_stalls_are_bounded_and_restore_exact_original_radio(self):
+        for fault in ("read", "write"):
+            directory = self.directory / fault
+            directory.mkdir(mode=0o700)
+            clock, stream, stock, sender = setup(lab_fast=True)
+            real_write = stream.write
+            deadline_at_fault = []
+            def stalled(wire):
+                command = wire[3:]
+                if command[0] == (35 if fault == "read" else 34) and sender.lease_end:
+                    deadline_at_fault.append(sender.lease_end)
+                    if fault == "write":
+                        self.assertGreater(stream.write_timeout, 0)
+                        self.assertLessEqual(stream.write_timeout, 3)
+                        clock.sleep(stream.write_timeout)
+                        raise ota.NoUsbResponse("synthetic bounded USB write timeout")
+                    return len(wire)
+                return real_write(wire)
+            with self.subTest(fault=fault), ota.radio_guard(stock, sender.binding, directory), \
+                    patch.object(stream, "write", side_effect=stalled), self.assertRaises(ota.NoUsbResponse):
+                sender.upload()
+            self.assertEqual(stream.profile, NORMAL)
+            self.assertEqual(stream.tx_power, 2)
+            self.assertTrue((directory / "restored.json").exists())
+            self.assertEqual(ota.private_read(directory / "original-radio.json")["profile"], list(NORMAL))
+            self.assertLess(clock(), deadline_at_fault[0])
+            self.assertFalse(any(rf[0] == 1 for _, _, rf in stream.rf_packets))
+
+    def test_campaign_timeout_and_ack_failure_restore_without_any500_switch(self):
+        for fault in ("deadline", "ack"):
+            directory = self.directory / fault
+            directory.mkdir(mode=0o700)
+            clock, stream, stock, sender = setup(lab_fast=True)
+            if fault == "deadline":
+                sender.deadline = clock() + 1
+            else:
+                stream.bad_ack = True
+            with self.subTest(fault=fault), ota.radio_guard(stock, sender.binding, directory), self.assertRaises(ota.Error):
+                sender.upload()
+            self.assertEqual(stream.profile, NORMAL)
+            self.assertTrue((directory / "restored.json").exists())
+            self.assertFalse(any(cmd[0] == 11 and struct.unpack_from("<I", cmd, 5)[0] == 500000
+                                 for cmd in stream.commands))
+
+    def test_unconfirmed_physical_tx_never_switches_and_retains_explicit_restore_artifact(self):
+        clock, stream, stock, sender = setup(lab_fast=True)
+        stream.admitted = True
+        with self.assertRaises(ota.Error):
+            with ota.radio_guard(stock, sender.binding, self.directory):
+                sender.negotiate()
+                stream.tx_fails = True
+                sender.send(b"\x07" + sender.candidate.digest[:4])
+        self.assertTrue((self.directory / "original-radio.json").exists())
+        self.assertFalse((self.directory / "restored.json").exists())
+        self.assertIsNotNone(stock.pending_tx)
+        self.assertEqual(stream.profile, (919000, 500000, 5, 5, 0))
 
 
 class EventTests(unittest.TestCase):

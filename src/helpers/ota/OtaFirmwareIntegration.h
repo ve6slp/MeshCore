@@ -201,8 +201,23 @@ public:
   }
   using SignFn = void (*)(void*, const uint8_t*, size_t, uint8_t[64]);
   using RadioChangeFn = bool (*)(void*, uint32_t, bool);
+  using ProfileRadioChangeFn = bool (*)(void*, uint32_t, OtaDirectProfile, bool);
   void attachRfIdentity(void* ctx, SignFn sign, RadioChangeFn change, uint32_t normal_freq_khz) {
-    rf_ctx_ = ctx; rf_sign_ = sign; rf_radio_change_ = change; normal_freq_khz_ = normal_freq_khz;
+    rf_ctx_ = ctx; rf_sign_ = sign; rf_radio_change_ = change; rf_profile_radio_change_ = nullptr;
+    normal_freq_khz_ = normal_freq_khz;
+  }
+  void attachRfProfileIdentity(void* ctx, SignFn sign, ProfileRadioChangeFn change, uint32_t normal_freq_khz) {
+    rf_ctx_ = ctx; rf_sign_ = sign; rf_profile_radio_change_ = change; rf_radio_change_ = nullptr;
+    normal_freq_khz_ = normal_freq_khz;
+  }
+  bool supportsDirectProfile(OtaDirectProfile profile) const {
+    return isOtaDirectProfile(profile) &&
+           (rf_profile_radio_change_ || (profile != OtaDirectProfile::Bw500 && rf_radio_change_));
+  }
+  bool applyDirectRadio(uint32_t frequency, OtaDirectProfile profile, bool restore) {
+    if (rf_profile_radio_change_) return rf_profile_radio_change_(rf_ctx_, frequency, profile, restore);
+    return profile != OtaDirectProfile::Bw500 && rf_radio_change_ &&
+           rf_radio_change_(rf_ctx_, frequency, restore);
   }
   usb::UsbOtaReply handleUsbLocalControl(const uint8_t* command, size_t len, const uint8_t local_owner[32]) {
     usb::UsbOtaReply reply;
@@ -398,8 +413,9 @@ public:
   void stopDirect() {
     direct_pending_ = false;
     direct_waiting_ack_ = false;
-    if (pending_control_frame_valid_ && pending_control_frame_[0] == kOtaDirectAckKind) pending_control_frame_valid_ = false;
-    if (direct_active_ && rf_radio_change_ && rf_radio_change_(rf_ctx_, normal_freq_khz_, true)) direct_active_ = false;
+    if (pending_control_frame_valid_ && (pending_control_frame_[0] == kOtaDirectAckKind ||
+        pending_control_frame_[0] == kOtaDirectProfileAckKind)) pending_control_frame_valid_ = false;
+    if (direct_active_ && applyDirectRadio(normal_freq_khz_, OtaDirectProfile::Legacy250, true)) direct_active_ = false;
   }
   __attribute__((noinline)) void tickDirect(uint32_t now_ms, bool radio_idle = true) {
     if (direct_active_ && static_cast<int32_t>(now_ms - direct_expiry_ms_) >= 0) stopDirect();
@@ -413,10 +429,10 @@ public:
     if (direct_pending_ && !direct_ack_tx_wait_ && !pending_control_frame_valid_ &&
         static_cast<int32_t>(now_ms - direct_apply_ms_) >= 0 && radio_idle) {
       direct_pending_ = false;
-      if (rf_radio_change_ && rf_radio_change_(rf_ctx_, direct_freq_khz_, false)) {
+      if (applyDirectRadio(direct_freq_khz_, direct_profile_, false)) {
         direct_active_ = true;
         direct_expiry_ms_ = now_ms + direct_lease_ms_;
-      } else if (rf_radio_change_ && !rf_radio_change_(rf_ctx_, normal_freq_khz_, true)) {
+      } else if (!applyDirectRadio(normal_freq_khz_, OtaDirectProfile::Legacy250, true)) {
         direct_active_ = true;
         direct_expiry_ms_ = now_ms;
       }
@@ -427,13 +443,18 @@ public:
                           !st.valid || (!st.localCache && !lean_.currentAdmin(st.ownerPublicKey)))) stopDirect();
   }
   size_t buildDirectRequest(const uint8_t target[32], uint32_t freq_khz, uint16_t lease_ms,
-                            uint32_t token, uint8_t* out, size_t capacity) {
+                            uint32_t token, uint8_t* out, size_t capacity,
+                            OtaDirectProfile profile = OtaDirectProfile::Legacy250) {
     const auto st = lean_.status();
     if (!st.valid || !rf_sign_ || !lean_.haveTargetPublicKey() || freq_khz == normal_freq_khz_ ||
         freq_khz < 150000 || freq_khz > 2500000 || lease_ms < usb::kDirectLeaseMsMin ||
-        lease_ms > usb::kDirectLeaseMsMax || direct_active_ || direct_pending_) return 0;
-    const auto len = encodeOtaDirectFrame(kOtaDirectRequestKind, lean_.targetPublicKey(), target, st.manifestHash,
-                                          freq_khz, lease_ms, token, out, capacity);
+        lease_ms > usb::kDirectLeaseMsMax || direct_active_ || direct_pending_ || !isOtaDirectProfile(profile) ||
+        (profile == OtaDirectProfile::Bw500 && !supportsDirectProfile(profile))) return 0;
+    const auto len = profile == OtaDirectProfile::Legacy250 ?
+        encodeOtaDirectFrame(kOtaDirectRequestKind, lean_.targetPublicKey(), target, st.manifestHash,
+                            freq_khz, lease_ms, token, out, capacity) :
+        encodeOtaDirectProfileFrame(kOtaDirectProfileRequestKind, profile, lean_.targetPublicKey(), target,
+                                   st.manifestHash, freq_khz, lease_ms, token, out, capacity);
     if (!len) return 0;
     uint8_t message[160];
     const auto mlen = buildOtaDirectMessage(out, message);
@@ -974,6 +995,8 @@ private:
       }
       case kOtaDirectRequestKind:
       case kOtaDirectAckKind:
+      case kOtaDirectProfileRequestKind:
+      case kOtaDirectProfileAckKind:
         return handleDirectFrame(frame, frame_len, now_ms);
       case kOtaStatusPollKind: {
         OtaStatusPollFrame parsed;
@@ -988,17 +1011,23 @@ private:
   }
 
   LeanControlResult handleDirectFrame(const uint8_t* frame, size_t len, uint32_t now) {
-        if (len != kOtaDirectFrameBytes || !rf_sign_ || !rf_radio_change_ || !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
+        if (len != kOtaDirectFrameBytes || !rf_sign_ || (!rf_radio_change_ && !rf_profile_radio_change_) ||
+            !lean_.haveTargetPublicKey()) return LeanControlResult::Rejected;
         const auto st = lean_.status();
         if (!st.valid || std::memcmp(frame + 65, st.manifestHash, 32)) return LeanControlResult::Rejected;
-        const uint32_t freq = usb::getBE32(frame + 97);
+        uint32_t freq = 0;
+        OtaDirectProfile profile;
+        if (!parseOtaDirectProfile(frame, len, profile, freq) ||
+            (profile == OtaDirectProfile::Bw500 && !rf_profile_radio_change_)) return LeanControlResult::Rejected;
         const uint16_t lease = usb::getBE16(frame + 101);
         if (freq == normal_freq_khz_ || freq < 150000 || freq > 2500000 ||
             lease < usb::kDirectLeaseMsMin || lease > usb::kDirectLeaseMsMax) return LeanControlResult::Rejected;
         uint8_t message[160];
         const auto mlen = buildOtaDirectMessage(frame, message);
-        if (frame[0] == kOtaDirectAckKind) {
-          if (!direct_waiting_ack_ || std::memcmp(frame + 1, direct_request_ + 1, 106) ||
+        if (frame[0] == kOtaDirectAckKind || frame[0] == kOtaDirectProfileAckKind) {
+          const uint8_t expected_ack = direct_request_[0] == kOtaDirectRequestKind ?
+              kOtaDirectAckKind : kOtaDirectProfileAckKind;
+          if (!direct_waiting_ack_ || frame[0] != expected_ack || std::memcmp(frame + 1, direct_request_ + 1, 106) ||
               !lean_.verifySignature(frame + 33, message, mlen, frame + 107)) return LeanControlResult::Rejected;
           direct_waiting_ack_ = false;
           direct_ack_tx_wait_ = false;
@@ -1014,13 +1043,13 @@ private:
           if (direct_have_token_ && token == direct_last_token_) return LeanControlResult::Rejected;
           direct_have_token_ = true; direct_last_token_ = token;
           std::memcpy(pending_control_frame_, frame, len);
-          pending_control_frame_[0] = kOtaDirectAckKind;
+          pending_control_frame_[0] = frame[0] == kOtaDirectRequestKind ? kOtaDirectAckKind : kOtaDirectProfileAckKind;
           const auto ack_len = buildOtaDirectMessage(pending_control_frame_, message);
           rf_sign_(rf_ctx_, message, ack_len, pending_control_frame_ + 107);
           pending_control_frame_len_ = len; pending_control_frame_valid_ = true; pending_control_due_ms_ = now;
           direct_ack_tx_wait_ = true;
         }
-        direct_freq_khz_ = freq; direct_lease_ms_ = lease;
+        direct_freq_khz_ = freq; direct_lease_ms_ = lease; direct_profile_ = profile;
         direct_apply_ms_ = now + 5000u; direct_pending_ = true;
         direct_transition_deadline_ = now + 20000u;
         return LeanControlResult::Handled;
@@ -1540,6 +1569,8 @@ private:
   BootCandidateFn boot_candidate_ = nullptr;
   SignFn rf_sign_ = nullptr;
   RadioChangeFn rf_radio_change_ = nullptr;
+  ProfileRadioChangeFn rf_profile_radio_change_ = nullptr;
+  OtaDirectProfile direct_profile_ = OtaDirectProfile::Legacy250;
   uint32_t normal_freq_khz_ = 0, direct_freq_khz_ = 0;
   uint16_t direct_lease_ms_ = 0;
   uint32_t direct_apply_ms_ = 0, direct_expiry_ms_ = 0, direct_last_token_ = 0;

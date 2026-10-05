@@ -369,6 +369,57 @@ requires one target and channel 255; background requires a configured group
 channel and accepts up to 32 targets. On-mesh frequency and lease are zero.
 Positive airtime shares are 1..100,000 milli-percent; 2,000 means 2%.
 
+### Versioned direct profiles and lab-fast host opt-in
+
+Legacy signed RF REQ `0x0C` and ACK `0x0D` retain their exact 171-byte
+wire image and `MeshCore/OTA/direct/v1` signing domain. Frequency at97 is
+still BE32 kHz; their profile remains 250 kHz/SF5/CR5. REUPLOAD `0x0E`
+is unchanged and is never a profile command.
+
+Versioned profile REQ `0x0F` and ACK `0x10` instead sign
+`MeshCore/OTA/direct-profile/v2 || frame[0:107]`. Both are exactly171
+bytes, fitting the stock176-byte RX-log ceiling (three log bytes + two
+zero-hop packet bytes +171). Prefix offsets stay sender PK32@1,
+target PK32@33, manifest hash32@65, lease BE16@101, token BE32@103;
+signature64 starts at107. Only these new kinds interpret selector U8@97
+and frequency BE24@98. Selectors1 and2 mean 250 and500 kHz respectively,
+both fixed SF5/CR5. Selector0, other/reserved values, wrong lengths,
+frequency outside150000..2500000 kHz, normal frequency, and lease outside
+250..60000 ms are rejected. Full signature/owner/admin/manifest checks and
+the non-renewing volatile token rules still apply. ACK kind and the whole
+106-byte request body must match before applying the selected bandwidth.
+Legacy-only callbacks refuse500 rather than signing an impossible ACK.
+Both ACK kinds are sent zero-hop by `Mesh::pumpOtaControl`, retaining the
+stock RX ceiling even while still on the normal channel.
+
+USB Start retains its legacy14-byte request. An optional fifteenth byte
+is the explicit selector1/2 and is legal only in direct mode; no frequency
+bits or reply ABI are repurposed. `OtaRfUploader`, both MyMesh callbacks
+and driver-applied diagnostics carry the selected bandwidth through to
+the checked driver. Restoration always uses normal preferences, never the
+temporary profile. Native RF tests also preserve the legacy callback API.
+
+The stock host's single upload opt-in `--lab-fast` chooses selector2 and
+sixteen-block bounded bursts instead of four. Every block still uses
+CMD33/34/35 signing and exclusive queue/sent/direct-TX checks. Lab-fast
+polls core+packet stats while waiting and samples airtime once at completion,
+then waits a50ms inter-packet processing guard instead of duplicating the
+already completed TX duration. Normal-channel accounting still samples
+actual airtime and enforces the caller's unchanged share (2% by default).
+The22s pre-sign budget, absolute USB/signing/TX deadlines and2s safe-end
+lease margin remain conservative. No live renewal, firehose or count-only
+storage proof is introduced. Fresh bitmap polls and at most eight sends per
+block govern repair; READY is re-observed across all windows on normal
+radio before returning a receipt, and COMMIT remains separate.
+
+`make test-ota-integration`, `make test-ota-stock-companion` and
+`make test-ota-lab-host OTA_LAB_HOST_TEST_PATTERN=test_ota_uploader.py`
+cover compatibility, signed profile matching, bounded leases/restoration,
+USB/signing stalls, lost ACKs, repair and fake-clock elapsed comparisons.
+Simulation is not physical qualification: matching ROLE0 application
+builds, actual500 kHz driver measurements/throughput, normal-service returns
+and legal RF limits require separate supervised acceptance.
+
 `OtaAirtimeLimiter` retains up to 256 same-category accounting buckets,
 not 256 individual packets. A bucket's first completion bounds coalescing
 to 15 seconds, and its latest completion controls conservative expiry.

@@ -86,13 +86,19 @@ public:
   using SendFn = bool (*)(void*, OtaRfRoute, const uint8_t[32], const uint8_t*, size_t,
                           meshcore::ota::protocol::OtaAirtimeCategory);
   bool start(OtaFirmwareIntegration& integration, uint8_t mode, const uint8_t* targets, uint8_t count,
-              uint32_t frequency, uint16_t lease, uint32_t token, bool reupload) {
+              uint32_t frequency, uint16_t lease, uint32_t token, bool reupload,
+              OtaDirectProfile profile = OtaDirectProfile::Legacy250) {
     const auto st = integration.leanReceiver().status();
     if (!st.valid || st.phase != ::ota::storage::OtaCandidateStore::Phase::Ready ||
         !targets || count == 0 || count > usb::kMaxSelectedTargets || mode > usb::kStartModeBackground ||
-        (mode != usb::kStartModeBackground && count != 1)) return false;
+        (mode != usb::kStartModeBackground && count != 1) || !isOtaDirectProfile(profile) ||
+        (mode != usb::kStartModeDirect && profile != OtaDirectProfile::Legacy250) ||
+        (profile != OtaDirectProfile::Legacy250 &&
+         (!integration.supportsDirectProfile(profile) || frequency < 150000 || frequency > 2500000 ||
+          lease < usb::kDirectLeaseMsMin || lease > usb::kDirectLeaseMsMax))) return false;
     stop(integration);
     mode_ = mode; targets_ = targets; count_ = count; frequency_ = frequency; lease_ = lease; token_ = token;
+    profile_ = profile;
     reupload_ = reupload; active_ = true; stage_ = Stage::Admission;
     target_ = 0; index_ = 0; first_ = 0; last_poll_ = 0; waiting_poll_ = false; last_direct_request_ = 0;
     reupload_spent_ = 0; reupload_pending_ = 0;
@@ -191,7 +197,7 @@ public:
         }
         return;
       }
-      const auto len = integration.buildDirectRequest(targets_, frequency_, lease_, ++token_, frame, sizeof(frame));
+      const auto len = integration.buildDirectRequest(targets_, frequency_, lease_, ++token_, frame, sizeof(frame), profile_);
       if (len && send(ctx, OtaRfRoute::ZeroHop, targets_, frame, len, Category::Control)) {
         last_direct_request_ = now; normal_stage_ = 0;
       }
@@ -324,6 +330,7 @@ private:
     stage_ = Stage::Census; waiting_poll_ = false; repair_unknown_ = false;
   }
   const uint8_t* targets_ = nullptr;
+  OtaDirectProfile profile_ = OtaDirectProfile::Legacy250;
   uint8_t mode_ = 0, count_ = 0, target_ = 0;
   uint8_t admission_failed_data_ = 0;
   uint16_t index_ = 0, first_ = 0, lease_ = 0;

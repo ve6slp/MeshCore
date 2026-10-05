@@ -20,11 +20,26 @@ LoRa OTA does not replace a deployed network's normal radio settings.
 The lab tools default to 62.5 kHz bandwidth; supervised testing on the
 approved bench pair also uses 250 kHz.
 
+For supervised lab/development transfers only, the stock PC sender has an
+explicit `--lab-fast` upload option: negotiated 500 kHz/SF5/CR5 with bounded
+bursts. Both ends must support and sign the matching profile; there is no
+silent fallback. It still returns periodically to the original mesh channel
+and requires separate READY and COMMIT. This is software-tested, not physical
+500 kHz qualification or permission to increase TX power or legal airtime.
+
 ## Current availability: not ready for production use
 
 LoRa OTA is under active development and is **not** a supported way to update
 your node's firmware today. Treat everything below as a preview of an
 in-progress feature, not a how-to.
+
+The supervised nRF unit41 has completed a full signed LoRa update through
+an unchanged stock1.17.1 companion: autonomous reboot, actual new firmware,
+healthy confirmation, confirmed image hash/counter and full settings,
+identity, contact ACL and channel preservation. Both radios used2dBm and
+ordinary signed peer traffic worked afterward. That run required a USB
+observer to drain old-firmware diagnostics; unattended operation,
+500kHz hardware performance and failed-trial rollback remain unqualified.
 
 The current software implements signed transfer in all three modes, durable
 staging, explicit per-device commit and recoverable installation. It reuses
@@ -67,7 +82,7 @@ or `start ota` over USB/BLE — until this changes.
 
 | Board | LoRa OTA status |
 | --- | --- |
-| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 is install-capable; actual LoRa installation/rollback unqualified; unit77 needs bootloader repair |
+| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 completed a supervised healthy LoRa installation; unattended operation/rollback remain unqualified; unit77 needs bootloader repair |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
 | Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
 | Heltec v3/v4 | OTA receivers not qualified; unchanged Heltec v3 USB companion qualified as a signing/radio transport only |

@@ -42,6 +42,7 @@
 #include <cstring>
 
 #include <helpers/ota/OtaBlockSigning.h>
+#include <helpers/ota/OtaDirectRadioProfile.h>
 #include <helpers/ota/OtaUsbProtocol.h>
 
 namespace mesh {
@@ -58,6 +59,8 @@ static constexpr uint8_t kOtaCensusReportKind = 0x0Bu;
 static constexpr uint8_t kOtaDirectRequestKind = 0x0Cu;
 static constexpr uint8_t kOtaDirectAckKind = 0x0Du;
 static constexpr uint8_t kOtaReuploadKind = 0x0Eu;
+static constexpr uint8_t kOtaDirectProfileRequestKind = 0x0Fu;
+static constexpr uint8_t kOtaDirectProfileAckKind = 0x10u;
 static constexpr size_t kOtaCensusWindowBlocks = 128;
 static constexpr size_t kOtaCensusBitmapBytes = kOtaCensusWindowBlocks / 8;
 static constexpr size_t kOtaCensusPollBytes = 67;
@@ -180,11 +183,17 @@ inline bool parseOtaCensusReport(const uint8_t* frame, size_t len, OtaCensusRepo
   return true;
 }
 
-// Request and ACK sign different domains; both bind full target, manifest,
+// Request and ACK sign different kinds; V1/V2 use distinct domains. Both bind full target, manifest,
 // off-frequency profile and one volatile negotiation token. No durable
 // sequence registry: duplicates never extend an already scheduled lease.
 inline size_t buildOtaDirectMessage(const uint8_t* frame, uint8_t* out) {
   static constexpr char domain[] = "MeshCore/OTA/direct/v1";
+  static constexpr char profile_domain[] = "MeshCore/OTA/direct-profile/v2";
+  if (frame[0] == kOtaDirectProfileRequestKind || frame[0] == kOtaDirectProfileAckKind) {
+    std::memcpy(out, profile_domain, sizeof(profile_domain) - 1);
+    std::memcpy(out + sizeof(profile_domain) - 1, frame, 107);
+    return sizeof(profile_domain) - 1 + 107;
+  }
   std::memcpy(out, domain, sizeof(domain) - 1);
   std::memcpy(out + sizeof(domain) - 1, frame, 107);
   return sizeof(domain) - 1 + 107;
@@ -202,6 +211,39 @@ inline size_t encodeOtaDirectFrame(uint8_t kind, const uint8_t owner[32], const 
   usb::putBE16(out + 101, lease_ms);
   usb::putBE32(out + 103, token);
   return kOtaDirectFrameBytes;
+}
+
+// V2 has the same 171-byte ceiling as V1. Only V2 interprets byte97 as
+// a selector and bytes98..100 as frequencyBE24; no legacy bits change.
+inline size_t encodeOtaDirectProfileFrame(uint8_t kind, OtaDirectProfile profile,
+                                         const uint8_t owner[32], const uint8_t target[32],
+                                         const uint8_t hash[32], uint32_t freq_khz, uint16_t lease_ms,
+                                         uint32_t token, uint8_t* out, size_t capacity) {
+  if ((kind != kOtaDirectProfileRequestKind && kind != kOtaDirectProfileAckKind) ||
+      (profile != OtaDirectProfile::Bw250 && profile != OtaDirectProfile::Bw500) ||
+      freq_khz < 150000 || freq_khz > 2500000 ||
+      lease_ms < usb::kDirectLeaseMsMin || lease_ms > usb::kDirectLeaseMsMax) return 0;
+  const auto len = encodeOtaDirectFrame(kind, owner, target, hash, freq_khz, lease_ms, token, out, capacity);
+  if (len) out[97] = static_cast<uint8_t>(profile);
+  return len;
+}
+
+inline bool parseOtaDirectProfile(const uint8_t* frame, size_t len,
+                                  OtaDirectProfile& profile, uint32_t& freq_khz) {
+  if (!frame || len != kOtaDirectFrameBytes) return false;
+  if (frame[0] == kOtaDirectRequestKind || frame[0] == kOtaDirectAckKind) {
+    profile = OtaDirectProfile::Legacy250;
+    freq_khz = usb::getBE32(frame + 97);
+  } else if (frame[0] == kOtaDirectProfileRequestKind || frame[0] == kOtaDirectProfileAckKind) {
+    profile = static_cast<OtaDirectProfile>(frame[97]);
+    if (profile != OtaDirectProfile::Bw250 && profile != OtaDirectProfile::Bw500) return false;
+    freq_khz = usb::getBE32(frame + 97) & 0xFFFFFFu;
+  } else {
+    return false;
+  }
+  const auto lease = usb::getBE16(frame + 101);
+  return freq_khz >= 150000 && freq_khz <= 2500000 &&
+         lease >= usb::kDirectLeaseMsMin && lease <= usb::kDirectLeaseMsMax;
 }
 
 inline size_t buildOtaReuploadMessage(const uint8_t* frame, uint8_t* out) {

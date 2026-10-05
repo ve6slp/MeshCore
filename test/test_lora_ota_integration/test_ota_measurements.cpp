@@ -121,6 +121,14 @@ class OtaMeasurementDirect : public testing::Test {
     fixture.integration.observeRadioApply(fixture.applySucceeds, profile, !restore, fixture.clock.now);
     return fixture.applySucceeds;
   }
+  static bool profileChange(void* context, uint32_t frequency, mesh::ota::OtaDirectProfile direct, bool restore) {
+    auto& fixture = *static_cast<OtaMeasurementDirect*>(context);
+    auto profile = restore ? normalProfile : directProfile;
+    profile.frequencyKhz = frequency;
+    if (!restore) profile.bandwidthHz = mesh::ota::otaDirectBandwidthHz(direct);
+    fixture.integration.observeRadioApply(fixture.applySucceeds, profile, !restore, fixture.clock.now);
+    return fixture.applySucceeds;
+  }
 
   void SetUp() override {
     ::ota::storage::OtaCandidateStore::Snapshot snapshot;
@@ -246,6 +254,26 @@ TEST_F(OtaMeasurementDirect, TwoRealLeaseIntervalsRestoreAndResumeExcludingDirec
   ASSERT_TRUE(integration.formatBudgetMeasurement(reply, sizeof(reply), clock.now,
       dispatcher.getTotalAirTime(), dispatcher.getTxTimeoutCount(), dispatcher.getOtaAccountingFailureCount()));
   EXPECT_NE(nullptr, std::strstr(reply, "u=000000D2 tx=00000215 to=00000000 af=00000000"));
+}
+
+TEST_F(OtaMeasurementDirect, Negotiated500ReportsDriverApplied500AndRestoresExactNormalTuple) {
+  integration.attachRfProfileIdentity(this, sign, profileChange, normalProfile.frequencyKhz);
+  uint8_t frame[mesh::ota::kOtaDirectFrameBytes];
+  ASSERT_EQ(sizeof(frame), integration.buildDirectRequest(target, 908525, 60000, 25,
+      frame, sizeof(frame), mesh::ota::OtaDirectProfile::Bw500));
+  frame[0] = mesh::ota::kOtaDirectProfileAckKind;
+  ASSERT_TRUE(integration.handleReceivedFrame(frame, sizeof(frame), clock.now));
+  clock.now += 5000; integration.tickDirect(clock.now);
+  ASSERT_TRUE(integration.directActive());
+  char reply[160];
+  ASSERT_TRUE(integration.formatRadioMeasurement(reply, sizeof(reply), true, 0, clock.now));
+  EXPECT_NE(nullptr, std::strstr(reply, "f=908525 b=500000 s=5 c=5 v=1 a=1"));
+  EXPECT_NE(nullptr, std::strstr(reply, "d=00000001 r=00000000"));
+  clock.now += 60000; integration.tickDirect(clock.now);
+  ASSERT_FALSE(integration.directActive());
+  ASSERT_TRUE(integration.formatRadioMeasurement(reply, sizeof(reply), true, 0, clock.now));
+  EXPECT_NE(nullptr, std::strstr(reply, "f=907525 b=250000 s=7 c=5 v=1 a=0"));
+  EXPECT_NE(nullptr, std::strstr(reply, "d=00000001 r=00000001"));
 }
 
 TEST_F(OtaMeasurementDirect, FailedRestoreDoesNotPublishHealthyOrNormalAppliedTuple) {
