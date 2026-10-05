@@ -1103,10 +1103,45 @@ blocking frame writer. Unread USB can therefore stall the radio loop.
 A continuously drained USB observer is bench instrumentation, not the
 production fix or unattended acceptance. The core diagnostic path must become
 nonblocking without dropping ordinary command responses or truncating frames.
-The fourth campaign resumes the exact same candidate with that explicit
-observer; it does not qualify reader-free operation. Complete-image READY,
-signed COMMIT, healthy trial confirmation, autonomous failed-trial rollback
-and post-install userdata preservation remain unqualified.
+The fourth campaign delivered all6582 blocks of that exact candidate in
+115minutes with that explicit observer; it does not qualify reader-free
+operation. A complete52-window normal-channel RF census reported READY,
+generation11/counter1/manifest`894553fb...`; the private receipt explicitly
+says installation is not confirmed, and the unchanged stock companion
+restored its normal profile. The full pre-install snapshot still matched
+allfive contact ACLs, all40 channels, identity and settings. ROOT then set
+only41 TX power from22 to the user-authorized2dBm; independently validated
+full snapshots proved only the SelfInfo TX byte2 changed. The initial
+one-shot helper checked the adjacent maximum-power byte3 and failed its
+post-write guard; no setter retry was used. The TX2 snapshot is the new
+preservation reference. A separate signed-COMMIT command is running its
+fresh52-window READY sweep. Actual installation, healthy confirmation and
+autonomous failed-trial rollback are not yet established.
+
+The source correction now uses explicit best-effort output for both the OTA
+event and raw RX logging, which ran before packet dispatch and could also
+block reception. nRF TinyUSB reserves space for the whole framed diagnostic
+and checks DTR without waiting; other Arduino streams retain a complete frame
+in a179-byte member buffer and drain only available capacity per loop tick.
+Partial tails cannot overwrite or interleave with ordinary responses.
+The existing nonblocking BLE, WiFi and Ethernet queues explicitly opt in, so
+their raw RX logs remain available, including in non-OTA builds. Unsupported
+optional transports skip diagnostics rather than invoke a blocking fallback.
+Ordinary command-response methods retain their existing behaviour.
+
+ROOT independently passed276 integration cases on exact prospective tree
+`0dd5a999634177cc610a119eda2f6ecf92705ead`; bounded Opus5.5 follow-up found
+no blockers. The ten reviewed files are integrated byte-exact. Matching
+`ota-41-base03`/`ota-41-confirm03`/`ota-41-rollback03` firmware is frozen
+from that exact source: real nRF RAM174244 (+184), all18 entry-root bounds
+3264/4096 including IRQ104, and actual nRF USB/BLE and ESP BLE/WiFi builds
+passed. An actual ESP native-USB build exposed a partial-tail/session issue;
+the follow-up source passed294 integration cases but review found a C3
+atomic compile assertion and a mode0 DTR-only diagnostic regression.
+Those coupled corrections are still private and gated; the old03 images
+do not contain them. No corrected firmware has been installed, and
+continuous USB observation remains required for the current old-source
+bench campaign.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77

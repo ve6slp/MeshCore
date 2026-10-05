@@ -391,6 +391,15 @@ XIAO nRF52840/Wio SX1262 kit. The official flasher catalog lists both
 the Solar P1 OTAFIX in Downloads declares a different board. Neither vendor
 package was transferred.
 
+At `02:35:17Z` Oct.5, ROOT again measured all40KiB of77's primary and the
+entire4KiB SDK page through its exact, ancestry-bound read-only MSC volume.
+The digests still matched `93df3f...` and `20fee123...`; bank0 remained
+INVALID/size0/CRC0 and bank1 VALID_BOOT with bootloader size40960 and zero
+SD/APP sizes/start. No serial open, reset or firmware write was performed.
+This is current evidence of the same live recovery/software blocker, not
+proof that an APP restoration can succeed.77's external repair does not
+gate the independently progressing stock-companion-to41 RF campaign.
+
 Source21's serial START queries SoftDevice state before validating update
 kind, and its APP_ERROR_CHECK path resets on failure, matching the observed
 disconnect without identifying the live return code. It also explicitly
