@@ -1114,9 +1114,25 @@ only41 TX power from22 to the user-authorized2dBm; independently validated
 full snapshots proved only the SelfInfo TX byte2 changed. The initial
 one-shot helper checked the adjacent maximum-power byte3 and failed its
 post-write guard; no setter retry was used. The TX2 snapshot is the new
-preservation reference. A separate signed-COMMIT command is running its
-fresh52-window READY sweep. Actual installation, healthy confirmation and
-autonomous failed-trial rollback are not yet established.
+preservation reference.
+
+**First complete physical LoRa installation:** the separate command
+completed its fresh52-window normal-channel READY sweep and sent the
+signed COMMIT. 41 autonomously disconnected/re-enumerated USB; ROOT did
+not reset or reflash it. Actual DeviceQuery reports `ota-41-confirm02`.
+Independent readback reports healthy qualified state1/phase6, allowed
+writes and INSTALL_CAPABLE floorsequence2/counter1/extent552820/SHA256
+`947f06073473bdfed7d44d8a33582c116f3020214e66ed56767bd03b95040713`,
+with IO OK. The full pre-peer snapshot matched identity, settings,
+allfive contact ACLs and all40 channels against the TX2 reference.
+Ordinary direct zero-hop RF advertisements in both directions matched
+the exact peer keys and verified Ed25519 signatures; pre/post normal
+radio and TX2 guards passed. Stock reported a native contact notification.
+41 did not report that notification, but its subsequent contact readback
+stored the exact host-verified stock advertisement timestamp. Only that
+contact's advertisement timestamp and lastmod changed; allremaining
+contact bytes, including ACLs, and allsettings/channels were preserved.
+Autonomous failed-trial rollback and reader-free operation remain open.
 
 The source correction now uses explicit best-effort output for both the OTA
 event and raw RX logging, which ran before packet dispatch and could also
@@ -1138,10 +1154,16 @@ from that exact source: real nRF RAM174244 (+184), all18 entry-root bounds
 passed. An actual ESP native-USB build exposed a partial-tail/session issue;
 the follow-up source passed294 integration cases but review found a C3
 atomic compile assertion and a mode0 DTR-only diagnostic regression.
-Those coupled corrections are still private and gated; the old03 images
-do not contain them. No corrected firmware has been installed, and
-continuous USB observation remains required for the current old-source
-bench campaign.
+The subsequent SDK04 correction removed both blockers and passed bounded
+Opus review. It is integrated together with signed250/500kHz profile
+negotiation and opt-in bounded host bursts/less polling. ROOT independently
+passed306 integration and78 uploader cases on exact combined tree
+`d3031860b5ec508863a68e150b2eb3ab1feaacbf`. Actual fresh ROLE0 images,
+stack/RAM and cross-platform build gates are being prepared. Neither the
+old03 images nor the physically installed confirm02 contain those
+corrections. The first corrected-image upgrade must still use legacy250;
+only afterward can500kHz and reader-free hardware operation be qualified.
+Current old-source transfers still require the USB observer.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
