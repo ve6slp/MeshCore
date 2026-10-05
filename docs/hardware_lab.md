@@ -1295,6 +1295,39 @@ Autonomous failed-trial rollback, unattended installation and continuous
 fault-free radio operation remain unqualified. The original restart evidence's
 recovered fault growth remains degradation, not a resolved fault cause.
 
+**Diagnostic candidate READY; installation attempt unsuccessful:** the next
+healthy diagnostic image, `ota-41-diag-conf05`, completed a reader-free
+500kHz upload through the unchanged stock companion. The receiver reported
+all6618 blocks READY, counter4 and freshly measured generation14. The
+555876-byte image SHA256 is
+`7a58300659aeec6ccde7f7808e9407a2312e4a1100def28993ea8c50f2efe226`;
+its canonical manifest SHA256 is
+`adfff97d0ea018f9796619f4a56059417ac44a4db1290cfe08dc615796e27f30`.
+The uploader exited0 and restored the stock radio. This is unsigned READY
+evidence, not authenticated census or installation.
+
+A separate, once-only COMMIT process started with a750-second USB observer
+already armed. The stock process exited1 after535.401 seconds; restoration
+was proved, but no successful COMMIT result or seal was produced. The observer
+completed its fixed window with147 READY samples, no observed trial,
+installation, USB disconnect or response gap. Its final sample still showed
+`ota-41-confirm04`, the unchanged sequence3/counter2 confirmed floor, and the
+exact counter4/generation14 candidate READY with all6618 blocks. Sampled normal
+907525kHz/BW250000/SF7/CR5/TX2 and current driver health passed; the lifetime
+fault counter nevertheless increased791 to837. That growth has no established
+cause.
+
+The COMMIT wrapper discarded the child's public progress and error output.
+Consequently, the exact stock-process failure and whether a COMMIT transmission
+was attempted cannot be reconstructed. A535-second exit does not prove a
+timeout. The nominal292.062-second pacing calculation for52 census queries
+omits host/completion overhead and retries and is not an upper bound. No
+repeated COMMIT, reset, reflash, ABORT or late fabricated seal was used.
+Post-install diagnostic collection and private userdata comparison remain
+unperformed because their successful-install admission requirement was not met.
+The preparation snapshot covers only protocol-visible userdata; it does not
+establish complete persistent storage or private-key preservation.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

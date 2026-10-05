@@ -68,6 +68,14 @@ post-COMMIT read-only diagnosis subsequently found that baseline running again,
 the original confirmed floor unchanged, the candidate marked failed, and a
 healthy sampled normal radio profile. This late snapshot does not recover the
 missing trial history or qualify autonomous rollback.
+The subsequent healthy diagnostic image also reached complete reader-free
+READY, with6618 blocks and measured generation14. Its separately prearmed
+installation attempt was unsuccessful: the stock process exited with an error
+and restored its radio, while the observer continued to see `ota-41-confirm04`,
+the unchanged confirmed floor and the new candidate READY. The wrapper did not
+retain the sender's error output, so the exact failure and whether a COMMIT was
+transmitted are unknown. No retry or host reset was used to manufacture an
+installation result.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.
