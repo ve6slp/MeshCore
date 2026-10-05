@@ -235,6 +235,14 @@ test-ota-integration: tmpdir
 test-ota-lab-host: tmpdir
 	python3 -m unittest discover -s scripts/tests -p '$(OTA_LAB_HOST_TEST_PATTERN)'
 
+.PHONY: test-ota-stock-companion ota-stock-companion
+test-ota-stock-companion:
+	python3 -m unittest discover -s scripts/tests -p 'test_ota_stock_companion.py'
+
+# Explicit arguments/binding only. Never resolves a lab role or auto-selects USB.
+ota-stock-companion:
+	python3 scripts/ota_stock_companion.py $(OTA_STOCK_ARGS)
+
 test-ota-lab-archive: tmpdir
 	python3 -m unittest discover -s scripts/tests -p 'test_ota_lab_archive.py'
 

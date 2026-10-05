@@ -993,7 +993,47 @@ original contact/channel bytes and a nonzero RTC, then used SET_ADMIN rather
 than retrying ADD. SET_ADMIN assigned a positive lastmod and restored complete
 contact iteration. New add requests should omit that optional timestamp.
 Actual OTA image delivery/confirmation/automatic rollback remain unqualified;
-the stock host uploader handoff is the remaining canary prerequisite.
+the following actual upload attempts supersede the earlier host-handoff gate.
+
+**Stock host integration and real RF attempts,Oct.5,00:05-00:41Z:** ROOT
+integrated `scripts/ota_stock_companion.py`, its focused suite and the two
+Make entry points. The first attempt stopped before activation because the
+host accepted direct replies but rejected the normal-channel flood census.
+Stock restoration was measured;41 retained its old ABORTED generation10
+cache, qualified floor0 and complete five-contact/40-channel userdata.
+The corrected decoder accepts version0/type0x0C direct or flood packets,
+validates and skips their path hashes, and retains identity/manifest/
+counter/generation checks. ROOT's focused75 cases and existing75 uploader
+cases passed before the second real attempt.
+
+That second attempt also ended without an admitted census or receiver
+activation. The stock companion's exact original907525/250000/SF7/CR5/
+repeater-off profile,2dBm and `v1.17.1-d929643` were independently read back.
+41 remained ABORTED generation10 with the old local-cache manifest; no
+RF data blocks or COMMIT had been accepted.
+
+ROOT then sent **one different, read-only census window**, first128,
+without another authorization, retirement or lease request.41 emitted its
+actual USB OTA event: accepted kind0x0A, direct route, one-byte path hash,
+rxFrames3 and badFrames0. The unchanged stock received and correctly
+decoded a107-byte flood notification containing the fresh confirming
+manifest, counter1, floor0, generation10, lifecycle ABORTED, zero received
+and6581 total blocks. This proves that the signed authorization had
+prepared the new receiver descriptor and that the corrected flood decoder
+works. It is not receiver activation or image delivery.
+
+The concrete remaining failure is mesh-level duplicate suppression:
+`Packet::calculatePacketHash` hashes payload type plus payload, and
+`SimpleMeshTables` retains160 hashes without expiry. `Mesh::onRecvPacket`
+discards identical OTA packets before the receiver sees them. The first
+attempt's identical first0 poll therefore prevented later retries from
+regenerating its discarded reply. A final READY sweep followed by a
+separate COMMIT sweep would encounter the same issue. The correction must
+allow idempotent local OTA retries while preserving duplicate suppression
+for forwarding and ordinary traffic. Resetting the device or filling/
+clearing the packet cache is not the fix. The installed baseline still
+contains this defect; corrected application artifacts and real full-image
+delivery/confirmation/automatic rollback remain separate gates.
 
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77

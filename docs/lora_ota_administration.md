@@ -11,21 +11,20 @@ results do not qualify the replacement. No physical node has completed a
 LoRa-delivered firmware install, confirmation or rollback. Do not use these
 controls to manage a deployed network.
 
-Earlier bench checks preserved identities, settings and administrator
-permissions and verified ordinary target-to-client reception. The target
-subsequently stopped returning on USB after a bootloader activation request;
-neither its installed bytes nor the cause is known. Recovery is paused:
-do not retry bootloader installation, reset, unlock or erase it. First
-diagnosis requires the physical checks and explicit authorization in the
+Bench unit41 now runs a qualified receiver application and reports
+`INSTALL_CAPABLE` with confirmed floor0. Its old local upload cache was
+explicitly aborted; its identity, settings, five complete contacts including
+administrator permissions, and all40 channels survived ordinary reboot.
+Unit77 still enumerates in a defective modified USB bootloader and requires
+external repair; no blind bootloader retry, unlock or erase is authorized.
+See the [hardware lab guide](hardware_lab.md) and
 [incident notes](lora_ota_bootloader_failure_notes.md#arrival-checklist).
 
-The working companion has verified full local cache staging, ordinary-reboot
-persistence, sealed retries and an explicit image-bound abort while preserving
-its captured settings. It remains stock `CACHE_ONLY`, not `INSTALL_CAPABLE`;
-no campaign START or COMMIT was sent. Keep the uploader on the stock bootloader.
-Stock-only compatibility honours the
-vendor's documented unused-CRC-zero convention without relaxing candidate
-or trial integrity. Installing a custom uploader loader is not a workaround.
+The additional stock1.17.1 companion is a separate signing/radio endpoint,
+not a receiver or locally staged uploader. It has not been flashed.
+Actual stock-signed RF authorization on41 has been observed, but receiver
+duplicate suppression blocks repeated census requests. No OTA image
+installation, confirmation or automatic rollback is qualified yet.
 
 ## Update policy
 
@@ -65,7 +64,7 @@ for another administrator to take over.
 
 ## Signed host workflow
 
-These experimental host commands use the companion's existing MeshCore
+These experimental host commands use an OTA-enabled companion's existing MeshCore
 identity. They never export its private key. Each target must already
 trust that identity as an administrator through its normal MeshCore
 permissions; there is no separate OTA key to commission.
@@ -204,6 +203,94 @@ A build flag alone does not establish install capability. The running
 application, signed receiver, durable storage and recovery-capable bootloader
 must all be qualified together. An unsupported backend must refuse the
 update explicitly without affecting ordinary mesh service.
+
+## Unchanged stock 1.17.1 USB companion
+
+`make ota-stock-companion` runs a separate PC-managed **zero-hop direct**
+sender. It uses stock signing commands33/34/35, raw-packet command65 and
+raw RX notification0x88. It never uses the custom OTA USB command66,
+stages an image locally, exports a private key, changes contacts, resets a
+device or flashes the companion. Do not use `ota-lab-upload` against an
+unchanged stock companion. This adapter currently accepts only an
+already-qualified XIAO nRF52840 **ROLE0 companion** raw APP BIN and its
+canonical59 descriptor, not ROLE1, ESP32, UF2, ZIP or compound images.
+
+The operator must supply an owned0600 JSON binding. Required fields are
+`schema:1`, `authorized:true`, `stock_version:"1.17.1"`, the exact USB
+`serial`, full32-byte hex `sender_public_key` and `target_public_key`,
+the measured confirmed `floor`, approved positive `min_generation`,
+`normal_profile:[frequency_khz,bandwidth_hz,SF,wire_CR]`,
+`image_kind:"ordinary-app"`, `image_sha256` and `manifest_hash`.
+The image hash covers the raw BIN; the manifest hash covers the unsigned
+59-byte descriptor. The descriptor counter must exceed the measured floor.
+The binding records an approval, not automatic commissioning or proof of
+the recipient's current state.
+
+CP2102 bridges can share a serial and by-id link. Such bindings also require
+the authorized physical `by_path`, matching `id_path`, four-hex-digit
+`usb_vid`/`usb_pid`, and exact public `sender_name`. Supply matching
+`--by-path` explicitly. The driver opens that anchor, verifies its physical
+USB metadata and full public identity, and **never resolves the ambiguous
+by-id link**. Preserve the binding and artifacts privately; raw userdata
+snapshots can contain channel secrets, location and BLE PIN.
+
+Set `stock_args` to those explicit identity, path and binding arguments;
+set `transfer_args` to `--manifest`, `--image`, an approved off-normal
+`--frequency-khz` and an adequate `--timeout`. Use new artifact directories
+for each operation:
+
+```sh
+make ota-stock-companion \
+  OTA_STOCK_ARGS="inspect $stock_args --artifacts .tmp/stock-inspect"
+make ota-stock-companion \
+  OTA_STOCK_ARGS="upload $stock_args $transfer_args --artifacts .tmp/stock-upload"
+make ota-stock-companion \
+  OTA_STOCK_ARGS="commit $stock_args $transfer_args --ready-receipt .tmp/stock-upload/result.json --artifacts .tmp/stock-commit"
+```
+
+Inspection is read-only and does not prove RF readiness. Upload negotiates
+signed30000-60000ms leases, default60000ms, on the recipient's normal
+channel, then switches to the approved frequency at250kHz/SF5/wire CR5.
+All normal-channel transmissions are conservatively paced by
+`--normal-duty-percent`, default2; the leased off-frequency transfer is
+not subject to that on-mesh share. Regulatory limits still apply. This is
+not qualification of mesh-wide2% fairness or routed/fleet OTA.
+
+For an already explicitly aborted candidate, the operator may additionally
+approve `allow_reupload:true` and pass `--reupload` to **upload only**.
+The sender learns the pending generation from a fresh matching RF census,
+signs the target/generation-bound retirement, and requires generation+1
+with an empty bitmap. It does not promote old cached bytes, abort
+automatically or obtain its generation from USB. An active matching
+candidate resumes without another retirement; later terminal candidates
+use normal admission, not automatic `--reupload`.
+
+Upload stops at complete observed RF READY and restores the stock profile.
+COMMIT is a separate operation requiring its exact private receipt and a
+new complete READY sweep. Census is unsigned and has no nonce; receipt
+freshness does not authenticate an indistinguishable on-air replay.
+Stock TX statistics are aggregate, not per-packet tokens. Neither a READY
+receipt nor a reported signed-COMMIT transmission proves installation.
+Measure the recipient's running version, confirmed floor, healthy trial
+outcome and complete preserved settings/permissions independently.
+
+SIGINT/SIGTERM runs restoration and reads back the exact original
+frequency/bandwidth/SF/CR/repeater setting; TX power is never changed.
+Keep `original-radio.json` even after an unsuccessful run. If the process
+was killed without cleanup, restore explicitly with the same binding and
+the **existing** upload artifact directory:
+
+```sh
+make ota-stock-companion \
+  OTA_STOCK_ARGS="restore $stock_args --artifacts .tmp/stock-upload"
+```
+
+The current receiver must also permit idempotent OTA retries through its
+mesh packet duplicate filter. A lost census reply otherwise prevents
+another identical poll from reaching the receiver, including the separate
+COMMIT READY sweep. The actual bench exposed this gate; do not work around
+it by clearing packet caches, inventing a successful receipt or resetting
+the device to claim qualification.
 
 ## Control surface
 

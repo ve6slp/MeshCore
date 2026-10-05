@@ -34,12 +34,14 @@ competing candidates. These results are not physical acceptance.
 
 Hardware qualification remains incomplete: no node has completed a
 LoRa-delivered install, trial confirmation or rollback with this
-implementation. The approved bench pair has received immutable applications,
-and earlier ordinary radio and configuration checks passed. The target no
-longer returns on USB after a bootloader activation request; its installed
-state and failure cause are unproven. The working companion has verified
-local cache staging and reboot persistence, not radio delivery or installation.
-Target recovery is paused pending separately authorized diagnosis. See the
+implementation. Bench unit41 is healthy and reports qualified
+`INSTALL_CAPABLE`; identity, settings, contact permissions and channels
+survived its receiver preparation. An unchanged stock1.17.1 USB companion
+has physically demonstrated signing, full-size radio transport and the SF5
+profile. The first actual upload attempts exposed host reply decoding and
+receiver duplicate-suppression defects; no new image has been activated or
+installed. Unit77 enumerates in its defective modified USB bootloader and
+still needs external repair. See the
 [hardware lab guide](hardware_lab.md) for current evidence and restrictions.
 The 2% airtime policy and ordinary mesh service must still be verified together
 during an update. Routed delivery through intermediate nodes and fleet
@@ -62,10 +64,10 @@ or `start ota` over USB/BLE — until this changes.
 
 | Board | LoRa OTA status |
 | --- | --- |
-| Seeed Studio XIAO nRF52840 + SX1262 | Earlier ordinary-radio checks passed; target recovery blocked, OTA unqualified |
+| Seeed Studio XIAO nRF52840 + SX1262 | Unit41 is install-capable; actual LoRa installation/rollback unqualified; unit77 needs bootloader repair |
 | SenseCAP Solar (P1 Pro), nRF52840-based | Design complete; hardware qualification still pending |
 | Seeed Studio XIAO ESP32-S3R8 + Wio SX1262 | SDK-backed staging and rollback implemented; physical qualification pending |
-| Heltec v3/v4 | Not started |
+| Heltec v3/v4 | OTA receivers not qualified; unchanged Heltec v3 USB companion qualified as a signing/radio transport only |
 
 ## What an update should do
 
