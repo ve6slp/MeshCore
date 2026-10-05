@@ -1323,8 +1323,9 @@ was attempted cannot be reconstructed. A535-second exit does not prove a
 timeout. The nominal292.062-second pacing calculation for52 census queries
 omits host/completion overhead and retries and is not an upper bound. No
 repeated COMMIT, reset, reflash, ABORT or late fabricated seal was used.
-Post-install diagnostic collection and private userdata comparison remain
-unperformed because their successful-install admission requirement was not met.
+Post-install diagnostic collection and private userdata comparison were not
+admitted by that failed attempt; the later independently confirmed installation
+and separately admitted readbacks are documented below.
 The preparation snapshot covers only protocol-visible userdata; it does not
 establish complete persistent storage or private-key preservation.
 
@@ -1362,9 +1363,41 @@ This is the third independently established healthy signed RF installation on41.
 No additional COMMIT, host reset or reflash was performed. The original
 observer receipt remains failed: the late image-bound confirmation proves
 current installation, not an uninterrupted trial/reset history or autonomous
-rollback. Diagnostic selector collection, protocol-visible userdata comparison
-and ordinary-peer recovery require separately admitted post-install readbacks;
-full private-key/storage preservation remains outside the exposed snapshot.
+rollback. Full private-key/storage preservation remains outside the exposed
+snapshot.
+
+**Diagnostic post-install userdata and ordinary RF recovery (2026-10-05):**
+ROOT separately collected passive selector5 diagnostics and compared a complete
+protocol-visible snapshot with the actual campaign06 pre-upload snapshot. All
+six checks matched: identity, self-info, raw self-info, exposed device settings,
+contact digest and channel digest. Both snapshots contained five contacts and
+40 channel slots. Fresh image-bound confirmation was required before each
+collection session. Selector5 reported healthy operation, no retained failure,
+and zero lifetime/origin counts in both reads; no active probe was requested.
+The successful readback receipt SHA256 is
+`ac6c96bb2bbc3cc58915af10912c5fcda06a089a4730714f9f83984f992f7624`.
+
+Only after that pre-peer comparison, ROOT admitted one standardCMD7 ordinary
+zero-hop advert request per transmitter. The unchanged stock companion and41
+each received the other full public key's Ed25519-verified ordinary advert on
+907525kHz/BW250000/SF7/CR5 at2dBm. Both native acceptance events were observed.
+Stock-to41 reception measured RSSI-35dBm/SNR12dB;41-to-stock measured
+RSSI-38dBm/SNR13dB. Fresh reads before and after still qualified the exact
+diag-conf05 image, floorsequence4/counter4, native Installed8, healthy normal
+profile and zero apply failures. The successful ordinary-peer receipt SHA256 is
+`6edcc0cffd6a53c4aa9dc34d6d2f7137f3a25ab9fd17a3be34b50d81359a59f2`.
+No OTA control, settings write, additional COMMIT, reset or reflash was performed.
+Ordinary contact-timestamp updates were expressly admitted after the snapshot.
+
+These are signed post-command RF receptions, not cryptographic proof of fresh
+emission or command causation. Native events did not independently correlate
+the signed packet's timestamp. The receiver's sampled lifetime fault count
+increased0 to1 across the peer exchange despite healthy current radio state.
+Its origin/cause is not established by those radio reads; recovery is proved,
+continuous fault-free operation is not. The original failed observer and its
+unlogged exception remain unchanged and historically unrecoverable. Exposed
+userdata equality does not prove hidden storage, private keys, hidden PSK
+halves, atomicity, uninterrupted boot history or autonomous rollback.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

@@ -44,6 +44,9 @@ diagnostic image after complete reader-free500kHz reception. Its prearmed
 observer failed during installation, but a separate late read-only capture
 confirmed the new running image, confirmed floor and Installed state. Continuous
 installation observation and autonomous failed-trial rollback remain unqualified.
+Separate post-install readbacks also established protocol-visible userdata
+preservation and bidirectional ordinary signed peer reception at2dBm for this
+third image.
 
 The current software implements signed transfer in all three modes, durable
 staging, explicit per-device commit and recoverable installation. It reuses
@@ -86,8 +89,15 @@ Installed, with sequence4/counter4, the exact555876-byte image hash and healthy
 sampled normal907525kHz/BW250000/SF7/CR5/TX2 operation. No additional COMMIT,
 host reset or reflash was needed. This establishes the installation, not the
 missing trial/reset history; the failed observer receipt remains failed.
-Diagnostic post-install userdata and ordinary-peer comparisons remain separate
-gates, as does continuous radio reliability.
+Separately admitted diagnostic post-install readbacks matched all exposed
+identity/settings, contact and channel comparison checks against the actual
+pre-upload snapshot: five contacts and40 channel slots. One ordinary zero-hop
+signed advert was then received in each direction through the unchanged stock
+companion at2dBm, with native acceptance events and fresh image/floor/profile
+checks before and afterward. This is not complete storage/private-key
+preservation or sustained service qualification. The receiver's fault count
+increased from0 to1 across that peer check despite healthy sampled radio state;
+continuous radio reliability and fault attribution remain open.
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.

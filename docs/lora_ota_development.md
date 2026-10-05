@@ -1086,6 +1086,15 @@ hash7a583..., running `ota-41-diag-conf05` and native Installed8. These are
 physical results, not inferred from a package or a source test. The latest
 prearmed observer failed and a separate late read-only capture established
 confirmation; the missing trial/reset history is not recovered by that capture.
+Separate post-install readbacks matched the actual pre-upload protocol-visible
+snapshot across all identity/settings/contact/channel checks. Ordinary signed
+zero-hop reception at2dBm passed in both directions through the unchanged stock
+companion, with native acceptance events and fresh image/floor/profile checks.
+Those bounded recovery results do not establish full private storage or
+sustained service: the receiver's lifetime radio fault count increased0 to1
+across the peer exchange, so radio-fault attribution and continuous reliability
+remain open. See the hardware lab guide for the actual receipt fingerprints
+and the limits of native-event correlation and emission freshness.
 Independent observation of the full internal transition sequence and autonomous
 failed-trial rollback remain acceptance gates.
 ESP32 uses vendor slot states, an independent RTC watchdog and late
