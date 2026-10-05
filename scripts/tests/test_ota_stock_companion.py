@@ -972,6 +972,112 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(prefix) - 7, 4)
 
 
+class EventTests(unittest.TestCase):
+    def test_complete_retirement_ready_commit_events_are_public_and_ordered(self):
+        clock, stream, stock, _ = setup(received={0, 1})
+        stream.local_cache = stream.aborted = True
+        stream.generation = 10
+        approved = replace(BINDING, min_generation=1, allow_reupload=True)
+        events = []
+        sender = ota.Sender(stock, approved, candidate(), NORMAL, clock() + 10000, 919000,
+                            clock=clock, sleep=clock.sleep, reupload=True, event_callback=events.append)
+        receipt = sender.upload()
+        committer = ota.Sender(stock, approved, candidate(), NORMAL, clock() + 10000, 919000,
+                               clock=clock, sleep=clock.sleep, event_callback=events.append)
+        committer.commit(receipt)
+        names = [event["event"] for event in events]
+        for name in ("auth_sent", "census_request", "census_sent", "rf_rx", "census_parsed",
+                     "reupload_sent", "reupload_receiving", "lease_request", "lease_ack_verified",
+                     "lease_active", "block_sent", "lease_leave", "ready_observed_unsigned", "commit_sent"):
+            self.assertIn(name, names)
+        self.assertLess(names.index("auth_sent"), names.index("reupload_sent"))
+        self.assertLess(names.index("reupload_sent"), names.index("lease_active"))
+        self.assertLess(names.index("ready_observed_unsigned"), names.index("commit_sent"))
+        reupload = next(event for event in events if event["event"] == "reupload_sent")
+        self.assertEqual((reupload["observed_generation"], reupload["expected_generation"]), (10, 11))
+        received = [event for event in events if event["event"] == "rf_rx"]
+        self.assertTrue(any(event["route"] == 1 and event["kind"] == 11 for event in received))
+        self.assertTrue(any(event["route"] == 2 and event["kind"] == 11 for event in received))
+        self.assertTrue(any(event["kind"] == 13 and event["payload_length"] == 171 for event in received))
+        self.assertTrue(all(event["target_match"] and event["manifest_match"] for event in received))
+        self.assertTrue(all(event["tx_evidence"] == "aggregate-counters" for event in events if "tx_evidence" in event))
+        self.assertEqual(sum(event["event"] == "block_sent" for event in events), 2)
+        text = json.dumps(events)
+        for forbidden in ("GPS-HIDE", "99887766", "signature", "private_key", "SelfInfo", "DeviceInfo"):
+            self.assertNotIn(forbidden, text)
+
+    def test_no_reply_diagnostics_preserve_auth_retry_count_packets_and_pacing(self):
+        outcomes = []
+        events = []
+        for enabled in (False, True):
+            clock, stream, _, sender = setup()
+            stream.drop_census = 100
+            sender.event_callback = events.append if enabled else None
+            with self.assertRaisesRegex(ota.Error, "target did not admit"):
+                sender.upload()
+            outcomes.append((stream.commands, stream.rf_packets, clock()))
+        self.assertEqual(outcomes[0], outcomes[1])
+        names = [event["event"] for event in events]
+        self.assertEqual(names.count("auth_sent"), 3)
+        self.assertEqual(names.count("census_request"), 9)
+        self.assertEqual(names.count("census_timeout"), 9)
+        self.assertEqual(names.count("census_retry"), 6)
+        self.assertEqual(names.count("auth_no_census"), 3)
+        self.assertEqual(names[-1], "auth_exhausted")
+        self.assertNotIn("reupload_sent", names)
+
+    def test_rf_metadata_wrong_target_stale_and_other_packet_types_never_log_bodies(self):
+        clock, stream, stock, sender = setup()
+        c = sender.candidate
+        stale = b"\x88\x08\x40\x31\x00" + census(c)
+        wrong = b"\x88\x08\x40\x31\x00" + (b"\x0b" + OWNER + census(c)[33:])
+        secret = b"PSK-HIDE SIGNATURE-HIDE PRIVATE-KEY-HIDE GPS-HIDE PIN-HIDE"
+        custom = b"\x88\x08\x40\x3e\x00" + secret
+        stock.frames.pending.extend([(clock(), b"\x05" + secret), (clock(), b"\x0d" + secret),
+                                     (clock() - 1, stale), (clock(), wrong), (clock(), custom)])
+        events = []
+        with self.assertRaises(TimeoutError):
+            stock.frames.receive(lambda payload: False, clock(), clock() + 1,
+                                 events.append, TARGET, c.digest)
+        self.assertEqual(len(events), 3)
+        self.assertFalse(events[0]["fresh"])
+        self.assertFalse(events[1]["target_match"])
+        self.assertTrue(events[1]["manifest_match"])
+        self.assertFalse(events[2]["decoded"])
+        self.assertEqual(events[2]["payload_type"], 15)
+        text = json.dumps(events)
+        for value in secret.decode().split():
+            self.assertNotIn(value, text)
+            self.assertNotIn(value.encode().hex(), text)
+        discarded = []
+        stream.push(census(c))
+        stock.frames.discard_rf(discarded.append, TARGET, c.digest)
+        self.assertEqual(discarded[0]["event"], "rf_discard")
+        self.assertTrue(discarded[0]["target_match"])
+
+    def test_census_refusal_event_does_not_bypass_target_guard(self):
+        _, stream, _, sender = setup()
+        stream.admitted = True
+        events = []
+        sender.event_callback = events.append
+        original_push = stream.push
+        def wrong_target(payload):
+            original_push(payload[:1] + OWNER + payload[33:])
+        with patch.object(stream, "push", side_effect=wrong_target), self.assertRaisesRegex(ota.Error, "target"):
+            sender.census()
+        self.assertFalse(next(event for event in events if event["event"] == "rf_rx")["target_match"])
+        self.assertEqual(events[-1]["event"], "census_rejected")
+        self.assertNotIn("census_parsed", [event["event"] for event in events])
+
+    def test_cli_public_event_serializes_one_json_line_and_flushes(self):
+        event = {"event": "auth_sent", "attempt": 1, "elapsed_s": 2.5, "tx_evidence": "aggregate-counters"}
+        with patch("builtins.print") as printed:
+            ota.public_event(event)
+        args, kwargs = printed.call_args
+        self.assertEqual(json.loads(args[0]), event)
+        self.assertEqual(kwargs, {"flush": True})
+
+
 class ReuploadTests(unittest.TestCase):
     def test_outside_lease_flood_pending_to_direct_transfer_to_flood_ready_and_separate_commit(self):
         for size, path in ((1, b""), (2, b"abcd"), (3, b"abcdef")):
@@ -1267,6 +1373,43 @@ class ReuploadTests(unittest.TestCase):
 
 
 class ArtifactTests(Scratch):
+    def test_cli_upload_wires_public_json_event_callback_without_hardware(self):
+        c = candidate()
+        path = self.directory / "binding.json"
+        ota.private_write(path, {"schema": 1, "authorized": True, "serial": BINDING.serial,
+                                 "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "stock_version": "1.17.1", "floor": 4, "min_generation": 10,
+                                 "normal_profile": list(NORMAL[:4]), "image_kind": "ordinary-app",
+                                 "image_sha256": BINDING.image_hash.hex(), "manifest_hash": c.digest.hex()})
+        image, manifest = self.directory / "ordinary.bin", self.directory / "canonical.bin"
+        image.write_bytes(c.image)
+        manifest.write_bytes(c.canonical)
+        _, stream, _, _ = setup()
+        @contextmanager
+        def uart(*args):
+            yield stream
+        @contextmanager
+        def guard(*args):
+            yield NORMAL
+        def sender_factory(*args, **kwargs):
+            self.assertIs(kwargs["event_callback"], ota.public_event)
+            def upload():
+                kwargs["event_callback"]({"event": "auth_sent", "attempt": 1, "tx_evidence": "aggregate-counters"})
+                return {"outcome": "synthetic-test-only"}
+            return SimpleNamespace(upload=upload)
+        argv = ["upload", "--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(), "--binding", str(path),
+                "--artifacts", str(self.directory / "run"), "--image", str(image), "--manifest", str(manifest),
+                "--frequency-khz", "919000"]
+        output = io.StringIO()
+        with patch.object(ota, "validated_stock_uart", uart), patch.object(ota, "radio_guard", guard), \
+                patch.object(ota, "Sender", side_effect=sender_factory), redirect_stdout(output):
+            ota.main(argv)
+        lines = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(lines[0]["event"], "auth_sent")
+        self.assertEqual(lines[1]["outcome"], "synthetic-test-only")
+        self.assertFalse(stream.commands)
+
     def test_generation_free_root_binding_and_upload_only_cli_flag(self):
         value = {"schema": 1, "authorized": True, "serial": BINDING.serial,
                  "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),

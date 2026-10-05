@@ -274,6 +274,12 @@ receipt nor a reported signed-COMMIT transmission proves installation.
 Measure the recipient's running version, confirmed floor, healthy trial
 outcome and complete preserved settings/permissions independently.
 
+The CLI prints flushed JSON phase/progress events without raw USB/RF
+bytes, signatures or private device fields. `auth_sent`, `block_sent` and
+`commit_sent` mean aggregate stock TX counters advanced, not recipient
+acceptance. Validated census events remain unsigned telemetry; only the
+direct ACK event follows verification of the target's signature.
+
 SIGINT/SIGTERM runs restoration and reads back the exact original
 frequency/bandwidth/SF/CR/repeater setting; TX power is never changed.
 Keep `original-radio.json` even after an unsuccessful run. If the process

@@ -299,6 +299,27 @@ def raw_rx(frame):
     return frame[offset:]
 
 
+def rf_metadata(frame, payload, target, manifest):
+    header = frame[3] if len(frame) >= 5 else None
+    kind = payload[0] if payload else None
+    target_offset = {11: 1, 13: 33}.get(kind)
+    hash_offset = {11: 33, 13: 65}.get(kind)
+    return {"usb_length": len(frame), "packet_length": max(0, len(frame) - 3),
+            "route": header & 3 if header is not None else None,
+            "version": header >> 6 if header is not None else None,
+            "payload_type": (header >> 2) & 15 if header is not None else None,
+            "decoded": payload is not None, "kind": kind,
+            "payload_length": len(payload) if payload is not None else None,
+            "target_match": payload[target_offset:target_offset + 32] == target
+            if target_offset is not None and target is not None else None,
+            "manifest_match": payload[hash_offset:hash_offset + 32] == manifest
+            if hash_offset is not None and manifest is not None else None}
+
+
+def public_event(event):
+    print(json.dumps(event, sort_keys=True), flush=True)
+
+
 def block_message(candidate, index):
     if not 0 <= index < candidate.total:
         raise Error("block index outside candidate")
@@ -362,16 +383,23 @@ class Frames:
             self.poll(min(0.1, deadline - self.clock()))
         raise NoUsbResponse("USB command deadline; no response")
 
-    def discard_rf(self):
+    def discard_rf(self, observer=None, target=None, manifest=None):
         self.poll(0)
+        if observer is not None:
+            for _, frame in self.pending:
+                if frame[0] == 0x88:
+                    observer({"event": "rf_discard", **rf_metadata(frame, raw_rx(frame), target, manifest)})
         self.pending = [(t, f) for t, f in self.pending if f[0] != 0x88]
 
-    def receive(self, predicate, since, deadline):
+    def receive(self, predicate, since, deadline, observer=None, target=None, manifest=None):
         while self.clock() < deadline:
             for i, (timestamp, frame) in enumerate(self.pending):
                 if frame[0] == 0x88:
                     self.pending.pop(i)
                     payload = raw_rx(frame)
+                    if observer is not None:
+                        observer({"event": "rf_rx", "fresh": timestamp >= since,
+                                  **rf_metadata(frame, payload, target, manifest)})
                     if timestamp >= since and payload is not None and predicate(payload):
                         return timestamp, payload
                     break
@@ -495,7 +523,8 @@ def airtime(raw_length, profile):
 
 class Sender:
     def __init__(self, stock, binding, candidate, profile, deadline, frequency, lease_ms=60000,
-                 duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False):
+                 duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False,
+                 event_callback=None):
         if not MIN_LEASE <= lease_ms <= 60000 or not 150000 <= frequency <= 2500000 or frequency == binding.normal[0]:
             raise Error("off-normal frequency and host lease 30000..60000ms required")
         if not math.isfinite(duty) or not 0 < duty <= 1:
@@ -519,6 +548,14 @@ class Sender:
         self.pending_generation = None
         self.activation_generation = None
         self.pending_reupload = False
+        self.event_callback, self.event_start = event_callback, clock()
+
+    def emit(self, event, **fields):
+        if self.event_callback is not None:
+            self.event_callback({"event": event, "elapsed_s": round(self.clock() - self.event_start, 3), **fields})
+
+    def rf_observer(self, phase):
+        return (lambda data: self.emit(phase=phase, **data)) if self.event_callback is not None else None
 
     def wait_until(self, when):
         if when >= self.deadline:
@@ -573,19 +610,35 @@ class Sender:
     def census(self, first=0, retries=3, allow_pending=False):
         self.room(15)
         c, b = self.candidate, self.binding
-        for _ in range(retries):
-            self.stock.frames.discard_rf()
+        observer = self.rf_observer("census")
+        for attempt in range(1, retries + 1):
+            self.stock.frames.discard_rf(observer, b.target, c.digest)
+            self.emit("census_request", attempt=attempt, first=first, allow_pending=allow_pending,
+                      channel="direct" if self.lease_end else "normal")
             since = self.send(b"\x0a" + b.target + c.digest + struct.pack(">H", first))
+            self.emit("census_sent", attempt=attempt, first=first, tx_evidence="aggregate-counters")
             try:
                 reply_wait = 4 if self.lease_end else 25
                 _, frame = self.stock.frames.receive(
                     lambda p: p[:1] == b"\x0b", since,
-                    min(self.deadline, self.clock() + reply_wait, self.lease_end or self.deadline))
+                    min(self.deadline, self.clock() + reply_wait, self.lease_end or self.deadline),
+                    observer, b.target, c.digest)
             except TimeoutError:
+                self.emit("census_timeout", attempt=attempt, first=first)
                 self.room(15)
+                if attempt < retries:
+                    self.emit("census_retry", next_attempt=attempt + 1, first=first)
                 continue
-            report = self.parse_census(frame, first, allow_pending)
+            try:
+                report = self.parse_census(frame, first, allow_pending)
+            except Error as exc:
+                self.emit("census_rejected", first=first, reason=str(exc))
+                raise
+            self.emit("census_parsed", first=report["first"], lifecycle=report["lifecycle"],
+                      generation=report["generation"], phase=report["phase"],
+                      received=report["received"], total=report["total"], bitmap_count=report["bits"].bit_count())
             return report
+        self.emit("census_exhausted", first=first, attempts=retries)
         raise NoCensus("fresh RF census deadline/retries exhausted")
 
     def parse_census(self, frame, first, allow_pending=False):
@@ -634,6 +687,7 @@ class Sender:
         if self.lease_end:
             self.stock.radio(self.normal)
             self.profile, self.lease_end = self.normal, 0
+            self.emit("lease_leave", frequency_khz=self.normal[0])
         self.wait_until(max(self.target_normal_after, self.next_normal))
 
     def negotiate(self):
@@ -645,16 +699,21 @@ class Sender:
         prefix = (b"\x0c" + b.sender + b.target + c.digest
                   + struct.pack(">IHI", self.frequency, self.lease_ms, secrets.randbits(32)))
         request = prefix + self.stock.sign(DIRECT_DOMAIN + prefix, self.deadline)
-        for _ in range(3):
-            self.stock.frames.discard_rf()
+        observer = self.rf_observer("lease")
+        for attempt in range(1, 4):
+            self.stock.frames.discard_rf(observer, b.target, c.digest)
+            self.emit("lease_request", attempt=attempt, frequency_khz=self.frequency, lease_ms=self.lease_ms)
             since = self.send(request)
+            self.emit("lease_sent", attempt=attempt, tx_evidence="aggregate-counters")
             # A lost ACK may still switch the receiver. Never invent a switch
             # or immediately retry during that unobserved lease.
             self.target_normal_after = self.clock() + 20 + self.lease_ms / 1000 + 2
             try:
                 timestamp, ack = self.stock.frames.receive(
-                    lambda p: p[:1] == b"\x0d", since, min(self.deadline, self.clock() + 22))
+                    lambda p: p[:1] == b"\x0d", since, min(self.deadline, self.clock() + 22),
+                    observer, b.target, c.digest)
             except TimeoutError:
+                self.emit("lease_timeout", attempt=attempt)
                 self.wait_until(max(self.target_normal_after, self.next_normal))
                 prefix = prefix[:103] + struct.pack(">I", secrets.randbits(32))
                 request = prefix + self.stock.sign(DIRECT_DOMAIN + prefix, self.deadline)
@@ -662,11 +721,13 @@ class Sender:
             if len(ack) != 171 or ack[1:107] != request[1:107]:
                 raise Error("direct ACK target/owner/manifest/profile/token mismatch")
             verify(b.target, DIRECT_DOMAIN + ack[:107], ack[107:])
+            self.emit("lease_ack_verified", attempt=attempt)
             self.target_normal_after = timestamp + 20 + self.lease_ms / 1000 + 2
             self.wait_until(timestamp + 5.5)
             self.stock.radio((self.frequency, 250000, 5, 5, 0))
             self.profile = (self.frequency, 250000, 5, 5, 0)
             self.lease_end = timestamp + 5 + self.lease_ms / 1000 - 2
+            self.emit("lease_active", frequency_khz=self.frequency, lease_ms=self.lease_ms)
             return
         raise Error("signed normal-channel direct ACK retries exhausted")
 
@@ -674,12 +735,15 @@ class Sender:
         c, b = self.candidate, self.binding
         signature = self.stock.sign(c.canonical, self.deadline)
         frame = b"\x08" + hashlib.sha256(b.target).digest()[:8] + b.sender + c.canonical + signature
-        for _ in range(3):
+        for attempt in range(1, 4):
+            self.emit("auth_request", attempt=attempt, counter=c.counter, total=c.total)
             self.send(frame)
+            self.emit("auth_sent", attempt=attempt, tx_evidence="aggregate-counters")
             try:
                 return self.census(allow_pending=True)
             except NoCensus:
-                pass
+                self.emit("auth_no_census", attempt=attempt)
+        self.emit("auth_exhausted", attempts=3)
         raise Error("target did not admit candidate; ROOT must resolve cache/admin state")
 
     def activate_prepared(self):
@@ -688,9 +752,12 @@ class Sender:
         c, b = self.candidate, self.binding
         prefix = b"\x0e" + b.sender + b.target + c.digest + struct.pack(">I", self.pending_generation)
         frame = prefix + self.stock.sign(REUPLOAD_DOMAIN + prefix, self.deadline)
-        for _ in range(3):
+        for attempt in range(1, 4):
             if self.pending_reupload:
+                self.emit("reupload_request", attempt=attempt, observed_generation=self.pending_generation)
                 self.send(frame)
+                self.emit("reupload_sent", attempt=attempt, observed_generation=self.pending_generation,
+                          expected_generation=self.activation_generation, tx_evidence="aggregate-counters")
             try:
                 report = self.census(allow_pending=True)
             except NoCensus:
@@ -700,6 +767,7 @@ class Sender:
             if report["received"] or report["bits"] or report["phase"] != 1:
                 raise Error("REUPLOAD did not create a fresh remote candidate with zero bitmap")
             if report["lifecycle"] == 3:
+                self.emit("reupload_receiving", generation=report["generation"])
                 return report
             if report["lifecycle"] != 2:
                 raise Error("REUPLOAD requires generation+1 Receiving, never old-cache promotion")
@@ -730,6 +798,8 @@ class Sender:
                     message, prefix = block_message(self.candidate, index)
                     signature = self.stock.sign(message, min(self.deadline, self.lease_end))
                     self.send(prefix + signature)
+                    self.emit("block_sent", index=index, attempt=self.attempts[index], total=self.candidate.total,
+                              tx_evidence="aggregate-counters")
                 # Retain the window cursor across leases; restarting at zero can
                 # starve the tail of a real application with many bitmap windows.
                 first = first + 128 if first + 128 < self.candidate.total else 0
@@ -738,8 +808,10 @@ class Sender:
                     for window in windows:
                         if self.census(window)["lifecycle"] != 5:
                             raise Error("READY lost after direct lease expiry")
+                    self.emit("ready_observed_unsigned", generation=self.generation, total=self.candidate.total)
                     return self.receipt("ready-observed-unsigned")
             except LeaseExpired:
+                self.emit("lease_margin_exhausted")
                 self.negotiate()
             # Polling is bounded by stock TX completion and receiver reply wait.
 
@@ -762,7 +834,9 @@ class Sender:
                 raise Error("fresh READY required before separate signed COMMIT")
         body = self.binding.target + self.candidate.digest + struct.pack(">I", self.candidate.counter)
         signature = self.stock.sign(COMMIT_DOMAIN + body, self.deadline)
+        self.emit("commit_request", generation=self.generation, counter=self.candidate.counter)
         self.send(b"\x03" + body + signature)
+        self.emit("commit_sent", tx_evidence="aggregate-counters", installation_confirmed=False)
         return self.receipt("signed-commit-aggregate-tx-observed-not-install-confirmed")
 
 
@@ -992,7 +1066,8 @@ def main(argv=None):
                 if candidate:
                     sender = Sender(stock, binding, candidate, profile, time.monotonic() + args.timeout,
                                     args.frequency_khz, args.lease_ms, args.normal_duty_percent / 100,
-                                    reupload_generation=args.reupload_generation, reupload=args.reupload)
+                                    reupload_generation=args.reupload_generation, reupload=args.reupload,
+                                    event_callback=public_event)
                     result = sender.upload() if args.operation == "upload" else sender.commit(receipt)
             if result is not None:
                 private_write(directory / "result.json", result)

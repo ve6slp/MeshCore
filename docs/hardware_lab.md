@@ -1035,6 +1035,16 @@ clearing the packet cache is not the fix. The installed baseline still
 contains this defect; corrected application artifacts and real full-image
 delivery/confirmation/automatic rollback remain separate gates.
 
+After both failed attempts and the distinct-window probe, ROOT again matched
+41's complete private identity/settings/five-contact ACL/40-channel snapshot
+against the pre-RF baseline. At `00:59:28Z`, actual preflight still reported
+qualified INSTALL_CAPABLE, sequence1/counter0/extent0/hash0 and `io=ok`.
+The diagnostic-only host revision10 is now integrated byte-exact and passed
+81 focused plus75 existing uploader cases. It adds flushed public-only
+phase, progress and RF metadata events, without changing wire requests,
+retry counts, budgets or authority/restore guards. It has not yet been used
+for a new physical transfer.
+
 **Supervised client41 paired commissioning:** only the explicit Sense ROLE0
 profile admits the selected550308 APP/ZIP above. The original Sense ROLE1/77
 helpers and ordinary APP643072 ceiling remain unchanged. Do not use77 commands
