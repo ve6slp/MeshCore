@@ -63,6 +63,50 @@ uint32_t Dispatcher::getCADFailMaxDuration() const {
   return 4000;   // 4 seconds
 }
 
+bool Dispatcher::completeOutboundSend() {
+  if (outbound == nullptr || !_radio->isSendComplete()) return false;
+  const unsigned long t = _ms->getMillis() - outbound_start;
+  total_air_time += t;
+  updateTxBudget();
+  tx_budget_ms = t > tx_budget_ms ? 0 : tx_budget_ms - t;
+#if MESHCORE_LORA_OTA
+  if (outbound_is_ota) {
+    if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
+      ++ota_accounting_failure_count;
+      MESH_DEBUG_PRINTLN("%s Dispatcher: WARNING: OTA airtime accounting ring full", getLogDateTime());
+    }
+    outbound_is_ota = false;
+  }
+#endif
+  if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
+    float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+    unsigned long needed = MIN_TX_BUDGET_RESERVE_MS - tx_budget_ms;
+    next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
+  } else {
+    next_tx_time = _ms->getMillis();
+  }
+  _radio->onSendFinished();
+  logTx(outbound, 2 + outbound->getPathByteLen() + outbound->payload_len);
+  if (outbound->isRouteFlood()) {
+    n_sent_flood++;
+  } else {
+    n_sent_direct++;
+  }
+  releasePacket(outbound);
+  outbound = nullptr;
+  next_agc_reset_time = futureMillis(getAGCResetInterval());
+  return true;
+}
+
+bool Dispatcher::probeRadioDriverStatus() {
+  return _radio != nullptr && _radio->probeDriverStatusWithTxCompletion(this, [](void* context) {
+    auto& dispatcher = *static_cast<Dispatcher*>(context);
+    return dispatcher.outbound != nullptr &&
+           !dispatcher.millisHasNowPassed(dispatcher.outbound_expiry) &&
+           dispatcher.completeOutboundSend();
+  });
+}
+
 void Dispatcher::loop() {
   if (millisHasNowPassed(next_floor_calib_time)) {
     _radio->triggerNoiseFloorCalibrate(getInterferenceThreshold());
@@ -84,59 +128,21 @@ void Dispatcher::loop() {
   }
 
   if (outbound) {  // waiting for outbound send to be completed
-    if (_radio->isSendComplete()) {
-      long t = _ms->getMillis() - outbound_start;
-      total_air_time += t;
-      //Serial.print("  airtime="); Serial.println(t);
-
-      updateTxBudget();
-
-      if (t > tx_budget_ms) {
-        tx_budget_ms = 0;
-      } else {
-        tx_budget_ms -= t;
-      }
-
+    if (!completeOutboundSend()) {
+      if (millisHasNowPassed(outbound_expiry)) {
 #if MESHCORE_LORA_OTA
-      if (outbound_is_ota) {
-        if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
-          ++ota_accounting_failure_count;
-          MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: OTA airtime accounting ring full", getLogDateTime());
-        }
-        outbound_is_ota = false;
-      }
+        ++tx_timeout_count;
 #endif
+        MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: outbound packed send timed out!", getLogDateTime());
 
-      if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
-        float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
-        unsigned long needed = MIN_TX_BUDGET_RESERVE_MS - tx_budget_ms;
-        next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
+        _radio->onSendFinished();
+        logTxFail(outbound, 2 + outbound->getPathByteLen() + outbound->payload_len);
+
+        releasePacket(outbound);  // return to pool
+        outbound = NULL;
       } else {
-        next_tx_time = _ms->getMillis();
+        return;  // can't do any more radio activity until send is complete or timed out
       }
-
-      _radio->onSendFinished();
-      logTx(outbound, 2 + outbound->getPathByteLen() + outbound->payload_len);
-      if (outbound->isRouteFlood()) {
-        n_sent_flood++;
-      } else {
-        n_sent_direct++;
-      }
-      releasePacket(outbound);  // return to pool
-      outbound = NULL;
-    } else if (millisHasNowPassed(outbound_expiry)) {
-#if MESHCORE_LORA_OTA
-      ++tx_timeout_count;
-#endif
-      MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: outbound packed send timed out!", getLogDateTime());
-
-      _radio->onSendFinished();
-      logTxFail(outbound, 2 + outbound->getPathByteLen() + outbound->payload_len);
-
-      releasePacket(outbound);  // return to pool
-      outbound = NULL;
-    } else {
-      return;  // can't do any more radio activity until send is complete or timed out
     }
 
     // going back into receive mode now...

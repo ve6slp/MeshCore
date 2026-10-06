@@ -101,6 +101,25 @@ separate passive diagnostics classified the retained fault as an active-probe
 transmit/standby mode mismatch, with successful checked SPI reads and no device
 error bits. Its triggering operation and continuous radio reliability remain
 unqualified; a latched TX_DONE flag is not fresh-completion proof.
+
+The source now services an owned, unexpired transmit completion before the
+trial-health probe, using the dispatcher's ordinary completion path for
+exactly-once airtime accounting, packet release and receive rearm. If its ISR
+arrives during checked reads, the SX1262 wrapper can service that same owned
+completion and take one fresh probe; SPI/device errors from the first probe
+remain visible. The strict mode classifier is unchanged: stale TX_DONE,
+unowned or expired completion, and persistent standby are not health exemptions.
+Both companion and repeater trial-health paths use this service. These changes
+are not installed on41 and do not establish the historical fault's cause or
+continuous physical radio reliability.
+
+A separate private floor4 diagnostic rollback observer profile is wired to
+the unchanged ordered-trial/return observer, with bounded disconnect handling.
+It requires a new ROOT-admitted signed descriptor, measured READY
+generation/native nonce, fresh physical/current-state checks and separately
+sealed COMMIT. Synthetic USB samples are not hardware rollback evidence; no
+old attempt or failed receipt is reused.
+
 Recovered driver-fault counter increases were observed during that restart
 proof despite healthy sampled radio state; continuous fault-free radio
 operation and the faults' cause remain unqualified.

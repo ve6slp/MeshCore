@@ -37,6 +37,7 @@ protected:
   void idle();
   void startRecv();
   uint8_t driverSoftwareState() const;
+  bool transmitCompletionPending() const;
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();

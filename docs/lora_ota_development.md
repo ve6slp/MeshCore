@@ -1095,8 +1095,20 @@ sustained service: the receiver's lifetime radio fault count increased0 to1
 across the peer exchange. A separate passive retained-fault read classified an
 ActiveProbe mode mismatch: expected transmit, observed STDBY_RC, latched TX_DONE,
 successful checked SPI reads and no device-error bits. That classifies the
-retained diagnostic, not its triggering command or fresh completion; ordering
-and continuous reliability remain open. See the hardware lab guide for the actual receipt fingerprints
+retained diagnostic, not its triggering command or fresh completion.
+A transmit-completion ordering fix is integrated in source: it services the
+current owned send and rearms receive before checking trial health, without
+accepting stale completion flags or hiding SPI/device errors. Both companion
+and repeater callsites use the shared dispatcher's completion/accounting path,
+and ISR-during-probe reconciliation is bounded to one fresh probe. The native
+product gate passed32 cases, including20 completion cases. XIAO nRF, Solar and
+Wio companion/repeater OTA plus XIAO nRF BLE compile/link boundaries passed.
+The fix is not yet installed on41; continuous physical reliability remains open.
+The separate exact floor4 rollback profile passed16 combined offline cases,
+including missing-trial refusal, unchanged-floor return and once-only approval
+binding. This source result does not authorize a hardware campaign or prove
+autonomous rollback.
+See the hardware lab guide for the actual receipt fingerprints
 and the limits of native-event correlation and emission freshness.
 Independent observation of the full internal transition sequence and autonomous
 failed-trial rollback remain acceptance gates.

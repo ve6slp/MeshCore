@@ -126,6 +126,12 @@ public:
   */
   virtual bool probeDriverStatus() { return isDriverHealthy(); }
 
+  // The callback can finish the current owned send, never schedule another.
+  virtual bool probeDriverStatusWithTxCompletion(void* context, bool (*complete)(void*)) {
+    if (complete != nullptr) complete(context);
+    return probeDriverStatus();
+  }
+
   /**
    * \returns  true if the radio is currently mid-receive of a packet.
   */
@@ -246,6 +252,7 @@ class Dispatcher {
 
   void processRecvPacket(Packet* pkt);
   void updateTxBudget();
+  bool completeOutboundSend();
 
 protected:
   PacketManager* _mgr;
@@ -297,6 +304,7 @@ protected:
 public:
   void begin();
   void loop();
+  bool probeRadioDriverStatus();
 
   Packet* obtainNewPacket(bool is_ota_bulk = false);
   void releasePacket(Packet* packet);

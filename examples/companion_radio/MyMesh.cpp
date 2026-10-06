@@ -3852,13 +3852,13 @@ void MyMesh::tickOtaTrialHealth() {
   if (_store != nullptr && !_store->probeStorageReadiness(self_id)) {
     _ota_service_.noteStorageIoResult(false);
   }
-  const bool radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
   // Sampled fresh THIS tick only -- never persisted across ticks (see
   // OtaTrialRadioReadiness.h for why a sticky "fault observed" bool
   // would wrongly abort the whole boot on one transient failure).
   const uint32_t radio_fault_count_before_probe = (_radio != nullptr) ? _radio->driverFaultCount() : _ota_trial_last_radio_fault_count_;
-  const bool radio_driver_healthy = (_radio != nullptr) && _radio->probeDriverStatus();
+  const bool radio_driver_healthy = probeRadioDriverStatus();
   const uint32_t radio_fault_count_after_probe = (_radio != nullptr) ? _radio->driverFaultCount() : radio_fault_count_before_probe;
+  const bool radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
   // Genuine ACTIVE service proof for this pass: an internally-consistent
   // "idle" chip status is NOT proof the radio is actually doing its job
   // -- only an active Rx or a genuinely in-flight Tx counts (see

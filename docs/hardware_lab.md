@@ -1416,8 +1416,41 @@ completion before the probe. Both sequential reads retained count1; the
 collection requested no active probe, RF transmission, settings write, reset or
 OTA action. It does not establish a shared MCU boot epoch with the prior peer
 session, continuous health, CMD7 causation, or the earlier837-to886 faults'
-cause. Transmit-completion/probe ordering remains a separate source investigation;
-the strict health classifier has not been weakened.
+cause. The qualified installed source showed a possible transmit-completion/probe
+ordering race compatible with this diagnostic, not proof of its historical cause.
+The strict health classifier has not been weakened.
+
+**Transmit-completion source milestone (2026-10-05):**
+Both companion and repeater trial-health paths now service an owned, unexpired
+send through the dispatcher's ordinary exactly-once completion/accounting path.
+RadioLib cleanup rearms receive. The SX1262 probe handles an ISR arriving during
+its reads with at most one completion service and fresh probe, retaining original
+SPI/device failures. No extra send is scheduled by the health probe; stale IRQs,
+unowned/expired completions and persistent standby remain unhealthy. The focused
+native boundary passed32 cases (20 completion product cases plus12 existing
+fault-attribution cases).
+
+Compile/link passed for XIAO nRF, Solar and Wio OTA companion/repeater firmware
+and XIAO nRF BLE non-OTA firmware. XIAO nRF OTA companion RAM/flash are
+174332/560068 bytes; Solar companion131156/557264; Wio companion168740/723077.
+These are compile results, not installed images or new physical reliability
+evidence. Unit41 remains on `ota-41-diag-conf05` with its existing floor4.
+
+The separate private exact floor4 diagnostic rollback profile passed16 combined
+offline profile/observer cases using synthetic USB, including genuine ordered
+trial/return requirements, missing-trial refusal, unhealthy/changed-floor return
+refusal, fixed deadlines and once-only approval binding. Production signature
+verification rejects the synthetic invalid signature; tests do not sign or
+authorize a campaign. The profile SHA256 is
+`3cf6193bb05ef7e5c48ea40c7bbb3d2a9e798a49add33850aa10a14820cb296d`;
+its scoped observer bridge SHA256 is
+`aec55e3dadaaa879af4c15b5fe1384fe8c992fdbfedc370291555ed699a36c23`.
+The bridge requires private owned single-link files and safe-path Python.
+This resolves the source-profile blocker only. A new legitimate ROOT authority
+must bind the actual floor4 baseline, qualified nonconfirming image, signed
+descriptor/counter, measured READY generation and native nonce before any new
+hardware campaign. No COMMIT, signing, upload, reset, reflash or observer rerun
+was performed for this milestone; all historical failed receipts stay unchanged.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

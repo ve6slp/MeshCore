@@ -82,18 +82,42 @@ public:
   // not merely "one error-accumulator register happened to read back as
   // zero".
   bool probeDriverStatus() override {
+    return probeDriverStatusWithTxCompletion(nullptr, nullptr);
+  }
+
+  bool probeDriverStatusWithTxCompletion(void* context, bool (*complete)(void*)) override {
+    const uint32_t faults_before = driverFaultCount();
+    if (complete != nullptr) complete(context);
     auto* sx = (CustomSX1262 *)_radio;
-    const uint8_t software_before = driverSoftwareState();
+    uint8_t software_before = driverSoftwareState();
+    auto expectedMode = [this]() {
+      if (isInRecvMode()) return Sx1262ExpectedChipMode::kReceiving;
+      if (isTransmitPending()) return Sx1262ExpectedChipMode::kTransmitting;
+      return Sx1262ExpectedChipMode::kIdle;
+    };
+    Sx1262ExpectedChipMode expected = expectedMode();
     Sx1262CheckedProbeResult r;
-    r.device_errors_status = sx->getDeviceErrorsChecked(&r.device_errors);
-    r.irq_flags_status = sx->getIrqFlagsChecked(&r.irq_flags);
-    r.status_read_status = sx->getStatusChecked(&r.status_byte);
+    auto readProbe = [&]() {
+      r.device_errors_status = sx->getDeviceErrorsChecked(&r.device_errors);
+      r.irq_flags_status = sx->getIrqFlagsChecked(&r.irq_flags);
+      r.status_read_status = sx->getStatusChecked(&r.status_byte);
+    };
+    readProbe();
+    const uint8_t software_after = driverSoftwareState();
 
-    Sx1262ExpectedChipMode expected = Sx1262ExpectedChipMode::kIdle;
-    if (isInRecvMode()) expected = Sx1262ExpectedChipMode::kReceiving;
-    else if (isTransmitPending()) expected = Sx1262ExpectedChipMode::kTransmitting;
-
+    // Only an ISR completion of this still-owned TX can invalidate its mode
+    // snapshot. The callback never starts a new generation; reconcile once.
+    if (expected == Sx1262ExpectedChipMode::kTransmitting && transmitCompletionPending() &&
+        complete != nullptr && complete(context)) {
+      if (!evaluateSx1262CheckedHealth(r, expected) &&
+          !evaluateSx1262CheckedHealth(r, Sx1262ExpectedChipMode::kIdle)) {
+        recordSx1262CheckedProbeOutcome(_driver_health, r, expected, software_before, software_after);
+      }
+      software_before = driverSoftwareState();
+      expected = expectedMode();
+      readProbe();
+    }
     recordSx1262CheckedProbeOutcome(_driver_health, r, expected, software_before, driverSoftwareState());
-    return _driver_health.healthy();
+    return _driver_health.healthy() && driverFaultCount() == faults_before;
   }
 };

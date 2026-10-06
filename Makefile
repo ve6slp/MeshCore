@@ -244,6 +244,22 @@ test-ota-radio-fault-attribution: tmpdir
 	  -o "$(TMPDIR)/ota-radio-fault-attribution/product-test"
 	"$(TMPDIR)/ota-radio-fault-attribution/product-test"
 
+.PHONY: test-ota-radio-tx-completion
+## Native real Dispatcher/wrapper completion service plus unchanged strict fault gate.
+test-ota-radio-tx-completion: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-radio-tx-completion"
+	$(CXX) -std=c++17 -pthread -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	  -DMESHCORE_LORA_OTA=1 -DMESHCORE_RADIO_TX_COMPLETION_NATIVE=1 \
+	  -DLORA_SF=7 -DLORA_FREQ=907.525 -DLORA_BW=250 -DLORA_CR=5 -DLORA_TX_POWER=2 \
+	  -I test/test_lora_ota_integration/radio_tx_mocks -I src -I test/mocks \
+	  -I "$(OTA_RADIO_FAULT_GTEST)/include" -I "$(OTA_RADIO_FAULT_GTEST)" \
+	  src/Dispatcher.cpp src/Packet.cpp src/helpers/radiolib/RadioLibWrappers.cpp \
+	  test/test_lora_ota_integration/test_radio_fault_attribution.cpp \
+	  test/test_lora_ota_integration/test_radio_tx_completion.cpp \
+	  "$(OTA_RADIO_FAULT_GTEST)/src/gtest-all.cc" "$(OTA_RADIO_FAULT_GTEST)/src/gtest_main.cc" \
+	  -o "$(TMPDIR)/ota-radio-tx-completion/product-test"
+	"$(TMPDIR)/ota-radio-tx-completion/product-test"
+
 test-ota-lab-host: tmpdir
 	python3 -m unittest discover -s scripts/tests -p '$(OTA_LAB_HOST_TEST_PATTERN)'
 

@@ -132,6 +132,10 @@ bool RadioLibWrapper::isTransmitPending() const {
   return (state & ~STATE_INT_READY) == STATE_TX_WAIT;
 }
 
+bool RadioLibWrapper::transmitCompletionPending() const {
+  return state == (STATE_TX_WAIT | STATE_INT_READY);
+}
+
 int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
   int len = 0;
   if (state & STATE_INT_READY) {
@@ -203,7 +207,7 @@ bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
 }
 
 bool RadioLibWrapper::isSendComplete() {
-  if (state & STATE_INT_READY) {
+  if (transmitCompletionPending()) {
     state = STATE_IDLE;
     n_sent++;
     return true;
@@ -212,9 +216,16 @@ bool RadioLibWrapper::isSendComplete() {
 }
 
 void RadioLibWrapper::onSendFinished() {
-  _radio->finishTransmit();
+  const uint8_t software_before = state;
+  const int err = _radio->finishTransmit();
   _board->onAfterTransmit();
   state = STATE_IDLE;
+  if (err != RADIOLIB_ERR_NONE) {
+    MESH_DEBUG_PRINTLN("RadioLibWrapper: error: finishTransmit(%d)", err);
+    _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::Unknown, err, software_before, state);
+    return;
+  }
+  startRecv();
 }
 
 int16_t RadioLibWrapper::performChannelScan() {

@@ -1801,10 +1801,10 @@ void MyMesh::tickOtaTrialHealth() {
   uint32_t radio_fault_count_after_probe = _ota_trial_last_radio_fault_count_;
   bool radio_genuinely_servicing = false;
   if (_radio_available_ && _radio != nullptr) {
-    radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
     radio_fault_count_before_probe = _radio->driverFaultCount();
-    radio_driver_healthy = _radio->probeDriverStatus();
+    radio_driver_healthy = probeRadioDriverStatus();
     radio_fault_count_after_probe = _radio->driverFaultCount();
+    radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
     radio_genuinely_servicing = _radio->isInRecvMode() || isSendInProgress();
   }
   const bool filesystem_ready_now =
