@@ -1435,6 +1435,25 @@ fresh parent helpers were fully pre-staged before policy time, record SHA256
 Only input proposals were created. Actual ROOT admissions, timed independent
 metadata reviews and strict postinstall acceptance remain mandatory; no
 hardware operation followed source qualification and no08/13 artifact changed.
+Separate fresh09/14 admissions then captured exposed userdata in1.800 seconds,
+receipt SHA256
+`e780399e2ace647405c01890715cbc21a6de25b60eded2454334a49dfc35e315`.
+All other exposed fields matched the original; only the two known stock
+timestamps differed. Independent baseline review completed20.118 seconds
+after capture and peer execution began22.097 seconds after capture, both
+within30 seconds under a fresh policy.
+The corrected adapter passed stock-core checks, issued one ordinary advert
+per direction and verified both private signatures/post-command RF with normal
+profile guards. Healthy/core0 receiver samples showed one new old-firmware
+fault1->2, stable within reads and within the explicit budget.
+The once-only stage nevertheless failed with
+`real-private-SIG-and-fresh-native-accepted-event-required`, receipt SHA256
+`3ec8a73e8acb22f75145c48738c99325f0318d69f93d688f40e571b48e1e33f0`.
+Native acceptance was observed at stock, not41; cryptographic signatures do
+not substitute for the missing native event or prove commanded fresh emission.
+No post-RF inventory/review, bootstrap acceptance, signing, upload or COMMIT
+followed. Readers exited; all09/14 evidence remains frozen pending diagnosis,
+without replay, native-event waiver or fault-causation inference.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

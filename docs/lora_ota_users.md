@@ -268,6 +268,12 @@ real adapter dispatch and a read-only check of the genuine original history.
 Fresh workflow helpers are ready before policy time. This creates no hardware
 permission; fresh admissions and strict postinstall checks are still required.
 The transmit fix remains unsigned and uninstalled.
+Fresh admissions then passed userdata and timed baseline checks. The corrected
+adapter reached both ordinary advert commands and verified both signatures,
+but native acceptance was missing at41. One new pre-fix fault was within the
+explicit budget; that did not waive the missing native event. The attempt
+stopped with evidence intact and readers released. No signing, upload or
+COMMIT followed; the transmit fix is still unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

@@ -2111,6 +2111,30 @@ hardware permission. Every actual admission and strict postinstall gate
 remains separate. Frozen08/13 evidence is unchanged; the transmit fix remains
 unsigned and uninstalled.
 
+Separate fresh09/14 ROOT policy/readbacks admissions then captured full exposed
+userdata in1.800 seconds, receipt SHA256
+`e780399e2ace647405c01890715cbc21a6de25b60eded2454334a49dfc35e315`.
+The original body and all other exposed fields matched; only the known two
+stock timestamps differed. The independent baseline review completed20.118
+seconds after capture; the peer stage began22.097 seconds after capture, both
+within30 seconds under a fresh policy.
+The corrected adapter passed stock-core checks and reached one ordinary advert
+command in each direction. Both private signatures and post-command RF were
+verified, with normal identity/profile guards before and after. Receiver
+samples remained healthy/core0; lifetime fault count increased1->2 and was
+stable within each read, one new preinstall fault within the explicit budget.
+That does not establish RF fault causation or continuous health.
+The once-only peer stage still failed after5.489 seconds:
+`real-private-SIG-and-fresh-native-accepted-event-required`, receipt SHA256
+`3ec8a73e8acb22f75145c48738c99325f0318d69f93d688f40e571b48e1e33f0`.
+Native acceptance was observed at stock but not at41. Signature verification
+does not replace the missing event; native packet correlation and commanded
+emission freshness were not proven. No post-RF inventory/review, bootstrap
+acceptance, signing, upload or COMMIT followed. Both readers exited.
+All09/14 artifacts and the consumed attempt remain frozen while the missing
+native-event boundary is investigated; no replay or acceptance waiver is used.
+The transmit fix remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;
