@@ -245,6 +245,12 @@ review/admission windows, so fresh RF permission was refused before any radio
 or OTA operation. That cycle stopped with its evidence intact. A fresh,
 isolated cycle is being prepared with review helpers ready beforehand;
 expired permissions and old captures will not be reused.
+That isolated cycle's source and genuine original-history preflight are now
+independently accepted. All timed-review and later stage input helpers are
+ready before a new policy begins; they do not automatically approve captures
+or waive timestamps. No hardware permission or operation comes from this
+preparation. Fresh separate ROOT admissions remain required, and the transmit
+fix is still unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

@@ -1373,6 +1373,23 @@ approval/start/receipt, fresh RF, signing, upload or COMMIT followed.
 The stopped cycle's artifacts remain unchanged. A fresh isolated08/13 scope
 is being prepared with all review helpers staged before starting policy time;
 no expiry extension, stale capture, marker reuse or failed05 promotion is used.
+The isolated08/13 source is now independently accepted with identical agent
+and parent product SHA256
+`c4d5647bdf8b2683bb09248a6a3c5e53ddf7b96e96c3e1ba4cd0a20ce6ea1945`,
+passing16 production-path MODEL and21 API cases without behavior or deadline
+changes. All17 sources and52 frozen preservation pins matched. The paired
+parent handoff SHA256 is
+`83c9982dd75b1f061a2e5dda877ead2b96b16d73f2faa6095e3f96ae223cc04b`.
+A new unprimed read-only genuine29-pin history preflight passed with SHA256
+`a7ef6e5677730ece6cbccf8623b8c391a39c67d3c87ebdcec787fbe0d5880465`.
+All parent review and later stage input helpers were staged before any new
+policy clock; the private pre-stage record SHA256 is
+`856d657638358da8c223ce8289532763da451ed611c1518e76fbe133ed970112`.
+The helpers emit input candidates, not authority. Exact independent timed
+timestamp reviews, explicit ROOT stage decisions, device-measured READY and
+strict zero-new-fault postinstall acceptance remain mandatory. No new policy,
+stage consumption or hardware operation followed source/pre-stage qualification;
+all stopped07/12 evidence remains unchanged.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

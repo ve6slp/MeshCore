@@ -2033,6 +2033,27 @@ A wholly fresh isolated08/13 cycle is being prepared, with review helpers
 staged before the policy clock starts. No clock extension, stale-data waiver,
 marker reuse or old-policy renewal is permitted.
 
+The isolated recovery08/deployment13/observer13 source is now independently
+accepted without behavior or deadline changes. Agent and parent Make runs
+matched product SHA256
+`c4d5647bdf8b2683bb09248a6a3c5e53ddf7b96e96c3e1ba4cd0a20ce6ea1945`,
+passing16 production-path MODEL and21 API cases. All17 source bindings and52
+frozen preservation pins matched; the paired parent handoff SHA256 is
+`83c9982dd75b1f061a2e5dda877ead2b96b16d73f2faa6095e3f96ae223cc04b`.
+A separate unprimed read-only preflight validated the genuine original29-pin
+history and immutable inventory reference, with SHA256
+`a7ef6e5677730ece6cbccf8623b8c391a39c67d3c87ebdcec787fbe0d5880465`.
+The parent staged the timed baseline/post-RF review helpers and all later
+preparation, signing, upload, native READY/profile, launch and strict
+postinstall inputs before starting a policy clock. The pre-stage record SHA256 is
+`856d657638358da8c223ce8289532763da451ed611c1518e76fbe133ed970112`.
+Input generation is not approval: each stage still requires its own legitimate
+ROOT decision. Native generation is measured, never assigned; changed
+timestamps are independently reviewed, never automatically waived.
+No policy, consumed stage, hardware operation or fix installation resulted
+from these source/pre-stage checks. The stopped07/12 artifacts remain frozen,
+and the transmit fix remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;
