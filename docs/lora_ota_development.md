@@ -1258,10 +1258,22 @@ floor4 and healthy sampled normal TX2 with actual stable count0, and the full
 new exposed-userdata inventory matched the prior ROOT comparison hashes.
 Separate descriptor and unchanged-stock USB signing admissions produced a new
 verified counter8 descriptor for the older nonconfirming image. Its distinctly
-admitted once-only reader-free500kHz AUTH/upload is running under the unchanged2%
-policy. READY, actual measured generation above17 and stock-radio restoration
-remain pending; no generation18 is assigned and no COMMIT has been invoked.
-New launch admission and genuine ordered rollback/recovery remain mandatory.
+admitted once-only reader-free500kHz AUTH/upload completed with exit0 under the
+unchanged2% policy. Actual READY generation18 was measured, not assigned, with
+all6617 blocks and true stock-radio restoration. The reviewed upload handoff
+SHA256 is
+`a883dd68ab7db2012fbc09468e675ba20a3a353b0c89a5c47aa36fc183e4029d`.
+Independent native binding review established attempt1 nonce
+`47ea9339f9b20a5c`, excluding all five prior nonces.
+After the65-second fast-lease expiry wait, a distinct fresh ROOT launch approval
+started the attached campaign. Fresh local USB READY confirmed the exact
+counter8/generation18/floor4 session, core0 and normal TX2 with actual stable
+fault count796, not forced zero. A genuine ARM preceded the separate bounded
+signed-COMMIT child on the exact stock USB4.2.4 path. The original2010-second
+budget is unchanged. COMMIT request/sent/result/restoration sealing and genuine
+new ordered trial, qualified post-trial kernel removal and new-epoch floor4
+return remain pending; process startup does not establish them. Independent
+post-return userdata/ordinary RF recovery remains blocked until completion.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

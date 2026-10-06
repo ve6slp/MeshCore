@@ -189,9 +189,15 @@ ROOT subsequently explicitly selected counter8 for another distinct campaign.
 Fresh preparation rechecked the failed counter7/generation17 floor4 baseline
 and matched the prior exposed-userdata inventory. Separate signing produced a
 verified descriptor for the same older nonconfirming image, and a separately
-admitted reader-free LoRa upload is now running. READY, measured generation
-above17 and stock-radio restoration are pending. No COMMIT has been invoked;
-this does not install the transmit fix or recover any old failed history.
+admitted reader-free LoRa upload completed with actual measured READY
+generation18 and confirmed stock-radio restoration. After receipt review and
+lease expiry, a distinct fresh ROOT admission started the observed campaign.
+A genuine fresh READY/prearm gate preceded the separate bounded signed-COMMIT
+child. Its result and new ordered trial/qualified post-trial removal/return
+proof remain pending. Sampled normal TX2 was healthy with actual stable fault
+count796, not forced zero; continuous fault-free operation is not established.
+Independent post-return userdata and two-way ordinary RF recovery remain
+blocked. This does not install the transmit fix or recover old failed history.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

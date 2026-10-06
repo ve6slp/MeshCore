@@ -1837,7 +1837,7 @@ independent full userdata and ordinary two-way RF recovery, transmit-fix
 installation and physical reliability remain open. All old sources, claims
 and failed receipts remain frozen; later snapshots do not promote them.
 
-**Fresh counter8 campaign (2026-10-06, prepared/signed; upload in progress):**
+**Fresh counter8 campaign (2026-10-06, READY complete; observed launch started):**
 After independent ROOT source acceptance, ROOT explicitly selected counter8,
 above the actual failed counter7; no READY generation was assigned. A distinct
 read-only preparation freshly remeasured diag-conf05, the exact original floor4,
@@ -1858,12 +1858,33 @@ Ed25519 signature against the exact stock owner. The signed descriptor SHA256 is
 A further distinct once-only AUTH/upload approval, SHA256
 `0ef989f7fb038936435fca759001cd67af0467ebb7c1446aa81e08d417cb4756`,
 started the reader-free500kHz LoRa upload under the unchanged2% airtime policy.
-The attached upload and actual stock production child were observed running on
-the authorized physical USB4.2.4 path. READY, actual measured generation above17
-and stock-radio restoration are pending. No COMMIT has been invoked.
-Only a completed reviewed upload may support separate ROOT launch admission,
-real prearm and the new ordered trial/qualified post-trial removal/return proof.
-The transmit fix remains unsigned and uninstalled.
+The attached upload completed with exit0 on the authorized physical USB4.2.4
+path. Its actual READY generation18 was measured, not assigned; all6617 blocks
+were present and stock-radio restoration was true. The upload handoff SHA256 is
+`a883dd68ab7db2012fbc09468e675ba20a3a353b0c89a5c47aa36fc183e4029d`;
+the production result SHA256 is
+`45e58ebb7caad16a88d8a5b0b9d796040379eae745b4687c361d4ca8bb90a0d2`.
+Independent native owner/manifest/generation binding review derived attempt1
+nonce `47ea9339f9b20a5c`, excluding all five prior nonces.
+
+After the65-second fast-lease expiry wait and completed receipt review, a
+distinct fresh ROOT launch approval, SHA256
+`5f0159b233de1bfa52ab8e68d86076ce80a65739630433cb8c3e4a7c1391172f`,
+started the attached observed campaign. Its actual fresh local USB READY sample
+confirmed counter8/generation18, diag-conf05, the exact floor4, core0 and normal
+TX2. Both radio readings retained actual stable lifetime fault count796,
+not forced zero; the cause and continuous fault-free operation remain unknown.
+The genuine prearm receipt SHA256 is
+`f0a0de230b5626431076c0bc0166c91159336384abc659031888286c5dfb8346`.
+Only after this real ARM did the separate bounded signed-COMMIT production child
+start on USB4.2.4, within the original2010-second campaign budget.
+COMMIT request/sent/result/restoration sealing and the new ordered trial,
+qualified post-trial kernel removal and new-epoch exact-floor4 return remain
+pending. Process startup is not install or rollback proof. No additional reader,
+reupload, reset, reflash, deadline extension or failed-receipt promotion was
+performed. Independent post-return userdata and two-way ordinary RF recovery
+remain gated on a genuinely complete campaign. The transmit fix remains
+unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
