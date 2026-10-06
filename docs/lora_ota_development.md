@@ -1316,6 +1316,26 @@ cryptographic causation, fault cause or continuous reliability is claimed.
 Frozen sources and the consumed failed stage remain intact, with no retry,
 reset, reflash, new AUTH or failed-receipt promotion. Recovery and transmit-fix
 deployment remain blocked pending a distinct legitimate next admission.
+The separately selected degraded-radio bootstrap now has independently
+accepted production wiring: recovery06, deployment11 and owned observer11.
+The agent and parent Make product runs matched SHA256
+`0cc6cc9ddf55df26a5fda0f39912efbe4dd65aea1515caec427996408c01ad3f`,
+passing13 production-path MODEL and21 API cases. Positive Ed25519/native-frame
+cryptography used synthetic fixtures; physical/process/history leaves were
+simulated. The source/schema/custody review SHA256 is
+`0600b12b26b1d2cd78cca9a1c86384fb700aa7b63f4ccdd301afdc9eb92ffa70`;
+all14 new source bindings and the known frozen/shared/archive pins matched.
+This is executable production integration, but not live authority or an install.
+An explicit default-deny ROOT budget0 or1 applies only to newly observed
+preinstall ordinary-RF faults, with current health, stable within-read samples
+and all physical/crypto/native-floor guards retained. Fresh userdata and an
+independent exact changed-timestamp baseline review must precede fresh RF;
+a separate exact post-RF review follows it. Failed05 remains failed.
+Preparation/signing/upload/launch remain separate once-only admissions.
+The exact APP06 requires device-measured READY, trueARM, bounded COMMIT and
+stock restoration, native Installed8/new floor, then independent strict
+userdata and both-way native RF with zero new faults. No fault causation,
+continuous reliability or userdata atomicity is inferred.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

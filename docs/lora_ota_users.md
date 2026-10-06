@@ -217,6 +217,18 @@ erase that fault. The failed stage remains failed and was not retried; recovery
 and transmit-fix deployment remain blocked. The transmit fix is unsigned and
 uninstalled. Old failed history remains failed.
 
+A new degraded-radio bootstrap path is independently source-qualified and
+wired through the production collectors, coordinator and owned observer.
+It can proceed only with fresh, separate ROOT admissions and an explicit
+budget of at most one newly observed pre-fix ordinary-RF fault; it does not
+turn the failed recovery into a pass. Fresh exposed-userdata checks and exact
+contact-timestamp reviews remain required, along with current radio health
+and the existing physical, signing, session and floor guards.
+Installing the exact transmit fix must establish native Installed/new floor
+and then pass separate strict userdata and both-way ordinary RF checks with
+no new faults. Source qualification performed no hardware operation and
+does not change the unsigned, uninstalled status.
+
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
 It requires a new ROOT-admitted signed descriptor, measured READY

@@ -1953,6 +1953,36 @@ and neither the fault's cause nor continuous reliability is established.
 The consumed failed stage is not retried or promoted. Recovery and healthy
 deployment remain blocked; the transmit fix is still unsigned and uninstalled.
 
+A distinct degraded-radio bootstrap source is now independently accepted:
+recovery06 collectors, deployment11 coordinator/materializer and owned
+observer11 are wired through the production paths, not just a MODEL API.
+Agent qualification and the independent parent Make run produced identical
+product SHA256
+`0cc6cc9ddf55df26a5fda0f39912efbe4dd65aea1515caec427996408c01ad3f`.
+The boundary passed13 production-path MODEL cases and21 API cases, including
+real Ed25519/native-frame verification on synthetic fixtures; port, kernel,
+process, clock and history leaves were simulated, not hardware evidence.
+The independently verified source/schema/custody handoff SHA256 is
+`0600b12b26b1d2cd78cca9a1c86384fb700aa7b63f4ccdd301afdc9eb92ffa70`.
+All14 new source/Make bindings, shared dependencies,10 known frozen-source
+pins and archived qualifications matched. Frozen04/05/09/10 sources and the
+failed RF05 stage remain unchanged.
+
+This path requires a separate explicit ROOT policy with budget0 or1 newly
+observed preinstall ordinary-RF fault; absent, unlimited or exhausted budgets
+are refused. It does not claim strict recovery, fault-free operation or RF
+causation. Current health, core0, stable within-read counts, exact physical and
+cryptographic identity, native session and floor remain mandatory. Fresh full
+userdata and any exact changed-timestamp baseline review precede new RF;
+an independent exact post-RF timestamp review follows it. Durable once-only
+consumption precedes side effects, and failure cannot be replayed as authority.
+The exact APP06 still needs separate preparation, signing, upload and launch
+admissions, device-measured READY, trueARM and bounded COMMIT/restoration.
+Native Installed8 and a new floor must then be followed by separate strict
+full-userdata and both-way native RF checks with zero new faults. No actual
+bootstrap authority, hardware operation or fix installation comes from source
+acceptance; the fix remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;
