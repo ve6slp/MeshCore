@@ -2159,6 +2159,9 @@ have no proven latency bounds. Neither a radio-fault-caused stall nor the
 actual delay's cause is established. No source correction was selected;
 further hardware diagnosis requires a distinct qualified plan and fresh
 admissions, without reusing this failed attempt or extending its deadline.
+Preparation and source qualification of that distinct timing-only probe are
+approved. This does not authorize hardware execution, installation or changes
+to the existing acceptance window.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

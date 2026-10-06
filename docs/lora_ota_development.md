@@ -1478,6 +1478,12 @@ bounds; neither actual delay causation nor a radio-fault-caused stall is proven.
 No corrective source was selected. A distinct qualified timing-only hardware
 diagnosis and fresh admissions would be required to resolve the remaining
 uncertainty, without changing this attempt's deadline or promoting its failure.
+Preparation and source qualification of a distinct timing-only observer are
+now approved. It must retain the real native parser, adapter and owned
+transport, capture count/time provenance without exposing payloads, and leave
+the existing acceptance guards unchanged. Execution still requires separate
+fresh admissions; this is not permission to install firmware or retry a
+consumed attempt.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

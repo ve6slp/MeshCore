@@ -285,6 +285,8 @@ host collection defect. The notification delay's cause is still unproven.
 Firmware inspection also found no notification timer or next-command gate.
 Further hardware diagnosis needs a distinct qualified plan and fresh
 permissions; no correction or retry has been authorized.
+Preparation and source qualification of a separate timing-only diagnostic
+are approved, but hardware execution and installation are not.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
