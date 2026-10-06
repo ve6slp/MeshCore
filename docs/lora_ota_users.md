@@ -143,8 +143,10 @@ confirmed diag-conf05/floor4 and matched the prior protocol-visible
 five-contact/40-channel userdata snapshot. Complete READY and native generation
 are not yet measured, and no counter6 COMMIT has started. Full autonomous
 rollback and subsequent ordinary RF recovery remain open. Corrected source-only
-healthy-deployment wiring is being prepared; the radio fix remains unsigned and
-uninstalled.
+recovery and healthy-deployment wiring is now qualified, but still refuses live
+deployment without that genuine rollback history, fresh userdata/ordinary RF
+recovery and separate ROOT admission. The radio fix remains unsigned and
+uninstalled; synthetic qualification does not change the hardware status.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

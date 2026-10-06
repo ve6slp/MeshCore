@@ -1158,8 +1158,19 @@ USB-signed and Ed25519-verified through the unchanged stock companion.
 Its separately admitted once-only reader-free500kHz upload is now running under
 the unchanged2% airtime policy. Complete READY and native generation are not yet
 measured; no counter6 COMMIT has begun. New source-only post-return recovery and
-healthy-deployment wiring is being prepared against genuine counter6 lineage
+healthy-deployment wiring is now qualified against genuine counter6 lineage
 and the corrected floor ABI, without relaxing the old failed campaign's gates.
+Its focused Make boundary passed12 cases with30 MODEL fixtures through the
+real scoped observer/recovery/coordinator; these are synthetic operation inputs,
+not actual trial history or ROOT authority. Live admission requires actual
+source-bound ordered rollback and COMMIT/restoration receipts, independent full
+userdata comparison and ordinary two-way RF recovery, plus a separate exact
+contact-timestamp diff review when needed. The corrected healthy observer still
+requires the exact APP06 image/new floor/native Installed8. A later healthy
+campaign must use an independently selected counter above the actual rolled6,
+measured READY generation above the actual rollback session, prior-session
+nonce exclusions and separately admitted prearm-before-bounded-COMMIT.
+Missing prerequisites deny live execution; no counter/generation is defaulted.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

@@ -1600,11 +1600,45 @@ complete READY or native generation is claimed yet; generation is unknown
 until actually measured. No counter6 COMMIT has started.
 
 Genuine ordered trial, post-trial gap and exact floor4 return, followed by fresh
-userdata and ordinary two-way RF recovery, remain required. New source-only
-recovery/healthy-deployment wiring is being prepared against this campaign's
-future genuine lineage and the corrected trial-floor ABI. It denies hardware
-admission until those prerequisites exist; no failed counter5 history is
-promoted. The transmit-fixed healthy APP remains unsigned and uninstalled.
+userdata and ordinary two-way RF recovery, remain required. The transmit-fixed
+healthy APP remains unsigned and uninstalled.
+
+**Post-return recovery and corrected healthy deployment (2026-10-05, source only):**
+Three new private capsules now wire the genuine counter6 campaign's future
+lineage into post-return recovery, the exact APP06 observer and staged healthy
+deployment. Their focused Make boundary passed12 cases using30 MODEL fixtures;
+these exercise the real scoped observer, recovery and coordinator against
+synthetic USB/RF/history and independent approval inputs, not actual campaign
+success or ROOT authority. The first failed qualification remains preserved.
+The final handoff SHA256 is
+`dfb5f6a34e0eb0e5dc5e3eb83a294aacf715191f99711419f0a958e03c9edc01`;
+the final product receipt and independent rerun SHA256 is
+`0cbddb5f26f80dfb0fba71fc0ed4bd0113a3939072789f2b3bce204c8f85d8e4`.
+
+Recovery requires the actual new source-bound preparation/signing/session
+receipts, genuine ordered trial/gap/unchanged-floor return and bounded signed
+COMMIT transmission/result/restoration seal under the original parent deadline.
+Only then can separate ROOT admission permit full protocol-visible userdata
+comparison and one ordinary signed, native-accepted advert in each direction
+at normal2dBm. Any permitted contact-timestamp change requires its own exact
+ROOT diff review; missing fields do not fall back to counts. Current healthy
+radio and unchanged observed fault counts are required, without erasing
+historical faults or requiring lifetime zero.
+
+The healthy observer retains the exact APP06 image/floor/native Installed8
+requirements and corrects only its trial-floor predicate, accepting the strict
+available baseline floor or legacy deferred floor. Deployment still requires
+genuine counter6 recovery, an independently selected higher counter, actually
+measured higher READY generation and native nonce excluding all prior sessions.
+No counter or generation is assigned by this source delivery. Separate
+prepare/descriptor/sign/upload/launch admission, actual fresh READY, real
+prearm before bounded COMMIT and sealed radio restoration remain mandatory.
+There is no permanent source-only refusal once genuine prerequisites are
+supplied, but absent prerequisites deny all live execution.
+
+The current reader-free counter6 upload still has no measured complete READY,
+generation or COMMIT result. No hardware operation was performed by this
+source qualification; the radio fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
