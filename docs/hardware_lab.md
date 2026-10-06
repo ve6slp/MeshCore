@@ -1478,9 +1478,28 @@ This is static selected-root analysis, not runtime stack high-water or whole-loo
 filesystem/UI/sensor certification. The original partial report remains
 unchanged; the new closure records the resolved edges explicitly.
 
-The new artifact is not signed, assigned a counter/generation or installed on41.
-Its later deployment needs its own exact observer profile and legitimate ROOT
-admission. Separately, a new counter5 campaign using the older qualified
+An exact private APP06 healthy-installation observer profile is now qualified
+in source. Its first focused boundary exposed the frozen observer's static
+diag-conf05 version decoder, which overwrote the caller's APP06 recognition.
+A separate source view replaces only the decoder binding at line291 with the
+exact caller-supplied decoder; the frozen classifier, evidence implementation,
+files and globals remain unchanged. The final focused Make boundary passed
+seven product groups using26 synthetic public USB fixtures. The original failed
+run remains preserved. The exact profile SHA256 is
+`a3845199cd5b1c9971da62aa215bd23b999724b35dd866a81019f50af7a669e0`;
+the successful product receipt SHA256 is
+`089a9f2a06177687ecc83cc8e74886ada7409945c83dd6f9640a34e5422106bd`.
+
+This is source qualification, not hardware admission. The profile still denies
+deployment without genuine completed counter5 trial/gap/unchanged-floor return
+and sealed COMMIT/restoration receipts, an independently reviewed fresh ROOT
+approval, the actual new signed descriptor/counter>5/measured generation/native
+nonce, current physical/floor/core/normal-radio checks and a real prearm before
+separate bounded COMMIT. Healthy confirmation requires the exact new image
+and floor with native Installed8. A short healthy trial may remain explicitly
+unobserved only under ROOT's separate policy; it is never fabricated.
+The new artifact is still unsigned, without an assigned counter/generation,
+and not installed on41. Separately, a new counter5 campaign using the older qualified
 nonconfirming `ota-41-diag-roll05` image was prepared and USB-signed through the
 unchanged stock companion. Its once-only reader-free500kHz RF upload completed:
 the exact counter5 manifest

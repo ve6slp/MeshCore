@@ -120,6 +120,10 @@ That upload completed READY at native measured generation15 and restored the
 stock radio. A fresh observer was armed before the separate signed COMMIT
 started; COMMIT completion, installation and autonomous rollback remain
 unconfirmed. Staging does not establish a new running image.
+The transmit-fixed APP's exact healthy-installation observer is now qualified
+in source, without changing the strict image/floor classifier. Its deployment
+still requires genuine completion of the current rollback campaign and fresh,
+separate ROOT admission; no signing or installation of that APP has begun.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

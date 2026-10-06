@@ -1109,8 +1109,14 @@ fits the Sense ROLE0 installer layout:560084 bytes,174332 bytes static RAM.
 Its new completion/cleanup path has a closed conservative1848-byte stack bound
 including IRQ104; the selected OTA-root maximum remains3348/4096. These are
 artifact/static-analysis results, not runtime stack certification or a running
-update. A separate exact observer profile and ROOT deployment admission are
-still required.
+update. Its separate exact healthy observer profile is now source-qualified:
+one isolated source-view decoder binding admits the exact APP06 version while
+retaining the frozen classifier and evidence implementation. Seven focused
+product groups passed using26 synthetic public USB fixtures; the failed first
+run remains unchanged. Actual deployment still requires genuine completed
+counter5 rollback lineage, a new signed descriptor and measured session,
+independent fresh ROOT admission, real prearm and bounded separate COMMIT.
+This source result does not install the fix or prove physical reliability.
 The separate exact floor4 rollback profile passed16 combined offline cases,
 including missing-trial refusal, unchanged-floor return and once-only approval
 binding. This source result does not authorize a hardware campaign or prove
