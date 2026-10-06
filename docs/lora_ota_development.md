@@ -1340,12 +1340,27 @@ Subsequent accessor review exposed a genuine-history dataflow blocker:
 strict preparation fills the history namespace, but policy materialization
 and recovery admission read a separate earlier namespace lacking the validated
 original-userdata summary. MODEL setup had supplied the missing field, so
-the passing product receipt does not establish this transition. Live bootstrap
-is blocked before any actual policy, admission, consumed stage or hardware
-operation. A new recovery07/deployment12/observer12 source-only correction
+the passing product receipt does not establish this transition. The frozen06/11
+live path is blocked before any actual policy, admission, consumed stage or
+hardware operation. A new recovery07/deployment12/observer12 source-only correction
 must carry strictly derived preparation through unprimed namespaces and retain
 the original inventory reference across later healthy preparation. Accepted
 06/11 sources and all receipts remain frozen; no fallback or bypass is used.
+The distinct07/12 correction is now independently accepted: agent and fresh
+parent Make runs matched product SHA256
+`c4ad8b8ca5721110c2adccb6cadf620857e6c41493cb3a008e70eacd9b686e28`,
+with16 production-path MODEL and21 API cases. Strict preparation now derives
+immutable original context from unprimed namespaces; failed validation clears
+it, and later candidate preparation cannot replace the original inventory.
+The paired source/schema/custody handoff SHA256 is
+`097e877031cf5712ff224633d96c036280d01f52b72da5ad9b24f1e9344003f6`;
+all17 source and30 preservation bindings matched. A separate parent read-only
+unprimed preflight passed the genuine campaign04 review and all29 original pins
+through the corrected API, with SHA256
+`4c88038e865f77cd22088eb30dd3c2768016da5100d3eaa2ffb90535e08d3fde`.
+Only private input proposals were produced: no policy, approval, stage
+consumption or hardware operation. Actual fresh ROOT admissions and strict
+postinstall acceptance remain separate; no old failed receipt is promoted.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

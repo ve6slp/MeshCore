@@ -228,11 +228,17 @@ Installing the exact transmit fix must establish native Installed/new floor
 and then pass separate strict userdata and both-way ordinary RF checks with
 no new faults. Source qualification performed no hardware operation and
 does not change the unsigned, uninstalled status.
-Live use is still blocked: review found that the validated original-userdata
+The earlier scoped path remains blocked: review found that the validated original-userdata
 summary does not reach the policy/admission context. Synthetic setup had
 masked this gap. A separately qualified source correction is required;
 accepted sources and evidence remain unchanged. No actual policy, consumed
 stage or hardware operation was created.
+A distinct correction is now independently source-qualified. It also passed
+a separate read-only check of the genuine original rollback evidence from
+an unprimed context, retaining the original inventory reference without
+altering any prior receipt. This produced input proposals only, not live
+permission. Fresh ROOT policy, userdata/radio and signing/upload/COMMIT
+admissions are still required; the transmit fix remains unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

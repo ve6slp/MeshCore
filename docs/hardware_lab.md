@@ -1983,17 +1983,37 @@ full-userdata and both-way native RF checks with zero new faults. No actual
 bootstrap authority, hardware operation or fix installation comes from source
 acceptance; the fix remains unsigned and uninstalled.
 
-**Live bootstrap remains blocked:** subsequent accessor review found that
+**The frozen06/11 live path remains blocked:** subsequent accessor review found that
 strict genuine-history preparation populates the history namespace, while
 policy materialization and recovery admission use a separate earlier copy.
 The validated original-userdata summary is not propagated between them.
 MODEL setup had supplied that field, masking the actual transition gap; the
 passing source-only receipt does not qualify this genuine-history boundary.
 No actual policy, admission, stage consumption or hardware operation followed.
-A new recovery07/deployment12/observer12 source-only correction is underway;
+A new recovery07/deployment12/observer12 source-only correction was scoped;
 accepted06/11 sources and all previous evidence remain frozen. The correction
 must exercise strict preparation from an unprimed namespace before any live
 bootstrap can be admitted.
+
+That distinct correction is now independently accepted. Fresh agent and parent
+Make runs matched product SHA256
+`c4ad8b8ca5721110c2adccb6cadf620857e6c41493cb3a008e70eacd9b686e28`,
+passing16 production-path MODEL and21 API cases. The new cases exercise actual
+inherited strict preparation from unprimed namespaces, reproduce the old gap,
+and retain immutable original inventory across failed validation and healthy
+candidate replacement. The parent paired handoff SHA256 is
+`097e877031cf5712ff224633d96c036280d01f52b72da5ad9b24f1e9344003f6`;
+all17 qualified sources and30 frozen/shared preservation pins matched.
+Independently, a fresh unprimed parent execution validated the genuine original
+campaign04 review and all29 receipt pins, deriving the exact original inventory
+artifact reference through the corrected public input API. This read-only
+preflight SHA256 is
+`4c88038e865f77cd22088eb30dd3c2768016da5100d3eaa2ffb90535e08d3fde`.
+It produced only private input proposals, not policy, approval, consumed stage
+or hardware access. The original campaign, failed RF05 and blocked06/11
+evidence remain unchanged. Fresh separate ROOT policy/readbacks and later
+radio/sign/upload/COMMIT/postinstall admissions are still required; the
+transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
