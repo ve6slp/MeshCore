@@ -1498,6 +1498,12 @@ nonce, current physical/floor/core/normal-radio checks and a real prearm before
 separate bounded COMMIT. Healthy confirmation requires the exact new image
 and floor with native Installed8. A short healthy trial may remain explicitly
 unobserved only under ROOT's separate policy; it is never fabricated.
+The subsequent live rollback trial exposed a second incompatibility shared by
+the frozen rollback and healthy classifiers: they require a deferred trial
+floor, while the actual diagnostic firmware exposes the exact existing floor
+as present, `STAGING_ONLY` and write-blocked. The synthetic APP06 qualification
+above remains recorded, but does not cover that actual trial ABI. The profile
+is not admitted for deployment; prospective source correction is required.
 The new artifact is still unsigned, without an assigned counter/generation,
 and not installed on41. Separately, a new counter5 campaign using the older qualified
 nonconfirming `ota-41-diag-roll05` image was prepared and USB-signed through the
@@ -1510,14 +1516,40 @@ unsigned RF READY result is staging evidence, not installation evidence.
 Fresh pre-upload readbacks established the existing diag-conf05/floor4
 baseline and captured five contacts/40 channels privately.
 
-A new ROOT-reviewed launch was then started once, with a real fresh READY
-sample and observer arm before the separately supervised signed COMMIT child.
-The observer owns only the approved unit41 UART; the unchanged stock child
-owns only the approved USB4.2.4 UART. The2010-second observer window retains
-the1800-second production COMMIT limit,1860-second child limit and120-second
-observation tail. COMMIT completion/restoration, ordered live trial, post-trial
-USB disconnect and autonomous exact floor4 return remain unconfirmed.
-No second COMMIT, host reset or reflash was started. A separate source-only
+A new ROOT-reviewed launch was started once, with a fresh READY sample and
+observer arm before the separately supervised signed COMMIT. The unchanged
+stock child exited0 after bounded request/sent/result and aggregate transmission
+evidence; its exact counter5/generation15 result and radio restoration were
+independently read and sealed. The campaign still ended incomplete: the observer
+reopened unit41 in a real native trial, then refused that sample and stopped.
+Its official receipt contains no accepted trial or post-trial return history.
+
+The journal's rejected sample shows `ota-41-diag-roll05`, native Trial7 for the
+exact counter5/generation15 candidate, write-blocked phase5, core0/uptime5,
+normal PHY/TX2 and healthy sampled radio. Its floor is present and matches the
+existing sequence4/counter4/extent555876/hash7a583... exactly, with successful
+I/O and `STAGING_ONLY`/blocked writes. The frozen trial classifier instead
+requires `floor=deferred`; this is the concrete refusal condition. The captured
+sample is not promoted into the failed observer's accepted history. That
+observer also counted49 newly observed radio faults before the trial and eight
+concrete disconnects; neither establishes a reset cause or the radio fault's
+triggering command. The failed campaign receipt SHA256 is
+`2518170d7510b6e60872a64202fa4a3a13f53a0db16821ad6a07a72d35ca8c4b`;
+the failed future-observer receipt SHA256 is
+`61c6cf65569b17811020b96a2926a434acf1678b3c7d570d1529fe5a038b598c`.
+
+One separately admitted read-only postattempt capture subsequently found
+`ota-41-diag-conf05`, the exact original floor4, write-allowed failed phase8 and
+native Failed10 for that counter5/generation15 candidate. Core0, normal TX2 and
+healthy sampled radio with lifetime count0 were observed. Both approved UARTs
+were released. Its receipt SHA256 is
+`84a33cc56502bf77771c3deca7d714b7221039cc67158b1c0dc0331ba62af6a7`.
+This establishes a later correct return state, not the missing uninterrupted
+trial/post-trial-gap/autonomous-return observation. No second COMMIT, host reset
+or reflash was performed; old receipts and consumed markers remain unchanged.
+Any new rollback campaign needs its own prospective strict available-floor
+trial profile and fresh ROOT authority, not a replay of this attempt.
+A separate source-only
 post-return recovery capsule requires genuine
 ordered trial/return receipts before strict exposed-userdata comparison and
 independently admitted ordinary RF checks; its delivery grants no hardware

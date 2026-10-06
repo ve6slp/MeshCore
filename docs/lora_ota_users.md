@@ -118,12 +118,19 @@ current running image remains diag-conf05. The separately admitted counter5
 nonconfirming-image upload is a rollback campaign, not deployment of this fix.
 That upload completed READY at native measured generation15 and restored the
 stock radio. A fresh observer was armed before the separate signed COMMIT
-started; COMMIT completion, installation and autonomous rollback remain
-unconfirmed. Staging does not establish a new running image.
+started. That COMMIT completed with transmission evidence and stock-radio
+restoration, but the observer refused the trial's available, write-blocked floor
+and stopped. A separate read-only capture later found diag-conf05 back on the
+exact original floor4 with the candidate failed. The missing ordered trial and
+post-trial return history still prevents a complete autonomous rollback claim;
+no retry, host reset or reflash was performed.
 The transmit-fixed APP's exact healthy-installation observer is now qualified
 in source, without changing the strict image/floor classifier. Its deployment
 still requires genuine completion of the current rollback campaign and fresh,
-separate ROOT admission; no signing or installation of that APP has begun.
+separate ROOT admission. The live attempt also exposed a shared trial-floor ABI
+mismatch not covered by its synthetic source qualification, so that observer
+needs prospective correction. No signing or installation of the fixed APP has
+begun.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

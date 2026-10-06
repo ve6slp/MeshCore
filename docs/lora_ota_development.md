@@ -1117,15 +1117,26 @@ run remains unchanged. Actual deployment still requires genuine completed
 counter5 rollback lineage, a new signed descriptor and measured session,
 independent fresh ROOT admission, real prearm and bounded separate COMMIT.
 This source result does not install the fix or prove physical reliability.
+Actual counter5 trial evidence subsequently exposed an additional ABI mismatch:
+the frozen rollback and healthy trial classifiers accept only a deferred floor,
+but the running diagnostic trial exposes the exact existing floor as present,
+with successful I/O, `STAGING_ONLY` capability and blocked writes. That sample
+was refused; the source-qualified APP06 profile therefore remains blocked for
+actual deployment. A prospective correction must validate the available floor's
+exact baseline identity without hiding it or granting trial writes.
 The separate exact floor4 rollback profile passed16 combined offline cases,
 including missing-trial refusal, unchanged-floor return and once-only approval
 binding. This source result does not authorize a hardware campaign or prove
 autonomous rollback.
 The subsequent distinctly admitted counter5 nonconfirming-image RF upload
 completed with measured READY generation15 and stock-radio restoration.
-Its fresh observer was genuinely armed before a separate signed COMMIT child
-started. This is live staging/prearm evidence only: the COMMIT result, ordered
-trial and autonomous unchanged-floor return are still pending. This campaign
+Its fresh observer was genuinely armed before a separate signed COMMIT child,
+which completed with actual aggregate TX evidence, exact result, restoration
+and seal. The observer stopped on the trial-floor ABI mismatch above; its failed
+receipt has no accepted trial/post-trial-gap/return sequence. One separately
+admitted read-only capture later established the exact original floor4 and
+diag-conf05 failed-candidate return state, not the missing autonomous history.
+No retry, host reset or reflash was used. This campaign
 uses the older diagnostic rollback image, not the transmit-fixed healthy APP.
 See the hardware lab guide for the actual receipt fingerprints
 and the limits of native-event correlation and emission freshness.
