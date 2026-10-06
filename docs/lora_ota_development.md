@@ -1287,7 +1287,20 @@ Independent post-return userdata/ordinary RF recovery has not run: source
 admission refuses the two identical accepted product-qualification and parent
 rerun files because its frozen lookup requires one matching file. No authority,
 hardware access, source mutation, receipt removal/rename or bypass followed
-that refusal. Recovery requires a separately admitted source correction.
+that refusal.
+A separately admitted source-only correction is now independently qualified:
+new recovery05 and healthy observation/deployment10 accept one or more
+byte-identical valid qualification copies, retaining explicit hash, content,
+current source/schema and default-denial checks. Frozen04/09 sources and
+archived receipts remain untouched. The focused Make boundary passed13 cases
+with28 MODEL fixtures, and independent parent rerun matched the agent's final
+receipt SHA256
+`773d73f7867f1b6014dc44fcc9c2f17ed3fc10a8bf66e3b9a46f5eb78225e073`.
+These paths retain the genuine campaign04 and all independent recovery,
+exact-APP06 and hardware-admission gates. No new rollback trial or old-history
+promotion is required or permitted merely to correct the source lookup.
+Actual recovery readbacks, ordinary RF and timestamp review remain pending
+their separate ROOT admissions; source qualification is not that authority.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

@@ -203,8 +203,13 @@ continuous fault-free operation is not established.
 Independent post-return userdata and two-way ordinary RF recovery have not run:
 their frozen source admission rejects two identical archived qualification
 receipts. No files were removed or renamed and no gate was bypassed. Recovery
-and transmit-fix deployment remain blocked on a separately admitted source
-correction. Old failed history remains failed.
+and transmit-fix deployment were therefore blocked before any recovery action.
+A separately admitted source-only correction is now independently qualified
+to accept the identical valid receipts without weakening their hash/source
+checks. It preserves the successful campaign's history and all independent
+data/radio recovery and hardware-admission gates; those checks have not yet run.
+The transmit fix remains unsigned and uninstalled. Old failed history remains
+failed.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

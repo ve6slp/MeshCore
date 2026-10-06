@@ -1837,7 +1837,7 @@ independent full userdata and ordinary two-way RF recovery, transmit-fix
 installation and physical reliability remain open. All old sources, claims
 and failed receipts remain frozen; later snapshots do not promote them.
 
-**Fresh counter8 campaign (2026-10-06, ordered rollback complete; recovery blocked):**
+**Fresh counter8 campaign (2026-10-06, ordered rollback complete; recovery pending):**
 After independent ROOT source acceptance, ROOT explicitly selected counter8,
 above the actual failed counter7; no READY generation was assigned. A distinct
 read-only preparation freshly remeasured diag-conf05, the exact original floor4,
@@ -1910,8 +1910,22 @@ the accepted qualification receipt and independent parent rerun have identical
 SHA256 `c2fd086bbda74b0e2260eb5a1d4bf68d85f33fe3da4f4a60624a7c126121adf0`,
 but the frozen lookup requires exactly one matching file. Both archived files
 remain intact; no source edit, receipt deletion/rename or gate bypass was made.
-Recovery and transmit-fix deployment therefore remain blocked on a separately
-admitted source correction. The transmit fix remains unsigned and uninstalled.
+A separately admitted source-only recovery/deployment correction is now
+independently qualified. It accepts one or more byte-identical copies of the
+explicitly pinned valid qualification while retaining exact source, schema,
+content and default-denial gates; different bytes, wrong hashes and invalid
+sources remain refused. Frozen capsules and both archived receipts are unchanged.
+The focused Make product boundary passed13 cases with28 MODEL fixtures; the
+agent's two final runs and independent parent rerun produced identical SHA256
+`773d73f7867f1b6014dc44fcc9c2f17ed3fc10a8bf66e3b9a46f5eb78225e073`.
+The parent-verified source/schema/custody handoff SHA256 is
+`41e6969d6506c75c6ff5b4999c56d2dfa04bd39795b6cc5c4293c2e50d24fc38`.
+The new recovery05 and healthy observation/deployment10 scopes retain the
+actual successful campaign04 history, not a new rollback trial or promoted old
+history. No recovery authority or hardware result comes from this qualification.
+Full exposed-userdata readbacks, independent ordinary RF and any exact
+contact-timestamp review still require separate ROOT admissions. The transmit
+fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
