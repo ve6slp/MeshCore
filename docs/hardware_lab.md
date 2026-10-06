@@ -1735,7 +1735,7 @@ deadlines and physical restrictions remain mandatory. The source delivery
 itself supplied no live authority or hardware result. The radio fix remains
 unsigned and uninstalled, and the old failed history remains irrecoverable.
 
-**Fresh counter7 rollback staging (2026-10-06, upload complete and COMMIT prearmed):**
+**Counter7 rollback attempt (2026-10-06, sealed COMMIT but incomplete history):**
 After separate ROOT source acceptance, ROOT explicitly selected counter7 for a
 distinct campaign using the same older nonconfirming diag-roll05 image, not
 the transmit-fixed APP. Fresh admitted preparation remeasured diag-conf05,
@@ -1776,11 +1776,51 @@ retaining the original2010-second parent deadline. The authority SHA256 is
 `0c803cba4d5d4d59ece2b0018024e4b58f7ab30c7dcaa395927268dd730805b1`;
 the actual armed receipt SHA256 is
 `0a9c624a1a5512bef5263ddeb546d596603458871f8a5bf251040f991c7c2408`.
-The observer and stock COMMIT child were observed running. COMMIT result,
-restoration seal and the complete ordered trial, qualified post-trial USB epoch
-and exact floor4 return remain pending at this milestone. Post-return userdata
-and ordinary RF recovery, transmit-fix installation and physical reliability
-remain open; old failed histories are not reused.
+The unchanged stock COMMIT completed with exit0, request/result transmission
+evidence for the exact counter7/generation17 session and stock-radio restoration.
+Its result SHA256 is
+`65647cd7e1507ce6d983c1227e7d51af0c88dfc8c308eaecc1050d2202bdaf5d`;
+the transmission/result/restoration seal SHA256 is
+`442a4fabbef64443bc114547e5a5eea16e62e6e33346cad0a716e51f3eea2a4b`.
+The campaign nevertheless completed with exit2 and all children reaped. The
+observer accepted no trial, qualified kernel USB gap, new epoch or floor4 return.
+Its next physical-resolution callback failed on an absent serial anchor
+(`ENOENT`) before the new kernel guard captured removal evidence. Missing-anchor
+failure alone does not establish kernel removal, a reset or any trial transition.
+The last accepted sample was still READY/core0/normal TX2, with lifetime
+radio-fault count847 versus796 initially:51 observed additional faults, without
+an established cause or continuous-health claim.
+The immutable failed campaign SHA256 is
+`a700e7c3a9a1dab848167c15e61dfc9cc092cb6c858c9095db33f9d98db0e6b0`;
+its observer SHA256 is
+`05b2e6b7f1207ce7fcca655d8511ddbf0b74e7f581655ba4cacc75475519a382`;
+its journal SHA256 is
+`866172f9b1c281de53d31f58d314e7668cfaf5678ef938050bb2dea9840b3d54`.
+
+A distinctly ROOT-admitted read-only capture later found diag-conf05, the exact
+original floor4, native Failed10 at counter7/generation17, core0 and healthy
+sampled normal TX2. Its actual lifetime fault count was0 before and afterward,
+not a host-forced zero; this does not explain the earlier faults or establish
+continuous reliability. The reader released ownership. The current-state
+receipt SHA256 is
+`b35a63cd13837fdbb5310b3d53e4bbdfad3197fb109ed56663828327f4c145f6`.
+This later return cannot recover the missing ordered trial/removal/return
+history or prove autonomous rollback. No retry, host reset or reflash was
+performed. This read-only capture did not compare userdata or exercise RF.
+
+The current campaign's recovery and healthy-deployment gates remain blocked.
+A distinct source-only correction is in progress for independently proved
+removal of the previously owned kernel USB epoch before resolving an absent
+anchor, across physical, framed-command and reopen paths. It must preserve
+identity/default-denial checks, the original deadline and a distinct qualified
+post-trial gap/new-epoch return; it supplies no hardware authority or result.
+A future campaign requires fresh ROOT review of the current failed
+counter7/generation17 baseline, an explicitly selected counter above7 and
+actually measured READY generation above17, with all five prior nonce
+exclusions. Nothing defaults to counter8 or generation18. New ordered rollback,
+independent full userdata and ordinary two-way RF recovery, transmit-fix
+installation and physical reliability remain open. All old sources, claims
+and failed receipts remain frozen; later snapshots do not promote them.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

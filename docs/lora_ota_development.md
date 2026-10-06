@@ -1218,10 +1218,30 @@ all four prior nonce exclusions. After the lease-expiry wait, fresh physical
 READY/core0/normal-TX2 checks and real observer prearm, the separately bounded
 signed COMMIT invocation began under the original2010-second parent deadline.
 Historical radio-fault count796 was stable within the fresh healthy sample;
-it is not zeroed or explained by that sample. COMMIT result, restoration seal
-and the full ordered trial/qualified post-trial kernel gap/exact floor4 return
-are still pending. This is a new rollback campaign, not deployment of the
-transmit fix or repair of old history.
+it is not zeroed or explained by that sample. The unchanged stock COMMIT
+subsequently completed with exit0, exact-session transmission evidence and a
+sealed stock-radio restoration. The campaign completed with exit2: its physical
+callback hit an absent serial anchor before the kernel guard captured removal.
+No trial, qualified kernel gap, new epoch or exact floor4 return was accepted.
+Generic `ENOENT` cannot establish removal or a reset. The final READY sample
+had lifetime fault count847,51 above the initial sample, with no established
+cause or continuous-health claim.
+A separately ROOT-admitted read-only capture later found diag-conf05, the
+exact floor4, failed counter7/generation17, core0 and healthy sampled normal
+TX2 with actual lifetime fault count0. That later state does not repair the
+missing ordered history, qualify autonomous rollback, compare userdata or
+exercise ordinary RF; recovery and healthy deployment remain blocked.
+No retry, host reset or reflash was performed.
+A distinct source-only correction is in progress to qualify independently
+proved removal of the previously owned kernel USB epoch before anchor
+resolution across physical/framed/reopen paths. It must retain the original
+deadline, exact identity, fresh native samples and a distinct post-trial
+gap/new-epoch return. All old sources and failed receipts remain frozen.
+A new campaign requires fresh ROOT baseline review, an explicitly selected
+counter above7, actually measured READY generation above17 and all five prior
+nonce exclusions, without counter/generation defaults. Source correction does
+not supply live admission or replace genuine ordered history and independent
+userdata/ordinary RF recovery.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

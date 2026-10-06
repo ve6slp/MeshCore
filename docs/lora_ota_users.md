@@ -167,9 +167,20 @@ was USB-signed through the unchanged stock companion, and its reader-free LoRa
 upload completed READY at native measured generation17 with stock-radio
 restoration. After a distinct ROOT launch admission and fresh normal-radio/core
 checks, the real observer armed before the separately bounded signed COMMIT
-invocation began. COMMIT result and complete ordered rollback history are still
-pending. This is another rollback campaign; it does not install the transmit
-fix or establish continuous radio reliability.
+invocation. COMMIT completed with transmission evidence and sealed stock-radio
+restoration, but the campaign failed when its physical callback encountered an
+absent serial anchor before recording qualified kernel removal. No trial or
+ordered removal/new-epoch return was accepted. A separate ROOT-admitted
+read-only capture later found diag-conf05, the exact floor4, failed
+counter7/generation17 and healthy sampled normal TX2; that snapshot cannot
+repair the missing history or prove autonomous rollback. No retry, host reset
+or reflash was performed. Recovery and healthy deployment remain blocked.
+A distinct source-only correction is in progress, retaining exact identity,
+original deadlines and separate ROOT admissions. A future attempt needs an
+explicitly selected counter above7 and actually measured READY generation
+above17, not assigned defaults. The transmit fix remains unsigned and
+uninstalled. Neither sampled health nor source qualification establishes
+continuous radio reliability, userdata preservation or ordinary RF recovery.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
