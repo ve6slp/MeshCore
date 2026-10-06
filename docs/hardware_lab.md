@@ -2162,6 +2162,15 @@ admissions, without reusing this failed attempt or extending its deadline.
 Preparation and source qualification of that distinct timing-only probe are
 approved. This does not authorize hardware execution, installation or changes
 to the existing acceptance window.
+The separate observer is now independently source-qualified: agent and parent
+each passed seven focused real-adapter cases, with102 frozen pins unchanged.
+It records observed byte counts, read/write boundaries and parser completion
+times without payloads; observation time is not proven device emission time,
+and instrumentation can add host overhead. Parent read-only preflight also
+passed the genuine29 original-history checks. A handoff path typo was corrected
+through the existing argument and a sealed path-only supplement, without
+changing source or original evidence. Complete ROOT workflow helpers are being
+prestaged before any policy or timed capture. No hardware stage has been admitted.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

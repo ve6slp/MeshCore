@@ -1484,6 +1484,19 @@ transport, capture count/time provenance without exposing payloads, and leave
 the existing acceptance guards unchanged. Execution still requires separate
 fresh admissions; this is not permission to install firmware or retry a
 consumed attempt.
+The separate timing observer now passes seven focused actual-adapter cases in
+both agent and independent parent execution;102 frozen pins remain unchanged.
+Timely native acceptance, late/fragmented rejection, scheduler-stall provenance,
+pre-write ordering and explicit read/instrumentation errors are preserved.
+Parent unprimed read-only preflight passed the genuine29 original-history
+checks. The handoff's nonexistent original-review path was replaced through the
+existing argument by the established immutable review, with a sealed path-only
+supplement rather than a source or evidence rewrite.
+Observed kernel byte counts, read/UART-write boundaries and parser completion
+times are diagnostic provenance, not proven arrival/emission times or hardware
+authority; recording can add host overhead. Complete explicit ROOT helpers are
+being prestaged before any fresh policy or timed capture. No hardware admission
+or execution has followed this qualification.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
