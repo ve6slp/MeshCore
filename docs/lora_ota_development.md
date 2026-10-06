@@ -1155,9 +1155,17 @@ baseline and healthy sampled normal TX2. The new five-contact/40-channel
 protocol-visible snapshot matches the actual counter5 pre-upload comparison
 hash. A new counter6 descriptor for the same older nonconfirming image was
 USB-signed and Ed25519-verified through the unchanged stock companion.
-Its separately admitted once-only reader-free500kHz upload is now running under
-the unchanged2% airtime policy. Complete READY and native generation are not yet
-measured; no counter6 COMMIT has begun. New source-only post-return recovery and
+Its separately admitted once-only reader-free500kHz upload completed under
+the unchanged2% airtime policy: exact counter6 manifest, complete READY,
+native measured generation16 and stock-radio restoration. This unsigned RF
+READY result is staging evidence, not installation confirmation. After the
+lease-expiry wait, a distinct ROOT launch approval bound the actual session and
+all prior nonce exclusions. A fresh physical USB READY sample established
+core0/healthy normal radio/TX2, and the real observer armed before the separate
+bounded signed COMMIT invocation under the original2010-second parent deadline.
+That campaign is running; COMMIT transmission/result/restoration seal and
+ordered trial/gap/return remain unestablished. No retry, reset or reflash was
+performed. New source-only post-return recovery and
 healthy-deployment wiring is now qualified against genuine counter6 lineage
 and the corrected floor ABI, without relaxing the old failed campaign's gates.
 Its focused Make boundary passed12 cases with30 MODEL fixtures through the

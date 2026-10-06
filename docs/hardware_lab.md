@@ -1593,11 +1593,32 @@ new59-byte canonical descriptor, manifest SHA256
 Separately admitted USB signing through the unchanged stock1.17.1 companion
 completed with real Ed25519 verification; the signed descriptor SHA256 is
 `15dd09298c24abee2087dbece38bb176fe7eb0a544194cc37e5452347e5ddd4a`.
-A separately admitted once-only reader-free RF upload is now running using
+A separately admitted once-only reader-free RF upload completed using
 908525kHz/BW500000/SF5/CR5 and the unchanged2% airtime policy, with a14400-second
-production deadline. Unit41 has no concurrent USB reader. No per-block progress,
-complete READY or native generation is claimed yet; generation is unknown
-until actually measured. No counter6 COMMIT has started.
+production deadline. Unit41 had no concurrent USB reader. The exact counter6
+manifest reached complete READY with native measured generation16, not a
+host-assigned generation, and the stock companion restored its radio. Its result
+is explicitly unsigned RF READY, not installation confirmation. The upload
+handoff SHA256 is
+`c5fa3e9ee25a33ae683370cbe7df320de23ec9a2cf7cf6ad4ee549a61b2eb478`;
+the stock result SHA256 is
+`fffe7784e735102c97eae94dd183413bd1a2bcfc110417a85428e25c88ca425e`.
+
+After the target lease-expiry wait, ROOT separately reviewed and admitted the
+new launch with exact counter6/generation16, native owner/manifest/generation
+nonce `eab6f0eccb242d0e` and all three known prior nonce exclusions. The new
+approval SHA256 is
+`1b37afc69e5a509a28f581c92fd308a2a1cec53c7efcc621f2203cb0cf5e213a`.
+A fresh physical USB READY sample established core0, normal radio before and
+afterward, and TX2. The real observer armed before the separately bounded
+signed COMMIT invocation, retaining the original2010-second parent deadline.
+The authority SHA256 is
+`b20d83472e9f9ecf959affa3d5afeb8801844b93db747e863f3045139dae3ef0`;
+the actual armed receipt SHA256 is
+`7e0a9145ce4690c6b0e2dae3ee9351944b7a6e537d5226335abd4235ebbd1ce3`.
+This launch is running. COMMIT transmission/result/restoration seal and the
+ordered trial/gap/return result are not yet established; starting the invocation
+is not proof of any of those outcomes. No retry, reset or reflash was performed.
 
 Genuine ordered trial, post-trial gap and exact floor4 return, followed by fresh
 userdata and ordinary two-way RF recovery, remain required. The transmit-fixed
@@ -1636,9 +1657,11 @@ prearm before bounded COMMIT and sealed radio restoration remain mandatory.
 There is no permanent source-only refusal once genuine prerequisites are
 supplied, but absent prerequisites deny all live execution.
 
-The current reader-free counter6 upload still has no measured complete READY,
-generation or COMMIT result. No hardware operation was performed by this
-source qualification; the radio fix remains unsigned and uninstalled.
+The counter6 upload subsequently completed READY at measured generation16, and
+the separately admitted, genuinely prearmed COMMIT campaign is now running.
+Its COMMIT result and ordered rollback history remain open. No hardware
+operation was performed by the source qualification itself; the radio fix
+remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

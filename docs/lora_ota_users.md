@@ -138,11 +138,14 @@ write-blocked. Source qualification passed27 focused cases; the failed counter5
 history has not been repaired or promoted into success. After separate ROOT
 review and admission, a fresh counter6 descriptor for the same older
 nonconfirming image was USB-signed through the unchanged stock companion.
-Its reader-free500kHz LoRa upload is now running. Fresh baseline readbacks
+Its reader-free500kHz LoRa upload completed with exact counter6 READY,
+native measured generation16 and stock-radio restoration. Fresh baseline readbacks
 confirmed diag-conf05/floor4 and matched the prior protocol-visible
-five-contact/40-channel userdata snapshot. Complete READY and native generation
-are not yet measured, and no counter6 COMMIT has started. Full autonomous
-rollback and subsequent ordinary RF recovery remain open. Corrected source-only
+five-contact/40-channel userdata snapshot. After separate ROOT admission, a
+fresh normal-radio/core0/TX2 READY check and real observer prearm, the bounded
+signed COMMIT campaign is now running. Its result and full autonomous rollback
+history are not yet established; complete READY does not prove installation.
+Subsequent ordinary RF recovery also remains open. Corrected source-only
 recovery and healthy-deployment wiring is now qualified, but still refuses live
 deployment without that genuine rollback history, fresh userdata/ordinary RF
 recovery and separate ROOT admission. The radio fix remains unsigned and
