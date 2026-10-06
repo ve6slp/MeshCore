@@ -143,13 +143,19 @@ native measured generation16 and stock-radio restoration. Fresh baseline readbac
 confirmed diag-conf05/floor4 and matched the prior protocol-visible
 five-contact/40-channel userdata snapshot. After separate ROOT admission, a
 fresh normal-radio/core0/TX2 READY check and real observer prearm, the bounded
-signed COMMIT campaign is now running. Its result and full autonomous rollback
-history are not yet established; complete READY does not prove installation.
-Subsequent ordinary RF recovery also remains open. Corrected source-only
+signed COMMIT completed with transmission evidence and stock-radio restoration.
+The corrected observer accepted the real trial, then failed on a physical USB
+binding check before observing the full return sequence. A separate read-only
+capture later found diag-conf05 back on the exact floor4 with counter6 failed
+and healthy sampled normal TX2. That later state does not repair the missing
+autonomous rollback history. No retry, host reset or reflash was performed.
+Subsequent userdata and ordinary RF recovery also remain open. Corrected source-only
 recovery and healthy-deployment wiring is now qualified, but still refuses live
 deployment without that genuine rollback history, fresh userdata/ordinary RF
 recovery and separate ROOT admission. The radio fix remains unsigned and
 uninstalled; synthetic qualification does not change the hardware status.
+Prospective USB-continuity correction is being prepared for a distinct future
+campaign, without relaxing board-identity checks or reusing failed history.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

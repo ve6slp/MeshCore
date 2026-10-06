@@ -1616,9 +1616,41 @@ The authority SHA256 is
 `b20d83472e9f9ecf959affa3d5afeb8801844b93db747e863f3045139dae3ef0`;
 the actual armed receipt SHA256 is
 `7e0a9145ce4690c6b0e2dae3ee9351944b7a6e537d5226335abd4235ebbd1ce3`.
-This launch is running. COMMIT transmission/result/restoration seal and the
-ordered trial/gap/return result are not yet established; starting the invocation
-is not proof of any of those outcomes. No retry, reset or reflash was performed.
+The stock COMMIT subsequently exited0 with actual request/sent/result and
+aggregate transmission evidence for the exact counter6/generation16 candidate,
+restored its radio and completed the bounded seal. The seal SHA256 is
+`74a756de749aecb3bb9edeb4dc65c0b1fefa7a6b2963984da1e7adc49d70cb87`.
+The whole campaign still exited2/incomplete: the corrected observer accepted
+eight genuine trial samples at uptime2,7,13,18,24,30,35 and41 seconds, then failed
+before observing the post-trial USB gap or healthy return. Those accepted
+samples establish the available-floor classifier's live compatibility: exact
+native Trial7/counter6/generation16/full6617, core0, normal PHY/TX2 and the exact
+present, write-blocked floor4. They do not establish a verified running trial
+image hash or complete autonomous rollback.
+
+The terminal journal event failed at the next identity-stage physical check,
+before any reply or decoded field. The open-UART binding guard refused an
+unequal selection, device number or character-device condition; it did not
+retain which comparison changed. The journal does not therefore prove a
+kernel USB re-enumeration or reset cause. Its eight concrete disconnects were
+all before the accepted trial, and no post-trial disconnect/reopen/return was
+accepted. The observer also counted47 newly observed radio faults before the
+trial despite healthy sampled trial radio; this does not identify their cause.
+The failed campaign receipt SHA256 is
+`068b2d513525629c2af906ffb5adc90f58bb0ad175e773591136fc689d535180`;
+the failed observer receipt SHA256 is
+`2e3bafcc6064dc7d2b052402ebacc66003eaa9c94db4e982fd0cdeabf47f64c1`.
+Both children were reaped. No retry, host reset or reflash was performed.
+
+One separately admitted read-only current-state capture later established
+diag-conf05, the exact original floor4 with successful I/O and allowed writes,
+failed phase8 and native Failed10 for counter6/generation16. Core0, normal TX2
+and healthy sampled radio with lifetime count0 were observed; both approved
+UARTs were released. The new capture receipt SHA256 is
+`37f0cf75b110260d54eb3d9050808ae991bfcdf19946417405d8142972d05e3b`.
+This is a later correct return state, not the missing ordered post-trial
+gap/return history, userdata comparison or ordinary RF recovery. The original
+failed receipts and consumed markers remain unchanged.
 
 Genuine ordered trial, post-trial gap and exact floor4 return, followed by fresh
 userdata and ordinary two-way RF recovery, remain required. The transmit-fixed
@@ -1657,11 +1689,22 @@ prearm before bounded COMMIT and sealed radio restoration remain mandatory.
 There is no permanent source-only refusal once genuine prerequisites are
 supplied, but absent prerequisites deny all live execution.
 
-The counter6 upload subsequently completed READY at measured generation16, and
-the separately admitted, genuinely prearmed COMMIT campaign is now running.
-Its COMMIT result and ordered rollback history remain open. No hardware
-operation was performed by the source qualification itself; the radio fix
-remains unsigned and uninstalled.
+The counter6 upload and separately prearmed COMMIT subsequently completed with
+measured generation16 and sealed stock-radio restoration, but the failed
+observer history above cannot satisfy these capsules' genuine-success gate.
+They remain default-denied for live deployment. No hardware operation was
+performed by the source qualification itself; the radio fix remains unsigned
+and uninstalled.
+
+New source-only observer/recovery/deployment capsules are being prepared for a
+distinct future campaign. They must distinguish strictly verified same-board
+kernel USB epoch changes from identity, ownership and protocol failures,
+without converting arbitrary errors or no-response into boot evidence.
+Fresh coherent native samples, the unchanged physical-board restrictions,
+original deadlines and complete ordered rollback history remain mandatory.
+Any future counter is independently ROOT-selected above6, and its READY
+generation must actually be measured above16; neither is assigned by this
+source work. No new signing, upload or COMMIT has begun.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

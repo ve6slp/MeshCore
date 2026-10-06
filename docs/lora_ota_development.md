@@ -1163,9 +1163,17 @@ lease-expiry wait, a distinct ROOT launch approval bound the actual session and
 all prior nonce exclusions. A fresh physical USB READY sample established
 core0/healthy normal radio/TX2, and the real observer armed before the separate
 bounded signed COMMIT invocation under the original2010-second parent deadline.
-That campaign is running; COMMIT transmission/result/restoration seal and
-ordered trial/gap/return remain unestablished. No retry, reset or reflash was
-performed. New source-only post-return recovery and
+That stock COMMIT completed with exact counter6/generation16 result, aggregate
+transmission evidence and sealed radio restoration. The corrected observer
+accepted eight genuine trial samples at uptime2 through41 seconds, confirming
+the available-floor ABI, then stopped at an open-UART physical-binding check
+before any identity reply. It did not accept the post-trial USB gap or return.
+The guard did not record which binding comparison changed; a kernel epoch
+change or reset cause cannot be inferred. A separately admitted read-only
+capture later found diag-conf05, the exact floor4, failed counter6/generation16,
+core0 and healthy sampled normal TX2. That late return does not recover the
+missing ordered history. No retry, host reset or reflash was performed.
+New source-only post-return recovery and
 healthy-deployment wiring is now qualified against genuine counter6 lineage
 and the corrected floor ABI, without relaxing the old failed campaign's gates.
 Its focused Make boundary passed12 cases with30 MODEL fixtures through the
@@ -1179,6 +1187,11 @@ campaign must use an independently selected counter above the actual rolled6,
 measured READY generation above the actual rollback session, prior-session
 nonce exclusions and separately admitted prearm-before-bounded-COMMIT.
 Missing prerequisites deny live execution; no counter/generation is defaulted.
+The failed counter6 history cannot satisfy this source-qualified chain's live
+gate. New prospective USB-epoch observer/recovery/deployment wiring is being
+prepared for a distinct ROOT-admitted campaign, with verified same-board kernel
+discontinuity, wrong-identity refusal and fresh coherent native samples.
+No failed receipt or later snapshot is promoted into complete rollback.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
