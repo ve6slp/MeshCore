@@ -2090,6 +2090,27 @@ qualify corrected both-way native signatures without substituting the checker.
 All08/13 sources and consumed actual artifacts remain unchanged; no new
 hardware permission follows diagnosis or source work.
 
+The distinct09/14 correction is now independently source-qualified. Agent and
+parent Make runs matched product SHA256
+`ac5125fbf22cb5c3f5beee586897ef3bc1ced032669120af643b9db088e17774`,
+passing17 production-path MODEL and21 API cases. The new adapter case retains
+production construction/dispatch and the native peer/signature bodies, faking
+only external leaves and cryptographic principals. It reproduces the old
+refusal before stock-core writes or ordinary advert commands, then exercises
+correct stock/receiver routing and rejects wrong bindings, missing receiver
+snapshots and unknown anchors without substituting the dispatcher.
+All18 sources and74 preservation pins matched; the paired parent handoff SHA256 is
+`68525fa68c5b1e38afd2f111e0b9b4cde82a60c28b4fc369db8a1765bc33c9c1`.
+A separate unprimed genuine29-pin history preflight passed with SHA256
+`755c8bbf499d382ecf338138f43616a757d08a16a13068cf80ef980ca4f158bc`.
+All fresh parent workflow helpers were staged before any policy clock, with
+pre-stage SHA256
+`18d978b8cbf453706c8e75ca3ef6b8f9d5be38b692c36a1e6baa37427b3f51ba`.
+These checks created input proposals only, not policy, consumed stages or
+hardware permission. Every actual admission and strict postinstall gate
+remains separate. Frozen08/13 evidence is unchanged; the transmit fix remains
+unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

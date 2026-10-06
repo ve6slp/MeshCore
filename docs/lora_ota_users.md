@@ -263,6 +263,11 @@ Diagnosis found that the adapter applied the receiver's epoch checker to the
 stock companion, rejecting its selection before any requested ordinary advert
 command. A separate source correction is underway; neither existing evidence
 nor consumed permissions will be reused. No new hardware action is authorized.
+The separate correction is now independently source-qualified, including the
+real adapter dispatch and a read-only check of the genuine original history.
+Fresh workflow helpers are ready before policy time. This creates no hardware
+permission; fresh admissions and strict postinstall checks are still required.
+The transmit fix remains unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

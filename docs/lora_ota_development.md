@@ -1418,6 +1418,23 @@ MODEL dispatcher replacement. It must reproduce the old refusal before any
 ordinary advert and exercise real native signatures through the corrected
 adapter. Frozen08/13 sources and consumed actual artifacts are not modified;
 new hardware admissions remain separate.
+The distinct09/14 correction is now independently accepted: agent and parent
+Make runs matched product SHA256
+`ac5125fbf22cb5c3f5beee586897ef3bc1ced032669120af643b9db088e17774`,
+passing17 production-path MODEL and21 API cases. The new case exercises real
+construction/dispatch and native peer/signature bodies with external leaves
+and principals simulated; no dispatcher or stock-checker replacement masks
+the old refusal. Wrong bindings, missing receiver snapshots and unknown
+anchors remain fatal. All18 sources and74 preservation pins matched.
+The parent paired handoff SHA256 is
+`68525fa68c5b1e38afd2f111e0b9b4cde82a60c28b4fc369db8a1765bc33c9c1`.
+A separate unprimed genuine29-pin preflight passed with SHA256
+`755c8bbf499d382ecf338138f43616a757d08a16a13068cf80ef980ca4f158bc`;
+fresh parent helpers were fully pre-staged before policy time, record SHA256
+`18d978b8cbf453706c8e75ca3ef6b8f9d5be38b692c36a1e6baa37427b3f51ba`.
+Only input proposals were created. Actual ROOT admissions, timed independent
+metadata reviews and strict postinstall acceptance remain mandatory; no
+hardware operation followed source qualification and no08/13 artifact changed.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
