@@ -1449,11 +1449,23 @@ fault1->2, stable within reads and within the explicit budget.
 The once-only stage nevertheless failed with
 `real-private-SIG-and-fresh-native-accepted-event-required`, receipt SHA256
 `3ec8a73e8acb22f75145c48738c99325f0318d69f93d688f40e571b48e1e33f0`.
-Native acceptance was observed at stock, not41; cryptographic signatures do
-not substitute for the missing native event or prove commanded fresh emission.
+Within the configured window, native acceptance was observed at stock, not41;
+cryptographic signatures do not substitute for that timing requirement or
+prove commanded fresh emission.
 No post-RF inventory/review, bootstrap acceptance, signing, upload or COMMIT
-followed. Readers exited; all09/14 evidence remains frozen pending diagnosis,
+followed. Readers exited; all09/14 evidence remains frozen,
 without replay, native-event waiver or fault-causation inference.
+Read-only classification verified the frozen receipt/trace raw pins,
+canonical direction-bucket pin and complete fresh userdata replay. All16
+host-parsed frames contained exactly one expected signed advert per direction.
+41's matching native key notification was parsed1.145135 seconds after the
+forward signature, outside the unchanged1-second window and after the reverse
+advert command; stock's matching notification was parsed0.462991 seconds after
+the reverse signature, inside the window. The forward advert timestamp was
+newer than the fresh stored stock contact. No contact-update frame was present.
+These are host parse times, not proven USB arrival or firmware emission times;
+collector ordering versus genuinely late delivery remains under source-only
+investigation. No failed receipt is promoted or new hardware attempt authorized.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

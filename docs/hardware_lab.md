@@ -2127,12 +2127,25 @@ That does not establish RF fault causation or continuous health.
 The once-only peer stage still failed after5.489 seconds:
 `real-private-SIG-and-fresh-native-accepted-event-required`, receipt SHA256
 `3ec8a73e8acb22f75145c48738c99325f0318d69f93d688f40e571b48e1e33f0`.
-Native acceptance was observed at stock but not at41. Signature verification
-does not replace the missing event; native packet correlation and commanded
-emission freshness were not proven. No post-RF inventory/review, bootstrap
+Within the configured window, native acceptance was observed at stock but not
+at41. Signature verification does not replace that timing requirement; native
+packet correlation and commanded emission freshness were not proven.
+No post-RF inventory/review, bootstrap
 acceptance, signing, upload or COMMIT followed. Both readers exited.
-All09/14 artifacts and the consumed attempt remain frozen while the missing
-native-event boundary is investigated; no replay or acceptance waiver is used.
+All09/14 artifacts and the consumed attempt remain frozen; no replay or
+acceptance waiver is used.
+Read-only classification of all16 frozen host-parsed frames, with the raw
+receipt/trace pins, canonical direction-bucket pin and full fresh userdata
+replay verified, found one expected signed advert per direction. The matching
+41 native key notification was present, but parsed1.145135 seconds after its
+signed advert, outside the unchanged1-second window and after the reverse
+advert command. Stock's matching notification was parsed0.462991 seconds after
+its signed advert, inside the window. The forward advert timestamp was newer
+than the fresh stored stock contact; no matching contact-update frame was
+present. Host parse times do not establish USB arrival or firmware emission
+times. Collector ordering versus genuinely late delivery remains under
+source-only investigation; this classification does not promote the failed
+receipt or authorize another hardware attempt.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

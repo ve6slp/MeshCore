@@ -270,10 +270,16 @@ permission; fresh admissions and strict postinstall checks are still required.
 The transmit fix remains unsigned and uninstalled.
 Fresh admissions then passed userdata and timed baseline checks. The corrected
 adapter reached both ordinary advert commands and verified both signatures,
-but native acceptance was missing at41. One new pre-fix fault was within the
-explicit budget; that did not waive the missing native event. The attempt
+but native acceptance was not observed at41 within the required window.
+One new pre-fix fault was within the explicit budget; that did not waive the
+native timing requirement. The attempt
 stopped with evidence intact and readers released. No signing, upload or
 COMMIT followed; the transmit fix is still unsigned and uninstalled.
+Private read-only trace classification found41's matching native notification,
+but it was parsed1.145 seconds after the signed advert, outside the unchanged
+1-second window. This is host parsing time, not proven device emission time.
+The failed attempt remains frozen while source-only collection diagnosis
+continues; no timing waiver or new hardware attempt is authorized.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
