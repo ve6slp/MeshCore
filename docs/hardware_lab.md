@@ -2151,7 +2151,14 @@ the real native adapter, frame parser and owned transport. Timely complete and
 fragmented native events were accepted; late, missing and mismatched events
 were denied without retroactive acceptance or deadline changes. All97 frozen
 pins remained unchanged. No deterministic host collection defect was found;
-firmware notification scheduling remains under read-only investigation.
+read-only inspection of the bound floor4 firmware found a direct advert
+receive-to-native-notification path and immediate USB writes, without a
+notification timer or a requirement for the next command. Signature
+verification, synchronous advert-blob persistence and underlying serial writes
+have no proven latency bounds. Neither a radio-fault-caused stall nor the
+actual delay's cause is established. No source correction was selected;
+further hardware diagnosis requires a distinct qualified plan and fresh
+admissions, without reusing this failed attempt or extending its deadline.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

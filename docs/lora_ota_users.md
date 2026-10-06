@@ -282,6 +282,9 @@ The failed attempt remains frozen while source-only collection diagnosis
 continues; no timing waiver or new hardware attempt is authorized.
 Source-only checks upheld the existing timing rule and found no deterministic
 host collection defect. The notification delay's cause is still unproven.
+Firmware inspection also found no notification timer or next-command gate.
+Further hardware diagnosis needs a distinct qualified plan and fresh
+permissions; no correction or retry has been authorized.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

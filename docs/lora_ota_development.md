@@ -1470,8 +1470,14 @@ Agent and independent parent execution each passed11 actual-adapter/parser/
 transport timing cases, preserving timely acceptance and terminal denial of
 late, fragmented-after-deadline, missing or mismatched native events. All97
 frozen pins remained unchanged. No deterministic host collection defect was
-established; firmware notification scheduling remains a read-only causal trace,
-not an authorized correction or hardware retry.
+established. Read-only inspection of the bound floor4 firmware found no native
+notification timer, coalescing or next-command gate: advert handling calls the
+native notification directly and USB writes immediately. Signature verification,
+synchronous advert-blob persistence and underlying writes have unproven latency
+bounds; neither actual delay causation nor a radio-fault-caused stall is proven.
+No corrective source was selected. A distinct qualified timing-only hardware
+diagnosis and fresh admissions would be required to resolve the remaining
+uncertainty, without changing this attempt's deadline or promoting its failure.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
