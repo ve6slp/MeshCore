@@ -1482,11 +1482,24 @@ The new artifact is not signed, assigned a counter/generation or installed on41.
 Its later deployment needs its own exact observer profile and legitimate ROOT
 admission. Separately, a new counter5 campaign using the older qualified
 nonconfirming `ota-41-diag-roll05` image was prepared and USB-signed through the
-unchanged stock companion, then its reader-free500kHz RF upload was started
-once. Fresh pre-upload readbacks established the existing diag-conf05/floor4
-baseline and captured five contacts/40 channels privately. READY generation,
-COMMIT and live autonomous rollback have not yet been established for that
-campaign. A separate source-only post-return recovery capsule requires genuine
+unchanged stock companion. Its once-only reader-free500kHz RF upload completed:
+the exact counter5 manifest
+`315f0ecf6d852f87e202c9017a895015a11083e2e347bd65bd838b4a8cccf600`
+reached complete READY with native measured generation15, and the stock
+companion restored its radio. Generation was not assigned by the host; this
+unsigned RF READY result is staging evidence, not installation evidence.
+Fresh pre-upload readbacks established the existing diag-conf05/floor4
+baseline and captured five contacts/40 channels privately.
+
+A new ROOT-reviewed launch was then started once, with a real fresh READY
+sample and observer arm before the separately supervised signed COMMIT child.
+The observer owns only the approved unit41 UART; the unchanged stock child
+owns only the approved USB4.2.4 UART. The2010-second observer window retains
+the1800-second production COMMIT limit,1860-second child limit and120-second
+observation tail. COMMIT completion/restoration, ordered live trial, post-trial
+USB disconnect and autonomous exact floor4 return remain unconfirmed.
+No second COMMIT, host reset or reflash was started. A separate source-only
+post-return recovery capsule requires genuine
 ordered trial/return receipts before strict exposed-userdata comparison and
 independently admitted ordinary RF checks; its delivery grants no hardware
 permission.

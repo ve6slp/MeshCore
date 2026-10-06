@@ -1115,6 +1115,12 @@ The separate exact floor4 rollback profile passed16 combined offline cases,
 including missing-trial refusal, unchanged-floor return and once-only approval
 binding. This source result does not authorize a hardware campaign or prove
 autonomous rollback.
+The subsequent distinctly admitted counter5 nonconfirming-image RF upload
+completed with measured READY generation15 and stock-radio restoration.
+Its fresh observer was genuinely armed before a separate signed COMMIT child
+started. This is live staging/prearm evidence only: the COMMIT result, ordered
+trial and autonomous unchanged-floor return are still pending. This campaign
+uses the older diagnostic rollback image, not the transmit-fixed healthy APP.
 See the hardware lab guide for the actual receipt fingerprints
 and the limits of native-event correlation and emission freshness.
 Independent observation of the full internal transition sequence and autonomous

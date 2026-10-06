@@ -116,6 +116,10 @@ A distinct healthy `ota-41-tx-conf06` APP containing this fix now exists and fit
 the enrolled Sense ROLE0 layout. It is still unsigned and not installed; the
 current running image remains diag-conf05. The separately admitted counter5
 nonconfirming-image upload is a rollback campaign, not deployment of this fix.
+That upload completed READY at native measured generation15 and restored the
+stock radio. A fresh observer was armed before the separate signed COMMIT
+started; COMMIT completion, installation and autonomous rollback remain
+unconfirmed. Staging does not establish a new running image.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
