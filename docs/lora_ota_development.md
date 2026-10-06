@@ -1283,8 +1283,8 @@ strict history validator. The observer receipt SHA256 is
 The return sampled healthy normal TX2 with actual stable count0, but49 recovered
 faults were observed before the trial; their cause and continuous reliability
 remain unqualified. No reset cause, running-image hash or atomicity is claimed.
-Independent post-return userdata/ordinary RF recovery has not run: source
-admission refuses the two identical accepted product-qualification and parent
+Independent post-return recovery initially stopped because source
+admission refused the two identical accepted product-qualification and parent
 rerun files because its frozen lookup requires one matching file. No authority,
 hardware access, source mutation, receipt removal/rename or bypass followed
 that refusal.
@@ -1299,8 +1299,23 @@ receipt SHA256
 These paths retain the genuine campaign04 and all independent recovery,
 exact-APP06 and hardware-admission gates. No new rollback trial or old-history
 promotion is required or permitted merely to correct the source lookup.
-Actual recovery readbacks, ordinary RF and timestamp review remain pending
-their separate ROOT admissions; source qualification is not that authority.
+Source qualification supplies no hardware authority. Distinct actual ROOT
+readbacks then passed the full exposed five-contact/40-channel/settingsACL and
+self-info comparison, retaining normalized userdata hash a9846106 and stable
+sampled normal TX2 count0. The receipt SHA256 is
+`93db23689b575331eab8b0b578e8b332f8f1c37e87f7fa339e0e2b4ccf0742ac`.
+A separately admitted once-each ordinary RF stage observed signature
+verification and native acceptance in both directions, but its overall result
+was failure: same-session receiver radio count increased0->1. The later
+healthy/stable count1 does not satisfy the no-new-fault gate. Its immutable
+receipt SHA256 is
+`15bae4ddf895bc1321e088978ba9437b411c0c52671a36f39aaf2adf0fe2b330`.
+Only the stock contact's permitted timestamp fields differed after RF; no
+metadata-acceptance stage followed the failed radio gate. No fresh-emission
+cryptographic causation, fault cause or continuous reliability is claimed.
+Frozen sources and the consumed failed stage remain intact, with no retry,
+reset, reflash, new AUTH or failed-receipt promotion. Recovery and transmit-fix
+deployment remain blocked pending a distinct legitimate next admission.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

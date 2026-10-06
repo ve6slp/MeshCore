@@ -1837,7 +1837,7 @@ independent full userdata and ordinary two-way RF recovery, transmit-fix
 installation and physical reliability remain open. All old sources, claims
 and failed receipts remain frozen; later snapshots do not promote them.
 
-**Fresh counter8 campaign (2026-10-06, ordered rollback complete; recovery pending):**
+**Fresh counter8 campaign (2026-10-06, rollback/userdata passed; RF recovery refused):**
 After independent ROOT source acceptance, ROOT explicitly selected counter8,
 above the actual failed counter7; no READY generation was assigned. A distinct
 read-only preparation freshly remeasured diag-conf05, the exact original floor4,
@@ -1904,8 +1904,8 @@ ordered failed-trial return, not exact reset cause, running-image hash,
 atomic samples or continuous fault-free operation. The observer recorded49
 additional recovered radio faults before the trial; their cause remains unknown.
 
-Independent post-return userdata and two-way ordinary RF recovery have not run.
-Their source admission refused before creating authority or accessing hardware:
+Initially, independent post-return recovery stopped at source admission before
+creating authority or accessing hardware:
 the accepted qualification receipt and independent parent rerun have identical
 SHA256 `c2fd086bbda74b0e2260eb5a1d4bf68d85f33fe3da4f4a60624a7c126121adf0`,
 but the frozen lookup requires exactly one matching file. Both archived files
@@ -1924,8 +1924,34 @@ The new recovery05 and healthy observation/deployment10 scopes retain the
 actual successful campaign04 history, not a new rollback trial or promoted old
 history. No recovery authority or hardware result comes from this qualification.
 Full exposed-userdata readbacks, independent ordinary RF and any exact
-contact-timestamp review still require separate ROOT admissions. The transmit
-fix remains unsigned and uninstalled.
+contact-timestamp review retain their separate ROOT admissions.
+
+Distinct ROOT readbacks subsequently completed with exit0 and an exact full
+protocol-visible comparison against the genuine campaign04 preupload inventory:
+all five contacts, all40 channels, settings/ACL and self-info matched. The
+normalized userdata SHA256 remained
+`a98461062125d68b01f5784de581af2a7fc71f857f27a9a0884d20bd6b4bf80f`;
+the readbacks receipt SHA256 is
+`93db23689b575331eab8b0b578e8b332f8f1c37e87f7fa339e0e2b4ccf0742ac`.
+The bounded30-second stage finished in approximately2 seconds with exact
+diag-conf05/floor4, failed counter8/generation18, core0 and sampled normal TX2.
+All four radio readings retained actual count0; no host zeroing, RF or settings
+write was performed. Hidden keys, unexposed storage and atomicity are not proven.
+
+A further distinct ROOT admission executed the once-each ordinary RF commands.
+Both directions had observed signature verification and native acceptance on
+the guarded normal2dBm profile, but the overall recovery stage failed with exit2:
+the receiver's same-session radio fault count increased0->1. Its later samples
+were healthy and stable at1; that does not cancel the new observed fault.
+The immutable failed peer receipt SHA256 is
+`15bae4ddf895bc1321e088978ba9437b411c0c52671a36f39aaf2adf0fe2b330`.
+The post-RF inventory recorded only the stock contact's last-advert and lastmod
+timestamp changes; channels and all other exposed fields were unchanged.
+No metadata-acceptance stage was admitted after the failed radio gate.
+Observed signed traffic is not cryptographic proof of fresh command causation,
+and neither the fault's cause nor continuous reliability is established.
+The consumed failed stage is not retried or promoted. Recovery and healthy
+deployment remain blocked; the transmit fix is still unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
