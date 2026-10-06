@@ -2146,6 +2146,12 @@ present. Host parse times do not establish USB arrival or firmware emission
 times. Collector ordering versus genuinely late delivery remains under
 source-only investigation; this classification does not promote the failed
 receipt or authorize another hardware attempt.
+Agent and independent parent execution each passed11 source-only cases through
+the real native adapter, frame parser and owned transport. Timely complete and
+fragmented native events were accepted; late, missing and mismatched events
+were denied without retroactive acceptance or deadline changes. All97 frozen
+pins remained unchanged. No deterministic host collection defect was found;
+firmware notification scheduling remains under read-only investigation.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

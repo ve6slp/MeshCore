@@ -280,6 +280,8 @@ but it was parsed1.145 seconds after the signed advert, outside the unchanged
 1-second window. This is host parsing time, not proven device emission time.
 The failed attempt remains frozen while source-only collection diagnosis
 continues; no timing waiver or new hardware attempt is authorized.
+Source-only checks upheld the existing timing rule and found no deterministic
+host collection defect. The notification delay's cause is still unproven.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

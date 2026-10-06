@@ -1466,6 +1466,12 @@ newer than the fresh stored stock contact. No contact-update frame was present.
 These are host parse times, not proven USB arrival or firmware emission times;
 collector ordering versus genuinely late delivery remains under source-only
 investigation. No failed receipt is promoted or new hardware attempt authorized.
+Agent and independent parent execution each passed11 actual-adapter/parser/
+transport timing cases, preserving timely acceptance and terminal denial of
+late, fragmented-after-deadline, missing or mismatched native events. All97
+frozen pins remained unchanged. No deterministic host collection defect was
+established; firmware notification scheduling remains a read-only causal trace,
+not an authorized correction or hardware retry.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
