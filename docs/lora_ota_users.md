@@ -239,6 +239,12 @@ an unprimed context, retaining the original inventory reference without
 altering any prior receipt. This produced input proposals only, not live
 permission. Fresh ROOT policy, userdata/radio and signing/upload/COMMIT
 admissions are still required; the transmit fix remains unsigned and uninstalled.
+Fresh full exposed-userdata capture then matched all other fields, retaining
+only the two known stock timestamp differences. The parent missed the timed
+review/admission windows, so fresh RF permission was refused before any radio
+or OTA operation. That cycle stopped with its evidence intact. A fresh,
+isolated cycle is being prepared with review helpers ready beforehand;
+expired permissions and old captures will not be reused.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

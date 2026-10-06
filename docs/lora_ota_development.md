@@ -1361,6 +1361,18 @@ through the corrected API, with SHA256
 Only private input proposals were produced: no policy, approval, stage
 consumption or hardware operation. Actual fresh ROOT admissions and strict
 postinstall acceptance remain separate; no old failed receipt is promoted.
+Separate actual policy/readbacks admissions subsequently captured fresh full
+exposed userdata in1.714 seconds, with receipt SHA256
+`bc20728c15054e85dba49e9816f5d3eb1caacf3e08178ee977ba3e1e34a24cba`.
+All other protocol-visible fields matched; only the two already observed
+stock timestamp fields differed, retaining normalized userdata c3107e6f and
+metadata diff120d0035. The parent missed the time windows: metadata review was
+materialized49.91 seconds after capture instead of within30, and the separate
+RF-approval materializer refused the expired300-second policy. No peer
+approval/start/receipt, fresh RF, signing, upload or COMMIT followed.
+The stopped cycle's artifacts remain unchanged. A fresh isolated08/13 scope
+is being prepared with all review helpers staged before starting policy time;
+no expiry extension, stale capture, marker reuse or failed05 promotion is used.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

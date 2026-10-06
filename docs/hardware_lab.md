@@ -2015,6 +2015,24 @@ evidence remain unchanged. Fresh separate ROOT policy/readbacks and later
 radio/sign/upload/COMMIT/postinstall admissions are still required; the
 transmit fix remains unsigned and uninstalled.
 
+Separate actual ROOT policy and readbacks admissions subsequently ran the
+fresh full exposed-userdata capture in1.714 seconds. The receipt SHA256 is
+`bc20728c15054e85dba49e9816f5d3eb1caacf3e08178ee977ba3e1e34a24cba`.
+All other protocol-visible fields matched the original inventory; only the
+two already observed stock contact timestamps differed. The fresh normalized
+userdata hash is c3107e6f, and the exact metadata diff remains120d0035.
+This is a new capture, not promotion of the failed RF05 receipt.
+The parent then missed the admission time windows: the metadata-review file
+was materialized49.91 seconds after capture, beyond the required30 seconds,
+and the separate RF-approval materializer refused the expired300-second
+policy. No peer approval, peer-start marker or peer receipt was created; no
+fresh RF, signing, upload or COMMIT ran. The cycle stopped with its policy,
+readbacks and late review unchanged. This is an orchestration timing failure,
+not regression of the corrected genuine-history path or a radio test failure.
+A wholly fresh isolated08/13 cycle is being prepared, with review helpers
+staged before the policy clock starts. No clock extension, stale-data waiver,
+marker reuse or old-policy renewal is permitted.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;
