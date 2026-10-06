@@ -1837,6 +1837,34 @@ independent full userdata and ordinary two-way RF recovery, transmit-fix
 installation and physical reliability remain open. All old sources, claims
 and failed receipts remain frozen; later snapshots do not promote them.
 
+**Fresh counter8 campaign (2026-10-06, prepared/signed; upload in progress):**
+After independent ROOT source acceptance, ROOT explicitly selected counter8,
+above the actual failed counter7; no READY generation was assigned. A distinct
+read-only preparation freshly remeasured diag-conf05, the exact original floor4,
+failed counter7/generation17, core0 and normal TX2. All four radio readings
+retained their actual stable lifetime fault count0. The full new
+five-contact/40-channel protocol-visible userdata comparison hashes match the
+prior ROOT inventories; hidden keys and full persistent storage remain outside
+that proof. The preparation receipt SHA256 is
+`dccf39e9d25c69066ce0f9fff8b128c59d1c891bdc25f01ee3e42b8d3db2065a`.
+
+Separate descriptor and unchanged-stock USB signing admissions produced the new
+counter8 manifest
+`31beac38b69ad96ec2189d6be2b234336c9c59712893e48e0b369906af245de7`
+for the same older nonconfirming diag-roll05 image, not the transmit-fixed APP.
+Independent review verified its actual59-byte canonical descriptor and64-byte
+Ed25519 signature against the exact stock owner. The signed descriptor SHA256 is
+`a6362801506ef34e786566ea294f6aa17d90b4ade7083e2b3219734c7ffa91c2`.
+A further distinct once-only AUTH/upload approval, SHA256
+`0ef989f7fb038936435fca759001cd67af0467ebb7c1446aa81e08d417cb4756`,
+started the reader-free500kHz LoRa upload under the unchanged2% airtime policy.
+The attached upload and actual stock production child were observed running on
+the authorized physical USB4.2.4 path. READY, actual measured generation above17
+and stock-radio restoration are pending. No COMMIT has been invoked.
+Only a completed reviewed upload may support separate ROOT launch admission,
+real prearm and the new ordered trial/qualified post-trial removal/return proof.
+The transmit fix remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

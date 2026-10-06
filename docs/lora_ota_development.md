@@ -1252,6 +1252,16 @@ counter above7, actually measured READY generation above17 and all five prior
 nonce exclusions, without counter/generation defaults. Source correction does
 not supply live admission or replace genuine ordered history and independent
 userdata/ordinary RF recovery.
+After separate ROOT source acceptance, ROOT explicitly selected counter8.
+Fresh read-only preparation remeasured failed counter7/generation17, the exact
+floor4 and healthy sampled normal TX2 with actual stable count0, and the full
+new exposed-userdata inventory matched the prior ROOT comparison hashes.
+Separate descriptor and unchanged-stock USB signing admissions produced a new
+verified counter8 descriptor for the older nonconfirming image. Its distinctly
+admitted once-only reader-free500kHz AUTH/upload is running under the unchanged2%
+policy. READY, actual measured generation above17 and stock-radio restoration
+remain pending; no generation18 is assigned and no COMMIT has been invoked.
+New launch admission and genuine ordered rollback/recovery remain mandatory.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

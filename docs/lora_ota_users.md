@@ -185,6 +185,13 @@ needs an explicitly selected counter above7 and actually measured READY
 generation above17, not assigned defaults. The transmit fix remains unsigned
 and uninstalled. Neither sampled health nor source qualification establishes
 continuous radio reliability, userdata preservation or ordinary RF recovery.
+ROOT subsequently explicitly selected counter8 for another distinct campaign.
+Fresh preparation rechecked the failed counter7/generation17 floor4 baseline
+and matched the prior exposed-userdata inventory. Separate signing produced a
+verified descriptor for the same older nonconfirming image, and a separately
+admitted reader-free LoRa upload is now running. READY, measured generation
+above17 and stock-radio restoration are pending. No COMMIT has been invoked;
+this does not install the transmit fix or recover any old failed history.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
