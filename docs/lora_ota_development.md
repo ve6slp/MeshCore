@@ -1390,6 +1390,22 @@ timestamp reviews, explicit ROOT stage decisions, device-measured READY and
 strict zero-new-fault postinstall acceptance remain mandatory. No new policy,
 stage consumption or hardware operation followed source/pre-stage qualification;
 all stopped07/12 evidence remains unchanged.
+Separate fresh08/13 policy/readbacks admissions then captured full exposed
+userdata in1.767 seconds, with receipt SHA256
+`22ebe1945f32f62d5bc2774c4dc34574bb7b892088ff7fe7dcdd06235a4417f1`.
+All other exposed fields matched the original; only the known two stock
+timestamps differed. The independent baseline review completed16.394 seconds
+after capture, and the peer stage began18.382 seconds after capture, both
+within30 seconds and under a fresh300-second policy. Current samples remained
+healthy/core0 with the exact floor4 and stable lifetime fault count1.
+The once-only peer stage failed after2.836 seconds with
+`independent-selected-epoch-snapshots-required`, receipt SHA256
+`2040f38e2d7c7be4d8185ed12e56b7d763d16b482b7b774274a0f2f782e30ba9`.
+Only RF-before was captured; both-way native RF was not qualified.
+No post-RF inventory/review, bootstrap acceptance, signing, upload or COMMIT
+followed. The readers exited and the consumed08/13 evidence remains frozen.
+This real-adapter failure is distinct from the corrected timing issue; its
+diagnosis and any correction require a new source scope, not replay or waiver.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

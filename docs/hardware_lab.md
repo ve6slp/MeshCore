@@ -2054,6 +2054,26 @@ No policy, consumed stage, hardware operation or fix installation resulted
 from these source/pre-stage checks. The stopped07/12 artifacts remain frozen,
 and the transmit fix remains unsigned and uninstalled.
 
+Separate fresh08/13 ROOT policy and readbacks admissions then completed full
+exposed-userdata capture in1.767 seconds, with receipt SHA256
+`22ebe1945f32f62d5bc2774c4dc34574bb7b892088ff7fe7dcdd06235a4417f1`.
+The original body and every other exposed field matched; only the two known
+stock timestamps differed. Current samples were healthy/core0 with exact
+floor4, retained counter8/generation18 and stable lifetime fault count1.
+The independent exact baseline review was materialized16.394 seconds after
+capture, and the separately admitted peer stage began18.382 seconds after
+capture: both within30 seconds, with the300-second policy still fresh.
+Thus this cycle did not repeat the earlier orchestration timing failure.
+The once-only peer stage nevertheless failed after2.836 seconds with category
+`independent-selected-epoch-snapshots-required`. Its immutable receipt SHA256 is
+`2040f38e2d7c7be4d8185ed12e56b7d763d16b482b7b774274a0f2f782e30ba9`.
+Only the healthy, stable-count RF-before sample was captured; both-way signed
+native RF was not qualified. No post-RF inventory/review, bootstrap acceptance,
+signing, upload or COMMIT followed. The hardware readers exited and released
+both exact anchors. This consumed cycle and all its artifacts remain frozen;
+the real-adapter failure needs diagnosis and a separately qualified correction,
+not a retry or clock waiver. The transmit fix remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

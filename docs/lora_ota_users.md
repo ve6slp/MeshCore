@@ -251,6 +251,13 @@ ready before a new policy begins; they do not automatically approve captures
 or waive timestamps. No hardware permission or operation comes from this
 preparation. Fresh separate ROOT admissions remain required, and the transmit
 fix is still unsigned and uninstalled.
+Fresh admissions then captured matching exposed userdata and completed the
+independent timestamp review within the required time window. The separately
+admitted peer stage failed an independent selected-epoch snapshot guard;
+both-way native RF was not qualified. That once-only attempt stopped with its
+evidence intact and its readers released. No signing, upload or COMMIT
+followed. A real-adapter correction remains necessary before proceeding;
+the transmit fix is still unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
