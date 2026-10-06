@@ -1210,11 +1210,18 @@ After independent ROOT acceptance and explicit counter7 selection, new admitted
 preparation freshly remeasured the failed counter6/generation16 floor4 baseline
 and matched the prior five-contact/40-channel protocol-visible userdata hashes.
 Separate descriptor and unchanged-stock USB signing admissions produced a new
-verified counter7 descriptor for the older nonconfirming image. A separately
-admitted once-only reader-free500kHz AUTH/upload is now running under the
-unchanged2% policy. No41 USB reader is active, actual READY generation remains
-unknown, and no COMMIT launch has been admitted or invoked. This is a new
-rollback campaign, not deployment of the transmit fix or repair of old history.
+verified counter7 descriptor for the older nonconfirming image. Its separately
+admitted once-only reader-free500kHz AUTH/upload completed under the unchanged2%
+policy with exact counter7 READY, native measured generation17 and stock-radio
+restoration. A distinct ROOT launch approval then bound the actual session and
+all four prior nonce exclusions. After the lease-expiry wait, fresh physical
+READY/core0/normal-TX2 checks and real observer prearm, the separately bounded
+signed COMMIT invocation began under the original2010-second parent deadline.
+Historical radio-fault count796 was stable within the fresh healthy sample;
+it is not zeroed or explained by that sample. COMMIT result, restoration seal
+and the full ordered trial/qualified post-trial kernel gap/exact floor4 return
+are still pending. This is a new rollback campaign, not deployment of the
+transmit fix or repair of old history.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

@@ -164,9 +164,12 @@ After separate ROOT acceptance, fresh preparation rechecked the current failed
 counter6/floor4 baseline and matched the prior exposed-userdata inventory.
 A distinctly admitted counter7 descriptor for the older nonconfirming image
 was USB-signed through the unchanged stock companion, and its reader-free LoRa
-upload is now running. Complete READY is still pending, actual generation is
-unknown, and no COMMIT has been admitted or invoked. This stages another
-rollback campaign; it does not install the transmit fix or prove rollback.
+upload completed READY at native measured generation17 with stock-radio
+restoration. After a distinct ROOT launch admission and fresh normal-radio/core
+checks, the real observer armed before the separately bounded signed COMMIT
+invocation began. COMMIT result and complete ordered rollback history are still
+pending. This is another rollback campaign; it does not install the transmit
+fix or establish continuous radio reliability.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

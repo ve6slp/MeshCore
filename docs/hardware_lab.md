@@ -1735,7 +1735,7 @@ deadlines and physical restrictions remain mandatory. The source delivery
 itself supplied no live authority or hardware result. The radio fix remains
 unsigned and uninstalled, and the old failed history remains irrecoverable.
 
-**Fresh counter7 rollback staging (2026-10-05, transfer running):**
+**Fresh counter7 rollback staging (2026-10-06, upload complete and COMMIT prearmed):**
 After separate ROOT source acceptance, ROOT explicitly selected counter7 for a
 distinct campaign using the same older nonconfirming diag-roll05 image, not
 the transmit-fixed APP. Fresh admitted preparation remeasured diag-conf05,
@@ -1755,11 +1755,32 @@ A distinct once-only AUTH/upload admission then started the reader-free500kHz
 LoRa transfer under the unchanged2% airtime policy and14400-second production
 timeout. Its approval SHA256 is
 `b71846ee73380297781de0128f821ac223f00e7854e46e3fa6a03d2a48432678`.
-The launcher and stock uploader were observed running; no41 USB reader is
-active during transfer. Complete READY and restoration are still pending at
-this milestone, and the actual generation has not been measured or assigned.
-No COMMIT launch has been admitted or invoked. Genuine ordered rollback,
-post-return userdata/ordinary RF recovery and radio-fix installation remain open.
+The transfer completed with exact counter7 READY, native measured generation17
+and stock-radio restoration. Generation17 was measured, not assigned, and this
+unsigned READY result is staging evidence, not installation confirmation.
+The upload handoff SHA256 is
+`77c32c7719ee29c9db3f967f87ae43901d32d3e32c5ee8f3194215b36849766d`;
+the actual stock result SHA256 is
+`761b3fbdb1585655b4e96fcc7cfc19b083e6b3f60a51c613bc9b49b1f6d88adf`.
+
+After the lease-expiry wait and independent ROOT session review, a new launch
+approval bound actual generation17, native nonce `2f631fab5e00e987` and all four
+prior nonce exclusions. Its SHA256 is
+`1a87d3e76725e4c7a6a9d1d637883bfb29fe86f945e542dce0cf2e6b2fbd8514`.
+A fresh physical USB READY sample established full6617, core0, the unchanged
+floor4 and healthy sampled normal TX2. Its historical lifetime radio-fault
+count was796 before and afterward; this is not erased or attributed to a cause,
+and sampled health does not establish continuous radio reliability.
+The real observer armed before the separately bounded signed COMMIT invocation,
+retaining the original2010-second parent deadline. The authority SHA256 is
+`0c803cba4d5d4d59ece2b0018024e4b58f7ab30c7dcaa395927268dd730805b1`;
+the actual armed receipt SHA256 is
+`0a9c624a1a5512bef5263ddeb546d596603458871f8a5bf251040f991c7c2408`.
+The observer and stock COMMIT child were observed running. COMMIT result,
+restoration seal and the complete ordered trial, qualified post-trial USB epoch
+and exact floor4 return remain pending at this milestone. Post-return userdata
+and ordinary RF recovery, transmit-fix installation and physical reliability
+remain open; old failed histories are not reused.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
