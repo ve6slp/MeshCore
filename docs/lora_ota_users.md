@@ -290,6 +290,10 @@ are approved, but hardware execution and installation are not.
 The observer is now independently source-qualified, without changing the
 existing timing rule. Complete permission/review helpers are being prepared
 before any timed hardware capture; no hardware stage has been admitted.
+Preparation found an inherited baseline-review gap for fully unchanged
+userdata. A separate correction is being prepared so a fresh independent review
+is required whether zero, one or two permitted stock timestamps changed.
+This does not change the RF timing rule or authorize hardware execution.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

@@ -2171,6 +2171,15 @@ passed the genuine29 original-history checks. A handoff path typo was corrected
 through the existing argument and a sealed path-only supplement, without
 changing source or original evidence. Complete ROOT workflow helpers are being
 prestaged before any policy or timed capture. No hardware stage has been admitted.
+The first parent helper passed six focused workflow cases and genuine read-only
+prestaging, but integration review found a separate zero-change baseline gap.
+Inherited materialization required timestamp changes while peer admission
+required no review for unchanged userdata, conflicting with mandatory fresh
+independent review in every allowed0–2-change case. The MODEL forced two changes
+and had not qualified zero. A fresh, separately scoped correction is underway
+across materialization, admission and parent review; old sources remain frozen.
+This setup gap does not explain the earlier late RF notification or authorize
+hardware execution, deadline changes or reuse of failed evidence.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

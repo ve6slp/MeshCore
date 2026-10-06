@@ -1497,6 +1497,19 @@ times are diagnostic provenance, not proven arrival/emission times or hardware
 authority; recording can add host overhead. Complete explicit ROOT helpers are
 being prestaged before any fresh policy or timed capture. No hardware admission
 or execution has followed this qualification.
+The first parent helper also passed six actual workflow cases and genuine
+read-only prestaging, but it is not full-plan-ready for unchanged userdata.
+Integration review found that inherited ROOT materialization requires nonempty
+timestamp changes while peer admission requires no baseline review for zero;
+the parent instead correctly holds for mandatory independent review. Its MODEL
+forced two changes, leaving zero unqualified.
+A fresh scoped correction must permit strict zero-change materialization and
+require a validated, pinned, fresh review before CMD7 for every allowed0–2
+known-stock timestamp changes. Materialization, admission and parent proposals
+are being wired together without changing native/deadline, crypto, preservation,
+identity or fault-budget guards. All earlier sources and artifacts remain frozen.
+This is a preparation integration defect, not proof of the earlier RF delay's
+cause or permission to execute hardware.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
