@@ -175,11 +175,15 @@ read-only capture later found diag-conf05, the exact floor4, failed
 counter7/generation17 and healthy sampled normal TX2; that snapshot cannot
 repair the missing history or prove autonomous rollback. No retry, host reset
 or reflash was performed. Recovery and healthy deployment remain blocked.
-A distinct source-only correction is in progress, retaining exact identity,
-original deadlines and separate ROOT admissions. A future attempt needs an
-explicitly selected counter above7 and actually measured READY generation
-above17, not assigned defaults. The transmit fix remains unsigned and
-uninstalled. Neither sampled health nor source qualification establishes
+A distinct source-only correction is now qualified. It requires independent
+proof that the previously owned kernel USB device was removed, not merely a
+missing serial anchor, before reopening the exact board. It retains original
+deadlines, fresh native readbacks, a distinct post-trial gap/return and separate
+ROOT admissions. Its synthetic product-path qualification does not establish
+hardware rollback or grant permission for a new attempt. A future attempt
+needs an explicitly selected counter above7 and actually measured READY
+generation above17, not assigned defaults. The transmit fix remains unsigned
+and uninstalled. Neither sampled health nor source qualification establishes
 continuous radio reliability, userdata preservation or ordinary RF recovery.
 
 A separate private floor4 diagnostic rollback observer profile is wired to

@@ -1232,11 +1232,21 @@ TX2 with actual lifetime fault count0. That later state does not repair the
 missing ordered history, qualify autonomous rollback, compare userdata or
 exercise ordinary RF; recovery and healthy deployment remain blocked.
 No retry, host reset or reflash was performed.
-A distinct source-only correction is in progress to qualify independently
-proved removal of the previously owned kernel USB epoch before anchor
-resolution across physical/framed/reopen paths. It must retain the original
-deadline, exact identity, fresh native samples and a distinct post-trial
-gap/new-epoch return. All old sources and failed receipts remain frozen.
+A distinct source-only correction now independently qualifies proved removal
+of the previously owned kernel USB epoch before anchor resolution across
+physical/framed/serial/reopen paths. It probes the saved kernel owner rather
+than treating an absent anchor as evidence, closes the old descriptor and
+bounds return to120 seconds within the original deadline. Startup absence,
+missing independent proof, wrong identity, permissions and ambiguous metadata
+remain fatal. Exact identity, fresh native samples and a distinct post-trial
+gap/new-epoch return are still required; a pre-trial removal cannot substitute.
+The focused Make product boundary passed25 cases with64 MODEL fixtures and an
+independent parent rerun matched the final receipt. Real scoped callpaths cover
+the absent-anchor failure before capture, full ordered history, default-denial,
+userdata/ordinary RF and conditional exact-APP06 deployment gates. Actual
+stable fault counts0 and847 pass without mutation; changing counts are refused.
+These synthetic inputs are not live ROOT authority or hardware evidence.
+All old sources and failed receipts remain frozen.
 A new campaign requires fresh ROOT baseline review, an explicitly selected
 counter above7, actually measured READY generation above17 and all five prior
 nonce exclusions, without counter/generation defaults. Source correction does

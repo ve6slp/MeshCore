@@ -1809,11 +1809,26 @@ history or prove autonomous rollback. No retry, host reset or reflash was
 performed. This read-only capture did not compare userdata or exercise RF.
 
 The current campaign's recovery and healthy-deployment gates remain blocked.
-A distinct source-only correction is in progress for independently proved
+A distinct source-only correction is now independently qualified for proved
 removal of the previously owned kernel USB epoch before resolving an absent
-anchor, across physical, framed-command and reopen paths. It must preserve
-identity/default-denial checks, the original deadline and a distinct qualified
-post-trial gap/new-epoch return; it supplies no hardware authority or result.
+anchor, across physical, framed-command, serial I/O and reopen paths.
+It probes the saved kernel owner independently, closes the old handle before
+reopening and bounds absence to120 seconds within the original2010-second
+deadline. Startup absence, missing removal proof, wrong identity, permissions
+and ambiguous metadata remain fatal. A pre-trial removal can permit observing
+a genuine trial but cannot replace the required distinct post-trial
+gap/new-epoch return. Actual stable fault counts, including0, are accepted
+without host mutation; changing counts still refuse admission.
+The focused Make product boundary passed25 cases with64 MODEL fixtures, with
+an independent parent rerun producing the same receipt. These are synthetic
+inputs through the real scoped product paths, not hardware history or ROOT
+authority. The final source handoff SHA256 is
+`bd46e3f3c106602d59fc6c75f279c6edfb6f5edc2f68aeb8e396e2849856a557`;
+the qualified product and parent rerun SHA256 is
+`c2fd086bbda74b0e2260eb5a1d4bf68d85f33fe3da4f4a60624a7c126121adf0`.
+All four new rollback/recovery/healthy-observation/deployment capsules retain
+their separate admission and genuine-history gates. The source delivery supplies
+no hardware authority or result.
 A future campaign requires fresh ROOT review of the current failed
 counter7/generation17 baseline, an explicitly selected counter above7 and
 actually measured READY generation above17, with all five prior nonce
