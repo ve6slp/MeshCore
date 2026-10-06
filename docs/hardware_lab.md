@@ -1983,6 +1983,18 @@ full-userdata and both-way native RF checks with zero new faults. No actual
 bootstrap authority, hardware operation or fix installation comes from source
 acceptance; the fix remains unsigned and uninstalled.
 
+**Live bootstrap remains blocked:** subsequent accessor review found that
+strict genuine-history preparation populates the history namespace, while
+policy materialization and recovery admission use a separate earlier copy.
+The validated original-userdata summary is not propagated between them.
+MODEL setup had supplied that field, masking the actual transition gap; the
+passing source-only receipt does not qualify this genuine-history boundary.
+No actual policy, admission, stage consumption or hardware operation followed.
+A new recovery07/deployment12/observer12 source-only correction is underway;
+accepted06/11 sources and all previous evidence remain frozen. The correction
+must exercise strict preparation from an unprimed namespace before any live
+bootstrap can be admitted.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

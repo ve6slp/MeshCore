@@ -1336,6 +1336,16 @@ The exact APP06 requires device-measured READY, trueARM, bounded COMMIT and
 stock restoration, native Installed8/new floor, then independent strict
 userdata and both-way native RF with zero new faults. No fault causation,
 continuous reliability or userdata atomicity is inferred.
+Subsequent accessor review exposed a genuine-history dataflow blocker:
+strict preparation fills the history namespace, but policy materialization
+and recovery admission read a separate earlier namespace lacking the validated
+original-userdata summary. MODEL setup had supplied the missing field, so
+the passing product receipt does not establish this transition. Live bootstrap
+is blocked before any actual policy, admission, consumed stage or hardware
+operation. A new recovery07/deployment12/observer12 source-only correction
+must carry strictly derived preparation through unprimed namespaces and retain
+the original inventory reference across later healthy preparation. Accepted
+06/11 sources and all receipts remain frozen; no fallback or bypass is used.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
