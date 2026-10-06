@@ -259,6 +259,11 @@ evidence intact and its readers released. No signing, upload or COMMIT
 followed. A real-adapter correction remains necessary before proceeding;
 the transmit fix is still unsigned and uninstalled.
 
+Diagnosis found that the adapter applied the receiver's epoch checker to the
+stock companion, rejecting its selection before any requested ordinary advert
+command. A separate source correction is underway; neither existing evidence
+nor consumed permissions will be reused. No new hardware action is authorized.
+
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
 It requires a new ROOT-admitted signed descriptor, measured READY

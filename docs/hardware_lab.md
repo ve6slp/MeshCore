@@ -2074,6 +2074,22 @@ both exact anchors. This consumed cycle and all its artifacts remain frozen;
 the real-adapter failure needs diagnosis and a separately qualified correction,
 not a retry or clock waiver. The transmit fix remains unsigned and uninstalled.
 
+Source diagnosis identified the actual adapter defect: inherited coordinator
+initialization replaces the stock companion's physical-selection checker with
+the41-only owned-receiver epoch checker. The stock selections have no entries
+in that receiver's snapshot registry, so the guard refuses them. Production
+MODEL setup had restored per-node routing, masking this construction-time
+overwrite. The failing check precedes even the stock-core USB request, and
+the ordinary advert command occurs later; this invocation reached no requested
+ordinary advert command. That says nothing about ambient RF or fault causation.
+A separate recovery09/deployment14/observer14 source-only correction is scoped
+to retain legitimate stock physical checks and owned41 epoch continuity,
+refuse unknown anchors, and exercise the actual unmodified production dispatch.
+It must reproduce the old guard with zero ordinary advert commands, then
+qualify corrected both-way native signatures without substituting the checker.
+All08/13 sources and consumed actual artifacts remain unchanged; no new
+hardware permission follows diagnosis or source work.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

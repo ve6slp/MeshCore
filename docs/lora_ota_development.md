@@ -1406,6 +1406,18 @@ No post-RF inventory/review, bootstrap acceptance, signing, upload or COMMIT
 followed. The readers exited and the consumed08/13 evidence remains frozen.
 This real-adapter failure is distinct from the corrected timing issue; its
 diagnosis and any correction require a new source scope, not replay or waiver.
+Source diagnosis found that inherited initialization overwrites the legitimate
+stock physical-selection checker with the41-only owned epoch checker. Stock
+selections are therefore absent from the required receiver snapshot registry.
+MODEL setup had supplied per-node routing, masking the construction-time
+defect. The failed guard precedes the stock-core USB write and all requested
+ordinary advert commands; ambient RF and fault causation are not inferred.
+A separate09/14 source-only correction must preserve both proper node guards,
+deny unknown anchors and qualify the actual production adapter without a
+MODEL dispatcher replacement. It must reproduce the old refusal before any
+ordinary advert and exercise real native signatures through the corrected
+adapter. Frozen08/13 sources and consumed actual artifacts are not modified;
+new hardware admissions remain separate.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
