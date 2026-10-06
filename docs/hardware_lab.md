@@ -1696,15 +1696,44 @@ They remain default-denied for live deployment. No hardware operation was
 performed by the source qualification itself; the radio fix remains unsigned
 and uninstalled.
 
-New source-only observer/recovery/deployment capsules are being prepared for a
-distinct future campaign. They must distinguish strictly verified same-board
-kernel USB epoch changes from identity, ownership and protocol failures,
-without converting arbitrary errors or no-response into boot evidence.
-Fresh coherent native samples, the unchanged physical-board restrictions,
-original deadlines and complete ordered rollback history remain mandatory.
-Any future counter is independently ROOT-selected above6, and its READY
-generation must actually be measured above16; neither is assigned by this
-source work. No new signing, upload or COMMIT has begun.
+**Prospective USB-epoch continuity (2026-10-05, source only):**
+Four distinct new capsules now wire a future rollback campaign, its post-return
+recovery and corrected healthy observation/deployment. Their focused Make
+product boundary passed21 cases using47 MODEL fixtures; an independent rerun
+produced the same receipt hash. These are source-operation inputs, not physical
+rollback history or hardware authority. The final handoff SHA256 is
+`7d2f9052abea501fb3f3b67fcd2c8ecb7ef430e0b2e4b9a708067fc0018b0cfe`;
+the qualified product receipt and independent rerun SHA256 is
+`9ac292ef1ba37c7f70d288caba258cabf0e3fa90eba9fdde4c1ae476f040051c`.
+
+The prospective observer requires the exact same serial, VID/PID, physical
+USB path and full public identity, a changed kernel USB device number and owner
+token, and old-handle/new-device discontinuity. It closes the old handle before
+reopening the exact board exclusively and obtaining completely fresh coherent
+native samples. Old-handle identity uses the stable device/inode/device-number
+tuple and character type, not inode ctime, which Linux changes on unlink.
+Receipt replay validates the actually recorded old-handle token and type;
+a timestamp-only change cannot establish a new device. Identity, ownership,
+ambiguous epoch and protocol failures
+remain fatal; arbitrary errors, tty changes or no-response are not boot or reset
+proof. Samples are bracketed, not atomic, and no reset cause is claimed.
+
+Recovery admits only a genuine new source-bound ordered trial, qualified
+post-trial kernel USB epoch change and exact floor4 return, with the separately
+bounded signed COMMIT transmission/result/restoration seal. The later counter6
+snapshot cannot satisfy that chain. Full userdata and independent ordinary RF
+recovery retain their separate ROOT gates, as does any exact contact-timestamp
+diff review. Healthy deployment retains exact APP06/native Installed8/new-floor
+requirements and independently higher actual counter/generation/nonce lineage;
+an unobserved short healthy trial requires an explicit ROOT boolean.
+
+The future rollback counter must be explicitly ROOT-selected above6, and READY
+generation actually measured above16; neither is assigned by this source work.
+Fresh preparation must remeasure the failed counter6/generation16 floor4
+baseline and full userdata. All five stage admissions, true prearm, original
+deadlines and physical restrictions remain mandatory. No new signing, upload
+or COMMIT has begun. The radio fix remains unsigned and uninstalled, and the
+old failed history remains irrecoverable.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

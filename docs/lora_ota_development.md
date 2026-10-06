@@ -1188,10 +1188,24 @@ measured READY generation above the actual rollback session, prior-session
 nonce exclusions and separately admitted prearm-before-bounded-COMMIT.
 Missing prerequisites deny live execution; no counter/generation is defaulted.
 The failed counter6 history cannot satisfy this source-qualified chain's live
-gate. New prospective USB-epoch observer/recovery/deployment wiring is being
-prepared for a distinct ROOT-admitted campaign, with verified same-board kernel
-discontinuity, wrong-identity refusal and fresh coherent native samples.
-No failed receipt or later snapshot is promoted into complete rollback.
+gate. Four distinct prospective USB-epoch observer/recovery/deployment capsules
+now pass21 focused Make product cases using47 MODEL fixtures, with an
+independent rerun matching the qualified receipt. They require exact same-board
+kernel device-number and owner-token changes plus old-handle/new-device
+discontinuity, exclusive reopening and completely fresh coherent native
+samples. Stable old-handle identity tolerates Linux unlink ctime changes;
+receipt replay retains the actual token/type and refuses timestamp-only
+discontinuity. Wrong identity, ownership, ambiguous epoch and protocol failures stay
+fatal; arbitrary errors, tty changes and no-response are not boot/reset proof.
+No reset cause or atomic sampling is claimed. Recovery requires the genuine
+new campaign's ordered trial, qualified post-trial kernel gap, exact floor4
+return and bounded COMMIT/restoration seal, never a failed receipt or later
+snapshot. Fresh ROOT preparation must remeasure failed counter6/generation16
+and full userdata; the future counter is explicitly selected above6 and actual
+READY generation measured above16, without defaults. Healthy deployment then
+requires independently higher actual lineage and separate userdata/ordinary RF
+recovery. An unobserved short healthy trial needs an explicit ROOT boolean.
+Source qualification supplies none of the five live stage admissions.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

@@ -154,8 +154,12 @@ recovery and healthy-deployment wiring is now qualified, but still refuses live
 deployment without that genuine rollback history, fresh userdata/ordinary RF
 recovery and separate ROOT admission. The radio fix remains unsigned and
 uninstalled; synthetic qualification does not change the hardware status.
-Prospective USB-continuity correction is being prepared for a distinct future
-campaign, without relaxing board-identity checks or reusing failed history.
+Prospective USB-continuity correction now passes its source product boundary
+for a distinct future campaign. It requires a verified same-board kernel USB
+epoch change, exclusive reopening and fresh native samples; ordinary errors
+and no-response are not boot proof. Board-identity checks, separate ROOT
+admissions and genuine new ordered rollback remain mandatory. Failed history
+is not reused, and this source delivery performs no hardware operation.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
