@@ -1837,7 +1837,7 @@ independent full userdata and ordinary two-way RF recovery, transmit-fix
 installation and physical reliability remain open. All old sources, claims
 and failed receipts remain frozen; later snapshots do not promote them.
 
-**Fresh counter8 campaign (2026-10-06, READY complete; observed launch started):**
+**Fresh counter8 campaign (2026-10-06, ordered rollback complete; recovery blocked):**
 After independent ROOT source acceptance, ROOT explicitly selected counter8,
 above the actual failed counter7; no READY generation was assigned. A distinct
 read-only preparation freshly remeasured diag-conf05, the exact original floor4,
@@ -1878,13 +1878,40 @@ The genuine prearm receipt SHA256 is
 `f0a0de230b5626431076c0bc0166c91159336384abc659031888286c5dfb8346`.
 Only after this real ARM did the separate bounded signed-COMMIT production child
 start on USB4.2.4, within the original2010-second campaign budget.
-COMMIT request/sent/result/restoration sealing and the new ordered trial,
-qualified post-trial kernel removal and new-epoch exact-floor4 return remain
-pending. Process startup is not install or rollback proof. No additional reader,
-reupload, reset, reflash, deadline extension or failed-receipt promotion was
-performed. Independent post-return userdata and two-way ordinary RF recovery
-remain gated on a genuinely complete campaign. The transmit fix remains
-unsigned and uninstalled.
+The attached campaign subsequently completed with exit0; both its observer and
+stock production child were reaped. Actual COMMIT request/sent/result events,
+exit0 and stock-radio restoration were sealed within the original deadline.
+The campaign receipt SHA256 is
+`7d4572b76446e0e2c56ed76a2ca47a820b279607c6e3a660246eaed20252d6a7`;
+the independent observer receipt SHA256 is
+`855d2fa6e77d968aa3c4df0566fe023d48b6cefe56953ebbb885988871e1a12b`.
+Its154-row journal, SHA256
+`7a2fff1231a344e6fe3a56bcc88b627c596e46209bfb8f8315e7734a74538779`,
+contains23 genuine native trial samples and four independently qualified
+owned-kernel removal/new-enumeration intervals. The exact board progressed
+through kernel device numbers86->87->88->89->90, with each old handle closed
+before exclusive reopening and each return inside120 seconds.
+
+The first observed diag-roll05 trial had counter8/generation18, core0/uptime1,
+and the unchanged PRESENT floor4 with qualified blocked STAGING_ONLY writes.
+A distinct post-trial removal preceded the final new-epoch diag-conf05 return:
+native Failed10 for the same counter8/generation18/manifest, core0/uptime9,
+exact original floor4 and sampled healthy normal TX2 with actual stable count0.
+Independent ROOT review of all29 pinned receipts passed the unchanged strict
+completed-history validator. No host reset, reflash, new AUTH, retry, deadline
+extension or old failed-receipt promotion was used. This establishes the new
+ordered failed-trial return, not exact reset cause, running-image hash,
+atomic samples or continuous fault-free operation. The observer recorded49
+additional recovered radio faults before the trial; their cause remains unknown.
+
+Independent post-return userdata and two-way ordinary RF recovery have not run.
+Their source admission refused before creating authority or accessing hardware:
+the accepted qualification receipt and independent parent rerun have identical
+SHA256 `c2fd086bbda74b0e2260eb5a1d4bf68d85f33fe3da4f4a60624a7c126121adf0`,
+but the frozen lookup requires exactly one matching file. Both archived files
+remain intact; no source edit, receipt deletion/rename or gate bypass was made.
+Recovery and transmit-fix deployment therefore remain blocked on a separately
+admitted source correction. The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

@@ -193,11 +193,18 @@ admitted reader-free LoRa upload completed with actual measured READY
 generation18 and confirmed stock-radio restoration. After receipt review and
 lease expiry, a distinct fresh ROOT admission started the observed campaign.
 A genuine fresh READY/prearm gate preceded the separate bounded signed-COMMIT
-child. Its result and new ordered trial/qualified post-trial removal/return
-proof remain pending. Sampled normal TX2 was healthy with actual stable fault
-count796, not forced zero; continuous fault-free operation is not established.
-Independent post-return userdata and two-way ordinary RF recovery remain
-blocked. This does not install the transmit fix or recover old failed history.
+child. The campaign then completed with a sealed successful COMMIT and genuinely
+observed native trial, independently qualified post-trial USB removal and
+new-epoch return to diag-conf05 and the exact original floor4. The returned
+counter8/generation18 session was failed as intended; this was a nonconfirming
+diagnostic rollback, not installation of the transmit fix. Normal TX2 was
+sampled healthy, but49 recovered faults were observed before the trial and
+continuous fault-free operation is not established.
+Independent post-return userdata and two-way ordinary RF recovery have not run:
+their frozen source admission rejects two identical archived qualification
+receipts. No files were removed or renamed and no gate was bypassed. Recovery
+and transmit-fix deployment remain blocked on a separately admitted source
+correction. Old failed history remains failed.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

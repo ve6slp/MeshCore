@@ -1270,15 +1270,29 @@ started the attached campaign. Fresh local USB READY confirmed the exact
 counter8/generation18/floor4 session, core0 and normal TX2 with actual stable
 fault count796, not forced zero. A genuine ARM preceded the separate bounded
 signed-COMMIT child on the exact stock USB4.2.4 path. The original2010-second
-budget is unchanged. COMMIT request/sent/result/restoration sealing and genuine
-new ordered trial, qualified post-trial kernel removal and new-epoch floor4
-return remain pending; process startup does not establish them. Independent
-post-return userdata/ordinary RF recovery remains blocked until completion.
+budget is unchanged. The campaign subsequently completed with exit0 and both
+children reaped. Actual COMMIT request/sent/result/restoration were sealed.
+The154-row journal contains23 genuine native trial samples and four qualified
+owned-kernel removal/new-enumeration intervals, including a distinct post-trial
+gap before the exact floor4 failed return. Diag-roll05 trial at uptime1 and
+diag-conf05 return at uptime9 both bound the actual counter8/generation18
+session; trial floor writes were blocked, and the returned original floor was
+unchanged. Independent review of all29 pinned receipts passed the unchanged
+strict history validator. The observer receipt SHA256 is
+`855d2fa6e77d968aa3c4df0566fe023d48b6cefe56953ebbb885988871e1a12b`.
+The return sampled healthy normal TX2 with actual stable count0, but49 recovered
+faults were observed before the trial; their cause and continuous reliability
+remain unqualified. No reset cause, running-image hash or atomicity is claimed.
+Independent post-return userdata/ordinary RF recovery has not run: source
+admission refuses the two identical accepted product-qualification and parent
+rerun files because its frozen lookup requires one matching file. No authority,
+hardware access, source mutation, receipt removal/rename or bypass followed
+that refusal. Recovery requires a separately admitted source correction.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
-Independent observation of the full internal transition sequence and autonomous
-failed-trial rollback remain acceptance gates.
+The new observed failed-trial return does not establish every internal
+transition or the broader platform/mode acceptance gates.
 ESP32 uses vendor slot states, an independent RTC watchdog and late
 confirmation rather than the Nordic register and copy/restore sequence.
 
