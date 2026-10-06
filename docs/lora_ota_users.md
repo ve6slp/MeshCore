@@ -112,6 +112,10 @@ unowned or expired completion, and persistent standby are not health exemptions.
 Both companion and repeater trial-health paths use this service. These changes
 are not installed on41 and do not establish the historical fault's cause or
 continuous physical radio reliability.
+A distinct healthy `ota-41-tx-conf06` APP containing this fix now exists and fits
+the enrolled Sense ROLE0 layout. It is still unsigned and not installed; the
+current running image remains diag-conf05. The separately admitted counter5
+nonconfirming-image upload is a rollback campaign, not deployment of this fix.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

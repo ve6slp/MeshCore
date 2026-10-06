@@ -1452,6 +1452,45 @@ descriptor/counter, measured READY generation and native nonce before any new
 hardware campaign. No COMMIT, signing, upload, reset, reflash or observer rerun
 was performed for this milestone; all historical failed receipts stay unchanged.
 
+**Transmit-fixed healthy APP candidate (2026-10-05, source/build only):**
+A distinct `ota-41-tx-conf06` artifact was built from the exact published
+`17df6089571f310c75db45c5f97aae8993bf9860` tree, not the dirty worktree or
+inherited index. It retains the routed-retry integration and strict classifier,
+uses the enrolled Sense-family target0x584E3430/ROLE0, and runs the ordinary
+10-second healthy confirmation policy with a45-second deadline. It does not
+force health, withhold confirmation or contain a bootloader/SoftDevice image.
+The raw APP is560084 bytes, SHA256
+`1c58ed5e99e863a4313e1d7dede6c3381dff5265fbcdb40ae48335a44f8cf5dd`;
+the APP-only ZIP SHA256 is
+`afda9a1865113f70f9b2d27a84c673a4c265d2f610c76497b1d1d46f5aa27502`.
+Its load range0x27000..0xafbd4 is below installer0xc4000, with82988 bytes of
+APP-slot slack and174332 bytes of static RAM. Raw/ZIP/ELF/HEX image bytes match.
+The ZIP's Nordic compatibility metadata is not an RF campaign signature or
+counter; target/role/version and geometry were checked separately.
+
+The new completion callback's initially partial1552-byte chain was closed
+against actual compiled targets, frames and indirect calls: its conservative
+bound is1848 bytes including the inherited104-byte IRQ allowance. The selected
+OTA-root maximum remains3348/4096, with748 bytes of headroom. The separate
+closure receipt SHA256 is
+`facc171e64b4324731c87b376e3abc8670ef12dae8ca735cd085625373fca340`.
+This is static selected-root analysis, not runtime stack high-water or whole-loop
+filesystem/UI/sensor certification. The original partial report remains
+unchanged; the new closure records the resolved edges explicitly.
+
+The new artifact is not signed, assigned a counter/generation or installed on41.
+Its later deployment needs its own exact observer profile and legitimate ROOT
+admission. Separately, a new counter5 campaign using the older qualified
+nonconfirming `ota-41-diag-roll05` image was prepared and USB-signed through the
+unchanged stock companion, then its reader-free500kHz RF upload was started
+once. Fresh pre-upload readbacks established the existing diag-conf05/floor4
+baseline and captured five contacts/40 channels privately. READY generation,
+COMMIT and live autonomous rollback have not yet been established for that
+campaign. A separate source-only post-return recovery capsule requires genuine
+ordered trial/return receipts before strict exposed-userdata comparison and
+independently admitted ordinary RF checks; its delivery grants no hardware
+permission.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

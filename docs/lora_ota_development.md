@@ -1104,6 +1104,13 @@ and ISR-during-probe reconciliation is bounded to one fresh probe. The native
 product gate passed32 cases, including20 completion cases. XIAO nRF, Solar and
 Wio companion/repeater OTA plus XIAO nRF BLE compile/link boundaries passed.
 The fix is not yet installed on41; continuous physical reliability remains open.
+A distinct healthy `ota-41-tx-conf06` APP built from the exact published fix tree
+fits the Sense ROLE0 installer layout:560084 bytes,174332 bytes static RAM.
+Its new completion/cleanup path has a closed conservative1848-byte stack bound
+including IRQ104; the selected OTA-root maximum remains3348/4096. These are
+artifact/static-analysis results, not runtime stack certification or a running
+update. A separate exact observer profile and ROOT deployment admission are
+still required.
 The separate exact floor4 rollback profile passed16 combined offline cases,
 including missing-trial refusal, unchanged-floor return and once-only approval
 binding. This source result does not authorize a hardware campaign or prove
