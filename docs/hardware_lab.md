@@ -1555,6 +1555,57 @@ ordered trial/return receipts before strict exposed-userdata comparison and
 independently admitted ordinary RF checks; its delivery grants no hardware
 permission.
 
+**Corrected observer and fresh counter6 rollback campaign (2026-10-05):**
+A new prospective profile accepts either the legacy deferred trial floor or
+the available floor actually exposed by the diagnostic firmware. The latter
+must have successful I/O, `STAGING_ONLY` capability, blocked writes and the
+exact baseline sequence4/counter4/extent555876/image hash. All existing native
+candidate/session bindings, core0, normal PHY/TX2, trial decision/proof and
+uptime-before45-second-deadline requirements remain enforced. It neither
+coerces the floor to deferred nor grants writes. The frozen evidence and
+ordered observer implementations remain unchanged; the source-view bridge
+qualifies the precise trial-floor refusal before applying this alternative.
+
+The focused Make boundary passed27 source product cases, including the
+captured trial-floor ABI and synthetic ordered trial/gap/return/seal coverage.
+These are not live rollback evidence. The new profile SHA256 is
+`b6628e71ff5f1fee2e1a33c9a298dd6b9e9e49c84ce6106f23307d3e1b657ae5`;
+the staged coordinator SHA256 is
+`55d66ea9049e31281a3556b6c04395c5ac8b722f27d8fcd074ec825ea516dec9`;
+the source handoff SHA256 is
+`2ee0be1a7fad981f60446cf6539330fb8338e6ffabc9770ac224d7006c1d9c61`.
+ROOT reviewed the full new sources and qualification before distinct admission.
+The failed counter5 campaign, receipts and consumed markers remain unchanged.
+
+Fresh readbacks for the new campaign established diag-conf05, the exact floor4,
+failed counter5/generation15, core0, normal PHY/TX2 and sampled healthy radio.
+The private protocol-visible snapshot again contained five contacts and40
+channel slots. Its public comparison hash
+`a98461062125d68b01f5784de581af2a7fc71f857f27a9a0884d20bd6b4bf80f`
+matches the actual counter5 pre-upload snapshot; this does not prove hidden
+storage or private-key preservation. The new prepare receipt SHA256 is
+`213fdfda40f971361f053c1a4d5095c6ee2aaaa5ea28e98d8ccd98711f2a3546`.
+
+ROOT explicitly selected counter6, not an automatically assigned floor+1.
+The same qualified nonconfirming `ota-41-diag-roll05` image was bound into a
+new59-byte canonical descriptor, manifest SHA256
+`6eef4e82422af2b84b596142dd38671c2ab528d46c15aa939123566205d0dd61`.
+Separately admitted USB signing through the unchanged stock1.17.1 companion
+completed with real Ed25519 verification; the signed descriptor SHA256 is
+`15dd09298c24abee2087dbece38bb176fe7eb0a544194cc37e5452347e5ddd4a`.
+A separately admitted once-only reader-free RF upload is now running using
+908525kHz/BW500000/SF5/CR5 and the unchanged2% airtime policy, with a14400-second
+production deadline. Unit41 has no concurrent USB reader. No per-block progress,
+complete READY or native generation is claimed yet; generation is unknown
+until actually measured. No counter6 COMMIT has started.
+
+Genuine ordered trial, post-trial gap and exact floor4 return, followed by fresh
+userdata and ordinary two-way RF recovery, remain required. New source-only
+recovery/healthy-deployment wiring is being prepared against this campaign's
+future genuine lineage and the corrected trial-floor ABI. It denies hardware
+admission until those prerequisites exist; no failed counter5 history is
+promoted. The transmit-fixed healthy APP remains unsigned and uninstalled.
+
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts
 advance only after send/queue acceptance, not during budget or queue refusal;

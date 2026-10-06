@@ -132,6 +132,20 @@ mismatch not covered by its synthetic source qualification, so that observer
 needs prospective correction. No signing or installation of the fixed APP has
 begun.
 
+A new prospective rollback observer now handles the firmware's available trial
+floor only when it exactly matches the existing confirmed image and remains
+write-blocked. Source qualification passed27 focused cases; the failed counter5
+history has not been repaired or promoted into success. After separate ROOT
+review and admission, a fresh counter6 descriptor for the same older
+nonconfirming image was USB-signed through the unchanged stock companion.
+Its reader-free500kHz LoRa upload is now running. Fresh baseline readbacks
+confirmed diag-conf05/floor4 and matched the prior protocol-visible
+five-contact/40-channel userdata snapshot. Complete READY and native generation
+are not yet measured, and no counter6 COMMIT has started. Full autonomous
+rollback and subsequent ordinary RF recovery remain open. Corrected source-only
+healthy-deployment wiring is being prepared; the radio fix remains unsigned and
+uninstalled.
+
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
 It requires a new ROOT-admitted signed descriptor, measured READY

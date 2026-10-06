@@ -1140,6 +1140,29 @@ No retry, host reset or reflash was used. This campaign
 uses the older diagnostic rollback image, not the transmit-fixed healthy APP.
 See the hardware lab guide for the actual receipt fingerprints
 and the limits of native-event correlation and emission freshness.
+A new prospective rollback profile now accepts the actual available trial floor
+only with successful I/O, `STAGING_ONLY`/blocked writes and exact baseline
+sequence/counter/extent/hash, while retaining legacy deferred-floor support and
+all native session, core, normal-radio and trial-deadline requirements.
+Its focused Make boundary passed27 source product cases, including the captured
+ABI and synthetic ordered trial/gap/return/seal coverage. The frozen evidence
+and ordered observer are unchanged; failed counter5 receipts remain failed.
+These results correct the source mismatch, not the missing physical history.
+
+After distinct ROOT source review and admission, fresh counter6 campaign
+readbacks established diag-conf05/floor4, the failed counter5/generation15
+baseline and healthy sampled normal TX2. The new five-contact/40-channel
+protocol-visible snapshot matches the actual counter5 pre-upload comparison
+hash. A new counter6 descriptor for the same older nonconfirming image was
+USB-signed and Ed25519-verified through the unchanged stock companion.
+Its separately admitted once-only reader-free500kHz upload is now running under
+the unchanged2% airtime policy. Complete READY and native generation are not yet
+measured; no counter6 COMMIT has begun. New source-only post-return recovery and
+healthy-deployment wiring is being prepared against genuine counter6 lineage
+and the corrected floor ABI, without relaxing the old failed campaign's gates.
+The transmit-fixed healthy APP is still unsigned and uninstalled. Source
+qualification, baseline readbacks and signing do not establish autonomous
+rollback or continuous radio reliability.
 Independent observation of the full internal transition sequence and autonomous
 failed-trial rollback remain acceptance gates.
 ESP32 uses vendor slot states, an independent RTC watchdog and late
