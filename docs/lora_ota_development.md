@@ -1206,6 +1206,15 @@ READY generation measured above16, without defaults. Healthy deployment then
 requires independently higher actual lineage and separate userdata/ordinary RF
 recovery. An unobserved short healthy trial needs an explicit ROOT boolean.
 Source qualification supplies none of the five live stage admissions.
+After independent ROOT acceptance and explicit counter7 selection, new admitted
+preparation freshly remeasured the failed counter6/generation16 floor4 baseline
+and matched the prior five-contact/40-channel protocol-visible userdata hashes.
+Separate descriptor and unchanged-stock USB signing admissions produced a new
+verified counter7 descriptor for the older nonconfirming image. A separately
+admitted once-only reader-free500kHz AUTH/upload is now running under the
+unchanged2% policy. No41 USB reader is active, actual READY generation remains
+unknown, and no COMMIT launch has been admitted or invoked. This is a new
+rollback campaign, not deployment of the transmit fix or repair of old history.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.

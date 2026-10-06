@@ -1731,9 +1731,35 @@ The future rollback counter must be explicitly ROOT-selected above6, and READY
 generation actually measured above16; neither is assigned by this source work.
 Fresh preparation must remeasure the failed counter6/generation16 floor4
 baseline and full userdata. All five stage admissions, true prearm, original
-deadlines and physical restrictions remain mandatory. No new signing, upload
-or COMMIT has begun. The radio fix remains unsigned and uninstalled, and the
-old failed history remains irrecoverable.
+deadlines and physical restrictions remain mandatory. The source delivery
+itself supplied no live authority or hardware result. The radio fix remains
+unsigned and uninstalled, and the old failed history remains irrecoverable.
+
+**Fresh counter7 rollback staging (2026-10-05, transfer running):**
+After separate ROOT source acceptance, ROOT explicitly selected counter7 for a
+distinct campaign using the same older nonconfirming diag-roll05 image, not
+the transmit-fixed APP. Fresh admitted preparation remeasured diag-conf05,
+the exact original floor4, failed counter6/generation16, core0 and healthy
+sampled normal TX2. The new full protocol-visible five-contact/40-channel
+userdata inventory matches the actual counter6 pre-upload comparison hashes;
+this does not establish hidden-key or full-storage preservation. The preparation
+receipt SHA256 is
+`b4d98b7ab8e90db27ceda6af712d10392f1dcbe6593c56912a07e1da12cb9d3b`.
+
+Separate descriptor and signing admissions produced a new canonical59 manifest
+`6da16c8a571d15be24e03c285af7e8e5082db07642180349be79331fbd72fff6`
+and a real, verified USB signature through the unchanged stock companion on
+physical USB4.2.4. The signed descriptor SHA256 is
+`05ab1e38bac6b3b8b3b672374f1a2544856d0c80e6a985fc4fb5c173d20e61c9`.
+A distinct once-only AUTH/upload admission then started the reader-free500kHz
+LoRa transfer under the unchanged2% airtime policy and14400-second production
+timeout. Its approval SHA256 is
+`b71846ee73380297781de0128f821ac223f00e7854e46e3fa6a03d2a48432678`.
+The launcher and stock uploader were observed running; no41 USB reader is
+active during transfer. Complete READY and restoration are still pending at
+this milestone, and the actual generation has not been measured or assigned.
+No COMMIT launch has been admitted or invoked. Genuine ordered rollback,
+post-return userdata/ordinary RF recovery and radio-fix installation remain open.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

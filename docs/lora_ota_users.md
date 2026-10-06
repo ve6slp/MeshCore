@@ -160,6 +160,13 @@ epoch change, exclusive reopening and fresh native samples; ordinary errors
 and no-response are not boot proof. Board-identity checks, separate ROOT
 admissions and genuine new ordered rollback remain mandatory. Failed history
 is not reused, and this source delivery performs no hardware operation.
+After separate ROOT acceptance, fresh preparation rechecked the current failed
+counter6/floor4 baseline and matched the prior exposed-userdata inventory.
+A distinctly admitted counter7 descriptor for the older nonconfirming image
+was USB-signed through the unchanged stock companion, and its reader-free LoRa
+upload is now running. Complete READY is still pending, actual generation is
+unknown, and no COMMIT has been admitted or invoked. This stages another
+rollback campaign; it does not install the transmit fix or prove rollback.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
