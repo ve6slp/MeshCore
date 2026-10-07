@@ -2176,10 +2176,24 @@ prestaging, but integration review found a separate zero-change baseline gap.
 Inherited materialization required timestamp changes while peer admission
 required no review for unchanged userdata, conflicting with mandatory fresh
 independent review in every allowed0–2-change case. The MODEL forced two changes
-and had not qualified zero. A fresh, separately scoped correction is underway
+and had not qualified zero. A fresh, separately scoped correction was required
 across materialization, admission and parent review; old sources remain frozen.
 This setup gap does not explain the earlier late RF notification or authorize
 hardware execution, deadline changes or reuse of failed evidence.
+That correction is now independently source-qualified: agent and parent each
+passed two core-admission and seven coupled ROOT/native workflow cases.
+Materialization, admission and parent review require the same validated, pinned,
+fresh independent review for zero, one or two allowed timestamp changes,
+including either single field. Missing, stale, mismatched or unrelated changes
+are refused; late native events remain terminal failures.
+All160 frozen pins remain unchanged. Parent genuine29 read-only preflight and
+core helper prestaging passed without policy, authority or hardware ports.
+The final operator interface is not yet ready: the backend provides JSONL
+stdin/stdout, but lacks a cross-call client and production ROOT decision-authoring
+command. A thin private local frontend is being prepared, keeping decision
+authoring, approval and capture separate. Preparation remains incomplete until
+that interface is qualified. A separate execution decision and fresh admissions
+are still required. This is not evidence of the RF delay's cause or an installation.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

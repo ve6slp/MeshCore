@@ -291,9 +291,16 @@ The observer is now independently source-qualified, without changing the
 existing timing rule. Complete permission/review helpers are being prepared
 before any timed hardware capture; no hardware stage has been admitted.
 Preparation found an inherited baseline-review gap for fully unchanged
-userdata. A separate correction is being prepared so a fresh independent review
+userdata. A separate correction was needed so a fresh independent review
 is required whether zero, one or two permitted stock timestamps changed.
 This does not change the RF timing rule or authorize hardware execution.
+The corrected observer/review workflow is now independently source-qualified
+and read-only prestaged. Unchanged userdata and either
+permitted timestamp change still require fresh independent review.
+Execution needs a separate decision and fresh permissions; no hardware capture
+or firmware installation has followed this preparation.
+The final local operator/decision interface is still being prepared, so the
+complete diagnostic plan is not ready for execution yet.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.

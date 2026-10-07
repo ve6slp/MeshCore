@@ -1506,10 +1506,27 @@ forced two changes, leaving zero unqualified.
 A fresh scoped correction must permit strict zero-change materialization and
 require a validated, pinned, fresh review before CMD7 for every allowed0–2
 known-stock timestamp changes. Materialization, admission and parent proposals
-are being wired together without changing native/deadline, crypto, preservation,
+required coupled wiring without changing native/deadline, crypto, preservation,
 identity or fault-budget guards. All earlier sources and artifacts remain frozen.
 This is a preparation integration defect, not proof of the earlier RF delay's
 cause or permission to execute hardware.
+The fresh correction is now independently source-qualified: both agent and
+parent passed two core-admission and seven coupled ROOT/native workflow cases
+for zero, one or two exact known-stock timestamp changes, including either
+single field. Every case requires validated, pinned, fresh independent review
+before CMD7. Missing, stale, mismatched and unrelated changes fail closed;
+late native failures still withhold post-RF review.
+All160 frozen pins remain unchanged. Parent unprimed genuine29 read-only
+preflight and core helper prestaging passed without creating policy or
+authority or opening hardware ports. The backend currently exposes JSONL
+stdin/stdout only, without a cross-call client or production ROOT decision-authoring
+command; MODEL decision authoring is not production authority.
+A thin private local operator frontend is being prepared before any policy or
+timed capture. It must retain the actual preloaded parent, provide independent
+write-once reviewed decisions and keep authoring, approval and capture separate,
+without adding acceptance logic or changing guards. Full preparation remains
+incomplete; separate execution authorization and fresh admissions are outstanding.
+No RF cause, continuous health, installation or broader release gate is claimed.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous
 rollback or continuous radio reliability.
