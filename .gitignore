@@ -17,3 +17,8 @@ compile_commands.json
 .venv/
 venv/
 platformio.local.ini
+.tmp/
+
+# Python bytecode from repo tooling and tests.
+__pycache__/
+*.pyc

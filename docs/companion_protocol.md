@@ -16,6 +16,47 @@ Please see the following repos for existing MeshCore Companion Protocol librarie
 - JavaScript: [https://github.com/meshcore-dev/meshcore.js](https://github.com/meshcore-dev/meshcore.js)
 - Python: [https://github.com/meshcore-dev/meshcore_py](https://github.com/meshcore-dev/meshcore_py)
 
+## Optional LoRa OTA USB extension
+
+Explicit OTA builds add **CMD67**, with fixed **reply30**, ABI2 (90 bytes).
+Ordinary **CMD66/reply29 remain the upstream CLI interface**. OTA is disabled
+in standard builds; a DeviceQuery or USB vendor ID does not advertise support.
+The product host is `scripts/ota_uploader.py`; see the
+[deployment/recovery guide](lora_ota_users.md).
+
+The existing USB frame is `<` + little-endian uint16 payload length + request;
+responses use `>`. Multi-byte fields inside the following OTA operations and
+ABI2 replies are **big-endian**:
+
+| Subop | Operation | Request body |
+| --- | --- | --- |
+| `0x10` | CACHE_BEGIN | flags8, owner public key32, canonical descriptor59, Ed25519 signature64 |
+| `0x11` | CACHE_PUT | block index16, length8, data (1..84 bytes) |
+| `0x12` | CACHE_SEAL | empty |
+| `0x13` | ADD_TARGET | full target public key32 |
+| `0x14` | START | mode8, channel8, frequency kHz32, lease ms16, duty milli-percent32 |
+| `0x15` | COMMIT | target32, descriptor SHA-25632, security counter32 |
+| `0x16` | ABORT | target32, image SHA-25632, observed generation32 |
+| `0x17` | STATUS | target32; zero means local cache |
+| `0x18` | SET_CONTACT_ADMIN | contact public key32, enabled8 |
+
+START mode is direct=0, directed=1, background=2. Direct uses channel255,
+an explicit legal off-normal frequency and bounded lease. On-mesh modes use
+frequency/lease zero; background requires a configured channel. The optional
+on-mesh retry extension appends profile0/flags1. It has no stock-host fallback.
+
+Reply byte offsets are code0, ABI1, opcode2, result3, phase4, flags5,
+target6..37, descriptor hash38..69, durable received blocks70..71, total72..73,
+counter74..77, snapshot age ms78..81, retry delay ms82..85, generation86..89.
+Flags bit0 marks a valid snapshot; bit1 distinguishes remote from local. A
+successful command result is not itself a valid/fresh candidate snapshot.
+Hosts must bind READY and Installed to the expected target, descriptor, counter,
+generation, scope and freshness. RF status is currently unsigned and is not
+independent cryptographic attestation.
+
+The unchanged MeshCore 1.17.1 stock adapter uses existing signing/raw RF commands,
+not CMD67; it supports direct zero-hop delivery only.
+
 ## Important Security Note
 
 All secrets, hashes, and cryptographic values shown in this guide are example values only.
