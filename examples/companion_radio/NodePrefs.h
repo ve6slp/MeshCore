@@ -58,6 +58,10 @@ public:
   // use ssid from prefs, or fallback to ssid from build flags
   const char* getWifiSSID() const { return wifi_ssid[0] ? wifi_ssid : WIFI_SSID; }
 #endif
+#if MESHCORE_LORA_OTA
+  uint8_t ota_mode = 2;          // 0=direct, 1=routed mesh, 2=background fleet
+  float ota_duty_percent = 2.0f; // percent of rolling one-hour airtime window
+#endif
 
 private:
   class RadioPrefs : public CommonRadioPrefs {
@@ -166,6 +170,10 @@ private:
       def("tel_loc", _parent->telemetry_mode_loc);
       def("tel_env", _parent->telemetry_mode_env);
       def("tz_offset", _parent->tz_offset);
+#if MESHCORE_LORA_OTA
+      def("ota_mode", _parent->ota_mode);
+      def("ota_duty", _parent->ota_duty_percent);
+#endif
     }
   public:
     CompanionPrefs(NodePrefs* parent) : _parent(parent) { }

@@ -2,6 +2,9 @@
 
 #include <Mesh.h>
 #include <RadioLib.h>
+#if MESHCORE_LORA_OTA
+#include <helpers/radiolib/RadioDriverHealthLatch.h>
+#endif
 
 #ifdef USE_CC310_HW_CRYPTO
 #include <Adafruit_nRFCrypto.h>
@@ -22,8 +25,25 @@ protected:
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
 
+#if MESHCORE_LORA_OTA
+  // Latched by the actual return status of a real startReceive()/
+  // readData()/startTransmit() driver call (see .cpp) -- true means the
+  // driver just reported a genuine failure on ordinary traffic, not a
+  // fabricated probe. Cleared back to false the next time one of those
+  // same real operations succeeds. Defaults to healthy so a device that
+  // has not yet performed any radio operation is not reported unhealthy.
+  // The decision logic itself lives in RadioDriverHealthLatch (plain
+  // C++, no RadioLib/Arduino dependency) specifically so it can be
+  // exercised by real native host unit tests -- see that header.
+  RadioDriverHealthLatch _driver_health;
+#endif
+
   void idle();
   void startRecv();
+#if MESHCORE_LORA_OTA
+  uint8_t driverSoftwareState() const;
+  bool transmitCompletionPending() const;
+#endif
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();
@@ -39,7 +59,42 @@ public:
   bool isSendComplete() override;
   void onSendFinished() override;
   bool isInRecvMode() const override;
+#if MESHCORE_LORA_OTA
+  // True iff the driver's own internal state currently reflects an
+  // in-flight, not-yet-complete transmit (STATE_TX_WAIT, set by
+  // startSendRaw() and cleared by isSendComplete()/onSendFinished()) --
+  // the SAME real state isInRecvMode() already exposes, just for the
+  // complementary Tx case. Used by CustomSX1262Wrapper::probeDriverStatus()
+  // to tell the checked chip-mode probe what software currently expects
+  // the radio to be doing, without any extra/duplicate state tracking.
+  bool isTransmitPending() const;
+#endif
   bool isChannelActive();
+
+#if MESHCORE_LORA_OTA
+  /**
+   * \brief  true unless the most recent genuine startReceive()/readData()/
+   *         startTransmit() driver call actually returned a non-success
+   *         status. Latched by real, already-happening radio operations
+   *         (never a synthetic extra query); cleared back to healthy by
+   *         the next one of those operations that succeeds. See
+   *         `_driver_op_failed`.
+  */
+  bool isDriverHealthy() const override { return _driver_health.healthy(); }
+
+  uint32_t driverFaultCount() const override { return _driver_health.faultCount(); }
+
+  bool getDriverFaultDiagnostic(mesh::RadioDriverFaultDiagnostic& out) const override {
+    _driver_health.getDiagnostic(out);
+    return true;
+  }
+
+  // No chip-agnostic active probe exists at this generic RadioLib-wrapper
+  // level (only the concrete chip-specific subclass, e.g.
+  // CustomSX1262Wrapper, knows a real hardware status/error-flag read) --
+  // pass through to the existing passive/reactive signal unchanged.
+  bool probeDriverStatus() override { return isDriverHealthy(); }
+#endif
 
   bool isReceiving() override {
     if (isReceivingPacket()) return true;

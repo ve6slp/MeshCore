@@ -1,4 +1,5 @@
 #include "IdentityStore.h"
+#include "IdentityIntegrityCodec.h"
 
 bool IdentityStore::load(const char *name, mesh::LocalIdentity& id) {
   bool loaded = false;
@@ -55,10 +56,13 @@ bool IdentityStore::save(const char *name, const mesh::LocalIdentity& id) {
   File file = _fs->open(filename, "w", true);
 #endif
   if (file) {
+    // Real, already-performed write outcome -- a genuine short/failed
+    // write here must not be reported as a successful save merely
+    // because the file itself was opened.
     bool success = id.writeTo(file);
     file.close();
     MESH_DEBUG_PRINTLN("IdentityStore::save() write - %s", success ? "OK" : "Err");
-    return true;
+    return success;
   }
   MESH_DEBUG_PRINTLN("IdentityStore::save() failed");
   return false;
@@ -77,17 +81,56 @@ bool IdentityStore::save(const char *name, const mesh::LocalIdentity& id, const 
   File file = _fs->open(filename, "w", true);
 #endif
   if (file) {
-    id.writeTo(file);
+    // Real, already-performed write outcomes for BOTH the identity
+    // bytes and the display-name blob -- a genuine short/failed write
+    // on either must not be reported as a successful save.
+    bool success = id.writeTo(file);
 
     uint8_t tmp[32];
     memset(tmp, 0, sizeof(tmp));
     int n = strlen(display_name);
     if (n > sizeof(tmp)-1) n = sizeof(tmp)-1;
     memcpy(tmp, display_name, n);
-    file.write(tmp, sizeof(tmp));
+    success = success && (file.write(tmp, sizeof(tmp)) == sizeof(tmp));
 
     file.close();
-    return true;
+    return success;
   }
   return false;
+}
+
+bool IdentityStore::checkIntegrity(const char *name, mesh::LocalIdentity& expected) const {
+  char filename[40];
+  sprintf(filename, "%s/%s.id", _dir, name);
+  if (!_fs->exists(filename)) return false;  // mandatory artifact -- absence IS a fault here.
+
+#if defined(RP2040_PLATFORM)
+  File file = _fs->open(filename, "r");
+#else
+  File file = _fs->open(filename);
+#endif
+  if (!file) return false;  // exists() said yes but the open genuinely failed.
+
+  // LocalIdentity::writeTo(uint8_t*, size_t) is the only PUBLIC accessor
+  // to the private prv_key bytes; it serializes [prv_key][pub_key] (note:
+  // reverse order from the on-disk Stream format below), so we ask it
+  // for the expected bytes and compare field-by-field rather than
+  // assuming a shared byte order. Performs no IO of its own.
+  uint8_t expected_buf[PRV_KEY_SIZE + PUB_KEY_SIZE];
+  size_t written = expected.writeTo(expected_buf, sizeof(expected_buf));
+  if (written != sizeof(expected_buf)) { file.close(); return false; }
+
+  // On-disk order is [pub_key(PUB_KEY_SIZE)][prv_key(PRV_KEY_SIZE)] (the
+  // same order IdentityStore::save()/LocalIdentity::writeTo(Stream&)
+  // already write) -- the shared identity_io::checkIdentityIntegrity()
+  // performs the actual direct, bounded, single File::read() (never
+  // Stream::readBytes()) and content comparison, never logging key
+  // bytes.
+  uint8_t disk_buf[PUB_KEY_SIZE + PRV_KEY_SIZE];
+  const bool ok = identity_io::checkIdentityIntegrity(file, PUB_KEY_SIZE, PRV_KEY_SIZE,
+                                                       expected_buf + PRV_KEY_SIZE,  // expected pub_key
+                                                       expected_buf,                  // expected prv_key
+                                                       disk_buf, sizeof(disk_buf));
+  file.close();
+  return ok;
 }

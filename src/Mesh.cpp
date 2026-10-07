@@ -1,5 +1,6 @@
 #include "Mesh.h"
 //#include <Arduino.h>
+#include <helpers/ota/OtaMeshHooks.h>
 
 namespace mesh {
 
@@ -8,8 +9,41 @@ void Mesh::begin() {
 }
 
 void Mesh::loop() {
+#if MESHCORE_LORA_OTA
+  _ota.tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+#endif
   Dispatcher::loop();
+#if MESHCORE_LORA_OTA
+  pumpOtaControl();
+#endif
 }
+
+#if MESHCORE_LORA_OTA
+__attribute__((noinline)) void Mesh::pumpOtaControl() {
+  _ota.loop();
+  // Leave the reply pending on queue/budget pressure. Census is a real RF
+  // exchange even with no USB client connected.
+  uint8_t frame[ota::kOtaDirectFrameBytes];
+  size_t len = 0;
+  if (_mgr->getOutboundTotal() == 0 && !isSendInProgress() &&
+      _ota.peekOutboundControlFrame(frame, sizeof(frame), len, _ms->getMillis())) {
+    const auto category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
+    const auto airtime = _radio->getEstAirtimeFor(static_cast<int>(len + 4));
+    if (_ota.canTransmit(_ms->getMillis(), category, airtime, true, hasQueuedNormalTraffic())) {
+      auto* packet = createOtaData(frame, len);
+      if (packet) {
+        if (_ota.directActive() || frame[0] == ota::kOtaDirectAckKind ||
+            frame[0] == ota::kOtaDirectProfileAckKind) {
+          sendZeroHop(packet);
+          _ota.releaseOutboundControlFrame();
+        } else if (sendFlood(packet)) {
+          _ota.releaseOutboundControlFrame();
+        }
+      }
+    }
+  }
+}
+#endif
 
 bool Mesh::allowPacketForward(const mesh::Packet* packet) { 
   return false;  // by default, Transport NOT enabled
@@ -39,6 +73,15 @@ int Mesh::searchChannelsByHash(const uint8_t* hash, GroupChannel channels[], int
 }
 
 DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
+#if MESHCORE_LORA_OTA
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA && pkt->payload_len &&
+      ota::isOtaRetryAttempt(pkt->payload[0])) {
+    uint32_t attempt; const uint8_t* inner; size_t inner_len;
+    if (!ota::parseOtaRetryAttempt(pkt->payload, pkt->payload_len, attempt, inner, inner_len) ||
+        !ota::otaRfPathFits(pkt->payload_len, pkt->path_len, pkt->hasTransportCodes()))
+      return ACTION_RELEASE;
+  }
+#endif
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     if (pkt->path_len < MAX_PATH_SIZE) {
       uint8_t i = 0;
@@ -103,7 +146,8 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
         removeSelfFromPath(pkt);
 
         uint32_t d = getDirectRetransmitDelay(pkt);
-        return ACTION_RETRANSMIT_DELAYED(0, d);  // Routed traffic is HIGHEST priority 
+        uint8_t pri = pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA ? mesh::ota::kOtaForwardPriority : 0;
+        return ACTION_RETRANSMIT_DELAYED(pri, d);  // Routed traffic is HIGHEST priority, except OTA background traffic
       }
     }
     return ACTION_RELEASE;   // this node is NOT the next hop (OR this packet has already been forwarded), so discard.
@@ -111,6 +155,23 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 
   if (pkt->isRouteFlood() && filterRecvFloodPacket(pkt)) return ACTION_RELEASE;
 
+#if MESHCORE_LORA_OTA
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) {
+    if (!_tables->wasSeen(pkt)) {
+      _tables->markSeen(pkt);
+      onOtaDataRecv(pkt);
+      return routeRecvPacket(pkt);
+    }
+    // Retry only first-hop delivery; relayed copies and echoes stay suppressed.
+    if (pkt->getPathHashCount() == 0 &&
+        (pkt->payload_len == 0 || !ota::isOtaRetryAttempt(pkt->payload[0]))) onOtaDataRecv(pkt);
+    return ACTION_RELEASE;
+  }
+  return onRecvOrdinaryPacket(pkt);
+}
+
+__attribute__((noinline)) DispatcherAction Mesh::onRecvOrdinaryPacket(Packet* pkt) {
+#endif
   DispatcherAction action = ACTION_RELEASE;
 
   switch (pkt->getPayloadType()) {
@@ -297,6 +358,14 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       }
       break;
     }
+    case PAYLOAD_TYPE_LORA_OTA: {
+      if (!_tables->wasSeen(pkt)) {
+        _tables->markSeen(pkt);
+        onOtaDataRecv(pkt);
+        action = routeRecvPacket(pkt);
+      }
+      break;
+    }
     case PAYLOAD_TYPE_MULTIPART:
       if (pkt->payload_len > 2) {
         uint8_t remaining = pkt->payload[0] >> 4;  // num of packets in this multipart sequence still to be sent
@@ -351,9 +420,20 @@ DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
 
     uint32_t d = getRetransmitDelay(packet);
     // as this propagates outwards, give it lower and lower priority
-    return ACTION_RETRANSMIT_DELAYED(packet->getPathHashCount(), d);   // give priority to closer sources, than ones further away
+    uint8_t pri = packet->getPayloadType() == PAYLOAD_TYPE_LORA_OTA
+      ? mesh::ota::floodPriorityForPayload(PAYLOAD_TYPE_LORA_OTA, packet->getPathHashCount())
+      : packet->getPathHashCount();
+    return ACTION_RETRANSMIT_DELAYED(pri, d);   // give priority to closer sources, than ones further away
   }
   return ACTION_RELEASE;
+}
+
+void Mesh::onOtaDataRecv(Packet* packet) {
+#if MESHCORE_LORA_OTA
+  _ota.handleReceivedFrame(packet->payload, packet->payload_len, _ms->getMillis());
+#else
+  (void)packet;
+#endif
 }
 
 DispatcherAction Mesh::forwardMultipartDirect(Packet* pkt) {
@@ -602,6 +682,26 @@ Packet* Mesh::createRawData(const uint8_t* data, size_t len) {
   return packet;
 }
 
+Packet* Mesh::createOtaData(const uint8_t* data, size_t len) {
+  if (len > sizeof(Packet::payload)) return NULL;
+
+  // OTA's own outbound bulk traffic must never starve the ordinary
+  // sender/raw-ingress/delayed-RX/relay paths of buffers -- allocate
+  // against the reserved-below-threshold OTA path (see PacketManager::
+  // allocNew()).
+  Packet* packet = obtainNewPacket(true);
+  if (packet == NULL) {
+    MESH_DEBUG_PRINTLN("%s Mesh::createOtaData(): error, packet pool empty", getLogDateTime());
+    return NULL;
+  }
+  packet->header = (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);  // ROUTE_TYPE_* set later
+
+  memcpy(packet->payload, data, len);
+  packet->payload_len = len;
+
+  return packet;
+}
+
 Packet* Mesh::createTrace(uint32_t tag, uint32_t auth_code, uint8_t flags) {
   Packet* packet = obtainNewPacket();
   if (packet == NULL) {
@@ -634,14 +734,14 @@ Packet* Mesh::createControlData(const uint8_t* data, size_t len) {
   return packet;
 }
 
-void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
+bool Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
-    return;
+    return false;
   }
   if (path_hash_size == 0 || path_hash_size > 3) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
-    return;
+    return false;
   }
 
   packet->header &= ~PH_ROUTE_MASK;
@@ -650,25 +750,18 @@ void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_si
 
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
-  uint8_t pri;
-  if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
-    pri = 2;
-  } else if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT) {
-    pri = 3;   // de-prioritie these
-  } else {
-    pri = 1;
-  }
-  sendPacket(packet, pri, delay_millis);
+  uint8_t pri = mesh::ota::floodPriorityForPayload(packet->getPayloadType(), 0);
+  return sendPacket(packet, pri, delay_millis);
 }
 
-void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis, uint8_t path_hash_size) {
+bool Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): TRACE type not suspported", getLogDateTime());
-    return;
+    return false;
   }
   if (path_hash_size == 0 || path_hash_size > 3) {
     MESH_DEBUG_PRINTLN("%s Mesh::sendFlood(): invalid path_hash_size", getLogDateTime());
-    return;
+    return false;
   }
 
   packet->header &= ~PH_ROUTE_MASK;
@@ -679,15 +772,8 @@ void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_m
 
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
-  uint8_t pri;
-  if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
-    pri = 2;
-  } else if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT) {
-    pri = 3;   // de-prioritie these
-  } else {
-    pri = 1;
-  }
-  sendPacket(packet, pri, delay_millis);
+  uint8_t pri = mesh::ota::floodPriorityForPayload(packet->getPayloadType(), 0);
+  return sendPacket(packet, pri, delay_millis);
 }
 
 void Mesh::sendDirect(Packet* packet, const uint8_t* path, uint8_t path_len, uint32_t delay_millis) {
@@ -704,11 +790,7 @@ void Mesh::sendDirect(Packet* packet, const uint8_t* path, uint8_t path_len, uin
     pri = 5;   // maybe make this configurable
   } else {
     packet->path_len = Packet::copyPath(packet->path, path, path_len);
-    if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
-      pri = 1;   // slightly less priority
-    } else {
-      pri = 0;
-    }
+    pri = mesh::ota::directPriorityForPayload(packet->getPayloadType());
   }
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
   sendPacket(packet, pri, delay_millis);
@@ -722,7 +804,7 @@ void Mesh::sendZeroHop(Packet* packet, uint32_t delay_millis) {
 
   _tables->markSeen(packet); // mark this packet as already sent in case it is rebroadcast back to us
 
-  sendPacket(packet, 0, delay_millis);
+  sendPacket(packet, mesh::ota::directPriorityForPayload(packet->getPayloadType()), delay_millis);
 }
 
 void Mesh::sendZeroHop(Packet* packet, uint16_t* transport_codes, uint32_t delay_millis) {

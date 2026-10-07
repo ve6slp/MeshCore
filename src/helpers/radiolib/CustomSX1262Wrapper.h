@@ -3,6 +3,9 @@
 #include "CustomSX1262.h"
 #include "RadioLibWrappers.h"
 #include "SX126xReset.h"
+#if MESHCORE_LORA_OTA
+#include "Sx1262CheckedProbe.h"
+#endif
 
 #ifndef USE_SX1262
 #define USE_SX1262
@@ -49,4 +52,76 @@ public:
   }
 
   void doResetAGC() override { sx126xResetAGC((SX126x *)_radio, getRxBoostedGainMode()); }
+
+  // Genuine, ACTIVE, bounded hardware status probe: performs THREE real,
+  // independent, CHECKED SPI register reads right now (device-errors,
+  // irq-flags, AND a genuinely-working GET_STATUS read -- see
+  // CustomSX1262::getDeviceErrorsChecked()/getIrqFlagsChecked()/
+  // getStatusChecked()), instead of only reacting to whichever ordinary
+  // send/receive call happens to run next, and instead of trusting
+  // RadioLib's own getDeviceErrors()/getStatus(), which either discard
+  // the real SPI transaction status or (for getStatus() in this
+  // vendored version) never populate their output at all. The decision
+  // itself (evaluateSx1262CheckedHealth()) is plain, RadioLib/Arduino-
+  // independent C++ specifically so it is natively testable -- see
+  // Sx1262CheckedProbe.h. Feeds the verdict into the SAME shared
+  // RadioDriverHealthLatch as ordinary op outcomes so this call and
+  // ordinary send/receive results cannot disagree about what "healthy"
+  // means. Deliberately does NOT call clearDeviceErrors(): that is a
+  // separate write/SPI round-trip with a real side effect (resets the
+  // chip's hardware error-accumulator), and a read-only probe must not
+  // mutate hardware state merely to observe it -- the latch already
+  // self-clears back to healthy on the next real successful op, so a
+  // single historical error bit cannot wedge this signal permanently.
+  //
+  // The real chip-mode bits decoded from getStatusChecked() are cross-
+  // checked against what software currently expects (isInRecvMode()/
+  // isTransmitPending(), the SAME real state ordinary send/receive call
+  // sites already maintain) via evaluateSx1262CheckedHealth() -- a
+  // genuine disagreement (e.g. the chip reporting neither Rx nor Tx
+  // while software believes it is actively receiving, with no IRQ
+  // evidence of a just-completed operation) is a real, unhealthy fault,
+  // not merely "one error-accumulator register happened to read back as
+  // zero".
+#if MESHCORE_LORA_OTA
+  bool probeDriverStatus() override {
+    return probeDriverStatusWithTxCompletion(nullptr, nullptr);
+  }
+
+  bool probeDriverStatusWithTxCompletion(void* context, bool (*complete)(void*)) override {
+    const uint32_t faults_before = driverFaultCount();
+    if (complete != nullptr) complete(context);
+    auto* sx = (CustomSX1262 *)_radio;
+    uint8_t software_before = driverSoftwareState();
+    auto expectedMode = [this]() {
+      if (isInRecvMode()) return Sx1262ExpectedChipMode::kReceiving;
+      if (isTransmitPending()) return Sx1262ExpectedChipMode::kTransmitting;
+      return Sx1262ExpectedChipMode::kIdle;
+    };
+    Sx1262ExpectedChipMode expected = expectedMode();
+    Sx1262CheckedProbeResult r;
+    auto readProbe = [&]() {
+      r.device_errors_status = sx->getDeviceErrorsChecked(&r.device_errors);
+      r.irq_flags_status = sx->getIrqFlagsChecked(&r.irq_flags);
+      r.status_read_status = sx->getStatusChecked(&r.status_byte);
+    };
+    readProbe();
+    const uint8_t software_after = driverSoftwareState();
+
+    // Only an ISR completion of this still-owned TX can invalidate its mode
+    // snapshot. The callback never starts a new generation; reconcile once.
+    if (expected == Sx1262ExpectedChipMode::kTransmitting && transmitCompletionPending() &&
+        complete != nullptr && complete(context)) {
+      if (!evaluateSx1262CheckedHealth(r, expected) &&
+          !evaluateSx1262CheckedHealth(r, Sx1262ExpectedChipMode::kIdle)) {
+        recordSx1262CheckedProbeOutcome(_driver_health, r, expected, software_before, software_after);
+      }
+      software_before = driverSoftwareState();
+      expected = expectedMode();
+      readProbe();
+    }
+    recordSx1262CheckedProbeOutcome(_driver_health, r, expected, software_before, driverSoftwareState());
+    return _driver_health.healthy() && driverFaultCount() == faults_before;
+  }
+#endif
 };

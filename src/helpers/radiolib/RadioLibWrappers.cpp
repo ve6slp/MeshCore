@@ -1,6 +1,9 @@
 
 #define RADIOLIB_STATIC_ONLY 1
 #include "RadioLibWrappers.h"
+#if MESHCORE_LORA_OTA
+#include "RadioLibDriverFaultClassification.h"
+#endif
 
 #define STATE_IDLE       0
 #define STATE_RX         1
@@ -113,17 +116,40 @@ void RadioLibWrapper::startRecv() {
   #if defined(USE_LR2021)
   _radio->standby(); // without this LR2021 can throw -706 when calling startReceive after hardware CAD when side detectors are enabled
   #endif
+#if MESHCORE_LORA_OTA
+  const uint8_t software_before = state;
+#endif
   int err = _radio->startReceive();
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_RX;
+#if MESHCORE_LORA_OTA
+    _driver_health.recordOutcome(true);
+#endif
   } else {
     MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
+#if MESHCORE_LORA_OTA
+    _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::StartReceive, err, software_before, state);
+#endif
   }
 }
+
+#if MESHCORE_LORA_OTA
+uint8_t RadioLibWrapper::driverSoftwareState() const { return state; }
+#endif
 
 bool RadioLibWrapper::isInRecvMode() const {
   return (state & ~STATE_INT_READY) == STATE_RX;
 }
+
+#if MESHCORE_LORA_OTA
+bool RadioLibWrapper::isTransmitPending() const {
+  return (state & ~STATE_INT_READY) == STATE_TX_WAIT;
+}
+
+bool RadioLibWrapper::transmitCompletionPending() const {
+  return state == (STATE_TX_WAIT | STATE_INT_READY);
+}
+#endif
 
 int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
   int len = 0;
@@ -131,14 +157,35 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
     len = _radio->getPacketLength();
     if (len > 0) {
       if (len > sz) { len = sz; }
+#if MESHCORE_LORA_OTA
+      const uint8_t software_before = state;
+#endif
       int err = _radio->readData(bytes, len);
       if (err != RADIOLIB_ERR_NONE) {
-        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
         len = 0;
         n_recv_errors++;
+#if MESHCORE_LORA_OTA
+        if (radiolib_health::isGenuineRadioDriverFault(err)) {
+          MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
+          _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::ReadData, err, software_before, state);
+        } else {
+          // Expected, ordinary over-the-air PHY decode rejection (e.g.
+          // RADIOLIB_ERR_CRC_MISMATCH): the driver call itself completed
+          // fine, only the packet's payload was corrupted on-air -- not
+          // evidence of an SPI/driver fault, so it must not reset the
+          // OTA trial-boot health window. The packet is still discarded
+          // and still counted in n_recv_errors above, unchanged.
+          _driver_health.recordOutcome(true);
+        }
+#else
+        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
+#endif
       } else {
       //  Serial.print("  readData() -> "); Serial.println(len);
         n_recv++;
+#if MESHCORE_LORA_OTA
+        _driver_health.recordOutcome(true);
+#endif
       }
     }
     #if defined(USE_LR2021)
@@ -149,11 +196,20 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
   }
 
   if (state != STATE_RX) {
+#if MESHCORE_LORA_OTA
+    const uint8_t software_before = state;
+#endif
     int err = _radio->startReceive();
     if (err == RADIOLIB_ERR_NONE) {
       state = STATE_RX;
+#if MESHCORE_LORA_OTA
+      _driver_health.recordOutcome(true);
+#endif
     } else {
       MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
+#if MESHCORE_LORA_OTA
+      _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::ReceiveRearm, err, software_before, state);
+#endif
     }
   }
   return len;
@@ -165,19 +221,32 @@ uint32_t RadioLibWrapper::getEstAirtimeFor(int len_bytes) {
 
 bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
   _board->onBeforeTransmit();
+#if MESHCORE_LORA_OTA
+  const uint8_t software_before = state;
+#endif
   int err = _radio->startTransmit((uint8_t *) bytes, len);
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_TX_WAIT;
+#if MESHCORE_LORA_OTA
+    _driver_health.recordOutcome(true);
+#endif
     return true;
   }
   MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startTransmit(%d)", err);
+#if MESHCORE_LORA_OTA
+  _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::StartTransmit, err, software_before, state);
+#endif
   idle();   // trigger another startRecv()
   _board->onAfterTransmit();
   return false;
 }
 
 bool RadioLibWrapper::isSendComplete() {
+#if MESHCORE_LORA_OTA
+  if (transmitCompletionPending()) {
+#else
   if (state & STATE_INT_READY) {
+#endif
     state = STATE_IDLE;
     n_sent++;
     return true;
@@ -186,9 +255,22 @@ bool RadioLibWrapper::isSendComplete() {
 }
 
 void RadioLibWrapper::onSendFinished() {
+#if MESHCORE_LORA_OTA
+  const uint8_t software_before = state;
+  const int err = _radio->finishTransmit();
+  _board->onAfterTransmit();
+  state = STATE_IDLE;
+  if (err != RADIOLIB_ERR_NONE) {
+    MESH_DEBUG_PRINTLN("RadioLibWrapper: error: finishTransmit(%d)", err);
+    _driver_health.recordFailure(mesh::RadioDriverFaultOrigin::Unknown, err, software_before, state);
+    return;
+  }
+  startRecv();
+#else
   _radio->finishTransmit();
   _board->onAfterTransmit();
   state = STATE_IDLE;
+#endif
 }
 
 int16_t RadioLibWrapper::performChannelScan() {

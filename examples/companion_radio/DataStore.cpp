@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "DataStore.h"
+#include "DataStoreRecordCodec.h"
+#include <helpers/ota/OtaWriteGate.h>
 
 #if defined(EXTRAFS) || defined(QSPIFLASH)
   #define MAX_BLOBRECS 100
@@ -46,20 +48,30 @@ static File openWrite(FILESYSTEM* fs, const char* filename) {
   static uint32_t _ContactsChannelsTotalBlocks = 0;
 #endif
 
-void DataStore::begin() {
+void DataStore::begin(bool allow_destructive_writes, bool allow_format) {
+  _destructive_writes_disallowed_ = !allow_destructive_writes;
+  _format_disallowed_ = !allow_format;
 #if defined(RP2040_PLATFORM)
-  identity_store.begin();
+  // IdentityStore::begin() unconditionally mkdir()s its identity
+  // directory -- an OTA trial/unknown boot must not create it either;
+  // loading an EXISTING identity from an already-present directory does
+  // not depend on this call having run.
+  if (allow_destructive_writes) identity_store.begin();
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   _ContactsChannelsTotalBlocks = _getContactsChannelsFS()->_getFS()->cfg->block_count;
   checkAdvBlobFile();
   #if defined(EXTRAFS) || defined(QSPIFLASH)
-  migrateToSecondaryFS();
+  // migrateToSecondaryFS() unconditionally copies-then-deletes several
+  // legacy files; during an OTA trial/unknown boot this destructive
+  // migration must not run at all (zero writes/deletes, all original
+  // files preserved) -- see DataStore.h's begin() doc comment.
+  if (allow_destructive_writes) migrateToSecondaryFS();
   #endif
 #else
   // init 'blob store' support
-  _fs->mkdir("/bl");
+  if (allow_destructive_writes) _fs->mkdir("/bl");
 #endif
 }
 
@@ -145,7 +157,7 @@ File DataStore::openRead(const char* filename) {
 #endif
 }
 
-File DataStore::openRead(FILESYSTEM* fs, const char* filename) {
+File DataStore::openRead(FILESYSTEM* fs, const char* filename) const {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   return fs->open(filename, FILE_O_READ);
 #elif defined(RP2040_PLATFORM)
@@ -156,14 +168,20 @@ File DataStore::openRead(FILESYSTEM* fs, const char* filename) {
 }
 
 bool DataStore::removeFile(const char* filename) {
+  if (_destructive_writes_disallowed_) return false;  // OTA trial/unknown boot: zero writes/deletes.
   return _fs->remove(filename);
 }
 
 bool DataStore::removeFile(FILESYSTEM* fs, const char* filename) {
+  if (_destructive_writes_disallowed_) return false;  // OTA trial/unknown boot: zero writes/deletes.
   return fs->remove(filename);
 }
 
 bool DataStore::formatFileSystem() {
+  // Deliberately NOT _destructive_writes_disallowed_: format authority is
+  // a genuinely separate permit from ordinary userdata read/write -- see
+  // DataStore.h's _format_disallowed_ doc comment.
+  if (_format_disallowed_) return false;  // No explicit, separately-verified format authority for this boot.
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   if (_fsExtra == nullptr) {
     return _fs->format();
@@ -186,183 +204,231 @@ bool DataStore::loadMainIdentity(mesh::LocalIdentity &identity) {
 }
 
 bool DataStore::saveMainIdentity(const mesh::LocalIdentity &identity) {
-  return identity_store.save("_main", identity);
+  // See ota_write_gate::guardedPersist()'s contract: identity_store.save()
+  // is never invoked at all during a policy-refused write.
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_,
+                                        [&]() { return identity_store.save("_main", identity); });
 }
 
-void DataStore::loadPrefs(NodePrefs& prefs) {
+bool DataStore::loadPrefs(NodePrefs& prefs, bool allow_migration_write) {
   if (_fs->exists("/prefs.json")) {
     File file = openRead(_fs, "/prefs.json");
-    if (file) {
-      prefs.loadSerial(file);   // new Serial prefs
-      file.close();
-    }
+    if (!file) return false;  // exists() said yes but the open genuinely failed.
+    const bool ok = prefs.loadSerial(file);   // new Serial prefs -- real decode outcome, never discarded.
+    file.close();
+    return ok;
   } else if (_fs->exists("/new_prefs")) {
-    loadPrefsInt("/new_prefs", prefs);
-    if (savePrefs(prefs) ) {                // save to new format
+    // Decode the legacy format into `prefs` (this boot's RAM working
+    // state) -- loadPrefsInt() itself never partially commits fields on
+    // a genuine read fault, see its own comment. A read failure here is
+    // real trial-boot-health evidence either way.
+    if (!loadPrefsInt("/new_prefs", prefs)) return false;
+    if (!allow_migration_write) {
+      // OTA trial/unknown boot: the legacy file is still usable in RAM
+      // this boot, but writing the new-format migration file is a
+      // persisted-state change that must not happen until this boot is
+      // known-Normal -- zero writes, original /new_prefs untouched.
+      return true;
+    }
+    if (savePrefs(prefs)) {                // save to new format
       //_fs->remove("/new_prefs"); // remove old
     }
+    return true;  // legacy migration path: unchanged best-effort behavior.
   }
+  return true;  // legitimately nothing persisted yet -- fresh device, not a fault.
 }
 
-void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs) {
+bool DataStore::loadPrefsInt(const char *filename, NodePrefs& prefs) {
   File file = openRead(_fs, filename);
-  if (file) {
-    uint8_t pad[8];
+  if (!file) return false;  // genuine open failure.
 
-    file.read((uint8_t *)&_prefs.airtime_factor, sizeof(float));                           // 0
-    file.read((uint8_t *)_prefs.node_name, sizeof(_prefs.node_name));                      // 4
-    file.read(pad, 4);                                                                     // 36
-    file.read((uint8_t *)&_prefs.node_lat, sizeof(_prefs.node_lat));                       // 40
-    file.read((uint8_t *)&_prefs.node_lon, sizeof(_prefs.node_lon));                       // 48
-    file.read((uint8_t *)&_prefs.freq, sizeof(_prefs.freq));                               // 56
-    file.read((uint8_t *)&_prefs.sf, sizeof(_prefs.sf));                                   // 60
-    file.read((uint8_t *)&_prefs.cr, sizeof(_prefs.cr));                                   // 61
-    file.read((uint8_t *)&_prefs._client_repeat, sizeof(_prefs._client_repeat));             // 62
-    file.read((uint8_t *)&_prefs.manual_add_contacts, sizeof(_prefs.manual_add_contacts)); // 63
-    file.read((uint8_t *)&_prefs.bw, sizeof(_prefs.bw));                                   // 64
-    file.read((uint8_t *)&_prefs.tx_power_dbm, sizeof(_prefs.tx_power_dbm));               // 68
-    file.read((uint8_t *)&_prefs.telemetry_mode_base, sizeof(_prefs.telemetry_mode_base)); // 69
-    file.read((uint8_t *)&_prefs.telemetry_mode_loc, sizeof(_prefs.telemetry_mode_loc));   // 70
-    file.read((uint8_t *)&_prefs.telemetry_mode_env, sizeof(_prefs.telemetry_mode_env));   // 71
-    file.read((uint8_t *)&_prefs.rx_delay_base, sizeof(_prefs.rx_delay_base));             // 72
-    file.read((uint8_t *)&_prefs.advert_loc_policy, sizeof(_prefs.advert_loc_policy));     // 76
-    file.read((uint8_t *)&_prefs.multi_acks, sizeof(_prefs.multi_acks));                   // 77
-    file.read((uint8_t *)&_prefs.path_hash_mode, sizeof(_prefs.path_hash_mode));           // 78
-    file.read(pad, 1);                                                                     // 79
-    file.read((uint8_t *)&_prefs.ble_pin, sizeof(_prefs.ble_pin));                         // 80
-    file.read((uint8_t *)&_prefs.buzzer_quiet, sizeof(_prefs.buzzer_quiet));               // 84
-    file.read((uint8_t *)&_prefs.gps_enabled, sizeof(_prefs.gps_enabled));                 // 85
-    file.read((uint8_t *)&_prefs.gps_interval, sizeof(_prefs.gps_interval));               // 86
-    file.read((uint8_t *)&_prefs.autoadd_config, sizeof(_prefs.autoadd_config));           // 87
-    file.read((uint8_t *)&_prefs.autoadd_max_hops, sizeof(_prefs.autoadd_max_hops));       // 88
-    file.read((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 89
-    file.read((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 90
-    file.read((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));     // 121
+  // Delegates the actual field-by-field decode to the shared,
+  // Arduino/NodePrefs-independent datastore_io::readLegacyPrefsFields()
+  // (see DataStoreRecordCodec.h) -- the EXACT SAME logic native host
+  // tests exercise against a byte-backed fake File, not a second
+  // hand-rolled reimplementation. `fields` is a purely local working
+  // copy; NEVER a whole-struct NodePrefs copy (NodePrefs::radio holds a
+  // private `_parent` back-pointer to its OWNING NodePrefs instance,
+  // which such a copy would corrupt to dangle at a destroyed temporary).
+  //
+  // Pre-seed `fields` from the CURRENT `prefs` values first: this format
+  // has grown field-by-field across many commits, so an older, shorter
+  // -- but otherwise valid -- file legitimately ends exactly at a field
+  // boundary. readLegacyPrefsFields() leaves every field beyond that
+  // point untouched in `fields`, matching the original hand-written
+  // loader's tolerant behaviour (plain sequential file.read() calls,
+  // return value ignored) of silently keeping prior/default values for
+  // fields a legacy file doesn't contain, instead of rejecting the
+  // whole read.
+  datastore_io::LegacyPrefsFields fields;
+  fields.airtime_factor = prefs.airtime_factor;
+  memcpy(fields.node_name, prefs.node_name, sizeof(fields.node_name));
+  fields.node_lat = prefs.node_lat;
+  fields.node_lon = prefs.node_lon;
+  fields.freq = prefs.freq;
+  fields.sf = prefs.sf;
+  fields.cr = prefs.cr;
+  fields.client_repeat = prefs._client_repeat;
+  fields.manual_add_contacts = prefs.manual_add_contacts;
+  fields.bw = prefs.bw;
+  fields.tx_power_dbm = prefs.tx_power_dbm;
+  fields.telemetry_mode_base = prefs.telemetry_mode_base;
+  fields.telemetry_mode_loc = prefs.telemetry_mode_loc;
+  fields.telemetry_mode_env = prefs.telemetry_mode_env;
+  fields.rx_delay_base = prefs.rx_delay_base;
+  fields.advert_loc_policy = prefs.advert_loc_policy;
+  fields.multi_acks = prefs.multi_acks;
+  fields.path_hash_mode = prefs.path_hash_mode;
+  fields.ble_pin = prefs.ble_pin;
+  fields.buzzer_quiet = prefs.buzzer_quiet;
+  fields.gps_enabled = prefs.gps_enabled;
+  fields.gps_interval = prefs.gps_interval;
+  fields.autoadd_config = prefs.autoadd_config;
+  fields.autoadd_max_hops = prefs.autoadd_max_hops;
+  fields.rx_boosted_gain = prefs.rx_boosted_gain;
+  memcpy(fields.default_scope_name, prefs.default_scope_name, sizeof(fields.default_scope_name));
+  memcpy(fields.default_scope_key, prefs.default_scope_key, sizeof(fields.default_scope_key));
 
-    // migrate old fields
-    _prefs.setRepeatEn(_prefs._client_repeat != 0);
+  const bool ok = datastore_io::readLegacyPrefsFields(file, fields);
+  file.close();
+  if (!ok) return false;  // genuine mid-field short/partial read: prefs left untouched.
 
-    file.close();
-  }
+  // Commit the working copy into the real `prefs` fields individually
+  // (safe: these are scalar/array field assignments, never a
+  // whole-struct NodePrefs copy-assignment). Either every field matched
+  // the file (full/current format), or the file legitimately ended
+  // early (older/shorter format) and the not-read tail above still
+  // holds the pre-seeded prior value -- both cases commit cleanly here.
+  prefs.airtime_factor = fields.airtime_factor;
+  memcpy(prefs.node_name, fields.node_name, sizeof(fields.node_name));
+  prefs.node_lat = fields.node_lat;
+  prefs.node_lon = fields.node_lon;
+  prefs.freq = fields.freq;
+  prefs.sf = fields.sf;
+  prefs.cr = fields.cr;
+  prefs._client_repeat = fields.client_repeat;
+  prefs.manual_add_contacts = fields.manual_add_contacts;
+  prefs.bw = fields.bw;
+  prefs.tx_power_dbm = fields.tx_power_dbm;
+  prefs.telemetry_mode_base = fields.telemetry_mode_base;
+  prefs.telemetry_mode_loc = fields.telemetry_mode_loc;
+  prefs.telemetry_mode_env = fields.telemetry_mode_env;
+  prefs.rx_delay_base = fields.rx_delay_base;
+  prefs.advert_loc_policy = fields.advert_loc_policy;
+  prefs.multi_acks = fields.multi_acks;
+  prefs.path_hash_mode = fields.path_hash_mode;
+  prefs.ble_pin = fields.ble_pin;
+  prefs.buzzer_quiet = fields.buzzer_quiet;
+  prefs.gps_enabled = fields.gps_enabled;
+  prefs.gps_interval = fields.gps_interval;
+  prefs.autoadd_config = fields.autoadd_config;
+  prefs.autoadd_max_hops = fields.autoadd_max_hops;
+  prefs.rx_boosted_gain = fields.rx_boosted_gain;
+  memcpy(prefs.default_scope_name, fields.default_scope_name, sizeof(fields.default_scope_name));
+  memcpy(prefs.default_scope_key, fields.default_scope_key, sizeof(fields.default_scope_key));
+
+  // migrate old fields
+  prefs.setRepeatEn(prefs._client_repeat != 0);
+
+  return true;
 }
 
 bool DataStore::savePrefs(NodePrefs& _prefs) {
-  File file = openWrite(_fs, "/prefs.json");
-  if (file) {
-    bool success = _prefs.saveSerial(file);
-    file.close();
-    return success;
-  }
-  return false;
-}
-
-void DataStore::loadContacts(DataStoreHost* host) {
-File file = openRead(_getContactsChannelsFS(), "/contacts3");
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    File file = openWrite(_fs, "/prefs.json");
     if (file) {
-      bool full = false;
-      while (!full) {
-        ContactInfo c;
-        uint8_t pub_key[32];
-        uint8_t unused;
-
-        bool success = (file.read(pub_key, 32) == 32);
-        success = success && (file.read((uint8_t *)&c.name, 32) == 32);
-        success = success && (file.read(&c.type, 1) == 1);
-        success = success && (file.read(&c.flags, 1) == 1);
-        success = success && (file.read(&unused, 1) == 1);
-        success = success && (file.read((uint8_t *)&c.sync_since, 4) == 4); // was 'reserved'
-        success = success && (file.read((uint8_t *)&c.out_path_len, 1) == 1);
-        success = success && (file.read((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-        success = success && (file.read(c.out_path, 64) == 64);
-        success = success && (file.read((uint8_t *)&c.lastmod, 4) == 4);
-        success = success && (file.read((uint8_t *)&c.gps_lat, 4) == 4);
-        success = success && (file.read((uint8_t *)&c.gps_lon, 4) == 4);
-
-        if (!success) break; // EOF
-
-        c.id = mesh::Identity(pub_key);
-        if (!host->onContactLoaded(c)) full = true;
-      }
+      bool success = _prefs.saveSerial(file);
       file.close();
+      return success;
     }
+    return false;
+  });
 }
 
-void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
-  File file = openWrite(_getContactsChannelsFS(), "/contacts3");
-  if (file) {
-    uint32_t idx = 0;
-    ContactInfo c;
-    uint8_t unused = 0;
+bool DataStore::probeStorageReadiness(mesh::LocalIdentity& current_identity) const {
+  // "_main.id" is a MANDATORY artifact, not an optional one:
+  // MyMesh::begin() unconditionally creates and saves it (if not already
+  // present) strictly BEFORE the trial-health monitor is even
+  // constructed, so by the time this probe ever runs during a live
+  // trial window its absence, an unreadable/short read, OR a well-
+  // formed-but-WRONG persisted identity is unconditionally a genuine
+  // storage fault -- never a legitimate "nothing saved yet" case (unlike
+  // prefs.json/contacts/channels below, which a freshly-formatted device
+  // may legitimately never have saved). identity_store.checkIntegrity()
+  // performs its own direct, bounded, single-shot File::read() (never
+  // Stream::readBytes(), which can block on a short/stalled file) and
+  // compares the persisted key bytes against the identity ACTUALLY
+  // currently in RAM -- never merely a read-length check -- and is
+  // side-effect-free (a pure read, never a write).
+  if (!identity_store.checkIntegrity("_main", current_identity)) return false;
 
-    while (host->getContactForSave(idx, c)) {
-      if (filter && !filter(c)) {
-        idx++;  // advance to next contact
-        continue;
-      }
-      bool success = (file.write(c.id.pub_key, 32) == 32);
-      success = success && (file.write((uint8_t *)&c.name, 32) == 32);
-      success = success && (file.write(&c.type, 1) == 1);
-      success = success && (file.write(&c.flags, 1) == 1);
-      success = success && (file.write(&unused, 1) == 1);
-      success = success && (file.write((uint8_t *)&c.sync_since, 4) == 4);
-      success = success && (file.write((uint8_t *)&c.out_path_len, 1) == 1);
-      success = success && (file.write((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-      success = success && (file.write(c.out_path, 64) == 64);
-      success = success && (file.write((uint8_t *)&c.lastmod, 4) == 4);
-      success = success && (file.write((uint8_t *)&c.gps_lat, 4) == 4);
-      success = success && (file.write((uint8_t *)&c.gps_lon, 4) == 4);
-
-      if (!success) break; // write failed
-
-      idx++;  // advance to next contact
-    }
-    file.close();
+  if (!_fs->exists("/prefs.json")) {
+    // Legitimately nothing to check yet (freshly-formatted device that
+    // has never saved prefs, or still on the old /new_prefs format) --
+    // absence of an optional file is NOT evidence of an IO fault.
+    return true;
   }
+  File file = openRead(_fs, "/prefs.json");
+  if (!file) return false;  // exists() said yes but the open genuinely failed.
+  file.close();
+  return true;
 }
 
-void DataStore::loadChannels(DataStoreHost* host) {
-    File file = openRead(_getContactsChannelsFS(), "/channels2");
-    if (file) {
-      bool full = false;
-      uint8_t channel_idx = 0;
-      while (!full) {
-        ChannelDetails ch;
-        uint8_t unused[4];
+bool DataStore::loadContacts(DataStoreHost* host) {
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  if (!fs->exists("/contacts3")) return true;  // legitimately nothing persisted yet -- not a fault.
+  File file = openRead(fs, "/contacts3");
+  if (!file) return false;  // exists() said yes but the open genuinely failed.
 
-        bool success = (file.read(unused, 4) == 4);
-        success = success && (file.read((uint8_t *)ch.name, 32) == 32);
-        success = success && (file.read((uint8_t *)ch.channel.secret, 32) == 32);
-
-        if (!success) break; // EOF
-
-        if (host->onChannelLoaded(channel_idx, ch)) {
-          channel_idx++;
-        } else {
-          full = true;
-        }
-      }
-      file.close();
-    }
+  // Delegates to the shared, Arduino-type-agnostic template in
+  // DataStoreRecordCodec.h -- the SAME field-read-order/clean-EOF-vs-
+  // genuine-fault decision logic native host tests exercise directly
+  // against a byte-backed fake File, not a second reimplementation.
+  const bool ok = datastore_io::readAllContacts(file, host);
+  file.close();
+  return ok;
 }
 
-void DataStore::saveChannels(DataStoreHost* host) {
-  File file = openWrite(_getContactsChannelsFS(), "/channels2");
-  if (file) {
-    uint8_t channel_idx = 0;
-    ChannelDetails ch;
-    uint8_t unused[4];
-    memset(unused, 0, 4);
+bool DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    File file = openWrite(_getContactsChannelsFS(), "/contacts3");
+    if (!file) return false;  // genuine open failure -- distinct from a legitimately empty contact list.
 
-    while (host->getChannelForSave(channel_idx, ch)) {
-      bool success = (file.write(unused, 4) == 4);
-      success = success && (file.write((uint8_t *)ch.name, 32) == 32);
-      success = success && (file.write((uint8_t *)ch.channel.secret, 32) == 32);
-
-      if (!success) break; // write failed
-      channel_idx++;
-    }
+    // Delegates to the shared, Arduino-type-agnostic template in
+    // DataStoreRecordCodec.h -- the SAME field-write-order/stop-on-first-
+    // failure decision logic native host tests exercise directly against
+    // a byte-backed fake File, not a second reimplementation.
+    const bool all_ok = datastore_io::writeAllContacts(file, host, filter);
     file.close();
-  }
+    return all_ok;
+  });
+}
+
+bool DataStore::loadChannels(DataStoreHost* host) {
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  if (!fs->exists("/channels2")) return true;  // legitimately nothing persisted yet -- not a fault.
+  File file = openRead(fs, "/channels2");
+  if (!file) return false;  // exists() said yes but the open genuinely failed.
+
+  uint8_t channel_idx = 0;
+  // Delegates to the shared, Arduino-type-agnostic template in
+  // DataStoreRecordCodec.h -- see loadContacts() above.
+  const bool ok = datastore_io::readAllChannels(file, host, channel_idx);
+  file.close();
+  return ok;
+}
+
+bool DataStore::saveChannels(DataStoreHost* host) {
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    File file = openWrite(_getContactsChannelsFS(), "/channels2");
+    if (!file) return false;  // genuine open failure -- distinct from a legitimately empty channel list.
+
+    // Delegates to the shared, Arduino-type-agnostic template in
+    // DataStoreRecordCodec.h -- see saveContacts() above.
+    const bool all_ok = datastore_io::writeAllChannels(file, host);
+    file.close();
+    return all_ok;
+  });
 }
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -376,7 +442,15 @@ struct BlobRec {
   uint8_t  data[MAX_ADVERT_PKT_LEN];
 };
 
+#define BLOB_KEY_PREFIX_LEN  7  // sizeof(BlobRec::key)
+
 void DataStore::checkAdvBlobFile() {
+  // Defense-in-depth backstop, same discipline as migrateToSecondaryFS():
+  // an OTA trial/unknown boot must never create/preallocate this file,
+  // even though this method's other call site (putBlobByKey) is already
+  // gated by guardedPersist() -- begin() calls this unconditionally, so
+  // the check must live here too, not merely at that other call site.
+  if (_destructive_writes_disallowed_) return;
   if (!_getContactsChannelsFS()->exists("/adv_blobs")) {
     File file = openWrite(_getContactsChannelsFS(), "/adv_blobs");
     if (file) {
@@ -391,6 +465,11 @@ void DataStore::checkAdvBlobFile() {
 }
 
 void DataStore::migrateToSecondaryFS() {
+  // Defense-in-depth backstop: begin() already gates its one call site
+  // on `allow_destructive_writes`, but this guards against ANY future
+  // caller too -- an OTA trial/unknown boot must never run this
+  // unconditional copy-then-delete migration.
+  if (_destructive_writes_disallowed_) return;
   // migrate old adv_blobs, contacts3 and channels2 files to secondary FS if they don't already exist
   if (!_fsExtra->exists("/adv_blobs")) {
     if (_fs->exists("/adv_blobs")) {
@@ -502,58 +581,71 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
   File file = openRead(_getContactsChannelsFS(), "/adv_blobs");
   uint8_t len = 0;  // 0 = not found
   if (file) {
-    BlobRec tmp;
-    while (file.read((uint8_t *) &tmp, sizeof(tmp)) == sizeof(tmp)) {
-      if (memcmp(key, tmp.key, sizeof(tmp.key)) == 0) {  // only match by 7 byte prefix
-        len = tmp.len;
-        memcpy(dest_buf, tmp.data, len);
-        break;
-      }
-    }
+    // Delegates the scan itself to the shared
+    // datastore_io::scanBlobRecordsForKey() (see DataStoreRecordCodec.h)
+    // -- the EXACT SAME clean-EOF-vs-genuine-fault provenance logic
+    // native host tests exercise against a byte-backed fake File and a
+    // plain POD fake record, not a second hand-rolled reimplementation.
+    // A fault here means this store's contents could not be fully and
+    // reliably scanned for `key`, so it is latched separately via
+    // _blob_io_fault_observed rather than silently reported as
+    // "not found" through this uint8_t return alone.
+    bool found = false, fault = false;
+    datastore_io::scanBlobRecordsForKey<File, BlobRec>(file, key, BLOB_KEY_PREFIX_LEN, found, len, dest_buf, fault);
+    if (fault) _blob_io_fault_observed = true;
     file.close();
   }
   return len;
 }
 
 bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
-  if (len < PUB_KEY_SIZE+4+SIGNATURE_SIZE || len > MAX_ADVERT_PKT_LEN) return false;
-  checkAdvBlobFile();
-  File file = _getContactsChannelsFS()->open("/adv_blobs", FILE_O_WRITE);
-  if (file) {
-    uint32_t pos = 0, found_pos = 0;
-    uint32_t min_timestamp = 0xFFFFFFFF;
-
-    // search for matching key OR evict by oldest timestamp
-    BlobRec tmp;
-    file.seek(0);
-    while (file.read((uint8_t *) &tmp, sizeof(tmp)) == sizeof(tmp)) {
-      if (memcmp(key, tmp.key, sizeof(tmp.key)) == 0) {  // only match by 7 byte prefix
-        found_pos = pos;
-        break;
-      }
-      if (tmp.timestamp < min_timestamp) {
-        min_timestamp = tmp.timestamp;
-        found_pos = pos;
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    if (len < PUB_KEY_SIZE+4+SIGNATURE_SIZE || len > MAX_ADVERT_PKT_LEN) return false;
+    checkAdvBlobFile();
+    File file = _getContactsChannelsFS()->open("/adv_blobs", FILE_O_WRITE);
+    if (file) {
+      if (!file.seek(0)) {
+        _blob_io_fault_observed = true;
+        file.close();
+        return false;
       }
 
-      pos += sizeof(tmp);
+      // search for matching key OR evict by oldest timestamp, via the
+      // same shared datastore_io::scanBlobRecordsForWritePosition() the
+      // native tests exercise -- a scan fault here means the eviction/
+      // match decision itself cannot be trusted, so this aborts (writes
+      // nothing) rather than risk clobbering the wrong record.
+      bool matched = false, fault = false;
+      uint32_t found_pos = 0;
+      datastore_io::scanBlobRecordsForWritePosition<File, BlobRec>(file, key, BLOB_KEY_PREFIX_LEN, matched, found_pos, fault);
+      if (fault) {
+        _blob_io_fault_observed = true;
+        file.close();
+        return false;
+      }
+
+      BlobRec tmp;
+      memcpy(tmp.key, key, sizeof(tmp.key));  // just record 7 byte prefix of key
+      memcpy(tmp.data, src_buf, len);
+      tmp.len = len;
+      tmp.timestamp = _clock->getCurrentTime();
+
+      bool write_ok = file.seek(found_pos);
+      if (write_ok) write_ok = (file.write((uint8_t *) &tmp, sizeof(tmp)) == sizeof(tmp));
+
+      file.close();
+      if (!write_ok) {
+        _blob_io_fault_observed = true;
+        return false;
+      }
+      return true;
     }
-
-    memcpy(tmp.key, key, sizeof(tmp.key));  // just record 7 byte prefix of key
-    memcpy(tmp.data, src_buf, len);
-    tmp.len = len;
-    tmp.timestamp = _clock->getCurrentTime();
-
-    file.seek(found_pos);
-    file.write((uint8_t *) &tmp, sizeof(tmp));
-
-    file.close();
-    return true;
-  }
-  return false; // error
+    return false; // error
+  });
 }
 bool DataStore::deleteBlobByKey(const uint8_t key[], int key_len) {
-  return true; // this is just a stub on NRF52/STM32 platforms
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_,
+                                        [&]() { return true; });  // this is just a stub on NRF52/STM32 platforms
 }
 #else
 inline void makeBlobPath(const uint8_t key[], int key_len, char* path, size_t path_size) {
@@ -569,36 +661,51 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
 
   if (_fs->exists(path)) {
     File f = openRead(_fs, path);
-    if (f) {
-      int len = f.read(dest_buf, 255); // currently MAX 255 byte blob len supported!!
-      f.close();
-      return len;
+    if (!f) {
+      _blob_io_fault_observed = true;  // exists() said yes but the open genuinely failed.
+      return 0;
     }
+    int len = f.read(dest_buf, 255); // currently MAX 255 byte blob len supported!!
+    f.close();
+    if (len < 0) {
+      // Genuine read fault (negative status), distinct from a
+      // legitimately empty (0-byte) blob.
+      _blob_io_fault_observed = true;
+      return 0;
+    }
+    return (uint8_t)len;
   }
   return 0; // not found
 }
 
 bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
-  char path[64];
-  makeBlobPath(key, key_len, path, sizeof(path));
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    char path[64];
+    makeBlobPath(key, key_len, path, sizeof(path));
 
-  File f = openWrite(_fs, path);
-  if (f) {
+    File f = openWrite(_fs, path);
+    if (!f) {
+      _blob_io_fault_observed = true;  // genuine open-for-write failure.
+      return false;
+    }
     int n = f.write(src_buf, len);
     f.close();
     if (n == len) return true; // success!
 
-    _fs->remove(path); // blob was only partially written!
-  }
-  return false; // error
+    _blob_io_fault_observed = true;  // blob was only partially written!
+    _fs->remove(path);
+    return false; // error
+  });
 }
 
 bool DataStore::deleteBlobByKey(const uint8_t key[], int key_len) {
-  char path[64];
-  makeBlobPath(key, key_len, path, sizeof(path));
+  return ota_write_gate::guardedPersist(_destructive_writes_disallowed_, [&]() {
+    char path[64];
+    makeBlobPath(key, key_len, path, sizeof(path));
 
-  _fs->remove(path);
-  
-  return true; // return true even if file did not exist
+    _fs->remove(path);
+
+    return true; // return true even if file did not exist
+  });
 }
 #endif

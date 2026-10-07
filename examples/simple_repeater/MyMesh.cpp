@@ -1,5 +1,69 @@
 #include "MyMesh.h"
 #include <algorithm>
+#include <cmath>
+
+#if XIAO_OTA_USB_RECOVERY
+#include <wiring.h>
+#endif
+
+#if MESHCORE_LORA_OTA
+#include <helpers/ota/OtaBoardBackendCommon.h>
+#include <helpers/ota/OtaWriteGate.h>
+#include <helpers/ota/OtaMeshTrialHealthTick.h>
+__attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
+  out = mesh::ota::OtaBootLifecycleEvidence();
+  return false;
+}
+__attribute__((weak)) bool otaBoardBootLifecycleVerificationPending() { return false; }
+__attribute__((weak)) bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence&,
+                                                    ::ota::storage::OtaCandidateStore::Snapshot&) { return false; }
+__attribute__((weak)) bool otaBoardApplyRfProfile(float, float, uint8_t, uint8_t) { return false; }
+// Weak-defaulted in examples/companion_radio/MyMesh.cpp, strong-overridden
+// in variants/*/Ota*Backend.cpp -- that TU is never linked into THIS
+// (simple_repeater) binary, so this TU needs its OWN weak defaults for
+// every board-backend-provided symbol it (directly or, via
+// OtaMeshTrialHealthTick.h/main.cpp, indirectly) calls: a board lacking a
+// dedicated Ota*Backend.cpp (e.g. the xiao_s3_wio ESP32 variant, which
+// currently sets MESHCORE_LORA_OTA=1 with no QSPI backend written yet)
+// would otherwise fail to LINK this binary at all, exactly as companion's
+// own weak defaults exist for the identical reason.
+__attribute__((weak)) bool otaBoardStorageIoFaultObserved() {
+  return false;
+}
+__attribute__((weak)) bool otaBoardTrialHealthWindowActive() {
+  return false;
+}
+__attribute__((weak)) mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHealthyTrialBoot(
+    uint32_t, bool, bool, bool) {
+  return mesh::ota::OtaBoardTrialHealthOutcome::Pending;
+}
+// Matches examples/companion_radio/MyMesh.cpp's identical weak default
+// and fail-closed reasoning (see its own doc comment): a board with no
+// real Ota*Backend.cpp has no bootloader-tracked trial/qualification
+// concept wired at all, so this must stay "unknown" (true), never
+// silently "definitely not a trial".
+__attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
+  return true;
+}
+// Weak default matches examples/companion_radio/MyMesh.cpp's declaration
+// exactly; strong board-level overrides (variants/xiao_nrf52/OtaProductionBackend.cpp,
+// variants/sensecap_solar/OtaProductionBackend.cpp) are linked in board-wide
+// (shared build_src_filter), so this repeater TU reaches the same real
+// attach path companion uses, with a safe no-op fallback on boards lacking
+// a backend override.
+__attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
+  return false;
+}
+// Same weak-default pattern as examples/companion_radio/MyMesh.cpp's
+// declaration (see its own comment); used by formatFirmwareOtaStatus()
+// below.
+__attribute__((weak)) const char* otaBoardInstallCapabilityStatus() {
+  return "backend not configured";
+}
+__attribute__((weak)) const char* otaBoardEarlyWriteDiagnostic() {
+  return "proof=backend-unavailable";
+}
+#endif
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -878,7 +942,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   uptime_millis = 0;
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
-  set_radio_at = revert_radio_at = 0;
+  _temporary_radio_lease.reset();
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -946,8 +1010,16 @@ void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
   // load persisted prefs
-  _cli.loadPrefs(_fs);
-  acl.load(_fs, self_id);
+  _prefs_filename = resolveRepeaterPrefsFilename(*_fs);
+  _cli.loadPrefs(_fs, _prefs_filename);
+  // acl.load() keys every entry against self_id's own identity -- skip it
+  // entirely (ACL stays empty) rather than load/bind against an unset
+  // identity when _identity_available_ is false (see its doc comment in
+  // MyMesh.h); this is the repeater-specific instance of "no ACL load
+  // before real identity binding."
+  if (_identity_available_) {
+    acl.load(_fs, self_id);
+  }
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -977,15 +1049,19 @@ void MyMesh::begin(FILESYSTEM *fs) {
   }
 #endif
 
-  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-  radio_driver.setTxPower(_prefs.tx_power_dbm);
-
-  radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
-  MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
-                     radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-
   board.attachDynamicPrefs(_prefs.getCustom());
+  // All of the following genuinely touch/configure the LoRa radio
+  // hardware -- skip entirely when _radio_available_ is false (this
+  // boot's radio_init() failed) rather than operate on a known-failed
+  // radio, matching the same guard on repeater's loop()-driven dispatch.
+  if (_radio_available_) {
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    radio_driver.setTxPower(_prefs.tx_power_dbm);
 
+    radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+    MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
+                       radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
+  }
   updateAdvertTimer();
   updateFloodAdvertTimer();
 
@@ -993,6 +1069,27 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
 #if ENV_INCLUDE_GPS == 1
   applyGpsPrefs();
+#endif
+
+#if MESHCORE_LORA_OTA
+  // Real attach path (trust provider + staging sink), same free-function
+  // companion calls -- attach is identity-independent crypto/staging
+  // wiring (no identity-dependent OTA send/recv dispatch happens here),
+  // called once, after self_id/ACL are established above.
+  configureCompanionFirmwareOtaBackend(getOtaIntegration());
+  // Identity-dependent wiring (must happen here, now that self_id/acl
+  // exist): without this, the repeater's lean receiver has a null admin
+  // check (every RF Authorization is fail-closed Denied, never actually
+  // admitted) and no target identity (every target-bound Commit/Abort
+  // is fail-closed Unavailable) -- this was previously missing entirely.
+  getOtaIntegration().setLeanAdminCheck(this, &MyMesh::otaAdminCheckThunk);
+  if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
+  getOtaIntegration().attachRfProfileIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
+                                       static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
+  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
+#if defined(NRF52840_XXAA)
+  getOtaIntegration().attachCommitReboot(nullptr, [](void*) { board.reboot(); });
+#endif
 #endif
 }
 
@@ -1008,13 +1105,72 @@ void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint3
 }
 
 void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) {
-  set_radio_at = futureMillis(2000); // give CLI reply some time to be sent back, before applying temp radio params
+#if MESHCORE_LORA_OTA
+  getOtaIntegration().stopDirect();
+#endif
   pending_freq = freq;
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
 
-  revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
+  _temporary_radio_lease.schedule(_ms->getMillis(), timeout_mins);
+}
+
+#if MESHCORE_LORA_OTA
+bool MyMesh::setFirmwareOtaMode(const char* mode) {
+  mesh::ota::FirmwareOtaMode parsed;
+  if (!mesh::ota::parseFirmwareOtaMode(mode, parsed)) return false;
+  getOtaIntegration().setMode(parsed);
+  return true;
+}
+
+bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
+  if (!std::isfinite(percent) || percent < 0.0f || percent > 100.0f) return false;
+  if (!getOtaIntegration().setDutyCyclePercent(percent)) return false;
+  return setOtaAirtimeDutyCyclePercent(percent);
+}
+
+void MyMesh::abortFirmwareOta() {
+  getOtaIntegration().abortSession();
+  if (_temporary_radio_lease.pending()) {
+    _temporary_radio_lease.cancel(_ms->getMillis());
+    revertTempRadioLeaseIfDue();
+  }
+}
+
+void MyMesh::rollbackFirmwareOta() {
+  getOtaIntegration().requestRollback();
+  abortFirmwareOta();
+}
+
+void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
+  auto& integration = getOtaIntegration();
+  const auto boot = integration.bootLifecycle();
+  const auto view = integration.readback(boot);
+  mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
+                                         view.phase, view.snapshot.counter);
+}
+#endif
+
+void MyMesh::applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr) {
+  radio_driver.setParams(freq, bw, sf, cr);
+}
+
+void MyMesh::revertTempRadioLeaseIfDue() {
+  if (!_radio_available_) return;
+  const uint32_t now = _ms->getMillis();
+#if MESHCORE_LORA_OTA && defined(NRF52_PLATFORM)
+  const bool restored = _temporary_radio_lease.restoreIfDue(now, [this]() {
+    const bool applied = otaBoardApplyRfProfile(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    if (!applied) MESH_DEBUG_PRINTLN("Temporary radio lease: normal profile restore failed");
+    return applied;
+  }, !isSendInProgress() && !_radio->isReceiving());
+#else
+  const bool restored = _temporary_radio_lease.restoreUncheckedIfDue(now, [this]() {
+    applyRadioParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  });
+#endif
+  if (restored) MESH_DEBUG_PRINTLN("Radio params restored");
 }
 
 bool MyMesh::formatFileSystem() {
@@ -1031,6 +1187,11 @@ bool MyMesh::formatFileSystem() {
 }
 
 void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
+  // Identity/radio-dependent dispatch -- same guard as loop()'s own
+  // advert-timer blocks (see _identity_available_/_radio_available_'s
+  // doc comments in MyMesh.h). main.cpp's boot-time ENABLE_ADVERT_ON_BOOT
+  // call is this method's only external caller today.
+  if (!_identity_available_ || !_radio_available_) return;
   mesh::Packet *pkt = createSelfAdvert();
   if (pkt) {
     if (flood) {
@@ -1195,7 +1356,50 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
-void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
+#if MESHCORE_LORA_OTA
+bool MyMesh::isOtaAdminKey(const uint8_t key[32]) const {
+  if (key == nullptr) return false;
+  ClientInfo* client = const_cast<ClientACL&>(acl).getClient(key, PUB_KEY_SIZE);
+  return client != nullptr && client->isAdmin();
+}
+
+bool MyMesh::otaAdminCheckThunk(void* ctx, const uint8_t key[32]) {
+  return ctx != nullptr && static_cast<MyMesh*>(ctx)->isOtaAdminKey(key);
+}
+
+void MyMesh::otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
+  static_cast<MyMesh*>(ctx)->self_id.sign(signature, message, static_cast<int>(len));
+}
+
+bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore) {
+  auto* mesh = static_cast<MyMesh*>(ctx);
+  if (!mesh->_radio_available_) return false;
+  return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
+                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
+                         restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
+}
+bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
+  return otaBoardGetBootLifecycle(out);
+}
+bool MyMesh::otaBootCandidateThunk(void*, const mesh::ota::OtaBootLifecycleEvidence& boot,
+                                  ::ota::storage::OtaCandidateStore::Snapshot& out) {
+  return otaBoardReadBootCandidate(boot, out);
+}
+#endif
+
+#if XIAO_OTA_USB_RECOVERY
+bool MyMesh::uf2RebootAllowed() {
+  const auto phase = getOtaIntegration().readback().phase;
+  using Phase = mesh::ota::usb::UsbOtaPhase;
+  return !_ota_destructive_writes_disallowed_ && !otaBoardTrialHealthWindowActive() &&
+      !otaBoardBootLifecycleVerificationPending() && !getOtaIntegration().hasPendingRfWork() &&
+      phase != Phase::Erasing && phase != Phase::Receiving && phase != Phase::Verifying && phase != Phase::Ready &&
+      phase != Phase::CacheSealed && phase != Phase::CommitPending && phase != Phase::Trial;
+}
+#endif
+
+void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply, bool local_usb) {
+  (void)local_usb;
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1237,6 +1441,28 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     reply += 3;
     command += 3;
   }
+
+#if XIAO_OTA_USB_RECOVERY
+  if (strncmp(command, "reboot uf2", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    // USB transport provenance, never a remote client's timestamp, grants recovery.
+    if (!local_usb) {
+      strcpy(reply, "Err - USB only");
+    } else if (command[10] != 0) {
+      strcpy(reply, "Err - usage: reboot uf2");
+    } else if (!uf2RebootAllowed()) {
+      strcpy(reply, "Err - OTA busy");
+    } else {
+      if (!_uf2_reboot_pending) {
+        const uint32_t now = _ms->getMillis();
+        _uf2_reboot_pending = true;
+        _uf2_reboot_due_ms = now + mesh::ota::OtaFirmwareIntegration::kCommitRebootGraceMs;
+        _uf2_reboot_queue_deadline_ms = now + mesh::ota::OtaFirmwareIntegration::kCommitRebootQueueWaitMs;
+      }
+      strcpy(reply, "OK - rebooting UF2");
+    }
+    return;
+  }
+#endif
 
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
@@ -1281,60 +1507,260 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+#if MESHCORE_LORA_OTA
+  } else if (memcmp(command, "ota ", 4) == 0) {
+    // Real admin control surface, reached ONLY via the same trust gates
+    // handleCommand() already enforces: local serial (sender_timestamp==0,
+    // physically-present trusted owner) or a remote client already
+    // confirmed client->isAdmin() by the PAYLOAD_TYPE_TXT_MSG caller
+    // before handleCommand() is ever invoked -- no new admin/auth path.
+    const char* sub = command + 4;
+    while (*sub == ' ') sub++;
+    if (strcmp(sub, "status") == 0) {
+      formatFirmwareOtaStatus(reply, 160);
+    } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
+      mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
+          strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
+    } else if (strcmp(sub, "abort") == 0) {
+      abortFirmwareOta();
+      strcpy(reply, "OK");
+    } else if (strcmp(sub, "rollback") == 0) {
+      rollbackFirmwareOta();
+      strcpy(reply, "OK");
+    } else if (memcmp(sub, "mode ", 5) == 0) {
+      if (setFirmwareOtaMode(sub + 5)) strcpy(reply, "OK"); else strcpy(reply, "Err - bad mode");
+    } else if (memcmp(sub, "duty ", 5) == 0) {
+      if (setFirmwareOtaDutyCycle((float)atof(sub + 5))) strcpy(reply, "OK"); else strcpy(reply, "Err - bad duty");
+    } else {
+      strcpy(reply, "Err - usage: ota status|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
+    }
+#endif
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }
 
 void MyMesh::loop() {
+#if MESHCORE_LORA_OTA
+  if (!_identity_available_) getOtaIntegration().stopDirect();
+  getOtaIntegration().tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+#endif
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif
 
-  mesh::Mesh::loop();
+  // Ordinary mesh dispatch (packet TX/RX scheduling, forwarding, signing,
+  // advertising) and temp-radio-param apply/revert are entirely identity-
+  // and/or radio-dependent -- suppressed whenever begin() could not bind
+  // a real identity (ota_identity_boot::Outcome::IdentityUnavailable) or
+  // this boot's radio_init() failed (see _identity_available_/
+  // _radio_available_'s doc comments in MyMesh.h). The bounded serial/
+  // CLI/maintenance/trial-health path (driven from main.cpp's loop() and
+  // tickOtaTrialHealth() below) still runs either way -- mirrors
+  // examples/companion_radio/MyMesh.cpp's identically-structured guard
+  // around BaseChatMesh::loop()/checkTempRadioLease().
+  if (_identity_available_ && _radio_available_) {
+    mesh::Mesh::loop();
 
-  if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    uint32_t delay_millis = 0;
-    if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+    if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
+      mesh::Packet *pkt = createSelfAdvert();
+      uint32_t delay_millis = 0;
+      if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
 
-    updateFloodAdvertTimer(); // schedule next flood advert
-    updateAdvertTimer();      // also schedule local advert (so they don't overlap)
-  } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendZeroHop(pkt);
+      updateFloodAdvertTimer(); // schedule next flood advert
+      updateAdvertTimer();      // also schedule local advert (so they don't overlap)
+    } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
+      mesh::Packet *pkt = createSelfAdvert();
+      if (pkt) sendZeroHop(pkt);
 
-    updateAdvertTimer(); // schedule next local advert
+      updateAdvertTimer(); // schedule next local advert
+    }
+
+    if (_temporary_radio_lease.applyIfDue(_ms->getMillis(), [this]() {
+      applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
+    })) MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
-  if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
-    set_radio_at = 0;                                     // clear timer
-    radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
-    MESH_DEBUG_PRINTLN("Temp radio params");
-  }
+  // Restoring normal parameters requires a live radio, not an identity.
+  revertTempRadioLeaseIfDue();
 
-  if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
-    revert_radio_at = 0;                                        // clear timer
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    MESH_DEBUG_PRINTLN("Radio params restored");
-  }
-
-  // is pending dirty contacts write needed?
+  // is pending dirty contacts write needed? A denied/failed write must
+  // never be silently labeled "saved" -- ClientACL::save() is void, so
+  // the existing shared-service destructive-write permission must be
+  // checked BEFORE calling it, mirroring companion_radio's
+  // DataStore::destructiveWritesDisallowed() gate around saveContacts().
+  // Astra's correction: the previous version cleared dirty_contacts_expiry
+  // unconditionally, even when guardedPersist() denied the write (acl.save()
+  // never invoked) -- that permanently discarded the pending save instead of
+  // retrying once writes are allowed again. Only clear the flag when
+  // guardedPersist() reports the write actually ran.
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
+#if MESHCORE_LORA_OTA
+    if (ota_write_gate::guardedPersist(_ota_destructive_writes_disallowed_, [&](){ acl.save(_fs); return true; })) {
+      dirty_contacts_expiry = 0;
+    }
+#else
     acl.save(_fs);
     dirty_contacts_expiry = 0;
+#endif
   }
 
   // update uptime
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+#if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
+  getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(), _mgr->getOutboundTotal() != 0);
+#endif
+#if XIAO_OTA_USB_RECOVERY
+  if (_uf2_reboot_pending) {
+    if (!uf2RebootAllowed()) {
+      _uf2_reboot_pending = false;
+      Serial.println("  -> Err - OTA busy");
+    } else {
+      const uint32_t now_ms = _ms->getMillis();
+      if (static_cast<int32_t>(now_ms - _uf2_reboot_due_ms) >= 0 &&
+          ((!isSendInProgress() && _mgr->getOutboundTotal() == 0) ||
+           static_cast<int32_t>(now_ms - _uf2_reboot_queue_deadline_ms) >= 0)) {
+        _uf2_reboot_pending = false;
+        Serial.flush();
+        enterUf2Dfu();
+      }
+    }
+  }
+#endif
 }
+
+#if MESHCORE_LORA_OTA
+// Mirrors examples/companion_radio/MyMesh.cpp's identically-named method:
+// `_radio`, isSendInProgress()/getCurrentSendDeadlineMs()/
+// getRadioNonRecvSinceMs() are all base Dispatcher members/methods, so
+// this logic is genuinely identical across both boards (no separate
+// radio-wrapper type here).
+bool MyMesh::isRadioStuckOutOfRecv(uint32_t now_ms) {
+  if (_radio != nullptr && _radio->isInRecvMode()) return false;
+  if (isSendInProgress()) {
+    return millisHasNowPassed(getCurrentSendDeadlineMs());
+  }
+  return (now_ms - getRadioNonRecvSinceMs()) > 8000;
+}
+
+// Bounded, side-effect-free fresh-storage-evidence probe -- repeater's
+// counterpart of companion_radio's DataStore::probeStorageReadiness().
+// "_main.id" is MANDATORY here exactly as it is for companion: main.cpp's
+// setup() unconditionally loads-or-generates-and-saves it strictly BEFORE
+// the_mesh.begin()/this collector are ever reachable, so by the time a
+// live trial window calls this, its absence or a well-formed-but-WRONG
+// persisted identity is unconditionally a genuine storage fault, never a
+// legitimate "nothing saved yet" case. checkIntegrity() performs its own
+// direct, bounded, single-shot File::read() (never Stream::readBytes(),
+// which can block on a short/stalled file) and compares the persisted
+// key bytes against self_id ACTUALLY in RAM right now -- never merely a
+// read-length check -- and is a pure read, never a write. Reuses the
+// exact same per-platform IdentityStore construction as saveIdentity().
+bool MyMesh::probeIdentityStorageReadiness() const {
+  // Invoke only after real identity binding (Astra's correction): a
+  // probe against an unbound/unset identity would only ever "pass"
+  // vacuously against whatever garbage self_id currently holds, never
+  // real evidence -- report not-ready instead.
+  if (!_identity_available_) return false;
+  if (_fs == nullptr) return false;
+
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore identity_store(*_fs, "");
+#elif defined(ESP32)
+  IdentityStore identity_store(*_fs, "/identity");
+#elif defined(RP2040_PLATFORM)
+  IdentityStore identity_store(*_fs, "/identity");
+#else
+#error "need to define probeIdentityStorageReadiness()"
+#endif
+  if (!identity_store.checkIntegrity("_main", const_cast<mesh::LocalIdentity&>(self_id))) return false;
+
+  if (!_fs->exists(_prefs_filename)) {
+    // Legitimately nothing to check yet (freshly-formatted device that
+    // has never saved prefs) -- absence of an optional file is NOT
+    // evidence of an IO fault.
+    return true;
+  }
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  File file = _fs->open(_prefs_filename, FILE_O_READ);
+#elif defined(RP2040_PLATFORM)
+  File file = _fs->open(_prefs_filename, "r");
+#else
+  File file = _fs->open(_prefs_filename, "r", false);
+#endif
+  if (!file) return false;  // exists() said yes but the open genuinely failed.
+  file.close();
+  return true;
+}
+
+// Simple_repeater's role-1 counterpart of companion_radio/MyMesh.cpp's
+// tickOtaTrialHealth() -- same shared decision function (see
+// helpers/ota/OtaMeshTrialHealthTick.h), called once per outer main.cpp
+// loop() pass AFTER every other real per-tick service, exactly like
+// companion's. Filesystem readiness now also covers a genuine per-tick
+// identity/prefs re-read (probeIdentityStorageReadiness(), mirroring
+// companion's DataStore::probeStorageReadiness()), not merely the
+// one-time boot-mount result plus the board-level
+// otaBoardStorageIoFaultObserved() candidate-sink latch.
+void MyMesh::tickOtaTrialHealth() {
+  const uint32_t now_ms = (uint32_t)millis();
+
+  // Astra's correction: `_radio != nullptr` is only "an object exists in
+  // RAM", NOT "this boot's radio_init() actually succeeded" -- a failed
+  // init still leaves this Dispatcher-bound pointer non-null, so every
+  // ACTIVE hardware probe below (isInRecvMode()/probeDriverStatus(),
+  // which issue genuine SPI transactions) must stay gated on
+  // _radio_available_, never merely on pointer non-nullness. When the
+  // radio is unavailable, report unhealthy/not-servicing evidence (never
+  // fabricate a healthy pass) while still running every tick so the
+  // deadline/reboot/measurement/USB scheduling below keeps progressing.
+  bool radio_stuck_non_recv = true;
+  uint32_t radio_fault_count_before_probe = _ota_trial_last_radio_fault_count_;
+  bool radio_driver_healthy = false;
+  uint32_t radio_fault_count_after_probe = _ota_trial_last_radio_fault_count_;
+  bool radio_genuinely_servicing = false;
+  if (_radio_available_ && _radio != nullptr) {
+    radio_fault_count_before_probe = _radio->driverFaultCount();
+    radio_driver_healthy = probeRadioDriverStatus();
+    radio_fault_count_after_probe = _radio->driverFaultCount();
+    radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
+    radio_genuinely_servicing = _radio->isInRecvMode() || isSendInProgress();
+  }
+  const bool filesystem_ready_now =
+      _ota_trial_filesystem_ready && !otaBoardStorageIoFaultObserved() && !_ota_service_.trialFilesystemFaultObserved() &&
+      probeIdentityStorageReadiness();
+
+  const mesh::ota::OtaMeshTrialHealthTickInputs tick_in{
+      now_ms, _radio_available_ && _radio != nullptr, _ota_trial_radio_ready, radio_stuck_non_recv,
+      radio_driver_healthy, radio_genuinely_servicing, radio_fault_count_before_probe,
+      radio_fault_count_after_probe, filesystem_ready_now};
+  const auto tick_result =
+      mesh::ota::evaluateOtaMeshTrialHealthTick(tick_in, _ota_trial_last_radio_fault_count_);
+
+
+  if (!_ota_trial_reboot_issued && tick_result.should_reboot) {
+    _ota_trial_reboot_issued = true;
+    board.reboot();
+  }
+}
+#endif
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+#if XIAO_OTA_USB_RECOVERY
+  if (_uf2_reboot_pending) return true;
+#endif
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#if MESHCORE_LORA_OTA
+  // Never let this device deep-sleep while a trial-boot health window is
+  // genuinely in progress -- see companion_radio/MyMesh.cpp's identical
+  // hasPendingWork() note.
+  if (otaBoardTrialHealthWindowActive() || otaBoardBootLifecycleVerificationPending() ||
+      getOtaIntegration().hasPendingRfWork()) return true;
 #endif
   return _mgr->getOutboundTotal() > 0;
 }

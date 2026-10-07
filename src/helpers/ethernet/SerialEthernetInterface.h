@@ -55,6 +55,9 @@ class SerialEthernetInterface : public BaseSerialInterface {
     bool isWriteBusy() const override;
 
     size_t writeFrame(const uint8_t src[], size_t len) override;
+#if MESHCORE_LORA_OTA
+    size_t tryWriteFrame(const uint8_t src[], size_t len) override { return writeFrame(src, len); }
+#endif
     size_t checkRecvFrame(uint8_t dest[]) override;
 
     virtual int available() = 0;
