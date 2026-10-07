@@ -24,10 +24,88 @@ For supervised lab/development transfers only, the stock PC sender has an
 explicit `--lab-fast` upload option: negotiated 500 kHz/SF5/CR5 with bounded
 bursts. Both ends must support and sign the matching profile; there is no
 silent fallback. It still returns periodically to the original mesh channel
-and requires separate READY and COMMIT. Complete500kHz reader-free reception
+and waits for READY before COMMIT. Complete500kHz reader-free reception
 to READY has been observed on the approved bench pair; installation, rollback
 and continuous radio reliability remain separate gates. This is not permission
 to increase TX power or legal airtime.
+
+## One-command deployment
+
+`make ota-deploy` is opt-in: sign and stage one application, wait for remote
+READY, send one signed COMMIT, and wait for the receiver's native Installed
+status. Failed/Aborted (including reported rollback), mismatched status and
+timeout exit nonzero; a COMMIT acknowledgement or READY alone is not success.
+Existing upload-only and separate commit commands are unchanged. No diagnostic
+campaign, userdata snapshot, approval ledger or independent observer is needed.
+
+For an OTA-enabled upgraded companion (nRF or ESP), select its explicit stable
+USB anchor and the **receiver's** board/role. The receiver must already authorize
+the companion's administrator key and have its platform's OTA/rollback backend:
+`make ota-device-inspect OTA_DEVICE_PORT=/dev/serial/by-id/usb-YOUR_COMPANION`
+reads public companion identity without resetting it (timeout defaults to 5 s).
+TinyUSB nRF companions require asserted DTR: add `OTA_DEVICE_DTR=1` when
+inspecting and `OTA_DEPLOY_CLIENT_DTR=1` when deploying through an explicit
+client port (`--dtr` / `--client-dtr` in the corresponding Python CLIs).
+DTR is asserted at **115200 baud**, not the 1200-baud bootloader reset gesture;
+RTS remains false. The known nRF lab-client fallback asserts DTR automatically.
+ESP explicit ports default to DTR false. This selects the local companion's
+serial handshake, independently of the receiver board in the manifest.
+
+```sh
+make ota-deploy OTA_DEPLOY_TRANSPORT=native \
+  OTA_DEPLOY_CLIENT_PORT=/dev/serial/by-id/usb-YOUR_COMPANION \
+  OTA_UPLOAD_IMAGE=path/to/application.bin OTA_UPLOAD_BOARD=xiao_s3_wio \
+  OTA_UPLOAD_ROLE_ID=0 OTA_UPLOAD_COUNTER=YOUR_NEW_COUNTER \
+  OTA_UPLOAD_TARGET=FULL_64_HEX_TARGET_KEY OTA_UPLOAD_TIMEOUT=14400
+```
+
+Supported descriptors: `xiao_nrf52840`, `xiao_nrf52840_sense`,
+`sensecap_solar_p1`, and `xiao_s3_wio`; role 0 is companion, role 1 repeater.
+Counter must explicitly exceed the receiver's confirmed floor. A canonical
+manifest is built in memory; optional `OTA_UPLOAD_MANIFEST=path/to/manifest.bin`
+must exactly match board, role, image and counter. ESP uses the logical app0
+address, not a manually selected inactive partition. Use a raw application, not
+an entire flash dump, bootloader, UF2 or ZIP.
+
+For an unchanged stock 1.17.1 companion, use the existing private device/image
+binding (one authorization, not approval of each step), and an off-normal direct
+frequency with a 30000–60000 ms lease:
+Deploy accepts one fresh, complete native READY report for the exact candidate,
+then checks one fresh window-0 READY report on the normal channel after the
+direct lease returns, before signing COMMIT. It does not rescan every READY
+bitmap window; upload-only and separate commit retain their existing behavior.
+
+```sh
+make ota-deploy OTA_DEPLOY_TRANSPORT=stock \
+  OTA_STOCK_ARGS='--serial FULL_SERIAL --by-id /dev/serial/by-id/usb-STOCK --sender-key FULL_64_HEX_SENDER_KEY --binding path/to/binding.json' \
+  OTA_UPLOAD_IMAGE=path/to/application.bin OTA_UPLOAD_BOARD=xiao_nrf52840 \
+  OTA_UPLOAD_ROLE_ID=0 OTA_UPLOAD_COUNTER=YOUR_NEW_COUNTER \
+  OTA_UPLOAD_TARGET=FULL_64_HEX_TARGET_KEY OTA_UPLOAD_FREQ_KHZ=YOUR_DIRECT_KHZ \
+  OTA_UPLOAD_LEASE_MS=60000 OTA_UPLOAD_TIMEOUT=14400
+```
+
+For CP2102/duplicate serials, additionally supply the binding's exact `--by-path`;
+that anchor is used directly, with DTR/RTS false. The stock adapter is zero-hop
+only; routed retry is explicitly unsupported. `OTA_DEPLOY_LAB_FAST=1` opts into
+the existing signed 500 kHz/SF5/CR5 profile when both ends support it. Native
+direct mode also requires `OTA_UPLOAD_MODE=direct` and the frequency/lease;
+native directed/background modes retain their existing airtime policy.
+`OTA_DEPLOY_INSTALL_TIMEOUT=300` bounds post-COMMIT waiting inside the overall
+`OTA_UPLOAD_TIMEOUT`. Normal duty defaults to 2%; neither transport changes TX
+power. The stock's exact saved radio/repeat settings are restored on success or
+failure, and `original-radio.json` remains available for explicit restoration
+after interruption.
+
+Completion means **Installed reported by the receiver for this target, manifest,
+counter and observed generation**, not cryptographic running-image attestation.
+Stock additionally checks the reported new confirmed floor. Its result says
+`native-installed-reported-unsigned`, `native_installed: true`,
+`installation_confirmed: false`, and `status_authenticated: false`: the current
+RF census has no signature. Native ABI2 exposes Installed, hash, counter,
+generation and observation age, but not a separate floor/running-image field.
+No USB observer of the remote target is required; these tools do not invent
+fields absent from the receiver protocol. Run host behavior tests with
+`make test-ota-deploy`.
 
 ## Current availability: not ready for production use
 

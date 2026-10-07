@@ -3,13 +3,17 @@
 
 cache only signs/stages a local image and observes CACHE_SEALED. It never starts
 RF, selects a remote target, commits or proves installation/airtime.
+deploy stages one board/role-bound image, waits for READY, commits and waits for
+the receiver's native INSTALLED status. upload and commit remain separate modes.
 ABORT requires ABI2 fresh STATUS generation and durable ABORTED readback.
 """
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import IntEnum
 import hashlib
+import importlib.util
 import math
 from pathlib import Path
 import struct
@@ -154,6 +158,20 @@ def validate_image(canonical, image):
         raise ValueError("image SHA-256 does not match the manifest")
 
 
+def deploy_manifest(image, board, role_id, counter, canonical=None):
+    """Use the existing shared nRF/ESP descriptor codec, never a second format."""
+    path = Path(__file__).resolve().parents[1] / "bootloader/xiao_nrf52840_ota/tools/xiao_ota_descriptor.py"
+    spec = importlib.util.spec_from_file_location("ota_deploy_descriptor", path)
+    codec = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(codec)
+    codec.assert_matches_canonical_layout_contract()
+    expected = codec.build_descriptor(board, role_id, counter, image)
+    if canonical is not None and canonical != expected:
+        raise ValueError("manifest does not match the selected board, role, image and counter")
+    validate_image(expected, image)
+    return expected
+
+
 def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, lab_fast=False, routed_retry=False):
     if type(routed_retry) is not bool or (routed_retry and (mode == "direct" or lab_fast)):
         raise ValueError("routed-retry requires directed/background mode without lab-fast")
@@ -294,15 +312,43 @@ class Uploader:
             self.require_accepted(self.exchange(Op.ADD_TARGET, target, target, self.remaining(deadline)))
         return self.require_accepted(self.exchange(Op.START, body, timeout=self.remaining(deadline)))
 
-    def commit(self, target, canonical, deadline):
+    def commit(self, target, canonical, deadline, generation=None):
         if len(target) != 32 or target == LOCAL_TARGET or len(canonical) != 59:
             raise ValueError("commit requires a full target identity and canonical manifest")
         manifest_hash = hashlib.sha256(canonical).digest()
         counter = struct.unpack_from(">I", canonical, 45)[0]
         since = time.monotonic()
-        self.wait_phase(target, Phase.READY, manifest_hash, counter, since, deadline)
+        options = {} if generation is None else {"generation": generation}
+        self.wait_phase(target, Phase.READY, manifest_hash, counter, since, deadline, **options)
+        return self._send_commit(target, manifest_hash, counter, deadline)
+
+    def _send_commit(self, target, manifest_hash, counter, deadline):
         return self.require_accepted(self.exchange(
             Op.COMMIT, target + manifest_hash + struct.pack(">I", counter), target, self.remaining(deadline)))
+
+    def deploy(self, target, canonical, image, owner_public_key, body, mode, deadline,
+               reupload=False, install_timeout=300):
+        if len(target) != 32 or target == LOCAL_TARGET:
+            raise ValueError("deploy requires one full remote target identity")
+        if not math.isfinite(install_timeout) or install_timeout <= 0:
+            raise ValueError("installation timeout must be finite and positive")
+        self.cache(canonical, image, owner_public_key, deadline, reupload)
+        started = time.monotonic()
+        self.start([target], body, mode, deadline)
+        manifest_hash = hashlib.sha256(canonical).digest()
+        counter = struct.unpack_from(">I", canonical, 45)[0]
+        ready = self.wait_phase(target, Phase.READY, manifest_hash, counter, started, deadline)
+        blocks = (len(image) + BLOCK_BYTES - 1) // BLOCK_BYTES
+        if ready.total != blocks:
+            raise UploaderError("READY block geometry does not match the selected image")
+        committed = time.monotonic()
+        self._send_commit(target, manifest_hash, counter, deadline)
+        installed = self.wait_phase(target, Phase.INSTALLED, manifest_hash, counter, committed,
+                                    min(deadline, time.monotonic() + install_timeout),
+                                    generation=ready.generation)
+        if installed.received != blocks or installed.total != blocks:
+            raise UploaderError("INSTALLED block geometry does not match the selected image")
+        return installed
 
     def abort(self, target, image_hash, deadline=None):
         if len(target) != 32 or len(image_hash) != 32:
@@ -344,18 +390,32 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     upload = commands.add_parser("upload", help="cache and start; never commit automatically")
     cache = commands.add_parser("cache", help="local signed cache only; no remote START, READY or install")
+    deploy = commands.add_parser("deploy", help="stage one image, wait READY, commit and wait native INSTALLED")
     for command in (upload, cache):
         command.add_argument("--manifest", required=True, type=Path)
         command.add_argument("--image", required=True, type=Path)
         command.add_argument("--reupload", action="store_true")
-    upload.add_argument("--target", required=True, type=full_key, action="append")
-    upload.add_argument("--mode", choices=tuple(MODES), default="directed")
-    upload.add_argument("--channel", type=int, default=255)
-    upload.add_argument("--frequency-khz", type=int, default=0)
-    upload.add_argument("--lease-ms", type=int, default=0)
-    upload.add_argument("--lab-fast", action="store_true", help="direct-only signed 500kHz/SF5/CR5 negotiation; requires matching receiver")
-    upload.add_argument("--routed-retry", action="store_true", help="opt-in attempt-diverse directed/background RF; requires upgraded receivers")
-    upload.add_argument("--duty-milli-percent", type=int, default=2000)
+    deploy.add_argument("--image", required=True, type=Path)
+    deploy.add_argument("--manifest", type=Path, help="optional exact canonical descriptor; otherwise built in memory")
+    deploy.add_argument("--board", required=True,
+                        choices=("xiao_nrf52840", "xiao_nrf52840_sense", "sensecap_solar_p1", "xiao_s3_wio"))
+    deploy.add_argument("--role-id", required=True, type=int, choices=(0, 1))
+    deploy.add_argument("--counter", required=True, type=int)
+    deploy.add_argument("--reupload", action="store_true")
+    deploy.add_argument("--install-timeout", type=float, default=300)
+    deploy.add_argument("--client-port", type=Path,
+                        help="explicit stable /dev/serial/by-id companion anchor; no reset, RTS false")
+    deploy.add_argument("--client-dtr", action="store_true",
+                        help="assert DTR at 115200 for an explicit TinyUSB nRF companion; ESP defaults false")
+    for command in (upload, deploy):
+        command.add_argument("--target", required=True, type=full_key, action="append")
+        command.add_argument("--mode", choices=tuple(MODES), default="directed")
+        command.add_argument("--channel", type=int, default=255)
+        command.add_argument("--frequency-khz", type=int, default=0)
+        command.add_argument("--lease-ms", type=int, default=0)
+        command.add_argument("--lab-fast", action="store_true", help="direct-only signed 500kHz/SF5/CR5 negotiation; requires matching receiver")
+        command.add_argument("--routed-retry", action="store_true", help="opt-in attempt-diverse directed/background RF; requires upgraded receivers")
+        command.add_argument("--duty-milli-percent", type=int, default=2000)
     upload.add_argument("--wait-ready", action="store_true")
     status = commands.add_parser("status")
     status.add_argument("--target", type=full_key, default=LOCAL_TARGET)
@@ -380,14 +440,20 @@ def main():
         arguments.error("--timeout must be finite and positive")
     if args.client_role != "client":
         arguments.error("uploader requires the approved client role; no role override")
-    canonical = args.manifest.read_bytes() if hasattr(args, "manifest") else None
+    canonical = args.manifest.read_bytes() if getattr(args, "manifest", None) is not None else None
     image = args.image.read_bytes() if hasattr(args, "image") else None
     if canonical is not None and len(canonical) != 59:
         arguments.error("--manifest must contain exactly 59 canonical bytes")
     body = None
+    if args.command == "deploy":
+        if len(args.target) != 1:
+            arguments.error("deploy selects exactly one target; use upload for fleet staging")
+        if not math.isfinite(args.install_timeout) or args.install_timeout <= 0:
+            arguments.error("--install-timeout must be finite and positive")
+        canonical = deploy_manifest(image, args.board, args.role_id, args.counter, canonical)
     if args.command in ("upload", "cache"):
         validate_image(canonical, image)
-    if args.command == "upload":
+    if args.command in ("upload", "deploy"):
         body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent,
                           args.lab_fast, args.routed_retry)
         if len(set(args.target)) != len(args.target) or len(args.target) > 32:
@@ -399,19 +465,37 @@ def main():
     evidence = (lab.Evidence(args.artifact_dir, exclusive=True) if args.command == "cache"
                 else lab.Evidence(args.artifact_dir))
     node = None
+    managed = False
+    connections = ExitStack()
     error = None
     try:
-        device = lab_device.resolve(args.client_role, mode=lab_device.MODE_APP)
-        evidence.check("approved-uploader-client", device.serial == lab.APPROVED_ADMIN_PAIR["client"],
-                       expected_serial=lab.APPROVED_ADMIN_PAIR["client"], observed_serial=device.serial)
-        node = lab.FramedSerial(f"{args.client_role}-{device.serial}", str(device.by_id), evidence)
-        time.sleep(2)
+        identity = None
+        if args.command == "deploy" and args.client_port is not None:
+            from ota_devices import open_companion, identify_companion
+            node = connections.enter_context(open_companion(
+                args.client_port, name="ota-deploy", evidence=evidence, dtr=args.client_dtr))
+            managed = True
+            info = identify_companion(node, timeout=min(5, args.timeout))
+            if info["role"] != "companion":
+                raise UploaderError("deploy requires a companion, not a repeater")
+            identity = full_key(info["pubkey"])
+        else:
+            device = lab_device.resolve(args.client_role, mode=lab_device.MODE_APP)
+            evidence.check("approved-uploader-client", device.serial == lab.APPROVED_ADMIN_PAIR["client"],
+                           expected_serial=lab.APPROVED_ADMIN_PAIR["client"], observed_serial=device.serial)
+            options = {"no_reset": True, "dtr": True} if args.command == "deploy" else {}
+            node = lab.FramedSerial(f"{args.client_role}-{device.serial}", str(device.by_id), evidence, **options)
+            time.sleep(2)
         uploader = Uploader(node, evidence, command_timeout=min(10, args.timeout))
         deadline = time.monotonic() + args.timeout
-        if args.command in ("upload", "cache"):
-            identity = lab.app_info(node)["pubkey_bytes"]
-            since = time.monotonic()
-            reply = uploader.cache(canonical, image, identity, deadline, args.reupload)
+        if args.command in ("upload", "cache", "deploy"):
+            identity = identity if identity is not None else lab.app_info(node)["pubkey_bytes"]
+            if args.command == "deploy":
+                reply = uploader.deploy(args.target[0], canonical, image, identity, body, args.mode,
+                                        deadline, args.reupload, args.install_timeout)
+            else:
+                since = time.monotonic()
+                reply = uploader.cache(canonical, image, identity, deadline, args.reupload)
             if args.command == "cache":
                 blocks = (len(image) + BLOCK_BYTES - 1) // BLOCK_BYTES
                 if not (reply.target == LOCAL_TARGET and not reply.flags & REMOTE
@@ -421,7 +505,7 @@ def main():
                         and reply.received == reply.total == blocks
                         and reply.fresh_since(since, time.monotonic())):
                     raise UploaderError("cache did not return fresh, complete, image-bound local CACHE_SEALED")
-            else:
+            elif args.command == "upload":
                 started = time.monotonic()
                 reply = uploader.start(args.target, body, args.mode, deadline)
                 if args.wait_ready:
@@ -447,7 +531,8 @@ def main():
         evidence.log("fatal", error=error)
         raise
     finally:
-        if node is not None:
+        connections.close()
+        if node is not None and not managed:
             node.close()
         evidence.finish(error)
 

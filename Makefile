@@ -120,6 +120,15 @@ OTA_UPLOAD_WAIT_READY ?= 0
 OTA_UPLOAD_ADMIN_ENABLED ?=
 OTA_UPLOAD_COMMAND = python3 scripts/ota_uploader.py \
 	--artifact-dir "$(OTA_LAB_ARTIFACT_DIR)" --timeout "$(OTA_UPLOAD_TIMEOUT)"
+OTA_DEPLOY_TRANSPORT ?= native
+OTA_DEPLOY_CLIENT_PORT ?=
+OTA_DEPLOY_CLIENT_DTR ?= 0
+OTA_DEPLOY_INSTALL_TIMEOUT ?= 300
+OTA_DEPLOY_LAB_FAST ?= 0
+OTA_DEPLOY_ROUTED_RETRY ?= 0
+OTA_DEVICE_PORT ?=
+OTA_DEVICE_DTR ?= 0
+OTA_DEVICE_TIMEOUT ?= 5
 OTA_SIGNED_LAB_MODE ?= $(OTA_UPLOAD_MODE)
 OTA_SIGNED_LAB_DUTY ?= $(OTA_UPLOAD_DUTY_MILLI_PERCENT)
 OTA_SIGNED_LAB_CHANNEL ?= $(OTA_UPLOAD_CHANNEL)
@@ -564,6 +573,50 @@ ota-lab-status: tmpdir
 
 ota-lab-commit: tmpdir
 	$(OTA_UPLOAD_COMMAND) commit --target "$(OTA_UPLOAD_TARGET)" --manifest "$(OTA_UPLOAD_MANIFEST)"
+
+.PHONY: ota-deploy test-ota-deploy ota-device-inspect
+ota-device-inspect:
+	@test -n "$(OTA_DEVICE_PORT)" || \
+	  { echo "Set OTA_DEVICE_PORT to an explicit /dev/serial/by-id companion anchor." >&2; exit 1; }
+	python3 scripts/ota_devices.py inspect --by-id "$(OTA_DEVICE_PORT)" --timeout "$(OTA_DEVICE_TIMEOUT)" \
+	  $(if $(filter 1,$(OTA_DEVICE_DTR)),--dtr)
+
+## One opt-in stage -> READY -> signed COMMIT -> native Installed operation.
+ota-deploy: tmpdir
+	@test -n "$(OTA_UPLOAD_IMAGE)" && test -n "$(OTA_UPLOAD_TARGET)" && test -n "$(OTA_UPLOAD_COUNTER)" || \
+	  { echo "Set OTA_UPLOAD_IMAGE, one OTA_UPLOAD_TARGET and an explicit OTA_UPLOAD_COUNTER above the target floor." >&2; exit 1; }
+ifeq ($(OTA_DEPLOY_TRANSPORT),native)
+	$(OTA_UPLOAD_COMMAND) deploy --image "$(OTA_UPLOAD_IMAGE)" \
+	  $(if $(strip $(OTA_UPLOAD_MANIFEST)),--manifest "$(OTA_UPLOAD_MANIFEST)") \
+	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" \
+	  $(foreach target,$(OTA_UPLOAD_TARGET),--target "$(target)") \
+	  $(if $(strip $(OTA_DEPLOY_CLIENT_PORT)),--client-port "$(OTA_DEPLOY_CLIENT_PORT)") \
+	  $(if $(filter 1,$(OTA_DEPLOY_CLIENT_DTR)),--client-dtr) \
+	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" \
+	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(OTA_UPLOAD_LEASE_MS)" \
+	  --duty-milli-percent "$(OTA_UPLOAD_DUTY_MILLI_PERCENT)" \
+	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" \
+	  $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) \
+	  $(if $(filter 1,$(OTA_DEPLOY_LAB_FAST)),--lab-fast) \
+	  $(if $(filter 1,$(OTA_DEPLOY_ROUTED_RETRY)),--routed-retry)
+else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
+	python3 scripts/ota_stock_companion.py deploy $(OTA_STOCK_ARGS) \
+	  --artifacts "$(OTA_LAB_ARTIFACT_DIR)" --image "$(OTA_UPLOAD_IMAGE)" \
+	  $(if $(strip $(OTA_UPLOAD_MANIFEST)),--manifest "$(OTA_UPLOAD_MANIFEST)") \
+	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" \
+	  --target "$(OTA_UPLOAD_TARGET)" --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" \
+	  --lease-ms "$(OTA_UPLOAD_LEASE_MS)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
+	  --normal-duty-percent "$$(python3 -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)')" \
+	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" \
+	  $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) \
+	  $(if $(filter 1,$(OTA_DEPLOY_LAB_FAST)),--lab-fast) \
+	  $(if $(filter 1,$(OTA_DEPLOY_ROUTED_RETRY)),--routed-retry)
+else
+	@echo "OTA_DEPLOY_TRANSPORT must be native or stock." >&2; exit 1
+endif
+
+test-ota-deploy: tmpdir
+	python3 -m unittest discover -s scripts/tests -p 'test_ota_deploy.py'
 
 ota-lab-abort: tmpdir
 	$(OTA_UPLOAD_COMMAND) abort --target "$(OTA_UPLOAD_TARGET)" --image "$(OTA_UPLOAD_IMAGE)"

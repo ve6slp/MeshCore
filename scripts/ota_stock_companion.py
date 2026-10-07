@@ -2,6 +2,9 @@
 """Host-managed, zero-hop OTA through an unchanged MeshCore 1.17.1 companion.
 
 upload stops at informational RF READY; commit is a separate signed operation.
+deploy combines those operations and waits for the full native lifecycle report:
+INSTALLED (8) and the candidate's confirmed floor, or failure/timeout. RF status
+is unsigned; even this result is a receiver report, not authenticated attestation.
 No CMD66, local staging, contact/key changes, bootloader commands or reset.
 SIGKILL cannot restore a stock radio: retain original-radio.json for restore.
 RF census has no signature or nonce: a post-poll observation is not authenticated
@@ -106,6 +109,10 @@ class Error(RuntimeError):
 
 
 class LeaseExpired(Error):
+    pass
+
+
+class DeadlineExpired(Error, TimeoutError):
     pass
 
 
@@ -258,7 +265,23 @@ class Candidate:
     total: int
 
     @classmethod
-    def build(cls, canonical, image, floor):
+    def build(cls, canonical, image, floor, *, board=None, role_id=None, counter=None):
+        if board is not None:
+            from ota_uploader import deploy_manifest
+            canonical = deploy_manifest(image, board, role_id, counter, canonical)
+            security_counter = struct.unpack_from(">I", canonical, 45)[0]
+            if not floor < security_counter:
+                raise Error("candidate counter must exceed the measured anti-rollback floor")
+            if board != "xiao_s3_wio":
+                address = struct.unpack_from(">I", canonical, 5)[0]
+                if len(image) < 8:
+                    raise Error("ordinary APP vector required")
+                stack, reset = struct.unpack_from("<II", image)
+                if (not 0x20000000 < stack <= 0x20040000 or stack % 8 or not reset & 1
+                        or not address <= (reset & ~1) < address + len(image)):
+                    raise Error("ordinary APP vector required; packages/boot images refused")
+            return cls(canonical, image, hashlib.sha256(canonical).digest(), security_counter,
+                       (len(image) + BLOCK - 1) // BLOCK)
         if len(canonical) != 59 or canonical[:5] != b"XN40\x00":
             raise Error("requires canonical59 XN40 ROLE0 companion APP, not ROLE1 cache")
         address, size = struct.unpack_from(">II", canonical, 5)
@@ -574,13 +597,13 @@ class Sender:
 
     def wait_until(self, when):
         if when >= self.deadline:
-            raise Error("campaign deadline expired")
+            raise DeadlineExpired("campaign deadline expired")
         if when > self.clock():
             self.sleep(when - self.clock())
 
     def room(self, seconds):
         if self.clock() + seconds >= self.deadline:
-            raise Error("campaign deadline expired")
+            raise DeadlineExpired("campaign deadline expired")
         if self.lease_end and self.clock() + seconds >= self.lease_end:
             raise LeaseExpired("direct lease operation margin exhausted")
 
@@ -625,7 +648,7 @@ class Sender:
             self.sleep(max(0.05, min(0.25, estimate / 2)))
         raise Error("no measured physical stock TX completion")
 
-    def census(self, first=0, retries=3, allow_pending=False):
+    def census(self, first=0, retries=3, allow_pending=False, post_commit=False):
         self.room(15)
         c, b = self.candidate, self.binding
         observer = self.rf_observer("census")
@@ -648,7 +671,7 @@ class Sender:
                     self.emit("census_retry", next_attempt=attempt + 1, first=first)
                 continue
             try:
-                report = self.parse_census(frame, first, allow_pending)
+                report = self.parse_census(frame, first, allow_pending, post_commit)
             except Error as exc:
                 self.emit("census_rejected", first=first, reason=str(exc))
                 raise
@@ -659,7 +682,7 @@ class Sender:
         self.emit("census_exhausted", first=first, attempts=retries)
         raise NoCensus("fresh RF census deadline/retries exhausted")
 
-    def parse_census(self, frame, first, allow_pending=False):
+    def parse_census(self, frame, first, allow_pending=False, post_commit=False):
         c, b = self.candidate, self.binding
         if len(frame) != 102 or frame[:1] != b"\x0b" or frame[1:33] != b.target or frame[33:65] != c.digest:
             raise Error("RF census target/full manifest mismatch or legacy status")
@@ -668,6 +691,24 @@ class Sender:
         bits = int.from_bytes(frame[67:83], "little")
         count = min(128, c.total - first)
         previous = self.previous.get(first)
+        if post_commit:
+            if (start != first or not 0 <= first < c.total or total != c.total or received > total
+                    or bits >> count or bits.bit_count() > received or counter != c.counter
+                    or generation != self.generation or generation < b.min_generation or known not in (0, 1)):
+                raise Error("post-COMMIT native status target/manifest/generation/geometry mismatch")
+            if lifecycle == 10:
+                raise Error("native FAILED: candidate installation failed or rolled back")
+            if lifecycle == 9:
+                raise Error("native ABORTED: candidate was not installed")
+            if (lifecycle not in (5, 6, 7, 8) or phase not in (3, 4)
+                    or received != total or bits != (1 << count) - 1
+                    or (known and floor not in (b.floor, c.counter))):
+                raise Error("invalid post-COMMIT native lifecycle/progress/floor")
+            if lifecycle == 8 and (known != 1 or floor != c.counter):
+                raise Error("native INSTALLED requires matching confirmed floor")
+            return {"first": first, "bits": bits, "received": received, "total": total,
+                    "generation": generation, "lifecycle": lifecycle, "phase": phase,
+                    "floor_known": bool(known), "confirmed_floor": floor}
         if lifecycle == 9:
             if not allow_pending or not self.reupload_enabled:
                 raise Error("pending ABORTED requires explicit ROOT-approved REUPLOAD; no auto-abort/clear")
@@ -798,7 +839,7 @@ class Sender:
                 raise Error("REUPLOAD requires generation+1 Receiving, never old-cache promotion")
         raise Error("REUPLOAD activation/Receiving deadline exhausted")
 
-    def upload(self):
+    def upload(self, *, ready_once=False):
         report = self.authorize()
         if report["lifecycle"] == 9:
             self.activate_prepared()
@@ -828,9 +869,10 @@ class Sender:
                 # Retain the window cursor across leases; restarting at zero can
                 # starve the tail of a real application with many bitmap windows.
                 first = first + 128 if first + 128 < self.candidate.total else 0
-                if len(ready_windows) == len(windows):
+                if ((ready_once and report["lifecycle"] == 5)
+                        or len(ready_windows) == len(windows)):
                     self.leave_direct()
-                    for window in windows:
+                    for window in ((0,) if ready_once else windows):
                         if self.census(window)["lifecycle"] != 5:
                             raise Error("READY lost after direct lease expiry")
                     self.emit("ready_observed_unsigned", generation=self.generation, total=self.candidate.total)
@@ -857,12 +899,44 @@ class Sender:
         for first in range(0, self.candidate.total, 128):
             if self.census(first)["lifecycle"] != 5:
                 raise Error("fresh READY required before separate signed COMMIT")
+        return self._send_commit()
+
+    def _send_commit(self):
         body = self.binding.target + self.candidate.digest + struct.pack(">I", self.candidate.counter)
         signature = self.stock.sign(COMMIT_DOMAIN + body, self.deadline)
         self.emit("commit_request", generation=self.generation, counter=self.candidate.counter)
         self.send(b"\x03" + body + signature)
         self.emit("commit_sent", tx_evidence="aggregate-counters", installation_confirmed=False)
         return self.receipt("signed-commit-aggregate-tx-observed-not-install-confirmed")
+
+    def wait_installed(self, install_timeout=300):
+        if not math.isfinite(install_timeout) or install_timeout <= 0:
+            raise Error("positive finite installation timeout required")
+        self.deadline = min(self.deadline, self.clock() + install_timeout)
+        try:
+            while self.clock() < self.deadline:
+                try:
+                    report = self.census(retries=1, post_commit=True)
+                except NoCensus:
+                    continue
+                self.emit("native_install_status", lifecycle=report["lifecycle"],
+                          generation=report["generation"], floor_known=report["floor_known"],
+                          confirmed_floor=report["confirmed_floor"], status_authenticated=False)
+                if report["lifecycle"] == 8:
+                    result = self.receipt("native-installed-reported-unsigned")
+                    result.update(native_installed=True, lifecycle=8,
+                                  confirmed_floor=report["confirmed_floor"], status_authenticated=False)
+                    return result
+        except DeadlineExpired as exc:
+            raise TimeoutError("installation timeout: no matching native INSTALLED report") from exc
+        raise TimeoutError("installation timeout: no matching native INSTALLED report")
+
+    def deploy(self, install_timeout=300):
+        if not math.isfinite(install_timeout) or install_timeout <= 0:
+            raise Error("positive finite installation timeout required")
+        self.upload(ready_once=True)
+        self._send_commit()
+        return self.wait_installed(install_timeout)
 
 
 @contextmanager
@@ -1023,7 +1097,7 @@ def termination_cleanup():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("operation", choices=("upload", "commit", "restore", "inspect"))
+    parser.add_argument("operation", choices=("upload", "commit", "deploy", "restore", "inspect"))
     parser.add_argument("--serial", required=True)
     parser.add_argument("--by-id", required=True)
     parser.add_argument("--by-path", help="explicit ROOT-bound physical anchor; required for short/duplicate CP2102 serial")
@@ -1034,6 +1108,10 @@ def main(argv=None):
     parser.add_argument("--artifacts", required=True, type=Path, help="exclusive new 0700 directory (including inspect); existing only for restore")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--image", type=Path, help="pure ordinary APP .bin only")
+    parser.add_argument("--board", choices=("xiao_nrf52840", "xiao_nrf52840_sense", "sensecap_solar_p1", "xiao_s3_wio"))
+    parser.add_argument("--role-id", type=int, choices=(0, 1))
+    parser.add_argument("--counter", type=int)
+    parser.add_argument("--install-timeout", type=float, default=300)
     parser.add_argument("--ready-receipt", type=Path)
     retirement = parser.add_mutually_exclusive_group()
     retirement.add_argument("--reupload", action="store_true", help="upload only; ROOT allow_reupload:true, generation learned only from fresh RF census")
@@ -1047,22 +1125,33 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.routed_retry:
         raise Error("routed-retry unsupported by the stock zero-hop-only adapter; no legacy fallback")
-    if args.lab_fast and args.operation != "upload":
-        raise Error("--lab-fast is an upload-only lab opt-in")
+    if args.lab_fast and args.operation not in ("upload", "deploy"):
+        raise Error("--lab-fast is an upload-only lab opt-in (including deploy)")
     binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)
-    if (args.reupload or args.reupload_generation is not None) and args.operation != "upload":
+    if (args.reupload or args.reupload_generation is not None) and args.operation not in ("upload", "deploy"):
         raise Error("explicit REUPLOAD is supported only by upload, never COMMIT/restore")
     binding.permit_reupload(args.reupload_generation, args.reupload)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise Error("positive finite campaign timeout required")
     candidate = None
     receipt = None
-    if args.operation in ("upload", "commit"):
-        if not args.manifest or not args.image or args.frequency_khz is None:
-            raise Error("upload/commit require manifest, ordinary APP image, direct frequency")
-        if args.image.suffix != ".bin" or not args.image.is_file() or not args.manifest.is_file():
+    if args.operation in ("upload", "commit", "deploy"):
+        if (not args.image or args.frequency_khz is None
+                or (args.operation != "deploy" and not args.manifest)):
+            raise Error("upload/commit/deploy require ordinary APP image and direct frequency; upload/commit also require manifest")
+        if (args.image.suffix != ".bin" or not args.image.is_file()
+                or (args.manifest is not None and not args.manifest.is_file())):
             raise Error("regular .bin APP and canonical59 manifest required; packages refused")
-        candidate = Candidate.build(args.manifest.read_bytes(), args.image.read_bytes(), binding.floor)
+        canonical = args.manifest.read_bytes() if args.manifest else None
+        if args.operation == "deploy":
+            if args.board is None or args.role_id is None or args.counter is None:
+                raise Error("deploy requires explicit --board, --role-id and --counter")
+            if not math.isfinite(args.install_timeout) or args.install_timeout <= 0:
+                raise Error("positive finite installation timeout required")
+            candidate = Candidate.build(canonical, args.image.read_bytes(), binding.floor,
+                                        board=args.board, role_id=args.role_id, counter=args.counter)
+        else:
+            candidate = Candidate.build(canonical, args.image.read_bytes(), binding.floor)
         binding.approve(candidate)
         if (not MIN_LEASE <= args.lease_ms <= 60000 or not 150000 <= args.frequency_khz <= 2500000
                 or args.frequency_khz == binding.normal[0] or not math.isfinite(args.normal_duty_percent)
@@ -1099,7 +1188,10 @@ def main(argv=None):
                                     args.frequency_khz, args.lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,
                                     event_callback=public_event, lab_fast=args.lab_fast)
-                    result = sender.upload() if args.operation == "upload" else sender.commit(receipt)
+                    if args.operation == "deploy":
+                        result = sender.deploy(args.install_timeout)
+                    else:
+                        result = sender.upload() if args.operation == "upload" else sender.commit(receipt)
             if result is not None:
                 private_write(directory / "result.json", result)
                 print(json.dumps(result, sort_keys=True))

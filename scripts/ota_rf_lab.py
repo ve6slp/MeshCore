@@ -14,6 +14,7 @@ software airtime diagnostics. It does not qualify PHY registers or a duty guaran
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -111,12 +112,35 @@ class Evidence:
 
 
 class LabSerial:
-    def __init__(self, name, path, evidence):
+    def __init__(self, name, path, evidence, *, no_reset=False, dtr: bool = False):
         if not str(path).startswith("/dev/serial/by-id/"):
             raise RuntimeError(f"refusing unstable device path: {path}")
         self.name = name
         self.path = path
         self.evidence = evidence
+        self.no_reset = no_reset
+        self.stream = None
+        self.fd = None
+        if no_reset:
+            try:
+                import serial
+            except ImportError:
+                raise RuntimeError("no-reset USB access requires pyserial") from None
+            self.stream = serial.Serial(port=None, baudrate=115200, timeout=0,
+                                        write_timeout=2.0, exclusive=True)
+            try:
+                self.stream.dtr = dtr
+                self.stream.rts = False
+                self.stream.port = str(path)
+                self.stream.open()
+                self.fd = self.stream.fileno()
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                evidence.log("serial_open", node=name, path=str(path),
+                             resolved=os.path.realpath(path), no_reset=True)
+            except BaseException:
+                self.close()
+                raise
+            return
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         attrs = termios.tcgetattr(self.fd)
         attrs[0] = 0
@@ -132,11 +156,20 @@ class LabSerial:
         evidence.log("serial_open", node=name, path=path, resolved=os.path.realpath(path))
 
     def close(self):
+        if getattr(self, "stream", None) is not None:
+            self.stream.close()
+            self.stream = None
+            self.fd = None
+            return
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
 
     def _write_bytes(self, frame):
+        if getattr(self, "no_reset", False):
+            if self.stream.write(frame) != len(frame):
+                raise ConnectionError(f"{self.name}: incomplete serial write")
+            return
         offset = 0
         while offset < len(frame):
             _, writable, _ = select.select([], [self.fd], [], 2.0)
@@ -175,8 +208,8 @@ def public_channel_info(frame):
 
 
 class FramedSerial(LabSerial):
-    def __init__(self, name, path, evidence):
-        super().__init__(name, path, evidence)
+    def __init__(self, name, path, evidence, *, no_reset=False, dtr: bool = False):
+        super().__init__(name, path, evidence, no_reset=no_reset, dtr=dtr)
         self.buffer = bytearray()
         self.pending = []
 
@@ -198,6 +231,8 @@ class FramedSerial(LabSerial):
             if len(self.buffer) < 3:
                 break
             length = self.buffer[1] | (self.buffer[2] << 8)
+            if getattr(self, "no_reset", False) and not 1 <= length <= MAX_SERIAL_FRAME_SIZE:
+                raise ValueError(f"{self.name}: invalid serial response length")
             if len(self.buffer) < 3 + length:
                 break
             payload = bytes(self.buffer[3:3 + length])
@@ -208,9 +243,14 @@ class FramedSerial(LabSerial):
     def poll(self, timeout=0.0):
         self.buffer.extend(self._read_bytes(timeout))
         for payload in self._extract():
+            if getattr(self, "no_reset", False) and len(self.pending) >= 256:
+                raise ValueError(f"{self.name}: serial response backlog overflow")
             self.pending.append((time.monotonic(), payload))
             fields = {"node": self.name, "length": len(payload), "code": payload[0] if payload else None}
-            if payload and payload[0] == RESP_CHANNEL_INFO:
+            if (getattr(self, "no_reset", False) and payload
+                    and payload[0] in (RESP_SELF_INFO, RESP_DEVICE_INFO)):
+                fields["redacted"] = True
+            elif payload and payload[0] == RESP_CHANNEL_INFO:
                 fields["redacted"] = True
                 try:
                     public = public_channel_info(payload)
@@ -233,6 +273,21 @@ class FramedSerial(LabSerial):
         raise TimeoutError(f"{self.name}: no frame with code {sorted(codes)}")
 
     def command(self, payload, expected=(RESP_OK, RESP_ERR), timeout=5.0):
+        if getattr(self, "no_reset", False):
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("serial command timeout must be finite and positive")
+            deadline = time.monotonic() + timeout
+            self.poll(0)
+            self.take_pending(set(expected))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.name}: serial command deadline expired")
+            self.stream.write_timeout = min(2.0, remaining)
+            self.write_frame(payload)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.name}: serial command deadline expired")
+            return self.wait_frame(set(expected), remaining)
         self.write_frame(payload)
         return self.wait_frame(set(expected), timeout)
 
@@ -348,9 +403,11 @@ class RepeaterSerial(LabSerial):
         raise TimeoutError(f"{self.name}: incomplete repeater ACL response")
 
 
-def app_info(node):
+def app_info(node, *, timeout=None):
     payload = bytes([CMD_APP_START]) + bytes(7) + b"ota-rf-lab"
-    frame = node.command(payload, expected=(RESP_SELF_INFO,))
+    options = {} if timeout is None else {"timeout": timeout}
+    expected = (RESP_SELF_INFO,) if timeout is None else (RESP_SELF_INFO, RESP_ERR)
+    frame = node.command(payload, expected=expected, **options)
     if len(frame) < 58:
         raise RuntimeError(f"{node.name}: short self-info frame")
     if frame[0] != RESP_SELF_INFO:
