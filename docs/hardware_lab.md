@@ -2216,7 +2216,14 @@ serial endpoints released. No post-RF review, retry or deadline extension was
 made. This is a host orchestration freshness failure, not new evidence about
 the native notification delay or RF reliability. The next distinct campaign
 needs less cross-call latency, not a weaker timing rule.
-The transmit fix remains unsigned and uninstalled; broad release gates remain open.
+That diagnostic workflow was superseded by the product's `make ota-deploy`
+command. A real update through the unchanged stock companion subsequently
+transferred all6668 blocks, sent signed COMMIT and received Installed with
+confirmed counter9. Unit41 now answers a normal device query as
+`ota-41-tx-conf06`; the stock radio settings were restored automatically.
+No installation observer, host reset or USB firmware flashing was used.
+ESP deployment software is implemented; the intended XIAO ESP32-S3R8/Wio
+SX1262 hardware is not available on this bench yet.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

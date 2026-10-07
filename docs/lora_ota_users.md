@@ -107,11 +107,23 @@ No USB observer of the remote target is required; these tools do not invent
 fields absent from the receiver protocol. Run host behavior tests with
 `make test-ota-deploy`.
 
-## Current availability: not ready for production use
+## Current availability
 
-LoRa OTA is under active development and is **not** a supported way to update
-your node's firmware today. Treat everything below as a preview of an
-in-progress feature, not a how-to.
+LoRa OTA is experimental and requires an OTA-enabled receiver and its compatible
+recovery backend. The one-command workflow above has now updated nRF unit41
+over LoRa through an unchanged stock companion: the receiver reported Installed
+at counter9, and a normal device query returned `ota-41-tx-conf06`. The stock
+radio settings were restored automatically. No diagnostic observer, host reset
+or USB firmware flashing was used.
+
+The ESP deployment path supports XIAO ESP32-S3R8 with Wio SX1262, but that
+hardware is not available on this bench yet. ESP hardware installation remains
+untested; the software command and platform backend are implemented.
+
+### Earlier lab development history
+
+The following records earlier diagnostic attempts. Their approval, observer
+and evidence procedures are not prerequisites for `make ota-deploy`.
 
 The supervised nRF unit41 has completed three full signed LoRa updates through
 an unchanged stock1.17.1 companion. The first two established actual new firmware,
@@ -345,7 +357,8 @@ The separate correction is now independently source-qualified, including the
 real adapter dispatch and a read-only check of the genuine original history.
 Fresh workflow helpers are ready before policy time. This creates no hardware
 permission; fresh admissions and strict postinstall checks are still required.
-The transmit fix remains unsigned and uninstalled.
+That diagnostic workflow was superseded by the one-command deployment above,
+which has installed the transmit fix.
 Fresh admissions then passed userdata and timed baseline checks. The corrected
 adapter reached both ordinary advert commands and verified both signatures,
 but native acceptance was not observed at41 within the required window.

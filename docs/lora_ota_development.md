@@ -1552,9 +1552,14 @@ This is orchestration latency at the pre-execution freshness gate, not an
 RF/native delay measurement. A distinct campaign needs faster explicit stage
 transitions while preserving independent reviews and the existing deadlines.
 No RF cause, continuous health, installation or broader release gate is claimed.
-The transmit-fixed healthy APP is still unsigned and uninstalled. Source
-qualification, baseline readbacks and signing do not establish autonomous
-rollback or continuous radio reliability.
+The diagnostic workflow was subsequently replaced with `make ota-deploy`,
+without its per-stage approval/history/observer requirements. The command
+completed a real LoRa update of nRF unit41 to `ota-41-tx-conf06`: all6668 blocks
+reached READY, signed COMMIT was sent, and the receiver reported Installed with
+confirmed counter9. A normal device query returned the new firmware version;
+the unchanged stock sender restored its radio settings. No host reset or USB
+firmware transfer was used. ESP deployment software is implemented, but the
+intended XIAO ESP32-S3R8/Wio SX1262 hardware is not available yet.
 The new observed failed-trial return does not establish every internal
 transition or the broader platform/mode acceptance gates.
 ESP32 uses vendor slot states, an independent RTC watchdog and late
