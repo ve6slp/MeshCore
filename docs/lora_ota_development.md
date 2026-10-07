@@ -1533,8 +1533,24 @@ Actual read-only startup passed genuine preflight; two separate client calls
 returned the same preloaded parent instance and exact product/prestage bindings.
 Graceful shutdown completed with private write-once lifecycle receipts and no
 execution runtime, policy, ROOT decision or hardware-stage ledger created.
-Preparation/qualification is complete. Separate execution authorization and
-fresh admissions remain outstanding; no hardware capture has followed.
+Preparation/qualification is complete. Autonomous lab testing was subsequently
+authorized, without waiving fresh independent ROOT admissions.
+One execution session passed guarded current userdata readbacks in1.700s:
+the body matched the original, only the two allowed known-stock timestamps
+changed, core errors were0, floor4/counter4 and counter8/generation18 were
+unchanged, and sampled normal radio health had no fault growth (2->2).
+Independent baseline review completed at18.595s after capture and peer
+admission at26.863s. The separately invoked peer capture failed the unchanged
+`fresh-bounded-capture` guard before `Execution.execute(peer)`: the baseline
+was then older than30s. No ordinary RF command, timing instrumentation,
+peer-start ledger, peer receipt or event chunk came from this session.
+The parent and operator preserved terminal failure receipts; client/server
+exited2 and both serial endpoints were released. The exact entry age was not
+persisted, so no more precise rejection time is claimed. No post-RF review,
+retry, receipt promotion or timing waiver followed.
+This is orchestration latency at the pre-execution freshness gate, not an
+RF/native delay measurement. A distinct campaign needs faster explicit stage
+transitions while preserving independent reviews and the existing deadlines.
 No RF cause, continuous health, installation or broader release gate is claimed.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous

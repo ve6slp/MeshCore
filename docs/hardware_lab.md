@@ -2199,9 +2199,24 @@ Actual read-only startup loaded the genuine backend; two separate client calls
 returned the same preloaded parent instance and exact qualified product/prestage
 pins. The service stopped cleanly, with private write-once ready/stopped receipts
 and no execution runtime, policy, ROOT decision or hardware-stage ledger created.
-Preparation and qualification are complete. No hardware capture or installation
-has occurred; execution still needs separate authorization and fresh admissions.
-The transmit fix remains unsigned and uninstalled.
+Preparation and qualification are complete. The user subsequently authorized
+autonomous lab testing; fresh, separate ROOT admissions still apply.
+The first execution session completed guarded current-state/userdata readbacks
+in1.700s. The original userdata body was identical, with only the two permitted
+known-stock contact timestamps changed. Core errors were0, floor4/counter4 and
+the retained counter8/generation18 session were unchanged, and sampled normal
+radio health held with lifetime faults2->2.
+Independent baseline review was admitted18.595s after capture completion;
+peer admission was materialized at26.863s. The separate peer capture then
+failed `fresh-bounded-capture`: its pre-execution check found the baseline older
+than30s. Neither the ordinary RF collector nor timing instrumentation started;
+no peer-start ledger, peer receipt or timing event chunks were created.
+The consumed execution stopped with exit2, private terminal receipts and both
+serial endpoints released. No post-RF review, retry or deadline extension was
+made. This is a host orchestration freshness failure, not new evidence about
+the native notification delay or RF reliability. The next distinct campaign
+needs less cross-call latency, not a weaker timing rule.
+The transmit fix remains unsigned and uninstalled; broad release gates remain open.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves
 the signed inner authority and native same-attempt deduplication. Attempts

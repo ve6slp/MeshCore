@@ -302,8 +302,16 @@ or firmware installation has followed this preparation.
 The final local operator/decision interface is now independently source-qualified
 and demonstrated in read-only mode across separate client calls. Preparation is
 complete, without creating policy or hardware permissions.
-Executing the bounded diagnostic still requires a separate decision and fresh
-admissions; the transmit fix remains unsigned and uninstalled.
+Autonomous lab testing was subsequently authorized, with fresh independent
+admissions retained. The first execution passed current-state and userdata
+readbacks: the userdata body was preserved, with only two permitted contact
+timestamp changes and no new faults during those reads.
+The separate RF step was refused before sending because its baseline had
+aged beyond30 seconds during the approval/capture sequence. No new RF timing
+result or firmware installation came from this attempt. The failed session
+is closed and its evidence preserved; the next distinct campaign must reduce
+host orchestration latency without relaxing the timing rule.
+The transmit fix remains unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
