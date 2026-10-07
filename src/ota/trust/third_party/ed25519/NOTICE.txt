@@ -1,0 +1,35 @@
+Vendored third-party code: Ed25519 signature verification
+===========================================================
+
+Source: https://github.com/orlp/ed25519 (a maintained fork of
+floodyberry/ed25519-donna), commit as of 2024.
+
+License: zlib license (see LICENSE in this directory). Copyright (c)
+2015 Orson Peters <orsonpeters@gmail.com>.
+
+Files vendored here: ed25519.h, fe.c/fe.h, fixedint.h, ge.c/ge.h,
+precomp_data.h, sc.c/sc.h, sha512.c/sha512.h, verify.c, sign.c,
+keypair.c.
+
+The firmware/production code path in this subsystem
+(Ed25519SignatureVerifier, DescriptorVerifier) only ever calls
+`ed25519_verify` and its transitive dependencies (field/group/scalar
+arithmetic and SHA-512); it never signs or generates keys, since a
+device only ever needs to verify signatures produced elsewhere.
+
+`sign.c` and `keypair.c` are additionally vendored (unmodified from
+upstream) purely as *test tooling*: test/test_lora_ota_trust uses
+`ed25519_create_keypair` + `ed25519_sign` to construct genuine,
+real-crypto signed image descriptors for exercising
+DescriptorVerifier's success and tamper-detection paths. This is a
+real Ed25519 sign/verify round trip, not a mock -- it deliberately
+avoids "pretending" a fake stand-in is cryptographic. The upstream
+seed-generation (`seed.c`, OS RNG) and key-exchange (`key_exchange.c`,
+`add_scalar.c`) sources are still intentionally NOT vendored, since
+tests supply their own fixed, deterministic 32-byte seeds and have no
+need for X25519 key exchange.
+
+This code is unmodified from upstream except for path-qualified
+`#include` directives where needed for this repository's build layout.
+Correctness is pinned by the RFC 8032 known-answer test vectors in
+test/test_lora_ota_trust.

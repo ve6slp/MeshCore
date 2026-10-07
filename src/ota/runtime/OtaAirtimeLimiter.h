@@ -1,0 +1,198 @@
+#pragma once
+
+// OTA rolling/sliding-window airtime limiter.
+//
+// - Uses a fixed-capacity (no heap) ring buffer of same-category usage
+//   buckets spanning at most 15 seconds from their first completion.
+//   A bucket expires only after its latest completion leaves the window;
+//   this conservatively retains earlier charges without refreshing a
+//   bucket indefinitely or imposing a per-packet accounting capacity cap.
+// - admits stored (still-valid) usage plus the prospective full duration of
+//   a new transmission before allowing it, never counting a transmission
+//   until it has actually happened (two-step canAdmit()/recordUsage()).
+// - tracks Control/Repair/Relay categories.
+// - clock arithmetic is wrap-safe: all elapsed-time comparisons use unsigned
+//   subtraction, which is correct modulo 2^32 as long as elapsed time
+//   itself never exceeds ~24 days (window sizes here are on the order of an
+//   hour, far below that bound).
+// - regulatory admissibility and mesh normal-traffic precedence are both
+//   supplied as explicit inputs to canAdmit(), not baked into internal
+//   state, so this module stays agnostic to *why* either gate fired.
+
+#include <cstdint>
+#include <cstddef>
+#include <array>
+#include "../protocol/OtaWireTypes.h"
+
+namespace meshcore {
+namespace ota {
+namespace runtime {
+
+struct OtaAirtimeDecisionInput {
+  // Independent regulatory-compliance verdict (e.g. duty-cycle/LBT rules
+  // for the operating region). false unconditionally denies admission
+  // regardless of remaining budget.
+  bool regulatoryAllowed = true;
+  // True while real (non-OTA) mesh traffic should take precedence. When
+  // true, all OTA categories yield, including Control.
+  bool normalTrafficActive = false;
+};
+
+class OtaAirtimeLimiter {
+public:
+  static constexpr size_t kMaxEntries = 256;
+  static constexpr uint32_t kCoalescingBucketMs = 15000;
+  static constexpr uint32_t kDefaultWindowMs = 3600000;  // 1 hour
+  static constexpr uint32_t kDefaultBudgetMs = 72000;    // 2% of 1 hour
+
+  explicit OtaAirtimeLimiter(uint32_t windowMs = kDefaultWindowMs, uint32_t budgetMs = kDefaultBudgetMs)
+      : windowMs_(windowMs), budgetMs_(budgetMs) {}
+
+  uint32_t windowMs() const { return windowMs_; }
+  uint32_t budgetMs() const { return budgetMs_; }
+
+  void retune(uint32_t windowMs, uint32_t budgetMs) {
+    windowMs_ = windowMs;
+    budgetMs_ = budgetMs;
+  }
+
+  // Sum of still-valid (non-expired as of nowMs) recorded usage, across all
+  // categories, saturating at UINT32_MAX. Admission uses the full 64-bit sum.
+  uint32_t storedUsageMs(uint32_t nowMs) const {
+    return boundedUsage(storedUsageMsFiltered(nowMs, false, protocol::OtaAirtimeCategory::Control));
+  }
+
+  // Sum of still-valid recorded usage restricted to one category.
+  uint32_t storedUsageMs(uint32_t nowMs, protocol::OtaAirtimeCategory category) const {
+    return boundedUsage(storedUsageMsFiltered(nowMs, true, category));
+  }
+
+  // True iff admitting `prospectiveDurationMs` more of `category` traffic
+  // right now would keep (still-valid stored usage + prospective) within
+  // budget, AND the regulatory input allows it, AND normal mesh traffic
+  // precedence (if asserted) does not block this category. When the ring
+  // is full, coalescence must also fit through the prospective completion:
+  // call at TX start with a duration covering the delay until completion.
+  bool canAdmit(uint32_t nowMs, protocol::OtaAirtimeCategory category, uint32_t prospectiveDurationMs,
+                const OtaAirtimeDecisionInput& decision) const {
+    if (!decision.regulatoryAllowed) return false;
+    // Ready normal (non-OTA) mesh traffic takes absolute precedence over
+    // ALL OTA airtime categories, Control included. An earlier version
+    // exempted Control here so that OTA session-control frames (auth,
+    // receipts, lease negotiation, census, etc.) could preempt ready
+    // normal traffic; that violates the "normal traffic is never starved
+    // by OTA" guarantee this limiter exists to enforce.
+    if (decision.normalTrafficActive) return false;
+    if (!hasAccountingCapacity(nowMs, category, prospectiveDurationMs)) return false;
+
+    const uint64_t used = storedUsageMsFiltered(nowMs, false, category);
+    const uint64_t prospective = used + static_cast<uint64_t>(prospectiveDurationMs);
+    return prospective <= static_cast<uint64_t>(budgetMs_);
+  }
+
+  // Records actual usage after a transmission has happened. Callers should
+  // only invoke this after a prior canAdmit() returned true for a duration
+  // covering `durationMs` and the elapsed time until completion.
+  // Fails closed (returns false, no state mutated)
+  // if the fixed-capacity ring is full of still-valid buckets and none can
+  // be coalesced or reclaimed -- this deliberately under-admits rather than
+  // silently losing accounted usage.
+  bool recordUsage(uint32_t nowMs, protocol::OtaAirtimeCategory category, uint32_t durationMs) {
+    const size_t coalesced = coalescingEntry(nowMs, category, durationMs);
+    if (coalesced != kMaxEntries) {
+      Entry& entry = entries_[coalesced];
+      entry.durationMs += durationMs;
+      entry.timestampMs = nowMs;
+      return true;
+    }
+    if (count_ < kMaxEntries) {
+      size_t idx = (head_ + count_) % kMaxEntries;
+      entries_[idx] = Entry{nowMs, nowMs, durationMs, category, true};
+      ++count_;
+      return true;
+    }
+    // Coalescence can reorder expiry across categories, so an expired
+    // slot need not be at the head. Never overwrite still-valid usage.
+    const size_t reclaimed = reclaimableEntry(nowMs);
+    if (reclaimed != kMaxEntries) {
+      entries_[reclaimed] = Entry{nowMs, nowMs, durationMs, category, true};
+      head_ = (reclaimed + 1) % kMaxEntries;
+      return true;
+    }
+    return false;
+  }
+
+private:
+  struct Entry {
+    // Never refreshed: completions may join through firstTimestampMs + 15s.
+    uint32_t firstTimestampMs = 0;
+    uint32_t timestampMs = 0;
+    uint32_t durationMs = 0;
+    protocol::OtaAirtimeCategory category = protocol::OtaAirtimeCategory::Control;
+    bool valid = false;
+  };
+
+  bool isExpired(const Entry& e, uint32_t nowMs) const {
+    // Wrap-safe: relies on unsigned modulo-2^32 subtraction.
+    const uint32_t elapsed = nowMs - e.timestampMs;
+    return elapsed > windowMs_;
+  }
+
+  size_t coalescingEntry(uint32_t nowMs, protocol::OtaAirtimeCategory category,
+                         uint32_t durationMs, uint32_t completionDelayMs = 0) const {
+    for (size_t i = count_; i > 0; --i) {
+      const size_t idx = (head_ + i - 1) % kMaxEntries;
+      const Entry& e = entries_[idx];
+      if (!e.valid || e.category != category || isExpired(e, nowMs)) continue;
+      const uint64_t span = static_cast<uint32_t>(nowMs - e.firstTimestampMs);
+      if (span + completionDelayMs > kCoalescingBucketMs) continue;
+      if (static_cast<uint64_t>(e.durationMs) + durationMs > UINT32_MAX) continue;
+      return idx;
+    }
+    return kMaxEntries;
+  }
+
+  size_t reclaimableEntry(uint32_t nowMs) const {
+    for (size_t i = 0; i < count_; ++i) {
+      const size_t idx = (head_ + i) % kMaxEntries;
+      const Entry& e = entries_[idx];
+      if (!e.valid || isExpired(e, nowMs)) return idx;
+    }
+    return kMaxEntries;
+  }
+
+  bool hasAccountingCapacity(uint32_t nowMs, protocol::OtaAirtimeCategory category,
+                             uint32_t prospectiveDurationMs) const {
+    if (count_ < kMaxEntries) return true;
+    if (reclaimableEntry(nowMs) != kMaxEntries) return true;
+    // A full ring must also have room at completion, not just at admission.
+    // The prospective full airtime must cover the completion delay.
+    return coalescingEntry(nowMs, category, prospectiveDurationMs, prospectiveDurationMs) != kMaxEntries;
+  }
+
+  static uint32_t boundedUsage(uint64_t total) {
+    return total > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(total);
+  }
+
+  uint64_t storedUsageMsFiltered(uint32_t nowMs, bool filterByCategory, protocol::OtaAirtimeCategory category) const {
+    uint64_t total = 0;
+    for (size_t i = 0; i < count_; ++i) {
+      const Entry& e = entries_[(head_ + i) % kMaxEntries];
+      if (!e.valid) continue;
+      if (isExpired(e, nowMs)) continue;
+      if (filterByCategory && e.category != category) continue;
+      total += e.durationMs;
+    }
+    return total;
+  }
+
+  std::array<Entry, kMaxEntries> entries_{};
+  size_t head_ = 0;
+  size_t count_ = 0;
+  uint32_t windowMs_;
+  uint32_t budgetMs_;
+};
+
+} // namespace runtime
+} // namespace ota
+} // namespace meshcore
