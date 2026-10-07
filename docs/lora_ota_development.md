@@ -1518,14 +1518,23 @@ before CMD7. Missing, stale, mismatched and unrelated changes fail closed;
 late native failures still withhold post-RF review.
 All160 frozen pins remain unchanged. Parent unprimed genuine29 read-only
 preflight and core helper prestaging passed without creating policy or
-authority or opening hardware ports. The backend currently exposes JSONL
+authority or opening hardware ports. The backend initially exposed JSONL
 stdin/stdout only, without a cross-call client or production ROOT decision-authoring
 command; MODEL decision authoring is not production authority.
-A thin private local operator frontend is being prepared before any policy or
+A thin private local operator frontend was required before any policy or
 timed capture. It must retain the actual preloaded parent, provide independent
 write-once reviewed decisions and keep authoring, approval and capture separate,
-without adding acceptance logic or changing guards. Full preparation remains
-incomplete; separate execution authorization and fresh admissions are outstanding.
+without adding acceptance logic or changing guards.
+The frontend now passes six actual RPC/parent/native cases in both agent and
+independent parent execution, with171 frozen pins unchanged. It provides a
+private same-UID retained local server, bounded clients and separate explicit
+reviewed decision authoring, approval and capture without changing backend guards.
+Actual read-only startup passed genuine preflight; two separate client calls
+returned the same preloaded parent instance and exact product/prestage bindings.
+Graceful shutdown completed with private write-once lifecycle receipts and no
+execution runtime, policy, ROOT decision or hardware-stage ledger created.
+Preparation/qualification is complete. Separate execution authorization and
+fresh admissions remain outstanding; no hardware capture has followed.
 No RF cause, continuous health, installation or broader release gate is claimed.
 The transmit-fixed healthy APP is still unsigned and uninstalled. Source
 qualification, baseline readbacks and signing do not establish autonomous

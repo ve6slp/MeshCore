@@ -2188,12 +2188,19 @@ including either single field. Missing, stale, mismatched or unrelated changes
 are refused; late native events remain terminal failures.
 All160 frozen pins remain unchanged. Parent genuine29 read-only preflight and
 core helper prestaging passed without policy, authority or hardware ports.
-The final operator interface is not yet ready: the backend provides JSONL
-stdin/stdout, but lacks a cross-call client and production ROOT decision-authoring
-command. A thin private local frontend is being prepared, keeping decision
-authoring, approval and capture separate. Preparation remains incomplete until
-that interface is qualified. A separate execution decision and fresh admissions
+The final operator interface initially lacked a cross-call client and production
+ROOT decision-authoring command beyond JSONL stdin/stdout. A thin private local
+frontend was required, keeping decision authoring, approval and capture separate.
+A separate execution decision and fresh admissions
 are still required. This is not evidence of the RF delay's cause or an installation.
+The frontend is now independently source-qualified: agent and parent each
+passed six real RPC/parent/native cases, with171 frozen pins unchanged.
+Actual read-only startup loaded the genuine backend; two separate client calls
+returned the same preloaded parent instance and exact qualified product/prestage
+pins. The service stopped cleanly, with private write-once ready/stopped receipts
+and no execution runtime, policy, ROOT decision or hardware-stage ledger created.
+Preparation and qualification are complete. No hardware capture or installation
+has occurred; execution still needs separate authorization and fresh admissions.
 The transmit fix remains unsigned and uninstalled.
 
 **Routed retry software milestone:** the opt-in per-attempt wrapper preserves

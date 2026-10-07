@@ -299,8 +299,11 @@ and read-only prestaged. Unchanged userdata and either
 permitted timestamp change still require fresh independent review.
 Execution needs a separate decision and fresh permissions; no hardware capture
 or firmware installation has followed this preparation.
-The final local operator/decision interface is still being prepared, so the
-complete diagnostic plan is not ready for execution yet.
+The final local operator/decision interface is now independently source-qualified
+and demonstrated in read-only mode across separate client calls. Preparation is
+complete, without creating policy or hardware permissions.
+Executing the bounded diagnostic still requires a separate decision and fresh
+admissions; the transmit fix remains unsigned and uninstalled.
 
 A separate private floor4 diagnostic rollback observer profile is wired to
 the unchanged ordered-trial/return observer, with bounded disconnect handling.
