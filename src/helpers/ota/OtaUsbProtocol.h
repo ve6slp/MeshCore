@@ -43,7 +43,13 @@ constexpr uint8_t kReplyCode = 30;
 // detect a future incompatible revision of this fixed layout without
 // guessing from reply length alone. ABI2 keeps ABI1 field offsets and
 // appends generationBE32; ABORT now requires an explicit generation.
-constexpr uint8_t kAbiVersion = 2;
+// ABI3 keeps ABI2 offsets and appends beginNonce16 + wireVersion; COMMIT
+// requests carry generationBE32 + beginNonce16 and sign commit/v2.
+constexpr uint8_t kAbiVersion = 3;
+// Shared RF/USB OTA wire generation: nonce-bound COMMIT, 123B census
+// report and challenge-bound direct leases.
+constexpr uint8_t kOtaWireVersion = 3;
+constexpr size_t kBeginNonceBytes = 16;
 
 constexpr size_t kPubKeyBytes = 32;
 constexpr size_t kHashBytes = 32;
@@ -60,7 +66,7 @@ enum class UsbOtaOp : uint8_t {
   CacheSeal       = 0x12, // no body                                      => 2B total
   AddTarget       = 0x13, // targetPubKey32                                => 34B total
   Start           = 0x14, // legacy14B; direct profile=>15B; on-mesh profile0/retry flag1=>16B
-  Commit          = 0x15, // targetPubKey32 + manifestHash32 + counterBE32 => 70B total
+  Commit          = 0x15, // target32 + manifestHash32 + counterBE32 + generationBE32 + beginNonce16 => 90B total
   Abort           = 0x16, // targetPubKey32 + imageHash32 + generationBE32 => 70B total
   Status          = 0x17, // targetPubKey32 (all-zero => local cache)      => 34B total
   SetContactAdmin = 0x18, // contactPubKey32 + enabledU8                   => 35B total
@@ -126,7 +132,7 @@ inline bool parseStartProfile(const uint8_t* command, size_t len, OtaDirectProfi
   bool retry_attempts;
   return len != kStartRetryTotalBytes && parseStartOptions(command, len, profile, retry_attempts);
 }
-constexpr size_t kCommitTotalBytes          = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70
+constexpr size_t kCommitTotalBytes          = 2 + kPubKeyBytes + kHashBytes + 4 + 4 + kBeginNonceBytes; // 90
 constexpr size_t kAbortTotalBytes           = 2 + kPubKeyBytes + kHashBytes + 4;                  // 70
 constexpr size_t kStatusTotalBytes          = 2 + kPubKeyBytes;                                   // 34
 constexpr size_t kSetContactAdminTotalBytes = 2 + kPubKeyBytes + 1;                                // 35
@@ -169,7 +175,7 @@ constexpr uint8_t kReplyFlagRemote        = 0x02;
 // Sentinel "no snapshot age known" value for reply bytes [78..82).
 constexpr uint32_t kStatusAgeUnknown = 0xFFFFFFFFu;
 
-constexpr size_t kReplyBytes = 90;
+constexpr size_t kReplyBytes = 107;
 
 inline void putBE16(uint8_t* out, uint16_t v) {
   out[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
@@ -215,6 +221,8 @@ struct UsbOtaReply {
   uint32_t statusAgeMs = kStatusAgeUnknown;
   uint32_t retryAfterMs = 0;
   uint32_t generation = 0; // BE32 at byte 86; the durable candidate sessionId.
+  uint8_t beginNonce[kBeginNonceBytes] = {0}; // bytes 90..105; COMMIT must echo it.
+  uint8_t wireVersion = 0; // byte 106; kOtaWireVersion when the reported node is nonce-bound.
 
   // Sets this reply to the canonical "no snapshot" shape required by the
   // contract: flags bit0 clear, phase Unknown, hash/counts/counter/generation zero,
@@ -227,6 +235,7 @@ struct UsbOtaReply {
     totalBlocks = 0;
     counter = 0;
     generation = 0;
+    std::memset(beginNonce, 0, sizeof(beginNonce));
     statusAgeMs = kStatusAgeUnknown;
   }
 };
@@ -251,6 +260,8 @@ inline size_t encodeUsbOtaReply(const UsbOtaReply& input, uint8_t* out) {
   putBE32(&out[78], reply.statusAgeMs);
   putBE32(&out[82], reply.retryAfterMs);
   putBE32(&out[86], reply.generation);
+  std::memcpy(&out[90], reply.beginNonce, kBeginNonceBytes);
+  out[106] = reply.wireVersion;
   return kReplyBytes;
 }
 
@@ -278,21 +289,53 @@ inline size_t encodeUsbOtaReply(const UsbOtaReply& input, uint8_t* out) {
 // must stay consistent end-to-end: whatever hash is signed here is the
 // SAME hash persisted and later checked against inbound background
 // frames before suppression is lifted.
-constexpr char kCommitDomain[] = "MeshCore/OTA/commit/v1";
+// v2 additionally binds generationBE32 and the durable per-BEGIN nonce,
+// so a COMMIT captured for one attempt can never authorize a later
+// ABORT+reupload of the identical image (no v1 fallback exists).
+constexpr char kCommitDomain[] = "MeshCore/OTA/commit/v2";
 constexpr size_t kCommitDomainLen = sizeof(kCommitDomain) - 1; // drop implicit NUL from the string literal.
-constexpr size_t kCommitSignedBytes = kCommitDomainLen + kPubKeyBytes + kHashBytes + 4;
+constexpr size_t kCommitSignedBytes = kCommitDomainLen + kPubKeyBytes + kHashBytes + 4 + 4 + kBeginNonceBytes; // 110
 
 // Fills `out` (>= kCommitSignedBytes) with the exact byte sequence that
 // must be Ed25519-signed/verified for a COMMIT -- domain || target32 ||
-// manifestHash32 || counterBE32.
+// manifestHash32 || counterBE32 || generationBE32 || beginNonce16.
 inline size_t buildCommitSignedMessage(const uint8_t target[kPubKeyBytes], const uint8_t manifestHash[kHashBytes],
-                                       uint32_t counter, uint8_t* out) {
+                                       uint32_t counter, uint32_t generation,
+                                       const uint8_t beginNonce[kBeginNonceBytes], uint8_t* out) {
   size_t i = 0;
   std::memcpy(&out[i], kCommitDomain, kCommitDomainLen); i += kCommitDomainLen;
   std::memcpy(&out[i], target, kPubKeyBytes); i += kPubKeyBytes;
   std::memcpy(&out[i], manifestHash, kHashBytes); i += kHashBytes;
   putBE32(&out[i], counter); i += 4;
+  putBE32(&out[i], generation); i += 4;
+  std::memcpy(&out[i], beginNonce, kBeginNonceBytes); i += kBeginNonceBytes;
   return i;
+}
+
+// An all-zero nonce marks legacy/unbound candidate state; never signable.
+inline bool beginNonceBound(const uint8_t nonce[kBeginNonceBytes]) {
+  uint8_t any = 0;
+  for (size_t i = 0; i < kBeginNonceBytes; ++i) any |= nonce[i];
+  return any != 0;
+}
+
+struct UsbCommitRequest {
+  const uint8_t* target = nullptr;
+  const uint8_t* manifestHash = nullptr;
+  uint32_t counter = 0;
+  uint32_t generation = 0;
+  const uint8_t* beginNonce = nullptr;
+};
+
+inline bool parseCommitRequest(const uint8_t* command, size_t len, UsbCommitRequest& out) {
+  if (!command || len != kCommitTotalBytes || command[0] != kCommand ||
+      command[1] != static_cast<uint8_t>(UsbOtaOp::Commit)) return false;
+  out.target = command + 2;
+  out.manifestHash = command + 2 + kPubKeyBytes;
+  out.counter = getBE32(command + 2 + kPubKeyBytes + kHashBytes);
+  out.generation = getBE32(command + 6 + kPubKeyBytes + kHashBytes);
+  out.beginNonce = command + 10 + kPubKeyBytes + kHashBytes;
+  return true;
 }
 
 // ABORT's own domain (distinct from COMMIT's, deliberately: an admin's

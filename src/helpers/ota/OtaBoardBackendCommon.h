@@ -1282,22 +1282,36 @@ private:
     memset(sequences, 0, sizeof(sequences));
     uint32_t valid_count = 0;
     uint8_t latest_phase = 0;
+    // Match load(): an exact reset tombstone supersedes every other slot.
+    bool own_reset = false;
+    for (uint32_t offset = 0; offset < Store::kSectorBytes && !own_reset; offset += sizeof(bytes)) {
+      if (!::ota::platform::isOk(records.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
+      own_reset = Store::classifyRecord(bytes) == Store::RecordClass::Tombstone;
+    }
     for (uint32_t offset = 0; offset < Store::kSectorBytes; offset += sizeof(bytes)) {
       if (!::ota::platform::isOk(records.read(offset, bytes, sizeof(bytes)))) return Result::IoError;
       hash.update(bytes, sizeof(bytes));
       if (blank(bytes, sizeof(bytes))) { found_blank = true; continue; }
+      if (own_reset) { needs_reset = true; continue; }
       // Match readSlot(): ignored torn bodies cannot supply ownership or phase.
+      // v1 keeps CRC@184/marker@188; v2 adds nonce16 then CRC@200/marker@204.
+      const bool legacy = bytes[4] == Store::kLegacyVersion && !bytes[5];
+      const uint32_t crc_at = legacy ? Store::kLegacyCrcOffset : Store::kCrcOffset;
+      const uint32_t marker_at = crc_at + 4u;
       if (le32(bytes) != Store::kMagic ||
-          le32(bytes + 184) != ::ota::storage::Crc32::computeFinalized(bytes, 184)) {
+          le32(bytes + crc_at) != ::ota::storage::Crc32::computeFinalized(bytes, crc_at)) {
+        // Marked corruption may hide newer (e.g. ABORTED) state; never reset past it.
+        const auto kind = Store::classifyRecord(bytes);
+        if (kind == Store::RecordClass::Unexplained) return Result::InvalidCache;
         needs_reset = true;
         continue;
       }
       const uint8_t phase = bytes[12] & 0x7f;
-      if (bytes[4] != Store::kVersion || bytes[5] ||
+      if ((!legacy && (bytes[4] != Store::kVersion || bytes[5])) ||
           bytes[6] != (Store::kRecordBytes & 0xff) || bytes[7] != (Store::kRecordBytes >> 8) ||
           !(bytes[12] & 0x80) || phase > uint8_t(Store::Phase::Failed) || phase == uint8_t(Store::Phase::Committed) ||
-          !le32(bytes + 8) || (le32(bytes + 188) & Store::kCommitMarker) != Store::kCommitMarker ||
-          !blank(bytes + 192, sizeof(bytes) - 192)) return Result::InvalidCache;
+          !le32(bytes + 8) || (le32(bytes + marker_at) & Store::kCommitMarker) != Store::kCommitMarker ||
+          !blank(bytes + marker_at + 4, sizeof(bytes) - marker_at - 4)) return Result::InvalidCache;
       static meshcore::ota::protocol::OtaDescriptor descriptor;
       if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(bytes + 29, 59, descriptor) !=
               meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
@@ -1308,8 +1322,9 @@ private:
               (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes ||
           !signatures.verify(bytes + 120, 64, bytes + 29, 59, bytes + 88, 32)) return Result::InvalidCache;
       // Only a complete authenticated body can explain an unfinished marker.
-      // The store ignores this slot; never project its phase or ownership.
-      if (le32(bytes + 188) != Store::kCommitMarker) {
+      // Never project its phase or ownership here; the store honours only a
+      // revocation phase from it (OtaCandidateStore::load).
+      if (le32(bytes + marker_at) != Store::kCommitMarker) {
         if (found_torn && !sameCacheContentBinding(torn_binding, bytes + 13)) return Result::InvalidCache;
         memcpy(torn_binding, bytes + 13, sizeof(torn_binding));
         found_torn = true;

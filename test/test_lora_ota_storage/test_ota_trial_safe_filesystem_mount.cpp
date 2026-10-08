@@ -55,30 +55,36 @@ TEST(OtaTrialSafeFilesystemMountTest, TrialDisallowedMountOnlyFailurePropagatesW
   EXPECT_EQ(legacy.count, 0);
 }
 
-TEST(OtaTrialSafeFilesystemMountTest, NormalBootUsesLegacyFormatOnFailPathUnchanged) {
+TEST(OtaTrialSafeFilesystemMountTest, NormalBootHealthyMountNeverReachesDestructiveRetry) {
   CallCounter mount_only(true);
   CallCounter legacy(true);
 
   bool ok = ota_fs_mount::mountTrialSafe(/*allow_destructive_boot_writes=*/true,
                                           std::ref(mount_only), std::ref(legacy));
 
-  // Normal/non-trial boot must preserve the exact prior behaviour: only the
-  // legacy (format-on-fail-capable) path is invoked, matching the original
-  // unconditional `InternalFS.begin()` / `ExtraFS.begin()` call.
   EXPECT_TRUE(ok);
-  EXPECT_EQ(mount_only.count, 0);
-  EXPECT_EQ(legacy.count, 1);
+  EXPECT_EQ(mount_only.count, 1);
+  EXPECT_EQ(legacy.count, 0);
+}
+
+TEST(OtaTrialSafeFilesystemMountTest, NormalBootFailedMountPermitsDestructiveRetryOnlyAfterFailure) {
+  int sequence = 0;
+  bool ok = ota_fs_mount::mountTrialSafe(true,
+      [&](){ EXPECT_EQ(0, sequence++); return false; },
+      [&](){ EXPECT_EQ(1, sequence++); return true; });
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(2, sequence);
 }
 
 TEST(OtaTrialSafeFilesystemMountTest, NormalBootLegacyFailurePropagates) {
-  CallCounter mount_only(true);
+  CallCounter mount_only(false);
   CallCounter legacy(false);
 
   bool ok = ota_fs_mount::mountTrialSafe(/*allow_destructive_boot_writes=*/true,
                                           std::ref(mount_only), std::ref(legacy));
 
   EXPECT_FALSE(ok);
-  EXPECT_EQ(mount_only.count, 0);
+  EXPECT_EQ(mount_only.count, 1);
   EXPECT_EQ(legacy.count, 1);
 }
 

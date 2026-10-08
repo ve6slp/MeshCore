@@ -31,6 +31,7 @@
 #include "../test_lora_ota_storage/FakeNorFlash.h"
 #include "../test_lora_ota_trust/Ed25519TestSigner.h"
 #include "../test_lora_ota_trust/FakeMonotonicCounter.h"
+#include "../test_lora_ota_trust/OtaTestEntropy.h"
 
 using namespace mesh;
 using namespace meshcore::ota::protocol;
@@ -568,8 +569,9 @@ public:
   Entry outbound[8]{};
   int outbound_count = 0;
 
-  Packet* allocNew(bool is_ota_bulk = false) override {
-    (void)is_ota_bulk;
+  bool supportsOtaQueue() const override { return true; }
+  Packet* allocOtaPacket() override { return allocNew(); }
+  Packet* allocNew() override {
     for (int i = 0; i < 8; ++i) {
       if (!used[i]) {
         used[i] = true;
@@ -588,16 +590,20 @@ public:
     }
   }
 
-  bool queueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) override {
-    if (outbound_count >= 8) {
-      free(packet);
-      return false;
-    }
+  void queueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) override {
+    if (!tryQueueOutbound(packet, priority, scheduled_for)) free(packet);
+  }
+
+  // Optional OTA capability: failure retains caller ownership.
+  bool tryQueueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) override {
+    if (outbound_count >= 8) return false;
     outbound[outbound_count++] = Entry{packet, priority, scheduled_for};
     return true;
   }
 
-  Packet* getNextOutbound(uint32_t now, uint8_t* out_priority = nullptr) override {
+  Packet* getNextOutbound(uint32_t now) override { return getNextOutboundWithPriority(now, nullptr); }
+
+  Packet* getNextOutboundWithPriority(uint32_t now, uint8_t* out_priority) override {
     int best = -1;
     uint8_t best_pri = 0xFF;
     for (int i = 0; i < outbound_count; ++i) {
@@ -630,8 +636,10 @@ public:
     return count;
   }
   Packet* getOutboundByIdx(int i) override { return i >= 0 && i < outbound_count ? outbound[i].packet : nullptr; }
-  uint32_t getOutboundScheduledForByIdx(int i) const override {
-    return i >= 0 && i < outbound_count ? outbound[i].scheduled_for : 0;
+  bool getOutboundScheduleByIdx(int i, uint32_t& scheduled_for) const override {
+    if (i < 0 || i >= outbound_count) return false;
+    scheduled_for = outbound[i].scheduled_for;
+    return true;
   }
   Packet* removeOutboundByIdx(int i) override {
     if (i < 0 || i >= outbound_count) return nullptr;
@@ -2327,18 +2335,20 @@ TEST(LoraOtaIntegration, ReadyNormalTrafficBlocksOtaRelayEvenIfOtaWasSelectedFir
 
   clock.advance(1);
   dispatcher.loop();
-  EXPECT_EQ(0, radio.sends);
-  EXPECT_EQ(2, manager.getOutboundTotal());
-  EXPECT_EQ(normal, manager.getNextOutbound(clock.getMillis()));
+  // OTA is clamped to the lowest queue priority, so ready ordinary traffic
+  // transmits first and the OTA relay stays queued behind it.
+  EXPECT_EQ(1, radio.sends);
+  EXPECT_EQ(1, manager.getOutboundTotal());
+  EXPECT_EQ(ota, manager.getNextOutbound(clock.getMillis()));
 }
 
-TEST(LoraOtaIntegration, BudgetGatedRequeuePreservesOriginalNonOtaPriority) {
+TEST(LoraOtaIntegration, OrdinaryTrafficKeepsDevHalfMtuAdmissionInsteadOfFullAirtimeGate) {
   FakeClock clock;
   FakeRadio radio;
-  radio.airtime = 2000;  // exceeds the 10 ms budget below on every attempt
+  radio.airtime = 2000;  // exceeds the 1500 ms budget, which still clears half-MTU admission
   QueuePacketManager manager;
   TinyGeneralBudgetTestDispatcher dispatcher(radio, clock, manager);
-  dispatcher.begin();  // tx_budget_ms starts at 3000ms * 0.5 duty_cycle = 1500ms
+  dispatcher.begin();
 
   Packet* normal = manager.allocNew();
   ASSERT_NE(nullptr, normal);
@@ -2346,16 +2356,12 @@ TEST(LoraOtaIntegration, BudgetGatedRequeuePreservesOriginalNonOtaPriority) {
   normal->path_len = 0;
   normal->payload_len = 1;
   normal->payload[0] = 0x42;
-  const uint8_t kOriginalPriority = 0;  // e.g. a direct/high-priority send
-  dispatcher.sendPacket(normal, kOriginalPriority);
+  dispatcher.sendPacket(normal, 0);
 
   clock.advance(1);
   dispatcher.loop();
-  EXPECT_EQ(0, radio.sends) << "packet must be budget-gated, not sent";
-  ASSERT_EQ(1, manager.getOutboundTotal());
-  EXPECT_EQ(kOriginalPriority, manager.outbound[0].priority)
-      << "budget-gated requeue must preserve the packet's original queue "
-         "priority instead of collapsing every non-OTA packet to priority 1";
+  EXPECT_EQ(1, radio.sends) << "only OTA packets take the full prospective-airtime gate";
+  EXPECT_EQ(0, manager.getOutboundTotal());
 }
 
 TEST(LoraOtaIntegration, OtaStatusReportsDispatcherAirtimeAccounting) {
@@ -2392,17 +2398,17 @@ TEST(LoraOtaIntegration, PacketPoolReservesBuffersForNonOtaPathsOverOtaBulkAlloc
   StaticPoolPacketManager manager(6);
   ASSERT_EQ(6, manager.getFreeCount());
 
-  Packet* held_a = manager.allocNew(false);
-  Packet* held_b = manager.allocNew(false);
+  Packet* held_a = manager.allocNew();
+  Packet* held_b = manager.allocNew();
   ASSERT_NE(nullptr, held_a);
   ASSERT_NE(nullptr, held_b);
   ASSERT_EQ(4, manager.getFreeCount());
 
-  EXPECT_EQ(nullptr, manager.allocNew(true))
+  EXPECT_EQ(nullptr, manager.allocOtaPacket())
       << "OTA bulk allocation must fail closed at/below the reserve";
   EXPECT_EQ(4, manager.getFreeCount()) << "a failed OTA alloc must not consume a buffer";
 
-  Packet* non_ota = manager.allocNew(false);
+  Packet* non_ota = manager.allocNew();
   EXPECT_NE(nullptr, non_ota)
       << "non-OTA paths (sender/raw-ingress/delayed-RX/relay) must still be able to allocate";
 
@@ -2413,7 +2419,7 @@ TEST(LoraOtaIntegration, PacketPoolReservesBuffersForNonOtaPathsOverOtaBulkAlloc
 
 TEST(LoraOtaIntegration, PacketPoolAllowsOtaBulkAllocAboveReserve) {
   StaticPoolPacketManager manager(6);
-  Packet* ota = manager.allocNew(true);
+  Packet* ota = manager.allocOtaPacket();
   EXPECT_NE(nullptr, ota) << "OTA alloc must still succeed while comfortably above the reserve";
   if (ota) manager.free(ota);
 }
@@ -2429,8 +2435,8 @@ TEST(LoraOtaIntegration, RawPacketInjectionReleasesOtaPacketAtReserveInsteadOfQu
   // (rather than queues) the packet under the same condition already
   // enforced at OTA's own bulk allocation / raw radio ingress / relay.
   StaticPoolPacketManager manager(6);
-  Packet* held_a = manager.allocNew(false);
-  Packet* held_b = manager.allocNew(false);
+  Packet* held_a = manager.allocNew();
+  Packet* held_b = manager.allocNew();
   ASSERT_NE(nullptr, held_a);
   ASSERT_NE(nullptr, held_b);
   ASSERT_EQ(4, manager.getFreeCount());
@@ -2455,8 +2461,8 @@ TEST(LoraOtaIntegration, RawPacketInjectionReleasesOtaPacketAtReserveInsteadOfQu
 
 TEST(LoraOtaIntegration, RawPacketInjectionAllowsOtaPacketAboveReserveAndNonOtaAtReserve) {
   StaticPoolPacketManager manager(8);
-  Packet* held_a = manager.allocNew(false);
-  Packet* held_b = manager.allocNew(false);
+  Packet* held_a = manager.allocNew();
+  Packet* held_b = manager.allocNew();
   ASSERT_NE(nullptr, held_a);
   ASSERT_NE(nullptr, held_b);
   ASSERT_EQ(6, manager.getFreeCount());
@@ -2509,7 +2515,7 @@ TEST(LoraOtaIntegration, DispatcherDropsInboundOtaPacketAtIngressWhenPoolAtReser
 
   Packet* held[4];
   for (int i = 0; i < 4; ++i) {
-    held[i] = manager.allocNew(false);
+    held[i] = manager.allocNew();
     ASSERT_NE(nullptr, held[i]);
   }
   ASSERT_EQ(4, manager.getFreeCount());
@@ -2543,7 +2549,7 @@ TEST(LoraOtaIntegration, DispatcherStillAcceptsInboundNonOtaPacketWhenPoolAtRese
 
   Packet* held[4];
   for (int i = 0; i < 4; ++i) {
-    held[i] = manager.allocNew(false);
+    held[i] = manager.allocNew();
     ASSERT_NE(nullptr, held[i]);
   }
   ASSERT_EQ(4, manager.getFreeCount());
@@ -2578,12 +2584,12 @@ TEST(LoraOtaIntegration, DispatcherDropsRelayedOtaPacketWhenPoolAtReserve) {
 
   Packet* held[4];
   for (int i = 0; i < 4; ++i) {
-    held[i] = manager.allocNew(false);
+    held[i] = manager.allocNew();
     ASSERT_NE(nullptr, held[i]);
   }
   ASSERT_EQ(4, manager.getFreeCount());
 
-  Packet* ota = manager.allocNew(false);
+  Packet* ota = manager.allocNew();
   ASSERT_NE(nullptr, ota);
   fillOtaChunkPayload(ota);
   ASSERT_EQ(3, manager.getFreeCount());
@@ -2618,12 +2624,12 @@ TEST(LoraOtaIntegration, DispatcherStillRelaysNonOtaPacketWhenPoolAtReserve) {
 
   Packet* held[4];
   for (int i = 0; i < 4; ++i) {
-    held[i] = manager.allocNew(false);
+    held[i] = manager.allocNew();
     ASSERT_NE(nullptr, held[i]);
   }
   ASSERT_EQ(4, manager.getFreeCount());
 
-  Packet* normal = manager.allocNew(false);
+  Packet* normal = manager.allocNew();
   ASSERT_NE(nullptr, normal);
   normal->header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT);
   normal->path_len = 0;
@@ -2661,7 +2667,7 @@ TEST(LoraOtaIntegration, SendPacketReturnsFalseAndFreesPacketWhenQueueFull) {
     filler[i].path_len = 0;
     filler[i].payload_len = 1;
     filler[i].payload[0] = 0x11;
-    ASSERT_TRUE(manager.queueOutbound(&filler[i], 1, 0));
+    ASSERT_TRUE(manager.tryQueueOutbound(&filler[i], 1, 0));
   }
   ASSERT_EQ(8, manager.getOutboundTotal());
 
@@ -2757,7 +2763,7 @@ struct LeanFixture {
     for (size_t i = 0; i < sizeof(target_public_key); ++i) target_public_key[i] = static_cast<uint8_t>(0xD0u + i);
     integration.attachTrustProvider(&trust);
     integration.attachStagingSink(&guarded);
-    integration.attachCandidateStore(&candidate_store);
+    integration.attachCandidateStore(&candidate_store); integration.attachEntropy(nullptr, &otaTestEntropy);
     integration.attachLeanSignatureVerifier(&sig_verifier);
     integration.setLeanAdminCheck(&admins, &leanAdminCheckThunk);
     integration.setLeanTargetPublicKey(target_public_key);
@@ -2809,7 +2815,7 @@ TEST(LoraOtaAbortGeneration, CapturedRfAbortCannotCancelSameImageReuploadOrReach
     auto& receiver = fx.integration.leanReceiver();
     ASSERT_EQ(UsbOtaResult::Ok, receiver.begin(owner.publicKey(), canonical, signature, false, false));
     Store::Snapshot initial;
-    ASSERT_TRUE(fx.candidate_store.load(initial));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(initial));
     initial.sessionId = generation;
     ASSERT_TRUE(fx.candidate_store.append(initial));
     receiver.restore();
@@ -2968,8 +2974,9 @@ TEST(LoraOtaAbortGeneration, UsbLocalStaleAbortPreservesReuploadedCacheAndOldLen
   EXPECT_EQ(before.phase, cache.status().phase);
   EXPECT_EQ(writes, fx.candidate_flash.programOpCount()); EXPECT_EQ(erases, fx.image_flash.eraseOpCount());
   uint8_t reply[kReplyBytes + 1]; std::memset(reply, 0xCC, sizeof(reply));
-  ASSERT_EQ(90u, encodeUsbOtaReply(stale, reply));
-  EXPECT_EQ(2u, reply[1]); EXPECT_EQ(before.generation, getBE32(reply + 86)); EXPECT_EQ(0xCC, reply[90]);
+  ASSERT_EQ(107u, encodeUsbOtaReply(stale, reply));
+  EXPECT_EQ(3u, reply[1]); EXPECT_EQ(before.generation, getBE32(reply + 86));
+  EXPECT_EQ(0, std::memcmp(before.beginNonce, reply + 90, 16)); EXPECT_EQ(0xCC, reply[107]);
   putBE32(abort + 66, before.generation);
   EXPECT_EQ(UsbOtaResult::Ok, fx.integration.handleUsbLocalControl(abort, sizeof(abort), self.publicKey()).result);
 }
@@ -2988,7 +2995,7 @@ TEST(LoraOtaAbortGeneration, OriginalSignatureRetriesDurableCleanupWithoutAppend
     fx.buildSmallManifest(image, sizeof(image), canonical); owner.sign(canonical, sizeof(canonical), signature);
     auto& receiver = fx.integration.leanReceiver();
     ASSERT_EQ(UsbOtaResult::Ok, receiver.begin(owner.publicKey(), canonical, signature, false, false));
-    Store::Snapshot initial; ASSERT_TRUE(fx.candidate_store.load(initial));
+    Store::Snapshot initial; ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(initial));
     initial.sessionId = generation; ASSERT_TRUE(fx.candidate_store.append(initial)); receiver.restore();
     const auto before = receiver.status();
     buildAbortSignedMessage(fx.target_public_key, before.imageHash, generation, message);
@@ -3008,7 +3015,7 @@ TEST(LoraOtaAbortGeneration, OriginalSignatureRetriesDurableCleanupWithoutAppend
     const auto writes = fx.candidate_flash.programOpCount();
     OtaFirmwareIntegration cold;
     cold.attachTrustProvider(&fx.trust); cold.attachStagingSink(&fx.guarded);
-    cold.attachCandidateStore(&fx.candidate_store); cold.attachLeanSignatureVerifier(&fx.sig_verifier);
+    cold.attachCandidateStore(&fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy); cold.attachLeanSignatureVerifier(&fx.sig_verifier);
     cold.setLeanAdminCheck(&fx.admins, leanAdminCheckThunk); cold.setLeanTargetPublicKey(fx.target_public_key);
     cold.attachUnadmittedAbort(&cleanup, AbortGenerationCleanupProbe::invoke);
     EXPECT_EQ(UsbOtaResult::IoError, cold.leanReceiver().abort(owner.publicKey(), signature, before.imageHash, generation));
@@ -3104,6 +3111,10 @@ TEST(LoraOtaIntegration, ProductionUsbRemoteControlRepliesAreCanonicalAndTransmi
       const auto* hash = op == UsbOtaOp::Commit ? st.manifestHash : st.imageHash;
       std::memcpy(command + 34, hash, 32);
       putBE32(command + 66, op == UsbOtaOp::Commit ? st.counter : 0xA1B2C3D4u);
+      if (op == UsbOtaOp::Commit) {
+        putBE32(command + 70, st.generation);
+        std::memcpy(command + 74, st.beginNonce, kBeginNonceBytes);
+      }
       if (expected == UsbOtaResult::Mismatch) command[34] ^= 1;
       const auto len = op == UsbOtaOp::Commit ? kCommitTotalBytes : kAbortTotalBytes;
       const auto image_writes = fx.image_flash.programOpCount();
@@ -3140,7 +3151,9 @@ TEST(LoraOtaIntegration, ProductionUsbRemoteControlRepliesAreCanonicalAndTransmi
           EXPECT_EQ(0, std::memcmp(commit.target, target, 32));
           EXPECT_EQ(0, std::memcmp(commit.manifestHash, hash, 32));
           EXPECT_EQ(st.counter, commit.counter);
-          message_len = buildCommitSignedMessage(target, hash, st.counter, message);
+          EXPECT_EQ(st.generation, commit.generation);
+          EXPECT_EQ(0, std::memcmp(commit.beginNonce, st.beginNonce, kBeginNonceBytes));
+          message_len = buildCommitSignedMessage(target, hash, st.counter, st.generation, st.beginNonce, message);
           signed_bytes = commit.signature;
         } else {
           ASSERT_TRUE(parseOtaAbortFrame(send_ctx.frame.data(), send_ctx.frame.size(), abort));
@@ -3957,7 +3970,7 @@ TEST(LoraOtaCacheRetirement, CacheOnlyStockBackendCannotPrepareBeginOrActivateRe
   using namespace mesh::ota;
   CacheRetirementFixture f;
   OtaBoardCacheOnlyBackend stock(f.fx.image_region, f.fx.candidate_store_region, &leanNoTrial);
-  ASSERT_TRUE(stock.attach(f.fx.integration, f.fx.sig_verifier));
+  ASSERT_TRUE((stock.attach(f.fx.integration, f.fx.sig_verifier) && attachOtaTestEntropy(f.fx.integration)));
   f.cache(); f.abortCache();
   f.manifest(f.remote, f.descriptor());
   ASSERT_TRUE(f.trust.verifyDescriptorPolicyOnly(f.descriptor()));
@@ -3997,9 +4010,9 @@ TEST(LoraOtaCacheRetirement, SignedRfReplacementResetsCacheAndRequiresAllFreshBl
   for (uint16_t i = 0; i < active.totalBlocks; ++i) EXPECT_FALSE(f.receiver().isBlockReceived(i));
   EXPECT_EQ(Result::Incomplete, f.receiver().requestSeal());
   uint8_t commit[kOtaCommitFrameBytes], message[usb::kCommitSignedBytes], commit_sig[64];
-  usb::buildCommitSignedMessage(f.local.publicKey(), f.hash, 1, message);
+  usb::buildCommitSignedMessage(f.local.publicKey(), f.hash, 1, f.receiver().status().generation, f.receiver().status().beginNonce, message);
   f.remote.sign(message, sizeof(message), commit_sig);
-  const auto commit_len = encodeOtaCommitFrame(f.local.publicKey(), f.hash, 1, commit_sig, commit, sizeof(commit));
+  const auto commit_len = encodeOtaCommitFrame(f.local.publicKey(), f.hash, 1, f.receiver().status().generation, f.receiver().status().beginNonce, commit_sig, commit, sizeof(commit));
   EXPECT_FALSE(f.fx.integration.handleReceivedFrame(commit, commit_len, 25));
   f.fx.integration.loop();
   ASSERT_EQ(Phase::Receiving, f.receiver().status().phase);
@@ -4217,9 +4230,9 @@ TEST(LoraOtaMeshRetry, ReadyWindowCanBePolledAgainBySeparateCommitCampaignWithou
   EXPECT_EQ(0, std::memcmp(upload_sweep.bitmap, commit_campaign.bitmap, sizeof(upload_sweep.bitmap)));
   EXPECT_EQ(programs, f.product.fx.candidate_flash.programOpCount());
   uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
-  usb::buildCommitSignedMessage(f.product.local.publicKey(), f.product.hash, 1, message);
+  usb::buildCommitSignedMessage(f.product.local.publicKey(), f.product.hash, 1, f.receiver().status().generation, f.receiver().status().beginNonce, message);
   f.product.remote.sign(message, sizeof(message), signature);
-  const auto len = encodeOtaCommitFrame(f.product.local.publicKey(), f.product.hash, 1, signature, frame, sizeof(frame));
+  const auto len = encodeOtaCommitFrame(f.product.local.publicKey(), f.product.hash, 1, f.receiver().status().generation, f.receiver().status().beginNonce, signature, frame, sizeof(frame));
   auto commit = f.packet(frame, len);
   ASSERT_EQ(ACTION_RELEASE, f.mesh.onRecvPacket(&commit));
   ASSERT_EQ(OtaMeshRetryFixture::Phase::Committed, f.receiver().status().phase);
@@ -4829,10 +4842,10 @@ TEST(LoraOtaRoutedRetry, SignedCommitAbortReuploadStillBindOwnerTargetImageGener
     const auto counter = st.counter + (mismatch == 0);
     if (mismatch == 1) hash[0] ^= 1;
     if (mismatch == 2) target[0] ^= 1;
-    usb::buildCommitSignedMessage(target, hash, counter, message);
+    usb::buildCommitSignedMessage(target, hash, counter, st.generation, st.beginNonce, message);
     (mismatch == 3 ? f.product.local : f.product.remote).sign(message, usb::kCommitSignedBytes, signature);
     if (mismatch == 4) signature[0] ^= 1;
-    reject(frame, encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame)));
+    reject(frame, encodeOtaCommitFrame(target, hash, counter, st.generation, st.beginNonce, signature, frame, sizeof(frame)));
   }
   for (unsigned mismatch = 0; mismatch < 4; ++mismatch) {
     std::memcpy(target, f.product.local.publicKey(), 32);
@@ -4979,7 +4992,7 @@ TEST(LoraOtaLeanReceiver, SealReachesReadyThenCommitRequiresExactOwnerAndExactTa
   for (size_t i = 0; i < sizeof(other_target); ++i) other_target[i] = static_cast<uint8_t>(0xFFu - i);
   uint8_t wrong_target_message[mesh::ota::usb::kCommitSignedBytes] = {};
   const size_t wrong_target_message_len =
-      mesh::ota::usb::buildCommitSignedMessage(other_target, manifest_hash, 1u, wrong_target_message);
+      mesh::ota::usb::buildCommitSignedMessage(other_target, manifest_hash, 1u, lean.status().generation, lean.status().beginNonce, wrong_target_message);
   uint8_t wrong_target_signature[64] = {};
   owner.sign(wrong_target_message, wrong_target_message_len, wrong_target_signature);
   EXPECT_EQ(mesh::ota::OtaLeanReceiver::Result::Denied, lean.commit(1u, wrong_target_signature))
@@ -5021,7 +5034,7 @@ TEST(LoraOtaLeanReceiver, SealReachesReadyThenCommitRequiresExactOwnerAndExactTa
   mesh::ota::computeOtaManifestHash(canonical2, manifest_hash2);
   uint8_t commit_message[mesh::ota::usb::kCommitSignedBytes] = {};
   const size_t commit_message_len =
-      mesh::ota::usb::buildCommitSignedMessage(fx.target_public_key, manifest_hash2, 6u, commit_message);
+      mesh::ota::usb::buildCommitSignedMessage(fx.target_public_key, manifest_hash2, 6u, lean.status().generation, lean.status().beginNonce, commit_message);
   uint8_t commit_signature[64] = {};
   owner.sign(commit_message, commit_message_len, commit_signature);
   EXPECT_EQ(mesh::ota::OtaLeanReceiver::Result::Ok, lean.commit(6u, commit_signature))
@@ -5058,13 +5071,13 @@ TEST(LoraOtaLeanReceiver, ReadyAppendFailureRetainsDurableVerifyingAndRetriesWit
       receiver.loop();
       EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Verifying, receiver.status().phase);
       ::ota::storage::OtaCandidateStore::Snapshot durable;
-      ASSERT_TRUE(fx.candidate_store.load(durable));
+      ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
       EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Verifying, durable.phase);
       EXPECT_EQ(1u, durable.receivedBlocks);
       fx.candidate_flash.clearFault();
       receiver.loop();
       ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, receiver.status().phase);
-      ASSERT_TRUE(fx.candidate_store.load(durable));
+      ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
       EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, durable.phase);
       EXPECT_EQ(local_cache, durable.localCache);
       EXPECT_EQ(0, std::memcmp(owner.publicKey(), durable.ownerPublicKey, 32));
@@ -5100,7 +5113,7 @@ TEST(LoraOtaLeanReceiver, VerifyingRebootResumesWithoutUnjournaledPhaseChangeOrM
   restarted.attachTrustProvider(&fx.trust);
   restarted.attachOwnerSignatureVerifier(&fx.sig_verifier);
   restarted.attachStagingSink(&fx.guarded);
-  restarted.attachCandidateStore(&fx.candidate_store);
+  restarted.attachCandidateStore(&fx.candidate_store); restarted.attachEntropy(nullptr, &otaTestEntropy);
   restarted.setAdminCheck(&fx.admins, &leanAdminCheckThunk);
   restarted.setTargetPublicKey(fx.target_public_key);
   ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Verifying, restarted.status().phase);
@@ -5111,7 +5124,7 @@ TEST(LoraOtaLeanReceiver, VerifyingRebootResumesWithoutUnjournaledPhaseChangeOrM
   restarted.loop();
   ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, restarted.status().phase);
   ::ota::storage::OtaCandidateStore::Snapshot durable;
-  ASSERT_TRUE(fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, durable.phase);
   EXPECT_EQ(1u, durable.receivedBlocks);
   EXPECT_EQ(image_writes, fx.image_flash.programOpCount());
@@ -5139,12 +5152,12 @@ TEST(LoraOtaLeanReceiver, FailedSealAppendRetriesWithoutReportingAnUnjournaledFa
   receiver.loop();
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Verifying, receiver.status().phase);
   ::ota::storage::OtaCandidateStore::Snapshot durable;
-  ASSERT_TRUE(fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Verifying, durable.phase);
   fx.candidate_flash.clearFault();
   receiver.loop();
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Failed, receiver.status().phase);
-  ASSERT_TRUE(fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Failed, durable.phase);
 }
 
@@ -5168,7 +5181,7 @@ TEST(LoraOtaLeanReceiver, ExplicitReuploadDoesNotVerifyAnIncompleteNewCandidateU
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Receiving, receiver.status().phase);
   EXPECT_EQ(0u, receiver.status().receivedBlocks);
   ::ota::storage::OtaCandidateStore::Snapshot durable;
-  ASSERT_TRUE(fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Receiving, durable.phase);
   ASSERT_EQ(Result::Ok, receiver.putBlock(0, image, sizeof(image)));
   ASSERT_EQ(Result::Pending, receiver.requestSeal());
@@ -5258,12 +5271,12 @@ TEST(LoraOtaRfFrames, CommitAndAbortFramesOverRfReuseSameTargetBindingAndAdminRu
   for (size_t i = 0; i < sizeof(other_target); ++i) other_target[i] = static_cast<uint8_t>(0xE0u + i);
   uint8_t wrong_message[mesh::ota::usb::kCommitSignedBytes] = {};
   const size_t wrong_message_len =
-      mesh::ota::usb::buildCommitSignedMessage(other_target, manifest_hash, 1u, wrong_message);
+      mesh::ota::usb::buildCommitSignedMessage(other_target, manifest_hash, 1u, lean.status().generation, lean.status().beginNonce, wrong_message);
   uint8_t wrong_signature[64] = {};
   owner.sign(wrong_message, wrong_message_len, wrong_signature);
   uint8_t wrong_commit_frame[mesh::ota::kOtaCommitFrameBytes] = {};
   const size_t wrong_commit_len = mesh::ota::encodeOtaCommitFrame(
-      other_target, manifest_hash, 1u, wrong_signature, wrong_commit_frame, sizeof(wrong_commit_frame));
+      other_target, manifest_hash, 1u, lean.status().generation, lean.status().beginNonce, wrong_signature, wrong_commit_frame, sizeof(wrong_commit_frame));
   EXPECT_FALSE(fx.integration.handleReceivedFrame(wrong_commit_frame, wrong_commit_len, 2000));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, lean.status().phase)
       << "an RF commit frame bound to a different target must not commit this device";
@@ -5272,12 +5285,12 @@ TEST(LoraOtaRfFrames, CommitAndAbortFramesOverRfReuseSameTargetBindingAndAdminRu
   // a real RF frame, must commit.
   uint8_t commit_message[mesh::ota::usb::kCommitSignedBytes] = {};
   const size_t commit_message_len =
-      mesh::ota::usb::buildCommitSignedMessage(fx.target_public_key, manifest_hash, 5u, commit_message);
+      mesh::ota::usb::buildCommitSignedMessage(fx.target_public_key, manifest_hash, 5u, lean.status().generation, lean.status().beginNonce, commit_message);
   uint8_t commit_signature[64] = {};
   owner.sign(commit_message, commit_message_len, commit_signature);
   uint8_t commit_frame[mesh::ota::kOtaCommitFrameBytes] = {};
   const size_t commit_frame_len = mesh::ota::encodeOtaCommitFrame(
-      fx.target_public_key, manifest_hash, 5u, commit_signature, commit_frame, sizeof(commit_frame));
+      fx.target_public_key, manifest_hash, 5u, lean.status().generation, lean.status().beginNonce, commit_signature, commit_frame, sizeof(commit_frame));
   EXPECT_TRUE(fx.integration.handleReceivedFrame(commit_frame, commit_frame_len, 2001));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Committed, lean.status().phase);
 
@@ -5532,6 +5545,13 @@ struct RealRfPacketNode {
   }
 };
 
+// START frames the production host CLI writes with no framing options
+// (`ota_uploader.py upload --manifest M --image I --target T`, and for
+// background `--mode background --channel 2 --target T2` added). The host
+// suite parses these exact arrays and compares them with real ota.main() output.
+static const uint8_t kHostDefaultDirectedStart[] = {0x43, 0x14, 0x01, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xd0, 0x00, 0x01};
+static const uint8_t kHostDefaultBackgroundStart[] = {0x43, 0x14, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xd0, 0x00, 0x01};
+
 struct RfProductHarness {
   uint8_t ownerSeed[32] = {1}, seedA[32] = {2}, seedB[32] = {3};
   RfNode sender{ownerSeed}, a{seedA}, b{seedB};
@@ -5541,9 +5561,11 @@ struct RfProductHarness {
   uint32_t now = 1;
   bool loseAck = false, lostAck = false, loseSparseBlocks = false;
   bool loseAuthorization = false, lostAuthorization = false;
+  int loseAuthorizations = 0;
   bool loseReupload = false, lostReupload = false;
   bool normalTrafficActive = false;
   bool missingAdmissionRouteA = false;
+  bool legacyReports = false;  // receivers answer with the pre-v3 102-byte census report
   int authorizations = 0, initialData = 0, commits = 0;
   int firstReadmissionData = -1;
   uint32_t estimateMs = 20, completedMs = 20;
@@ -5578,6 +5600,21 @@ struct RfProductHarness {
     std::memcpy(targets[0], a.signer.publicKey(), 32); std::memcpy(targets[1], b.signer.publicKey(), 32);
     ASSERT_TRUE(uploader.start(sender.fx.integration, mode, &targets[0][0], mode == 2 ? 2 : 1,
                                mode == 0 ? 908525 : 0, mode == 0 ? 60000 : 0, 100, reupload, profile, retry_attempts));
+  }
+  // Companion USB START decode exactly as MyMesh's UsbOtaOp::Start does it.
+  void prepareFromStart(size_t size, const uint8_t* frame, size_t len) {
+    OtaDirectProfile profile; bool retry_attempts = false;
+    ASSERT_TRUE(usb::parseStartOptions(frame, len, profile, retry_attempts));
+    const uint8_t mode = frame[2], channel = frame[3];
+    const uint32_t frequency_khz = usb::getBE32(frame + 4);
+    const uint32_t lease_ms = usb::getBE16(frame + 8);
+    const uint32_t duty_milli_percent = usb::getBE32(frame + 10);
+    ASSERT_TRUE(mode == usb::kStartModeDirected || mode == usb::kStartModeBackground);
+    ASSERT_TRUE(mode == usb::kStartModeBackground || channel == usb::kStartChannelDirectedOrDirect);
+    ASSERT_EQ(0u, frequency_khz); ASSERT_EQ(0u, lease_ms);
+    ASSERT_LE(duty_milli_percent, usb::kDutyMilliPercentMax);
+    ASSERT_TRUE(sender.fx.integration.setDutyCyclePercent(duty_milli_percent / 1000.0f));
+    prepare(size, mode, false, profile, retry_attempts);
   }
   static void sign(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
     auto& harness = *static_cast<RfProductHarness*>(ctx);
@@ -5628,6 +5665,9 @@ struct RfProductHarness {
     }
     if (h.loseAuthorization && !h.lostAuthorization && frame[0] == kOtaTargetAuthorizationKind) {
       h.lostAuthorization = true; return true;
+    }
+    if (h.loseAuthorizations > 0 && frame[0] == kOtaTargetAuthorizationKind) {
+      --h.loseAuthorizations; return true;
     }
     if (frame[0] == kOtaCensusPollKind) ++h.census;
     if (frame[0] == kOtaOwnerSignedBlockKind || frame[0] == kOtaSignedBlockKind) {
@@ -5690,6 +5730,7 @@ struct RfProductHarness {
       if (loseAck && !lostAck && (frame[0] == kOtaDirectAckKind || frame[0] == kOtaDirectProfileAckKind)) {
         lostAck = true; continue;
       }
+      if (legacyReports && frame[0] == kOtaCensusReportKind) len = 102;
       if (node->frequency == sender.frequency) {
         if (realRelays) {
           Packet response;
@@ -5864,7 +5905,10 @@ TEST(LoraOtaRoutedRetry, AutonomousUploaderActuallyRepairsLossAcrossTwoRealRelay
   for (const uint8_t mode : {usb::kStartModeDirected, usb::kStartModeBackground}) {
     RfProductHarness h;
     h.realRelays = true; h.loseAuthorization = true; h.loseSparseBlocks = true;
-    h.prepare(84 * 18 + 7, mode, false, OtaDirectProfile::Legacy250, true);
+    const auto* start = mode == usb::kStartModeDirected ? kHostDefaultDirectedStart : kHostDefaultBackgroundStart;
+    h.prepareFromStart(84 * 18 + 7, start, sizeof(kHostDefaultDirectedStart));
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(mode, start[2]);
     h.normalTrafficActive = true;
     for (int i = 0; i < 30; ++i) h.step();
     EXPECT_EQ(0u, h.relayAttempts);
@@ -5945,10 +5989,11 @@ TEST(LoraOtaRfProduct, DirectedLostBeginReadmitsBeforeInitialSweepAtTwoPercent) 
   for (int i = 0; i < 160 && h.a.fx.integration.leanReceiver().status().receivedBlocks == 0; ++i) h.step();
   ASSERT_TRUE(h.lostAuthorization);
   ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
-  ASSERT_GE(h.firstReadmissionData, 32);
-  EXPECT_LT(h.firstReadmissionData, 513);
+  // Capability negotiation needs a v3 census report before any DATA, so a
+  // lost BEGIN is re-offered before the sweep spends a single block.
+  EXPECT_EQ(0, h.firstReadmissionData);
   EXPECT_LT(h.initialData, 513);
-  EXPECT_LE(h.authorizations, 1 + h.initialData / 32);
+  EXPECT_LE(h.authorizations, 2 + h.initialData / 32);
   EXPECT_LE(h.sender.fx.integration.status(h.now).dutyUsedMs, 72000u);
   for (int i = 0; i < 2000 && !h.ready(h.a); ++i) h.step();
   EXPECT_TRUE(h.ready(h.a));
@@ -5969,9 +6014,9 @@ TEST(LoraOtaRfProduct, BackgroundLostBeginReadmitsWithoutBlockingHealthyFleetAtT
   ASSERT_TRUE(h.lostAuthorization);
   ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
   ASSERT_GT(h.b.fx.integration.leanReceiver().status().receivedBlocks, 0);
-  EXPECT_LT(h.firstReadmissionData, 513);
+  EXPECT_EQ(0, h.firstReadmissionData);
   EXPECT_LT(h.initialData, 513);
-  EXPECT_LE(h.authorizations, 2 + h.initialData / 32);
+  EXPECT_LE(h.authorizations, 3 + h.initialData / 32);
   h.normalTrafficActive = false;
   for (int i = 0; i < 3000 && !(h.ready(h.a) && h.ready(h.b)); ++i) h.step();
   EXPECT_TRUE(h.ready(h.a));
@@ -6019,10 +6064,9 @@ TEST_P(LoraOtaRfPacedAdmission, ScarceDutyCreditAcrossClockWrapAdmitsDataAndLost
   ASSERT_GT(h.a.fx.integration.leanReceiver().status().receivedBlocks, 0);
   if (GetParam() == usb::kStartModeBackground)
     EXPECT_GT(h.b.fx.integration.leanReceiver().status().receivedBlocks, 0);
-  EXPECT_LT(h.now, start);
-  EXPECT_LT(h.firstReadmissionData, 6403);
+  EXPECT_EQ(0, h.firstReadmissionData);
   EXPECT_LT(h.initialData, 6403);
-  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 2 : 1) + h.initialData / 32);
+  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 3 : 2) + h.initialData / 32);
   for (int i = 0; i < 180000 && !(h.ready(h.a) &&
       (GetParam() != usb::kStartModeBackground || h.ready(h.b))); ++i) {
     h.normalTrafficActive = i % 9 == 0;
@@ -6039,7 +6083,8 @@ TEST_P(LoraOtaRfPacedAdmission, ScarceDutyCreditAcrossClockWrapAdmitsDataAndLost
     h.expectByteExact(h.b);
   }
   EXPECT_EQ(6403, h.initialData);
-  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 2 : 1) + h.initialData / 32);
+  EXPECT_LT(h.now, start) << "the campaign crosses the 32-bit clock wrap";
+  EXPECT_LE(h.authorizations, (GetParam() == usb::kStartModeBackground ? 3 : 2) + h.initialData / 32);
   EXPECT_LE(h.controlTxMs * 10u, h.dataTxMs);
   EXPECT_GE(h.now - start, 24u * 3600000u);
   EXPECT_LE(h.now - start, 72u * 3600000u);
@@ -6115,6 +6160,22 @@ TEST(LoraOtaRfProduct, Direct500NegotiatesBothProfileCallbacksAcrossLostAckLease
   EXPECT_FALSE(h.a.fx.integration.directActive());
 }
 
+// Obtains the receiver's current single-use lease challenge exactly as an
+// uploader does: through a census poll and its v3 report.
+uint32_t freshLeaseChallenge(mesh::ota::OtaFirmwareIntegration& receiver, const uint8_t target[32], uint32_t now) {
+  const auto st = receiver.leanReceiver().status();
+  uint8_t poll[kOtaCensusPollBytes], report[kOtaCensusReportBytes];
+  if (!encodeOtaCensusPoll(target, st.manifestHash, 0, poll, sizeof(poll)) ||
+      !receiver.handleReceivedFrame(poll, sizeof(poll), now)) return 0;
+  size_t len = 0;
+  bool found = false;
+  for (uint32_t t = now; !found && t < now + 10000u; t += 50) found = receiver.peekOutboundControlFrame(report, sizeof(report), len, t);
+  if (!found) return 0;
+  receiver.releaseOutboundControlFrame();
+  OtaCensusReport parsed;
+  return parseOtaCensusReport(report, len, parsed) ? parsed.leaseChallenge : 0;
+}
+
 TEST(LoraOtaRfProduct, DirectProfileCodecRejectsReservedSelectorsLengthsBoundsAndKeepsLegacyBytes) {
   uint8_t owner[32] = {1}, target[32] = {2}, hash[32] = {3}, frame[172] = {};
   ASSERT_EQ(171u, encodeOtaDirectFrame(kOtaDirectRequestKind, owner, target, hash,
@@ -6124,7 +6185,7 @@ TEST(LoraOtaRfProduct, DirectProfileCodecRejectsReservedSelectorsLengthsBoundsAn
   EXPECT_EQ(60000u, usb::getBE16(frame + 101));
   EXPECT_EQ(0x12345678u, usb::getBE32(frame + 103));
   uint8_t message[160]; const auto legacyLen = buildOtaDirectMessage(frame, message);
-  const char legacyDomain[] = "MeshCore/OTA/direct/v1";
+  const char legacyDomain[] = "MeshCore/OTA/direct/v3";
   EXPECT_EQ(sizeof(legacyDomain) - 1 + 107, legacyLen);
   EXPECT_EQ(0, std::memcmp(message, legacyDomain, sizeof(legacyDomain) - 1));
   EXPECT_EQ(0, std::memcmp(message + sizeof(legacyDomain) - 1, frame, 107));
@@ -6138,7 +6199,7 @@ TEST(LoraOtaRfProduct, DirectProfileCodecRejectsReservedSelectorsLengthsBoundsAn
     EXPECT_EQ(static_cast<uint8_t>(p), frame[97]);
     ASSERT_TRUE(parseOtaDirectProfile(frame, 171, profile, freq));
     EXPECT_EQ(p, profile); EXPECT_EQ(908525u, freq);
-    const char domain[] = "MeshCore/OTA/direct-profile/v2";
+    const char domain[] = "MeshCore/OTA/direct-profile/v3";
     EXPECT_EQ(sizeof(domain) - 1 + 107, buildOtaDirectMessage(frame, message));
     EXPECT_EQ(0, std::memcmp(message, domain, sizeof(domain) - 1));
   }
@@ -6178,7 +6239,9 @@ TEST(LoraOtaRfProduct, DirectProfileAckCannotDowngradeKindDomainOrNonceBeforeBot
   ASSERT_TRUE(h.ready(h.a));
   auto& sender = h.sender.fx.integration; auto& receiver = h.a.fx.integration;
   uint8_t request[171], ack[171], message[160];
-  ASSERT_EQ(171u, sender.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 111,
+  const auto challenge = freshLeaseChallenge(receiver, h.a.signer.publicKey(), h.now);
+  ASSERT_NE(0u, challenge);
+  ASSERT_EQ(171u, sender.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, challenge,
                                            request, sizeof(request), OtaDirectProfile::Bw500));
   ASSERT_TRUE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
   size_t len = 0;
@@ -6197,7 +6260,7 @@ TEST(LoraOtaRfProduct, DirectProfileAckCannotDowngradeKindDomainOrNonceBeforeBot
     EXPECT_FALSE(sender.directPending()); EXPECT_FALSE(sender.directActive());
   }
   uint8_t wrongDomain[171]; std::memcpy(wrongDomain, ack, sizeof(ack));
-  const char domain[] = "MeshCore/OTA/direct/v1";
+  const char domain[] = "MeshCore/OTA/direct/v3";
   std::memcpy(message, domain, sizeof(domain) - 1);
   std::memcpy(message + sizeof(domain) - 1, ack, 107);
   h.a.signer.sign(message, sizeof(domain) - 1 + 107, wrongDomain + 107);
@@ -6216,7 +6279,9 @@ TEST(LoraOtaRfProduct, DirectProfileAuthorityAndUnsupportedCallbackFailClosedWit
   auto& receiver = h.a.fx.integration;
   const auto before = receiver.leanReceiver().status();
   uint8_t request[171], message[160];
-  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 112,
+  const auto challenge = freshLeaseChallenge(receiver, h.a.signer.publicKey(), h.now);
+  ASSERT_NE(0u, challenge);
+  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, challenge,
                                                             request, sizeof(request), OtaDirectProfile::Bw500));
   for (size_t offset : {size_t(1), size_t(33), size_t(65), size_t(97), size_t(98)}) {
     uint8_t changed[171]; std::memcpy(changed, request, sizeof(request));
@@ -6245,7 +6310,9 @@ TEST(LoraOtaRfProduct, DirectProfileRestoreFailureKeepsObligationAndRepeatedRequ
   ASSERT_TRUE(h.ready(h.a));
   auto& receiver = h.a.fx.integration;
   uint8_t request[171], ack[171]; size_t len = 0;
-  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 113,
+  const auto challenge = freshLeaseChallenge(receiver, h.a.signer.publicKey(), h.now);
+  ASSERT_NE(0u, challenge);
+  ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, challenge,
                                                             request, sizeof(request), OtaDirectProfile::Bw500));
   ASSERT_TRUE(receiver.handleReceivedFrame(request, sizeof(request), h.now));
   ASSERT_TRUE(receiver.peekOutboundControlFrame(ack, sizeof(ack), len, h.now));
@@ -6298,9 +6365,11 @@ TEST(LoraOtaRfProduct, ProductionMeshLegacyAndProfileAcksAreZeroHopAndFitStock17
     StaticPoolPacketManager manager(8);
     PacketBoundaryRng rng; PacketBoundaryRtc rtc; PacketBoundaryTables tables;
     ProductionPacketMesh mesh(radio, clock, rng, rtc, manager, tables);
+    const auto challenge = freshLeaseChallenge(h.a.fx.integration, h.a.signer.publicKey(), h.now);
+    ASSERT_NE(0u, challenge);
     mesh.begin(); mesh.getOtaIntegration() = h.a.fx.integration;
     uint8_t request[171];
-    ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, 114,
+    ASSERT_EQ(171u, h.sender.fx.integration.buildDirectRequest(h.a.signer.publicKey(), 908525, 60000, challenge,
                                                               request, sizeof(request), profile));
     Packet packet = {};
     packet.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
@@ -6334,7 +6403,7 @@ TEST(LoraOtaRfProduct, RebootResumesDurableBitmapWithoutErasingAndBadFramesPrese
   h.a.fx.integration = OtaFirmwareIntegration();
   h.a.fx.integration.attachTrustProvider(&h.a.fx.trust);
   h.a.fx.integration.attachStagingSink(&h.a.fx.guarded);
-  h.a.fx.integration.attachCandidateStore(&h.a.fx.candidate_store);
+  h.a.fx.integration.attachCandidateStore(&h.a.fx.candidate_store); h.a.fx.integration.attachEntropy(nullptr, &otaTestEntropy);
   h.a.fx.integration.attachLeanSignatureVerifier(&h.a.fx.sig_verifier);
   h.a.fx.integration.setLeanAdminCheck(&h.a.fx.admins, leanAdminCheckThunk);
   h.a.fx.integration.setLeanTargetPublicKey(h.a.signer.publicKey());
@@ -6354,16 +6423,16 @@ TEST(LoraOtaRfProduct, UploaderCacheIsDurablyNonInstallableAndOwnerRevocationDen
   auto st = h.sender.fx.integration.leanReceiver().status();
   ASSERT_TRUE(st.localCache);
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(h.sender.signer.publicKey(), st.manifestHash, 5, message);
+  usb::buildCommitSignedMessage(h.sender.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, message);
   h.sender.signer.sign(message, sizeof(message), signature);
   EXPECT_EQ(usb::UsbOtaResult::Denied, h.sender.fx.integration.leanReceiver().commit(5, signature));
   ::ota::storage::OtaCandidateStore::Snapshot persisted;
-  ASSERT_TRUE(h.sender.fx.candidate_store.load(persisted));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, h.sender.fx.candidate_store.load(persisted));
   EXPECT_TRUE(persisted.localCache);
   for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
   ASSERT_TRUE(h.ready(h.a));
   st = h.a.fx.integration.leanReceiver().status();
-  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, 5, message);
+  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, message);
   h.sender.signer.sign(message, sizeof(message), signature);
   h.a.fx.admins.count = 0;
   EXPECT_EQ(usb::UsbOtaResult::Denied, h.a.fx.integration.leanReceiver().commit(5, signature));
@@ -6410,9 +6479,9 @@ TEST(LoraOtaRfProduct, ControlWireTargetHashAndCounterCannotBeChangedAfterSignin
   ASSERT_TRUE(h.ready(h.a));
   auto st = h.a.fx.integration.leanReceiver().status();
   uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
-  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, 5, message);
+  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, message);
   h.sender.signer.sign(message, sizeof(message), signature);
-  const auto len = encodeOtaCommitFrame(h.a.signer.publicKey(), st.manifestHash, 5, signature, frame, sizeof(frame));
+  const auto len = encodeOtaCommitFrame(h.a.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, signature, frame, sizeof(frame));
   for (size_t offset : {size_t(1), size_t(33), size_t(68)}) {
     frame[offset] ^= 1;
     EXPECT_FALSE(h.a.fx.integration.handleReceivedFrame(frame, len, h.now));
@@ -6435,7 +6504,7 @@ TEST(LoraOtaRfProduct, DirectRecoversLostAdmissionAndReceiverRebootByNormalProfi
   h.a.fx.integration = OtaFirmwareIntegration();
   h.a.fx.integration.attachTrustProvider(&h.a.fx.trust);
   h.a.fx.integration.attachStagingSink(&h.a.fx.guarded);
-  h.a.fx.integration.attachCandidateStore(&h.a.fx.candidate_store);
+  h.a.fx.integration.attachCandidateStore(&h.a.fx.candidate_store); h.a.fx.integration.attachEntropy(nullptr, &otaTestEntropy);
   h.a.fx.integration.attachLeanSignatureVerifier(&h.a.fx.sig_verifier);
   h.a.fx.integration.setLeanAdminCheck(&h.a.fx.admins, leanAdminCheckThunk);
   h.a.fx.integration.setLeanTargetPublicKey(h.a.signer.publicKey());
@@ -6606,7 +6675,7 @@ TEST(LoraOtaRfProduct, SignedCommitRetryAfterMetadataFailurePreservesReadyAndNev
   auto& receiver = h.a.fx.integration.leanReceiver();
   const auto st = receiver.status();
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, message);
+  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, st.generation, st.beginNonce, message);
   h.sender.signer.sign(message, sizeof(message), signature);
   using Flash = ::ota::test::FakeNorFlash;
   Flash::FaultSpec fault;
@@ -6617,7 +6686,7 @@ TEST(LoraOtaRfProduct, SignedCommitRetryAfterMetadataFailurePreservesReadyAndNev
   ASSERT_EQ(usb::UsbOtaResult::IoError, receiver.commit(st.counter, signature));
   EXPECT_TRUE(h.ready(h.a));
   ::ota::storage::OtaCandidateStore::Snapshot durable;
-  ASSERT_TRUE(h.a.fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, h.a.fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, durable.phase);
   uint8_t abort_message[usb::kAbortSignedBytes], abort_signature[64];
   usb::buildAbortSignedMessage(h.a.signer.publicKey(), st.imageHash, st.generation, abort_message);
@@ -6626,7 +6695,7 @@ TEST(LoraOtaRfProduct, SignedCommitRetryAfterMetadataFailurePreservesReadyAndNev
             receiver.abort(h.sender.signer.publicKey(), abort_signature, st.imageHash, st.generation));
   h.a.fx.candidate_flash.clearFault();
   ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.commit(st.counter, signature));
-  ASSERT_TRUE(h.a.fx.candidate_store.load(durable));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, h.a.fx.candidate_store.load(durable));
   EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Committed, durable.phase);
 }
 
@@ -6710,7 +6779,7 @@ TEST(LoraOtaRfProduct, SignedUsbCompanionCachesRepeaterForAllRfModesWithoutLocal
         h.b.fx.integration.attachTrustProvider(&second_target_trust);
         OtaBoardCacheOnlyBackend stock_cache(
             h.sender.fx.image_region, h.sender.fx.candidate_store_region, &leanNoTrial);
-        if (stock_loader) ASSERT_TRUE(stock_cache.attach(h.sender.fx.integration, h.sender.fx.sig_verifier));
+        if (stock_loader) ASSERT_TRUE((stock_cache.attach(h.sender.fx.integration, h.sender.fx.sig_verifier) && attachOtaTestEntropy(h.sender.fx.integration)));
         h.image.resize(257);
         for (size_t i = 0; i < h.image.size(); ++i) h.image[i] = static_cast<uint8_t>(i * 17u);
         auto descriptor = buildProtocolDescriptor(h.image.data(), h.image.size(), 5);
@@ -6769,12 +6838,12 @@ TEST(LoraOtaRfProduct, SignedUsbCompanionCachesRepeaterForAllRfModesWithoutLocal
         ASSERT_EQ(usb::UsbOtaPhase::CacheSealed, h.sender.fx.integration.reportedPhase());
         EXPECT_EQ(image_writes, h.sender.fx.image_flash.programOpCount());
         uint8_t commit_message[usb::kCommitSignedBytes], commit_signature[64];
-        usb::buildCommitSignedMessage(h.sender.signer.publicKey(), cache.status().manifestHash, 5, commit_message);
+        usb::buildCommitSignedMessage(h.sender.signer.publicKey(), cache.status().manifestHash, 5, cache.status().generation, cache.status().beginNonce, commit_message);
         h.sender.signer.sign(commit_message, sizeof(commit_message), commit_signature);
         EXPECT_EQ(usb::UsbOtaResult::Denied, cache.commit(5, commit_signature));
         EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, cache.status().phase);
         if (stock_loader) {
-          ASSERT_TRUE(stock_cache.attach(h.sender.fx.integration, h.sender.fx.sig_verifier));
+          ASSERT_TRUE((stock_cache.attach(h.sender.fx.integration, h.sender.fx.sig_verifier) && attachOtaTestEntropy(h.sender.fx.integration)));
           EXPECT_EQ(usb::UsbOtaPhase::CacheSealed, h.sender.fx.integration.reportedPhase());
           EXPECT_EQ(image_writes, h.sender.fx.image_flash.programOpCount());
           EXPECT_EQ(usb::UsbOtaResult::Denied, h.sender.fx.integration.leanReceiver().begin(
@@ -6845,7 +6914,7 @@ TEST(LoraOtaRfProduct, RepeaterRfAdmissionIndependentlyChecksItsOwnRoleFloorAndB
 TEST(LoraOtaRfProduct, StockLoaderUsbCacheRequiresSelfOrLiveAdminCanonicalFieldsCapacityAndExactImageHash) {
   RfProductHarness h;
   OtaBoardCacheOnlyBackend backend(h.sender.fx.image_region, h.sender.fx.candidate_store_region, &leanNoTrial);
-  ASSERT_TRUE(backend.attach(h.sender.fx.integration, h.sender.fx.sig_verifier));
+  ASSERT_TRUE((backend.attach(h.sender.fx.integration, h.sender.fx.sig_verifier) && attachOtaTestEntropy(h.sender.fx.integration)));
   const uint8_t image[40] = {0x52};
   auto descriptor = buildProtocolDescriptor(image, sizeof(image), 5);
   descriptor.boardFamily = 0x584E;
@@ -6927,7 +6996,7 @@ TEST(LoraOtaRfProduct, StockLoaderCacheStillRefusesDestructiveStagingDuringTrial
     RfProductHarness h;
     OtaBoardCacheOnlyBackend backend(h.sender.fx.image_region, h.sender.fx.candidate_store_region,
                                      unknown ? nullptr : +[]() { return true; });
-    ASSERT_TRUE(backend.attach(h.sender.fx.integration, h.sender.fx.sig_verifier));
+    ASSERT_TRUE((backend.attach(h.sender.fx.integration, h.sender.fx.sig_verifier) && attachOtaTestEntropy(h.sender.fx.integration)));
     const uint8_t image[40] = {0x54};
     uint8_t canonical[59], signature[64];
     h.sender.fx.buildSmallManifest(image, sizeof(image), canonical);
@@ -7087,7 +7156,7 @@ struct UnadmittedFixture {
     trust.reset(new OtaNrf52FirmwareTrustProvider(*verifier, fx.image_region));
     fx.integration.attachTrustProvider(trust.get());
     fx.integration.attachStagingSink(&sink);
-    fx.integration.attachCandidateStore(&fx.candidate_store);
+    fx.integration.attachCandidateStore(&fx.candidate_store); fx.integration.attachEntropy(nullptr, &otaTestEntropy);
     fx.integration.attachLeanSignatureVerifier(&fx.sig_verifier);
     fx.integration.setLeanAdminCheck(&fx.admins, &leanAdminCheckThunk);
     fx.integration.setLeanTargetPublicKey(fx.target_public_key);
@@ -7122,7 +7191,7 @@ struct UnadmittedFixture {
     auto& receiver = fx.integration.leanReceiver();
     const auto st = receiver.status();
     uint8_t message[usb::kCommitSignedBytes], sig[64];
-    usb::buildCommitSignedMessage(fx.target_public_key, st.manifestHash, st.counter, message);
+    usb::buildCommitSignedMessage(fx.target_public_key, st.manifestHash, st.counter, st.generation, st.beginNonce, message);
     owner.sign(message, sizeof(message), sig);
     ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.commit(st.counter, sig));
   }
@@ -7374,14 +7443,14 @@ TEST(LoraOtaLifecycle, ConsecutiveRollbackProofNeverErasesNewerIntentOrIgnoresTo
     if (fault >= 6) {
       const auto ready = f.fx.integration.leanReceiver().status();
       uint8_t message[usb::kCommitSignedBytes], signature[64];
-      usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+      usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce, message);
       f.owner.sign(message, sizeof(message), signature);
       f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
                                     f.fx.candidate_flash.programOpCount() + 1});
       ASSERT_EQ(usb::UsbOtaResult::IoError, f.fx.integration.leanReceiver().commit(ready.counter, signature));
       f.fx.candidate_flash.clearFault();
       if (fault == 7) {
-        ::ota::storage::OtaCandidateStore::Snapshot aborted; ASSERT_TRUE(f.fx.candidate_store.load(aborted));
+        ::ota::storage::OtaCandidateStore::Snapshot aborted; ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(aborted));
         aborted.phase = ::ota::storage::OtaCandidateStore::Phase::Aborted; ++aborted.sessionId;
         ASSERT_TRUE(f.fx.candidate_store.append(aborted));
       }
@@ -7548,7 +7617,7 @@ TEST(LoraOtaLifecycle, ReadyUncertainCommitStillDisarmsOnlyBoundIntentAndNeverLe
     f.stage(rollback_sibling ? 6 : 5); ASSERT_FALSE(HasFatalFailure());
     const auto ready = f.fx.integration.leanReceiver().status();
     uint8_t message[usb::kCommitSignedBytes], signature[64];
-    usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+    usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce, message);
     f.owner.sign(message, sizeof(message), signature);
     f.fx.candidate_flash.armFault({::ota::test::FakeNorFlash::OpKind::Program,
         ::ota::test::FakeNorFlash::InjectionTiming::Before, f.fx.candidate_flash.programOpCount() + 1});
@@ -7826,7 +7895,7 @@ TEST(LoraOtaLifecycle, UnadmittedRecoveryNeverLeavesAnUnboundSiblingAboveTheProt
     const uint32_t sibling_offset = Cmd::isValidRecord(f.command_flash.rawBuffer(), Cmd::kRecordBytes) ? 4096 : 0;
     ASSERT_TRUE(::ota::platform::isOk(f.command.program(sibling_offset, sibling, sizeof(sibling))));
     ::ota::storage::OtaCandidateStore::Snapshot durable;
-    ASSERT_TRUE(f.fx.candidate_store.load(durable));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(durable));
     const auto image_before = std::vector<uint8_t>(f.fx.image_flash.rawBuffer(),
         f.fx.image_flash.rawBuffer() + f.fx.image_flash.rawSize());
     const auto command_before = std::vector<uint8_t>(f.command_flash.rawBuffer(),
@@ -8073,12 +8142,12 @@ TEST(LoraOtaLifecycle, RealMeshRemoteSignedCommitDefersResetAfterDurableIntentAn
     ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, integration.leanReceiver().status().phase);
     EXPECT_FALSE(integration.takeCommitReboot(99999, false, false));
     uint8_t message[usb::kCommitSignedBytes], signature[64];
-    usb::buildCommitSignedMessage(f.fx.target_public_key, hash, 5, message);
+    usb::buildCommitSignedMessage(f.fx.target_public_key, hash, 5, integration.leanReceiver().status().generation, integration.leanReceiver().status().beginNonce, message);
     f.owner.sign(message, sizeof(message), signature);
-    len = encodeOtaCommitFrame(f.fx.target_public_key, hash, 5, signature, frame, sizeof(frame));
+    len = encodeOtaCommitFrame(f.fx.target_public_key, hash, 5, integration.leanReceiver().status().generation, integration.leanReceiver().status().beginNonce, signature, frame, sizeof(frame));
     deliver(frame, len);
     ::ota::storage::OtaCandidateStore::Snapshot durable;
-    ASSERT_TRUE(f.fx.candidate_store.load(durable));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(durable));
     ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Committed, durable.phase);
     EXPECT_TRUE(integration.hasPendingRfWork());
     EXPECT_FALSE(integration.takeCommitReboot(2099, false, false));
@@ -8128,7 +8197,7 @@ TEST(LoraOtaLifecycle, RealMeshRemoteSignedCommitDefersResetAfterDurableIntentAn
     }
     OtaFirmwareIntegration cold;
     cold.attachTrustProvider(f.trust.get()); cold.attachStagingSink(&f.sink);
-    cold.attachCandidateStore(&f.fx.candidate_store); cold.attachLeanSignatureVerifier(&f.fx.sig_verifier);
+    cold.attachCandidateStore(&f.fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy); cold.attachLeanSignatureVerifier(&f.fx.sig_verifier);
     cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk); cold.setLeanTargetPublicKey(f.fx.target_public_key);
     cold.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
     EXPECT_TRUE(cold.handleReceivedFrame(frame, len, 3000));
@@ -8150,7 +8219,7 @@ TEST(LoraOtaLifecycle, RemoteCommitErrorsAndUncertainJournalNeverArmResetUntilSi
     if (fault == 0) target[0] ^= 1;
     if (fault == 1) hash[0] ^= 1;
     if (fault == 2) counter = 6;
-    usb::buildCommitSignedMessage(target, hash, counter, message);
+    usb::buildCommitSignedMessage(target, hash, counter, st.generation, st.beginNonce, message);
     f.owner.sign(message, sizeof(message), signature);
     if (fault == 3) signature[0] ^= 1;
     if (fault == 4) f.fx.admins.count = 0;
@@ -8159,7 +8228,7 @@ TEST(LoraOtaLifecycle, RemoteCommitErrorsAndUncertainJournalNeverArmResetUntilSi
                                              f.command_flash.programOpCount() + 1});
     if (fault == 6) f.fx.candidate_flash.armFault({Flash::OpKind::Program, Flash::InjectionTiming::Before,
                                                  f.fx.candidate_flash.programOpCount() + 1});
-    auto len = encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame));
+    auto len = encodeOtaCommitFrame(target, hash, counter, st.generation, st.beginNonce, signature, frame, sizeof(frame));
     EXPECT_FALSE(integration.handleReceivedFrame(frame, len, 100));
     EXPECT_FALSE(integration.takeCommitReboot(99999, false, false));
     EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, integration.leanReceiver().status().phase);
@@ -8184,8 +8253,10 @@ TEST(LoraOtaLifecycle, DeferredCommitResetWaitsForRestorationButQueueLossDoesNot
   integration.attachRfIdentity(&radio_node, &RfNode::sign, &RfNode::radio, 907525);
   const auto st = integration.leanReceiver().status();
   uint8_t direct[kOtaDirectFrameBytes], message[160], signature[64];
+  const auto challenge = freshLeaseChallenge(integration, radio_node.signer.publicKey(), 100);
+  ASSERT_NE(0u, challenge);
   ASSERT_EQ(sizeof(direct), encodeOtaDirectFrame(kOtaDirectRequestKind, f.owner.publicKey(),
-      radio_node.signer.publicKey(), st.manifestHash, 908525, 60000, 1, direct, sizeof(direct)));
+      radio_node.signer.publicKey(), st.manifestHash, 908525, 60000, challenge, direct, sizeof(direct)));
   auto len = buildOtaDirectMessage(direct, message);
   f.owner.sign(message, len, direct + 107);
   ASSERT_TRUE(integration.handleReceivedFrame(direct, sizeof(direct), 100));
@@ -8193,10 +8264,10 @@ TEST(LoraOtaLifecycle, DeferredCommitResetWaitsForRestorationButQueueLossDoesNot
   integration.tickDirect(200, true); integration.tickDirect(5200, true);
   ASSERT_TRUE(integration.directActive());
   radio_node.failRestore = true;
-  usb::buildCommitSignedMessage(radio_node.signer.publicKey(), st.manifestHash, 5, message);
+  usb::buildCommitSignedMessage(radio_node.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, message);
   f.owner.sign(message, usb::kCommitSignedBytes, signature);
   uint8_t commit[kOtaCommitFrameBytes];
-  len = encodeOtaCommitFrame(radio_node.signer.publicKey(), st.manifestHash, 5, signature, commit, sizeof(commit));
+  len = encodeOtaCommitFrame(radio_node.signer.publicKey(), st.manifestHash, 5, st.generation, st.beginNonce, signature, commit, sizeof(commit));
   const uint32_t now = 0xfffffff0;
   ASSERT_TRUE(integration.handleReceivedFrame(commit, len, now));
   EXPECT_FALSE(integration.takeCommitReboot(now + 15000, false, true, true));
@@ -8215,9 +8286,9 @@ TEST(LoraOtaLifecycle, ProvenNeverAdmittedAbortCancelsDeferredResetAndImmediateN
   const auto commit = [&](uint32_t now) {
     const auto st = integration.leanReceiver().status();
     uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
-    usb::buildCommitSignedMessage(f.fx.target_public_key, st.manifestHash, st.counter, message);
+    usb::buildCommitSignedMessage(f.fx.target_public_key, st.manifestHash, st.counter, st.generation, st.beginNonce, message);
     f.owner.sign(message, sizeof(message), signature);
-    auto len = encodeOtaCommitFrame(f.fx.target_public_key, st.manifestHash, st.counter, signature, frame, sizeof(frame));
+    auto len = encodeOtaCommitFrame(f.fx.target_public_key, st.manifestHash, st.counter, st.generation, st.beginNonce, signature, frame, sizeof(frame));
     ASSERT_TRUE(integration.handleReceivedFrame(frame, len, now));
   };
   commit(100); ASSERT_FALSE(HasFatalFailure());
@@ -8234,7 +8305,7 @@ TEST(LoraOtaLifecycle, ProvenNeverAdmittedAbortCancelsDeferredResetAndImmediateN
   aborted.fx.integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
   const auto st = aborted.fx.integration.leanReceiver().status();
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(aborted.fx.target_public_key, st.manifestHash, st.counter, message);
+  usb::buildCommitSignedMessage(aborted.fx.target_public_key, st.manifestHash, st.counter, st.generation, st.beginNonce, message);
   aborted.owner.sign(message, sizeof(message), signature);
   ASSERT_EQ(usb::UsbOtaResult::Ok, aborted.fx.integration.commitAndDeferReboot(st.counter, signature, 100));
   aborted.boot.accessor.image.back() ^= 1;
@@ -8250,7 +8321,7 @@ TEST(LoraOtaLifecycle, ContinuousOrdinaryTrafficCannotPostponeAuthorizedResetPas
   integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
   const auto st = integration.leanReceiver().status();
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(f.fx.target_public_key, st.manifestHash, st.counter, message);
+  usb::buildCommitSignedMessage(f.fx.target_public_key, st.manifestHash, st.counter, st.generation, st.beginNonce, message);
   f.owner.sign(message, sizeof(message), signature);
   ASSERT_EQ(usb::UsbOtaResult::Ok, integration.commitAndDeferReboot(st.counter, signature, 100));
   EXPECT_FALSE(integration.tickCommitReboot(15099, true, true, true));
@@ -8286,7 +8357,7 @@ TEST(LoraOtaLifecycle, ThreeProductionNrfCampaignsRetireOnlyConfirmedOrCompleted
           for (int tick = 0; tick < 10; ++tick) observer.tick(true);
           fx.integration.attachTrustProvider(&trust);
           fx.integration.attachStagingSink(&sink);
-          fx.integration.attachCandidateStore(&fx.candidate_store);
+          fx.integration.attachCandidateStore(&fx.candidate_store); fx.integration.attachEntropy(nullptr, &otaTestEntropy);
           fx.integration.attachBootLifecycle(&observer, [](void* ctx, OtaBootLifecycleEvidence& out) {
             return static_cast<OtaBoardBootLifecycleObserver*>(ctx)->read(true, out);
           });
@@ -8326,7 +8397,7 @@ TEST(LoraOtaLifecycle, ThreeProductionNrfCampaignsRetireOnlyConfirmedOrCompleted
           ASSERT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, receiver.status().phase);
           const auto ready = receiver.status();
           uint8_t message[usb::kCommitSignedBytes];
-          usb::buildCommitSignedMessage(fx.target_public_key, ready.manifestHash, security_counter, message);
+          usb::buildCommitSignedMessage(fx.target_public_key, ready.manifestHash, security_counter, ready.generation, ready.beginNonce, message);
           owner.sign(message, sizeof(message), signature);
           ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.commit(security_counter, signature));
           uint8_t durable[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
@@ -8472,7 +8543,7 @@ TEST(LoraOtaLifecycle, RemoteCensusCarriesRealPhaseAndCommitAckCannotFabricateIn
   auto& integration = h.a.fx.integration;
   const auto st = integration.leanReceiver().status();
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, message);
+  usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, st.generation, st.beginNonce, message);
   h.sender.signer.sign(message, sizeof(message), signature);
   ASSERT_EQ(usb::UsbOtaResult::Ok, integration.leanReceiver().commit(st.counter, signature));
   EXPECT_EQ(usb::UsbOtaPhase::CommitPending, integration.reportedPhase());
@@ -8532,10 +8603,10 @@ struct BootReadbackFixture {
     auto& receiver = h.a.fx.integration.leanReceiver();
     const auto st = receiver.status();
     uint8_t message[usb::kCommitSignedBytes], signature[64];
-    usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, message);
+    usb::buildCommitSignedMessage(h.a.signer.publicKey(), st.manifestHash, st.counter, st.generation, st.beginNonce, message);
     h.sender.signer.sign(message, sizeof(message), signature);
     ASSERT_EQ(usb::UsbOtaResult::Ok, receiver.commit(st.counter, signature));
-    ASSERT_TRUE(h.a.fx.candidate_store.load(candidate));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, h.a.fx.candidate_store.load(candidate));
     setBoot(usb::UsbOtaPhase::Installed);
     attach(cold);
   }
@@ -8596,7 +8667,7 @@ TEST(LoraOtaLifecycle, CommittedCandidateCannotRetireForTrialUnknownOrMismatched
         auto record = f.candidate;
         if (fault == 8) record.signature[0] ^= 1; else ++record.totalBlocks;
         ASSERT_TRUE(f.h.a.fx.candidate_store.append(record));
-        integration.attachCandidateStore(&f.h.a.fx.candidate_store);
+        integration.attachCandidateStore(&f.h.a.fx.candidate_store); integration.attachEntropy(nullptr, &otaTestEntropy);
         break;
       }
       case 10:
@@ -8630,7 +8701,7 @@ TEST(LoraOtaLifecycle, ActualTerminalBootResolvesReadyJournalCommitUncertaintyWi
   ready.phase = ::ota::storage::OtaCandidateStore::Phase::Ready;
   ASSERT_TRUE(f.h.a.fx.candidate_store.append(ready));
   auto& integration = f.h.a.fx.integration;
-  integration.attachCandidateStore(&f.h.a.fx.candidate_store);
+  integration.attachCandidateStore(&f.h.a.fx.candidate_store); integration.attachEntropy(nullptr, &otaTestEntropy);
   f.attach(integration);
   uint8_t image[40] = {0x73}, canonical[59], signature[64];
   f.h.a.fx.buildSmallManifest(image, sizeof(image), canonical, 6);
@@ -8660,7 +8731,7 @@ TEST(LoraOtaLifecycle, VerifiedNewerRunningProjectionDoesNotGrantRetirementForDi
     f.h.sender.signer.sign(old.canonical, sizeof(old.canonical), old.signature);
     ASSERT_TRUE(inactive.candidate_store.reset(old));
     for (uint16_t index = 0; index < old.totalBlocks; ++index) ASSERT_TRUE(inactive.candidate_store.markReceived(index));
-    inactive.integration.attachCandidateStore(&inactive.candidate_store);
+    inactive.integration.attachCandidateStore(&inactive.candidate_store); inactive.integration.attachEntropy(nullptr, &otaTestEntropy);
     inactive.admins.add(f.h.sender.signer.publicKey());
     f.attach(inactive.integration);
     const auto before = inactive.integration.leanReceiver().status();
@@ -8679,7 +8750,7 @@ TEST(LoraOtaLifecycle, VerifiedNewerRunningProjectionDoesNotGrantRetirementForDi
   }
 }
 
-TEST(LoraOtaLifecycle, ColdBootTrialAndInstalledReadbacksNeedNoWritableBackendAndKeepUsbAbi2AndRfBinding) {
+TEST(LoraOtaLifecycle, ColdBootTrialAndInstalledReadbacksNeedNoWritableBackendAndKeepUsbAbi3AndRfBinding) {
   BootReadbackFixture f;
   f.prepare();
   ASSERT_FALSE(HasFatalFailure());
@@ -8703,7 +8774,7 @@ TEST(LoraOtaLifecycle, ColdBootTrialAndInstalledReadbacksNeedNoWritableBackendAn
     EXPECT_EQ(f.boot.counter, reply.counter);
     EXPECT_EQ(view.snapshot.totalBlocks, reply.durableReceivedBlocks);
     uint8_t encoded[usb::kReplyBytes];
-    EXPECT_EQ(90u, usb::encodeUsbOtaReply(reply, encoded));
+    EXPECT_EQ(107u, usb::encodeUsbOtaReply(reply, encoded));
     EXPECT_EQ(view.snapshot.generation, usb::getBE32(encoded + 86));
     char text[160];
     formatOtaBootLifecycleStatus(text, sizeof(text), f.boot, view.phase, view.snapshot.counter);
@@ -8749,7 +8820,7 @@ TEST(LoraOtaLifecycle, VerifiedRunningProvenanceOverridesSupersededInactiveMetad
     old.phase = phase;
     ASSERT_TRUE(inactive.candidate_store.reset(old));
     for (uint16_t i = 0; i < old.totalBlocks; ++i) ASSERT_TRUE(inactive.candidate_store.markReceived(i));
-    inactive.integration.leanReceiver().attachCandidateStore(&inactive.candidate_store);
+    inactive.integration.leanReceiver().attachCandidateStore(&inactive.candidate_store); inactive.integration.leanReceiver().attachEntropy(nullptr, &otaTestEntropy);
     f.attach(inactive.integration);
     const auto before = inactive.integration.leanReceiver().status();
     const auto programs = inactive.candidate_flash.programOpCount() + inactive.image_flash.programOpCount();
@@ -8774,14 +8845,14 @@ TEST(LoraOtaLifecycle, NewCandidateAndLocalCacheKeepTheirOwnStatusWhileOldBootCa
   f.h.sender.signer.sign(f.candidate.canonical, sizeof(f.candidate.canonical), f.candidate.signature);
   f.setBoot(usb::UsbOtaPhase::Installed);
   ::ota::storage::OtaCandidateStore::Snapshot current;
-  ASSERT_TRUE(f.h.a.fx.candidate_store.load(current));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.h.a.fx.candidate_store.load(current));
   using Phase = ::ota::storage::OtaCandidateStore::Phase;
   for (const auto phase : {Phase::Receiving, Phase::Verifying, Phase::Ready, Phase::Committed}) {
     LeanFixture active;
     current.phase = phase;
     ASSERT_TRUE(active.candidate_store.reset(current));
     for (uint16_t i = 0; i < current.totalBlocks; ++i) ASSERT_TRUE(active.candidate_store.markReceived(i));
-    active.integration.leanReceiver().attachCandidateStore(&active.candidate_store);
+    active.integration.leanReceiver().attachCandidateStore(&active.candidate_store); active.integration.leanReceiver().attachEntropy(nullptr, &otaTestEntropy);
     f.attach(active.integration);
     EXPECT_EQ(OtaFirmwareIntegration::candidatePhase(phase), active.integration.readback().phase);
     EXPECT_EQ(OtaLeanReceiver::snapshotStatus(current).counter, active.integration.readback().snapshot.counter);
@@ -8792,10 +8863,10 @@ TEST(LoraOtaLifecycle, NewCandidateAndLocalCacheKeepTheirOwnStatusWhileOldBootCa
     EXPECT_EQ(installed.counter, queried.snapshot.counter);
   }
   ::ota::storage::OtaCandidateStore::Snapshot cache;
-  ASSERT_TRUE(f.h.sender.fx.candidate_store.load(cache));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.h.sender.fx.candidate_store.load(cache));
   cache.localCache = true;
   ASSERT_TRUE(f.h.sender.fx.candidate_store.append(cache));
-  f.h.sender.fx.integration.leanReceiver().attachCandidateStore(&f.h.sender.fx.candidate_store);
+  f.h.sender.fx.integration.leanReceiver().attachCandidateStore(&f.h.sender.fx.candidate_store); f.h.sender.fx.integration.leanReceiver().attachEntropy(nullptr, &otaTestEntropy);
   f.attach(f.h.sender.fx.integration);
   f.reads = 0;
   f.lifecycleReads = 0;
@@ -8849,7 +8920,7 @@ TEST(LoraOtaLifecycle, AuthorizedSameCounterRepairKeepsActiveReadyInsteadOfOlder
   LeanFixture active;
   ASSERT_TRUE(active.candidate_store.reset(retry));
   for (uint16_t i = 0; i < retry.totalBlocks; ++i) ASSERT_TRUE(active.candidate_store.markReceived(i));
-  active.integration.leanReceiver().attachCandidateStore(&active.candidate_store);
+  active.integration.leanReceiver().attachCandidateStore(&active.candidate_store); active.integration.leanReceiver().attachEntropy(nullptr, &otaTestEntropy);
   f.attach(active.integration);
   const auto view = active.integration.readback();
   EXPECT_FALSE(view.bootCandidate);
@@ -9169,7 +9240,7 @@ TEST(LoraOtaProofStack, DeferredCommitRejectsReentryBeforeMutationAndStillUsesIt
   q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
   const auto before = q.f.fx.integration.leanReceiver().status();
   uint8_t message[usb::kCommitSignedBytes], signature[64];
-  usb::buildCommitSignedMessage(q.f.fx.target_public_key, before.manifestHash, before.counter, message);
+  usb::buildCommitSignedMessage(q.f.fx.target_public_key, before.manifestHash, before.counter, before.generation, before.beginNonce, message);
   q.f.owner.sign(message, sizeof(message), signature);
   int resets = 0;
   q.f.fx.integration.attachCommitReboot(&resets, [](void* ptr) { ++*static_cast<int*>(ptr); });
@@ -9236,7 +9307,7 @@ TEST(LoraOtaProofStack, RecoveryReentryFailsClosedAndTheAuthorizedOuterAbortStil
     ::ota::storage::OtaCandidateStore::Snapshot candidate;
     bool called = false;
   } nested{q, {}};
-  ASSERT_TRUE(q.f.fx.candidate_store.load(nested.candidate));
+  ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, q.f.fx.candidate_store.load(nested.candidate));
   q.running.hookAt = q.running.reads + 1;
   q.running.hookContext = &nested;
   q.running.hook = [](void* ptr) {
@@ -9413,9 +9484,9 @@ TEST(LoraOtaQualifiedOriginal, VendorZeroFactoryFloorProducesRealSignedCommitWor
     q.f.stage(1); ASSERT_FALSE(HasFatalFailure());
     const auto ready = q.f.fx.integration.leanReceiver().status();
     uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
-    usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+    usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce, message);
     q.f.owner.sign(message, sizeof(message), signature);
-    const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter,
+    const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce,
                                             signature, frame, sizeof(frame));
     int resets = 0;
     q.f.fx.integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
@@ -9498,9 +9569,9 @@ TEST(LoraOtaQualifiedOriginal, ProductionColdGateRequiresPresentGenesisAndReadyC
       ASSERT_EQ(Store::Phase::Ready, q.f.fx.integration.leanReceiver().status().phase);
       const auto ready = q.f.fx.integration.leanReceiver().status();
       uint8_t message[usb::kCommitSignedBytes], signature[64], frame[kOtaCommitFrameBytes];
-      usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, message);
+      usb::buildCommitSignedMessage(q.f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce, message);
       q.f.owner.sign(message, sizeof(message), signature);
-      const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter,
+      const auto length = encodeOtaCommitFrame(q.f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation, ready.beginNonce,
                                               signature, frame, sizeof(frame));
       int resets = 0;
       q.f.fx.integration.attachCommitReboot(&resets, [](void* ctx) { ++*static_cast<int*>(ctx); });
@@ -10084,6 +10155,619 @@ TEST(LoraOtaQualifiedOriginal, PendingMalformedAndUnexplainedHistoryNeverUnlockN
     EXPECT_FALSE(store.savePrefs(prefs));
     EXPECT_EQ(0u, filesystem.mounts);
     EXPECT_EQ(0u, filesystem.writes);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SYN-03: COMMIT authority is bound to the durable BEGIN nonce.
+// ---------------------------------------------------------------------------
+TEST(LoraOtaSyn03, CapturedCommitCannotAuthorizeIdenticalReuploadAfterAbortRebootOrEmptyStore) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f; f.stage(); ASSERT_FALSE(HasFatalFailure());
+  auto& receiver = f.fx.integration.leanReceiver();
+  const auto first = receiver.status();
+  ASSERT_TRUE(usb::beginNonceBound(first.beginNonce));
+  const auto sign_commit = [&](const OtaLeanReceiver::Status& st, uint8_t out[kOtaCommitFrameBytes]) {
+    uint8_t message[usb::kCommitSignedBytes], sig[64];
+    usb::buildCommitSignedMessage(f.fx.target_public_key, st.manifestHash, st.counter, st.generation,
+                                  st.beginNonce, message);
+    f.owner.sign(message, sizeof(message), sig);
+    return encodeOtaCommitFrame(f.fx.target_public_key, st.manifestHash, st.counter, st.generation,
+                                st.beginNonce, sig, out, kOtaCommitFrameBytes);
+  };
+  uint8_t captured[kOtaCommitFrameBytes];
+  ASSERT_EQ(kOtaCommitFrameBytes, sign_commit(first, captured));
+  ASSERT_EQ(usb::UsbOtaResult::Ok, f.abort());
+  f.stage(5, true); ASSERT_FALSE(HasFatalFailure());  // identical image, new attempt
+  const auto second = receiver.status();
+  ASSERT_EQ(0, std::memcmp(first.manifestHash, second.manifestHash, 32));
+  ASSERT_TRUE(usb::beginNonceBound(second.beginNonce));
+  ASSERT_NE(0, std::memcmp(first.beginNonce, second.beginNonce, 16));
+
+  const auto replay_rejected = [&](mesh::ota::OtaFirmwareIntegration& flow, uint32_t now) {
+    auto& lean = flow.leanReceiver();
+    const auto st = lean.status();
+    const auto journal = f.fx.candidate_flash.programOpCount();
+    const auto journal_erases = f.fx.candidate_flash.eraseOpCount();
+    const auto command = f.command_flash.programOpCount();
+    flow.handleReceivedFrame(captured, sizeof(captured), now);
+    // The captured signature spliced onto the live generation and nonce.
+    uint8_t spliced[kOtaCommitFrameBytes];
+    ASSERT_EQ(kOtaCommitFrameBytes, encodeOtaCommitFrame(f.fx.target_public_key, st.manifestHash, st.counter,
+                                                         st.generation, st.beginNonce, captured + 89, spliced,
+                                                         sizeof(spliced)));
+    flow.handleReceivedFrame(spliced, sizeof(spliced), now + 1);
+    EXPECT_NE(usb::UsbOtaResult::Ok, lean.commit(st.counter, captured + 89));
+    EXPECT_EQ(Store::Phase::Ready, lean.status().phase);
+    EXPECT_EQ(0, std::memcmp(st.beginNonce, lean.status().beginNonce, 16));
+    EXPECT_EQ(journal, f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(journal_erases, f.fx.candidate_flash.eraseOpCount());
+    EXPECT_EQ(command, f.command_flash.programOpCount());
+  };
+  replay_rejected(f.fx.integration, 100);
+  ASSERT_FALSE(HasFatalFailure());
+
+  // Cold reboot: the nonce is durable, so the capture is still dead.
+  {
+    mesh::ota::OtaFirmwareIntegration cold;
+    cold.attachTrustProvider(f.trust.get());
+    cold.attachStagingSink(&f.sink);
+    cold.attachCandidateStore(&f.fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy);
+    cold.attachLeanSignatureVerifier(&f.fx.sig_verifier);
+    cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+    cold.setLeanTargetPublicKey(f.fx.target_public_key);
+    ASSERT_EQ(Store::Phase::Ready, cold.leanReceiver().status().phase);
+    EXPECT_EQ(second.generation, cold.leanReceiver().status().generation);
+    EXPECT_EQ(0, std::memcmp(second.beginNonce, cold.leanReceiver().status().beginNonce, 16));
+    replay_rejected(cold, 200);
+    ASSERT_FALSE(HasFatalFailure());
+  }
+
+  // Empty journal: generation restarts and collides; only the nonce differs.
+  for (uint32_t offset = 0; offset < Store::kExpectedRegionBytes; offset += Store::kSectorBytes)
+    ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.eraseSector(offset)));
+  receiver.restore();
+  ASSERT_FALSE(receiver.status().valid);
+  f.stage(); ASSERT_FALSE(HasFatalFailure());
+  const auto third = receiver.status();
+  EXPECT_EQ(first.generation, third.generation);
+  ASSERT_NE(0, std::memcmp(first.beginNonce, third.beginNonce, 16));
+  ASSERT_NE(0, std::memcmp(second.beginNonce, third.beginNonce, 16));
+  replay_rejected(f.fx.integration, 300);
+  ASSERT_FALSE(HasFatalFailure());
+
+  // The genuinely fresh COMMIT works and same-attempt retries are idempotent.
+  uint8_t genuine[kOtaCommitFrameBytes];
+  ASSERT_EQ(kOtaCommitFrameBytes, sign_commit(third, genuine));
+  ASSERT_TRUE(f.fx.integration.handleReceivedFrame(genuine, sizeof(genuine), 400));
+  Store::Snapshot durable;
+  ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(durable));
+  ASSERT_EQ(Store::Phase::Committed, durable.phase);
+  EXPECT_EQ(0, std::memcmp(third.beginNonce, durable.beginNonce, 16));
+  f.fx.integration.releaseOutboundControlFrame();
+  const auto journal = f.fx.candidate_flash.programOpCount();
+  const auto command = f.command_flash.programOpCount();
+  EXPECT_TRUE(f.fx.integration.handleReceivedFrame(genuine, sizeof(genuine), 500));
+  EXPECT_EQ(journal, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(command, f.command_flash.programOpCount());
+  EXPECT_EQ(Store::Phase::Committed, receiver.status().phase);
+}
+
+// ---------------------------------------------------------------------------
+// SYN-04: direct lease requests carry a single-use receiver challenge.
+// ---------------------------------------------------------------------------
+namespace {
+size_t signedLegacyDirectRequest(RfProductHarness& h, uint32_t token, uint8_t out[kOtaDirectFrameBytes]) {
+  const auto st = h.a.fx.integration.leanReceiver().status();
+  const auto len = encodeOtaDirectFrame(kOtaDirectRequestKind, h.sender.signer.publicKey(), h.a.signer.publicKey(),
+                                        st.manifestHash, 908525, 60000, token, out, kOtaDirectFrameBytes);
+  if (len != kOtaDirectFrameBytes) return 0;
+  uint8_t message[160];
+  const auto mlen = buildOtaDirectMessage(out, message);
+  h.sender.signer.sign(message, mlen, out + 107);
+  return len;
+}
+}  // namespace
+
+TEST(LoraOtaSyn04, AlternatingAndPreRebootLeaseRequestsNeverAckOrRetune) {
+  RfProductHarness h;
+  h.prepare(168, usb::kStartModeDirected);
+  for (int i = 0; i < 20 && !h.ready(h.a); ++i) h.step();
+  ASSERT_TRUE(h.ready(h.a));
+  auto& receiver = h.a.fx.integration;
+  uint32_t now = h.now + 1000;
+  const auto lease_once = [&](mesh::ota::OtaFirmwareIntegration& flow, const uint8_t* request) {
+    uint8_t ack[kOtaDirectFrameBytes]; size_t len = 0;
+    const int retunes = h.a.retunes;
+    ASSERT_TRUE(flow.handleReceivedFrame(request, kOtaDirectFrameBytes, now));
+    ASSERT_TRUE(flow.peekOutboundControlFrame(ack, sizeof(ack), len, now));
+    ASSERT_EQ(kOtaDirectFrameBytes, len); EXPECT_EQ(kOtaDirectAckKind, ack[0]);
+    flow.releaseOutboundControlFrame();
+    flow.tickDirect(now); flow.tickDirect(now + 5000);
+    ASSERT_TRUE(flow.directActive());
+    EXPECT_EQ(retunes + 1, h.a.retunes);
+    // An identical retry while leased neither ACKs nor renews.
+    EXPECT_TRUE(flow.handleReceivedFrame(request, kOtaDirectFrameBytes, now + 6000));
+    EXPECT_FALSE(flow.peekOutboundControlFrame(ack, sizeof(ack), len, now + 6000));
+    flow.tickDirect(now + 65001);
+    EXPECT_FALSE(flow.directActive());
+    EXPECT_EQ(907525u, h.a.frequency);
+    EXPECT_EQ(retunes + 1, h.a.retunes);
+    now += 70000;
+  };
+  const auto rejected = [&](mesh::ota::OtaFirmwareIntegration& flow, const uint8_t* request) {
+    uint8_t ack[kOtaDirectFrameBytes]; size_t len = 0;
+    const int retunes = h.a.retunes;
+    EXPECT_FALSE(flow.handleReceivedFrame(request, kOtaDirectFrameBytes, now));
+    EXPECT_FALSE(flow.peekOutboundControlFrame(ack, sizeof(ack), len, now));
+    EXPECT_FALSE(flow.directPending());
+    flow.tickDirect(now + 5000);
+    EXPECT_FALSE(flow.directActive());
+    EXPECT_EQ(retunes, h.a.retunes);
+    EXPECT_EQ(907525u, h.a.frequency);
+    now += 100;
+  };
+
+  uint8_t request_a[kOtaDirectFrameBytes], request_b[kOtaDirectFrameBytes];
+  const auto challenge_a = freshLeaseChallenge(receiver, h.a.signer.publicKey(), now);
+  ASSERT_NE(0u, challenge_a);
+  ASSERT_EQ(kOtaDirectFrameBytes, signedLegacyDirectRequest(h, challenge_a, request_a));
+  lease_once(receiver, request_a); ASSERT_FALSE(HasFatalFailure());
+  const auto challenge_b = freshLeaseChallenge(receiver, h.a.signer.publicKey(), now);
+  ASSERT_NE(0u, challenge_b);
+  ASSERT_NE(challenge_a, challenge_b);
+  ASSERT_EQ(kOtaDirectFrameBytes, signedLegacyDirectRequest(h, challenge_b, request_b));
+  lease_once(receiver, request_b); ASSERT_FALSE(HasFatalFailure());
+
+  // A pending, outstanding challenge does not revive either capture.
+  const auto outstanding = freshLeaseChallenge(receiver, h.a.signer.publicKey(), now);
+  ASSERT_NE(0u, outstanding);
+  for (int round = 0; round < 4; ++round) {
+    rejected(receiver, request_a);
+    rejected(receiver, request_b);
+  }
+  rejected(receiver, request_a);
+  EXPECT_EQ(outstanding, freshLeaseChallenge(receiver, h.a.signer.publicKey(), now));
+
+  // A signed request for the outstanding challenge is captured before reboot.
+  uint8_t pre_reboot[kOtaDirectFrameBytes];
+  ASSERT_EQ(kOtaDirectFrameBytes, signedLegacyDirectRequest(h, outstanding, pre_reboot));
+  mesh::ota::OtaFirmwareIntegration cold;
+  cold.attachTrustProvider(&h.a.fx.trust);
+  cold.attachStagingSink(&h.a.fx.guarded);
+  cold.attachCandidateStore(&h.a.fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy);
+  cold.attachLeanSignatureVerifier(&h.a.fx.sig_verifier);
+  cold.setLeanAdminCheck(&h.a.fx.admins, &leanAdminCheckThunk);
+  cold.setLeanTargetPublicKey(h.a.signer.publicKey());
+  cold.attachRfProfileIdentity(&h.a, &RfNode::sign, &RfNode::profileRadio, 907525);
+  ASSERT_TRUE(cold.leanReceiver().status().valid);
+  rejected(cold, pre_reboot);
+  rejected(cold, request_a);
+  rejected(cold, request_b);
+
+  // A genuinely fresh post-reboot challenge works exactly once.
+  const auto fresh = freshLeaseChallenge(cold, h.a.signer.publicKey(), now);
+  ASSERT_NE(0u, fresh);
+  uint8_t request_c[kOtaDirectFrameBytes];
+  ASSERT_EQ(kOtaDirectFrameBytes, signedLegacyDirectRequest(h, fresh, request_c));
+  lease_once(cold, request_c); ASSERT_FALSE(HasFatalFailure());
+  rejected(cold, request_c);
+  rejected(cold, pre_reboot);
+}
+
+// ---------------------------------------------------------------------------
+// SYN-05: unreadable candidate state is Unavailable, never "no candidate".
+// ---------------------------------------------------------------------------
+namespace {
+class ReadFaultFlash final : public ::ota::platform::FlashDevice {
+public:
+  explicit ReadFaultFlash(::ota::platform::FlashDevice& inner) : inner_(inner) {}
+  bool failReads = false;
+  uint32_t totalSizeBytes() const override { return inner_.totalSizeBytes(); }
+  uint32_t eraseUnitBytes() const override { return inner_.eraseUnitBytes(); }
+  uint32_t programUnitBytes() const override { return inner_.programUnitBytes(); }
+  ::ota::platform::FlashStatus eraseSector(uint32_t offset) override { return inner_.eraseSector(offset); }
+  ::ota::platform::FlashStatus program(uint32_t offset, const uint8_t* data, uint32_t len) override {
+    return inner_.program(offset, data, len);
+  }
+  ::ota::platform::FlashStatus read(uint32_t offset, uint8_t* data, uint32_t len) const override {
+    return failReads ? ::ota::platform::FlashStatus::IoError : inner_.read(offset, data, len);
+  }
+private:
+  ::ota::platform::FlashDevice& inner_;
+};
+}  // namespace
+
+TEST(LoraOtaSyn05, UnreadableCandidateStateBlocksMutationUntilAuthoritativeReload) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f; f.stage(); ASSERT_FALSE(HasFatalFailure());
+  ReadFaultFlash faulty(f.fx.candidate_flash);
+  ::ota::platform::FlashRegion region(faulty, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  auto& integration = f.fx.integration;
+  auto& receiver = integration.leanReceiver();
+  integration.attachCandidateStore(&store);
+  const auto ready = receiver.status();
+  ASSERT_EQ(Store::Phase::Ready, ready.phase);
+  ASSERT_FALSE(receiver.storageUnavailable());
+
+  faulty.failReads = true;
+  receiver.restore();
+  ASSERT_TRUE(receiver.storageUnavailable());
+  EXPECT_FALSE(receiver.status().valid);
+  EXPECT_TRUE(receiver.status().storageUnavailable);
+  usb::UsbOtaReply reply;
+  integration.fillUsbReadback(reply);
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable, reply.result);
+  EXPECT_EQ(0, reply.flags & usb::kReplyFlagSnapshotValid);
+
+  const auto journal = f.fx.candidate_flash.programOpCount();
+  const auto erases = f.fx.candidate_flash.eraseOpCount();
+  const auto image_programs = f.fx.image_flash.programOpCount();
+  const auto image_erases = f.fx.image_flash.eraseOpCount();
+  const auto command = f.command_flash.programOpCount();
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable,
+            receiver.begin(f.owner.publicKey(), f.canonical, f.signature, true, false));
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable,
+            receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  uint8_t message[usb::kCommitSignedBytes], sig[64];
+  usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation,
+                                ready.beginNonce, message);
+  f.owner.sign(message, sizeof(message), sig);
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable, receiver.commit(ready.counter, sig));
+  uint8_t frame[kOtaCommitFrameBytes];
+  ASSERT_EQ(kOtaCommitFrameBytes, encodeOtaCommitFrame(f.fx.target_public_key, ready.manifestHash, ready.counter,
+                                                       ready.generation, ready.beginNonce, sig, frame,
+                                                       sizeof(frame)));
+  integration.handleReceivedFrame(frame, sizeof(frame), 100);
+  uint8_t abort_message[usb::kAbortSignedBytes], abort_sig[64];
+  usb::buildAbortSignedMessage(f.fx.target_public_key, ready.imageHash, ready.generation, abort_message);
+  f.owner.sign(abort_message, sizeof(abort_message), abort_sig);
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable,
+            receiver.abort(f.owner.publicKey(), abort_sig, ready.imageHash, ready.generation));
+  EXPECT_NE(usb::UsbOtaResult::Ok, receiver.putBlock(0, f.image.data(), 84));
+  receiver.loop();
+  EXPECT_TRUE(receiver.storageUnavailable());
+  EXPECT_EQ(journal, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
+  EXPECT_EQ(image_programs, f.fx.image_flash.programOpCount());
+  EXPECT_EQ(image_erases, f.fx.image_flash.eraseOpCount());
+  EXPECT_EQ(command, f.command_flash.programOpCount());
+
+  // Only an authoritative reload restores service, to the exact durable state.
+  faulty.failReads = false;
+  ASSERT_TRUE(receiver.reloadStorage());
+  EXPECT_EQ(Store::Phase::Ready, receiver.status().phase);
+  EXPECT_EQ(ready.generation, receiver.status().generation);
+  EXPECT_EQ(0, std::memcmp(ready.beginNonce, receiver.status().beginNonce, 16));
+  usb::UsbOtaReply healthy;
+  integration.fillUsbReadback(healthy);
+  EXPECT_NE(0, healthy.flags & usb::kReplyFlagSnapshotValid);
+  EXPECT_EQ(ready.generation, healthy.generation);
+  EXPECT_EQ(usb::UsbOtaResult::Ok, receiver.commit(ready.counter, sig));
+}
+
+TEST(LoraOtaSyn03, DamagedDurableAbortNeverRevivesCapturedCommitAfterColdReload) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  // BodyBit: marked record with a bad CRC. The marker cases model an
+  // interrupted metadata erase that moved the ABORT marker's bits toward
+  // erased (in no particular address order), with or without also damaging
+  // its body/CRC.
+  enum class Damage { BodyBit, MarkerPartlyErased, MarkerFullyErased, MarkerPartlyErasedBodyBit,
+                      MarkerFullyErasedBodyBit };
+  for (const auto damage : {Damage::BodyBit, Damage::MarkerPartlyErased, Damage::MarkerFullyErased,
+                            Damage::MarkerPartlyErasedBodyBit, Damage::MarkerFullyErasedBodyBit}) {
+    SCOPED_TRACE(static_cast<int>(damage));
+    const bool unavailable = damage == Damage::BodyBit || damage == Damage::MarkerPartlyErasedBodyBit ||
+                             damage == Damage::MarkerFullyErasedBodyBit;
+    UnadmittedFixture f; f.stage(); ASSERT_FALSE(HasFatalFailure());
+    const auto ready = f.fx.integration.leanReceiver().status();
+    ASSERT_EQ(Store::Phase::Ready, ready.phase);
+    uint8_t message[usb::kCommitSignedBytes], sig[64], captured[kOtaCommitFrameBytes];
+    usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation,
+                                  ready.beginNonce, message);
+    f.owner.sign(message, sizeof(message), sig);
+    ASSERT_EQ(kOtaCommitFrameBytes, encodeOtaCommitFrame(f.fx.target_public_key, ready.manifestHash, ready.counter,
+                                                         ready.generation, ready.beginNonce, sig, captured,
+                                                         sizeof(captured)));
+    ASSERT_EQ(usb::UsbOtaResult::Ok, f.abort());
+    Store::Snapshot durable;
+    ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(durable));
+    ASSERT_EQ(Store::Phase::Aborted, durable.phase);
+
+    std::vector<uint8_t> sector(Store::kSectorBytes);
+    ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.read(0, sector.data(), sector.size())));
+    int newest = -1;
+    for (uint32_t slot = 0; slot < Store::kRecordSlots; ++slot) {
+      const uint8_t* r = sector.data() + slot * Store::kRecordBytes;
+      if (Store::classifyRecord(r) == Store::RecordClass::Valid && (r[12] & 0x7f) == uint8_t(Store::Phase::Aborted))
+        newest = int(slot);
+    }
+    ASSERT_GT(newest, 0);
+    uint8_t* abort_record = sector.data() + newest * Store::kRecordBytes;
+    uint8_t* marker = abort_record + Store::kMarkerOffset;
+    ASSERT_EQ(0, std::memcmp(marker, "DNAC", 4));  // CAND, little-endian
+    // Erase damage only moves bits toward 1: raise the first programmed body bit.
+    const auto erase_body_bit = [&]() {
+      uint32_t i = 40;
+      while (abort_record[i] == 0xff) ++i;
+      abort_record[i] |= uint8_t(~abort_record[i] & -~abort_record[i]);
+    };
+    switch (damage) {
+      case Damage::BodyBit: abort_record[40] ^= 0x01; break;
+      case Damage::MarkerPartlyErased: marker[3] = 0xff; marker[1] |= 0xb1; break;  // high byte first
+      case Damage::MarkerFullyErased: std::memset(marker, 0xff, 4); break;
+      case Damage::MarkerPartlyErasedBodyBit:
+        marker[3] = 0xff; marker[1] |= 0xb1; erase_body_bit(); break;
+      case Damage::MarkerFullyErasedBodyBit:
+        std::memset(marker, 0xff, 4); erase_body_bit(); break;
+    }
+    if (damage == Damage::MarkerPartlyErasedBodyBit || damage == Damage::MarkerFullyErasedBodyBit)
+      ASSERT_NE(Store::RecordClass::Valid, Store::classifyRecord(abort_record));
+    ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.eraseSector(0)));
+    ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.program(0, sector.data(), sector.size())));
+
+    const auto journal = f.fx.candidate_flash.programOpCount();
+    const auto journal_erases = f.fx.candidate_flash.eraseOpCount();
+    const auto image_programs = f.fx.image_flash.programOpCount();
+    const auto image_erases = f.fx.image_flash.eraseOpCount();
+    const auto command = f.command_flash.programOpCount();
+    const auto command_erases = f.command_flash.eraseOpCount();
+    const auto load = f.fx.candidate_store.load(durable);
+    if (unavailable) {
+      EXPECT_EQ(Store::LoadResult::IoError, load);
+    } else {
+      // The CRC-valid newer ABORT body is honoured: revocation stays durable.
+      ASSERT_EQ(Store::LoadResult::Found, load);
+      EXPECT_EQ(Store::Phase::Aborted, durable.phase);
+      EXPECT_EQ(0, std::memcmp(ready.beginNonce, durable.beginNonce, 16));
+    }
+
+    mesh::ota::OtaFirmwareIntegration cold;
+    cold.attachTrustProvider(f.trust.get());
+    cold.attachStagingSink(&f.sink);
+    cold.attachCandidateStore(&f.fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy);
+    cold.attachLeanSignatureVerifier(&f.fx.sig_verifier);
+    cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+    cold.setLeanTargetPublicKey(f.fx.target_public_key);
+    auto& lean = cold.leanReceiver();
+    usb::UsbOtaReply reply;
+    cold.fillUsbReadback(reply);
+    if (unavailable) {
+      ASSERT_TRUE(lean.storageUnavailable());
+      EXPECT_FALSE(lean.status().valid);
+      EXPECT_EQ(usb::UsbOtaResult::Unavailable, reply.result);
+      EXPECT_EQ(0, reply.flags & usb::kReplyFlagSnapshotValid);
+    } else {
+      ASSERT_FALSE(lean.storageUnavailable());
+      EXPECT_EQ(Store::Phase::Aborted, lean.status().phase);
+      EXPECT_EQ(usb::UsbOtaPhase::Aborted, reply.phase);
+    }
+
+    cold.handleReceivedFrame(captured, sizeof(captured), 100);
+    EXPECT_NE(usb::UsbOtaResult::Ok, lean.commit(ready.counter, sig));
+    // Only a non-reupload BEGIN here: a fresh signed reupload is the legitimate exit.
+    EXPECT_NE(usb::UsbOtaResult::Ok, lean.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+    cold.loop();
+    EXPECT_NE(Store::Phase::Ready, lean.status().phase);
+    EXPECT_EQ(journal, f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(journal_erases, f.fx.candidate_flash.eraseOpCount());
+    EXPECT_EQ(image_programs, f.fx.image_flash.programOpCount());
+    EXPECT_EQ(image_erases, f.fx.image_flash.eraseOpCount());
+    EXPECT_EQ(command, f.command_flash.programOpCount());
+    EXPECT_EQ(command_erases, f.command_flash.eraseOpCount());
+    uint8_t raw[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
+    EXPECT_FALSE(::ota::storage::XiaoOtaCommandRecordV3::readNewest(f.command, raw));
+    if (unavailable) {
+      EXPECT_EQ(usb::UsbOtaResult::Unavailable, lean.commit(ready.counter, sig));
+      EXPECT_EQ(usb::UsbOtaResult::Unavailable, lean.begin(f.owner.publicKey(), f.canonical, f.signature, true, false));
+      EXPECT_FALSE(lean.reloadStorage());
+    }
+  }
+}
+
+// Our own authenticated reupload BEGIN erases the records sector; a NOR erase
+// cut is unordered and may blank exactly the newest (ABORTED) slot while the
+// older READY survives. That must never revive the captured COMMIT.
+TEST(LoraOtaSyn03, InterruptedOwnResetEraseThatBlanksOnlyDurableAbortNeverRevivesCapturedCommit) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  using Flash = ::ota::test::FakeNorFlash;
+  for (const bool erase_reached : {false, true}) {
+    SCOPED_TRACE(erase_reached);
+    UnadmittedFixture f; f.stage(); ASSERT_FALSE(HasFatalFailure());
+    auto& lean0 = f.fx.integration.leanReceiver();
+    const auto ready = lean0.status();
+    ASSERT_EQ(Store::Phase::Ready, ready.phase);
+    uint8_t message[usb::kCommitSignedBytes], sig[64], captured[kOtaCommitFrameBytes];
+    usb::buildCommitSignedMessage(f.fx.target_public_key, ready.manifestHash, ready.counter, ready.generation,
+                                  ready.beginNonce, message);
+    f.owner.sign(message, sizeof(message), sig);
+    ASSERT_EQ(kOtaCommitFrameBytes, encodeOtaCommitFrame(f.fx.target_public_key, ready.manifestHash, ready.counter,
+                                                         ready.generation, ready.beginNonce, sig, captured,
+                                                         sizeof(captured)));
+    ASSERT_EQ(usb::UsbOtaResult::Ok, f.abort());
+    std::vector<uint8_t> sector(Store::kSectorBytes);
+    ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.read(0, sector.data(), sector.size())));
+    int newest = -1;
+    for (uint32_t slot = 0; slot < Store::kRecordSlots; ++slot) {
+      const uint8_t* r = sector.data() + slot * Store::kRecordBytes;
+      if (Store::classifyRecord(r) == Store::RecordClass::Valid && (r[12] & 0x7f) == uint8_t(Store::Phase::Aborted))
+        newest = int(slot);
+    }
+    ASSERT_GT(newest, 0);
+
+    // Fresh signed identical reupload: its metadata erase faults. erase_reached
+    // models a cut inside the erase itself; otherwise the erase never starts.
+    f.fx.candidate_flash.armFault({Flash::OpKind::Erase, Flash::InjectionTiming::Before,
+                                  f.fx.candidate_flash.eraseOpCount() + 1});
+    EXPECT_EQ(usb::UsbOtaResult::IoError, lean0.begin(f.owner.publicKey(), f.canonical, f.signature, true, false));
+    f.fx.candidate_flash.clearFault();
+    EXPECT_FALSE(lean0.status().valid);  // same session adopts the tombstoned durable state
+    if (erase_reached) {
+      // Unordered partial erase: exactly the ABORT slot is blank, the rest of
+      // the sector (older READY slots as left by the reset) is unchanged.
+      ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.read(0, sector.data(), sector.size())));
+      std::memset(sector.data() + newest * Store::kRecordBytes, 0xff, Store::kRecordBytes);
+      ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.eraseSector(0)));
+      ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.program(0, sector.data(), sector.size())));
+    }
+
+    const auto image_programs = f.fx.image_flash.programOpCount();
+    const auto image_erases = f.fx.image_flash.eraseOpCount();
+    const auto command = f.command_flash.programOpCount();
+    const auto command_erases = f.command_flash.eraseOpCount();
+    Store::Snapshot durable;
+    const auto load = f.fx.candidate_store.load(durable);
+    EXPECT_TRUE(load != Store::LoadResult::Found || durable.phase != Store::Phase::Ready);
+
+    mesh::ota::OtaFirmwareIntegration cold;
+    cold.attachTrustProvider(f.trust.get());
+    cold.attachStagingSink(&f.sink);
+    cold.attachCandidateStore(&f.fx.candidate_store); cold.attachEntropy(nullptr, &otaTestEntropy);
+    cold.attachLeanSignatureVerifier(&f.fx.sig_verifier);
+    cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
+    cold.setLeanTargetPublicKey(f.fx.target_public_key);
+    auto& lean = cold.leanReceiver();
+    EXPECT_NE(Store::Phase::Ready, lean.status().phase);
+    cold.handleReceivedFrame(captured, sizeof(captured), 100);
+    EXPECT_NE(usb::UsbOtaResult::Ok, lean.commit(ready.counter, sig));
+    cold.loop();
+    EXPECT_EQ(image_programs, f.fx.image_flash.programOpCount());
+    EXPECT_EQ(image_erases, f.fx.image_flash.eraseOpCount());
+    EXPECT_EQ(command, f.command_flash.programOpCount());
+    EXPECT_EQ(command_erases, f.command_flash.eraseOpCount());
+    uint8_t raw[::ota::storage::XiaoOtaCommandRecordV3::kRecordBytes];
+    EXPECT_FALSE(::ota::storage::XiaoOtaCommandRecordV3::readNewest(f.command, raw));
+
+    // The interrupted reset is our own, proven by its zeroed slots: storage
+    // reads as empty, and only a fresh signed BEGIN (new nonce) proceeds.
+    EXPECT_EQ(Store::LoadResult::Empty, load);
+    EXPECT_FALSE(lean.storageUnavailable());
+    EXPECT_FALSE(lean.status().valid);
+    ASSERT_EQ(usb::UsbOtaResult::Ok, lean.begin(f.owner.publicKey(), f.canonical, f.signature, true, false));
+    EXPECT_EQ(Store::Phase::Receiving, lean.status().phase);
+    EXPECT_NE(0, std::memcmp(ready.beginNonce, lean.status().beginNonce, 16));
+    EXPECT_NE(usb::UsbOtaResult::Ok, lean.commit(ready.counter, sig));
+  }
+}
+
+TEST(LoraOtaSyn03, EntropySourceFailureMakesBeginUnavailableWithoutSideEffects) {
+  UnadmittedFixture f;
+  auto& receiver = f.fx.integration.leanReceiver();
+  static int calls; calls = 0;
+  f.fx.integration.attachEntropy(nullptr, [](void*, uint8_t*, size_t) { ++calls; return false; });
+  f.manifest(5);
+  const auto candidate_programs = f.fx.candidate_flash.programOpCount();
+  const auto candidate_erases = f.fx.candidate_flash.eraseOpCount();
+  const auto image_programs = f.fx.image_flash.programOpCount();
+  const auto image_erases = f.fx.image_flash.eraseOpCount();
+  const auto command_programs = f.command_flash.programOpCount();
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable,
+            receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  EXPECT_EQ(1, calls);
+  EXPECT_FALSE(receiver.status().valid);
+  EXPECT_EQ(candidate_programs, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(candidate_erases, f.fx.candidate_flash.eraseOpCount());
+  EXPECT_EQ(image_programs, f.fx.image_flash.programOpCount());
+  EXPECT_EQ(image_erases, f.fx.image_flash.eraseOpCount());
+  EXPECT_EQ(command_programs, f.command_flash.programOpCount());
+  // No source at all is the same: there is no pseudo-random fallback.
+  f.fx.integration.attachEntropy(nullptr, nullptr);
+  EXPECT_EQ(usb::UsbOtaResult::Unavailable,
+            receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  EXPECT_EQ(candidate_programs, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(image_programs, f.fx.image_flash.programOpCount());
+  f.fx.integration.attachEntropy(nullptr, &otaTestEntropy);
+  f.stage(); ASSERT_FALSE(HasFatalFailure());
+  EXPECT_TRUE(usb::beginNonceBound(receiver.status().beginNonce));
+}
+
+TEST(LoraOtaNegotiation, LegacyCensusReceiversNeverCostImageDataAndV3ReceiversProceed) {
+  for (const uint8_t mode : {usb::kStartModeDirected, usb::kStartModeBackground}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    RfProductHarness h;
+    h.legacyReports = true;
+    h.prepare(168, mode);
+    ASSERT_FALSE(HasFatalFailure());
+    for (int i = 0; i < 600; ++i) h.step();
+    EXPECT_GT(h.census, 0);
+    EXPECT_EQ(0, h.initialData);
+    EXPECT_EQ(0, h.multicastBlocks + h.directedBlocks + h.zeroHopBlocks);
+    EXPECT_FALSE(h.ready(h.a));
+    EXPECT_EQ(0u, h.a.fx.integration.leanReceiver().status().receivedBlocks);
+    // The same receivers speaking the v3 census proceed without restarting the campaign.
+    h.legacyReports = false;
+    for (int i = 0; i < 200 && !(h.ready(h.a) && (mode != usb::kStartModeBackground || h.ready(h.b))); ++i) h.step();
+    EXPECT_GT(h.initialData, 0);
+    EXPECT_TRUE(h.ready(h.a));
+    if (mode == usb::kStartModeBackground) EXPECT_TRUE(h.ready(h.b));
+  }
+}
+
+TEST(LoraOtaNegotiation, UpgradedReceiverLegacyV1AttemptNeverCostsDataUntilFreshNonceBoundAttempt) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  for (const uint8_t mode : {usb::kStartModeDirected, usb::kStartModeBackground}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    RfProductHarness h;
+    h.prepare(168, mode);
+    ASSERT_FALSE(HasFatalFailure());
+    uint8_t canonical[59], signature[64];
+    ASSERT_TRUE(h.sender.fx.integration.leanReceiver().exportCandidateForUpload(canonical, signature));
+    std::vector<RfNode*> seeded{&h.a};
+    if (mode == usb::kStartModeBackground) seeded.push_back(&h.b);
+    for (auto* node : seeded) {
+      // The same image's attempt as an older firmware journaled it: exact v1
+      // record (CRC@184, marker@188), restored by the upgraded receiver.
+      auto& lean = node->fx.integration.leanReceiver();
+      ASSERT_EQ(usb::UsbOtaResult::Ok, lean.begin(h.sender.signer.publicKey(), canonical, signature, false, false));
+      uint8_t raw[Store::kRecordBytes];
+      ASSERT_TRUE(::ota::platform::isOk(node->fx.candidate_store_region.read(0, raw, sizeof(raw))));
+      raw[4] = 1; raw[5] = 0;
+      std::memset(raw + 184, 0xff, sizeof(raw) - 184);
+      const uint32_t crc = ::ota::storage::Crc32::computeFinalized(raw, 184);
+      for (int i = 0; i < 4; ++i) raw[184 + i] = static_cast<uint8_t>(crc >> (8 * i));
+      for (int i = 0; i < 4; ++i) raw[188 + i] = static_cast<uint8_t>(Store::kCommitMarker >> (8 * i));
+      ASSERT_TRUE(::ota::platform::isOk(node->fx.candidate_store_region.eraseSector(0)));
+      ASSERT_TRUE(::ota::platform::isOk(node->fx.candidate_store_region.program(0, raw, sizeof(raw))));
+      lean.restore();
+      ASSERT_EQ(Store::Phase::Receiving, lean.status().phase);
+      ASSERT_FALSE(usb::beginNonceBound(lean.status().beginNonce));
+    }
+    // Lose every target's first authorization so the upgraded receivers keep
+    // answering census polls for their unbound legacy attempt.
+    h.loseAuthorizations = static_cast<int>(seeded.size());
+    const auto data = [&]() { return h.initialData + h.multicastBlocks + h.directedBlocks + h.zeroHopBlocks; };
+    const auto all_unbound = [&]() {
+      for (auto* node : seeded)
+        if (usb::beginNonceBound(node->fx.integration.leanReceiver().status().beginNonce)) return false;
+      return true;
+    };
+    bool saw_zero_nonce_v3 = false;
+    int step = 0;
+    for (; step < 600 && all_unbound(); ++step) {
+      h.step();
+      for (auto* node : seeded) {
+        OtaFirmwareIntegration::TargetObservation observation;
+        h.sender.fx.integration.targetObservation(node->signer.publicKey(), h.now, observation);
+        if (observation.haveBitmap && observation.wireVersion == usb::kOtaWireVersion &&
+            !usb::beginNonceBound(observation.beginNonce)) saw_zero_nonce_v3 = true;
+      }
+      if (all_unbound()) ASSERT_EQ(0, data()) << "DATA for an attempt that can never COMMIT";
+    }
+    EXPECT_TRUE(saw_zero_nonce_v3);
+    ASSERT_FALSE(all_unbound()) << "the uploader's signed authorization must rebind a fresh nonce";
+    for (int i = 0; i < 300 && !(h.ready(h.a) && (mode != usb::kStartModeBackground || h.ready(h.b))); ++i) h.step();
+    EXPECT_GT(data(), 0);
+    ASSERT_TRUE(h.ready(h.a));
+    if (mode == usb::kStartModeBackground) EXPECT_TRUE(h.ready(h.b));
+    for (auto* node : seeded) {
+      const auto st = node->fx.integration.leanReceiver().status();
+      EXPECT_TRUE(usb::beginNonceBound(st.beginNonce));
+      Store::Snapshot durable;
+      ASSERT_EQ(Store::LoadResult::Found, node->fx.candidate_store.load(durable));
+      EXPECT_EQ(0, std::memcmp(st.beginNonce, durable.beginNonce, 16));
+    }
+    h.expectByteExact(h.a);
   }
 }
 

@@ -28,10 +28,14 @@ class Manager : public mesh::PacketManager {
   mesh::Packet packet;
   std::deque<mesh::Packet*> queue;
   unsigned released = 0;
-  mesh::Packet* allocNew(bool) override { return &packet; }
+  mesh::Packet* allocNew() override { return &packet; }
+  mesh::Packet* allocOtaPacket() override { return &packet; }
   void free(mesh::Packet*) override { ++released; }
-  bool queueOutbound(mesh::Packet* value, uint8_t, uint32_t) override { queue.push_back(value); return true; }
-  mesh::Packet* getNextOutbound(uint32_t, uint8_t* priority) override {
+  void queueOutbound(mesh::Packet* value, uint8_t, uint32_t) override { queue.push_back(value); }
+  bool tryQueueOutbound(mesh::Packet* value, uint8_t, uint32_t) override { queue.push_back(value); return true; }
+  bool supportsOtaQueue() const override { return true; }
+  mesh::Packet* getNextOutbound(uint32_t now) override { return getNextOutboundWithPriority(now, nullptr); }
+  mesh::Packet* getNextOutboundWithPriority(uint32_t, uint8_t* priority) override {
     if (queue.empty()) return nullptr;
     if (priority != nullptr) *priority = 1;
     auto* value = queue.front();
@@ -42,7 +46,7 @@ class Manager : public mesh::PacketManager {
   int getOutboundTotal() const override { return queue.size(); }
   int getFreeCount() const override { return 8; }
   mesh::Packet* getOutboundByIdx(int index) override { return queue.at(index); }
-  uint32_t getOutboundScheduledForByIdx(int) const override { return 0; }
+  bool getOutboundScheduleByIdx(int, uint32_t& out) const override { out = 0; return true; }
   mesh::Packet* removeOutboundByIdx(int index) override {
     auto* value = queue.at(index);
     queue.erase(queue.begin() + index);

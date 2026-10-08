@@ -46,6 +46,44 @@ bool otaBoardApplyRfProfile(float frequency, float bandwidth, uint8_t sf, uint8_
 // real device reports that marker, its uploader cache reports CACHE_ONLY.
 namespace {
 
+// Hardware entropy for the per-BEGIN OTA nonce. Freshness across resets
+// must not depend on RAM or durable counters; no entropy denies BEGIN.
+bool otaNrfEntropy(void*, uint8_t* out, size_t len) {
+  if (out == nullptr) return false;
+  uint8_t softdevice = 0;
+  if (sd_softdevice_is_enabled(&softdevice) != NRF_SUCCESS) return false;
+  const uint32_t start = millis();
+  size_t done = 0;
+  if (softdevice) {
+    while (done < len) {
+      uint8_t available = 0;
+      if (sd_rand_application_bytes_available_get(&available) != NRF_SUCCESS) return false;
+      if (available == 0) {
+        if (millis() - start > 250u) return false;
+        delay(1);
+        continue;
+      }
+      const uint8_t take = static_cast<uint8_t>(len - done < available ? len - done : available);
+      if (sd_rand_application_vector_get(out + done, take) != NRF_SUCCESS) return false;
+      done += take;
+    }
+    return true;
+  }
+  NRF_RNG->CONFIG = RNG_CONFIG_DERCEN_Msk;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  NRF_RNG->TASKS_START = 1;
+  while (done < len) {
+    if (!NRF_RNG->EVENTS_VALRDY) {
+      if (millis() - start > 250u) { NRF_RNG->TASKS_STOP = 1; return false; }
+      continue;
+    }
+    NRF_RNG->EVENTS_VALRDY = 0;
+    out[done++] = static_cast<uint8_t>(NRF_RNG->VALUE);
+  }
+  NRF_RNG->TASKS_STOP = 1;
+  return true;
+}
+
 class ProductionSignatureVerifier : public ota::trust::SignatureVerifier {
 public:
   bool verify(const uint8_t* signature, size_t signature_len,
@@ -283,12 +321,18 @@ bool otaBoardEarlyBootTrialOrUnknown() {
   return decision.status != mesh::ota::OtaBoardStartupDecisionStatus::Normal;
 }
 
+// Positive Normal proof for provisioning/format decisions: every false
+// return of otaBoardEarlyBootTrialOrUnknown() is a positive proof path;
+// IO, layout, identity and unknown-state paths all answer false here.
+bool otaBoardEarlyBootNormalProven() { return !otaBoardEarlyBootTrialOrUnknown(); }
+
 bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& integration) {
   // Reset on every (re)configure attempt: see the xiao_nrf52 lab backend's
   // identical comment -- the only place this is ever set true again is
   // the single fully-qualified INSTALL_CAPABLE path below.
   g_backend_qualified_and_bank0_valid = false;
   g_qualified = false;
+  integration.attachEntropy(nullptr, &otaNrfEntropy);
   g_stock_boot_result = mesh::ota::OtaBoardStockBootPreflight::Result::IoError;
   install_provider_v3 = nullptr;
   g_active_guarded_staging = nullptr;

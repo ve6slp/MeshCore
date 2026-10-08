@@ -236,20 +236,16 @@ __attribute__((noinline)) Packet* Dispatcher::readReceivedPacket(float& score, u
         MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): WARNING: received data, no unused packets available!", getLogDateTime());
       } else {
         if (tryParsePacket(pkt, raw, len)) {
-          // Raw ingress alloc above can't know the payload type ahead of
-          // time (is_ota_bulk=false), so OTA classification/reserve
-          // enforcement happens here instead, right after parsing -- this
-          // single check covers raw ingress, immediate-RX, and delayed-RX
-          // (the flood path below queues this same 'pkt' unchanged), so a
-          // sustained burst of *incoming* OTA traffic can never push the
-          // pool below the reserve out from under ordinary traffic, exactly
-          // like the existing is_ota_bulk reserve does for OTA's own
-          // outbound bulk allocations. See PacketManager::kOtaAllocReserve.
-          if (mesh::ota::isOtaPacket(pkt) && _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
+#if MESHCORE_LORA_OTA
+          // Ingress cannot classify OTA until after ordinary allocation.
+          if (mesh::ota::isOtaPacket(pkt) &&
+              (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve)) {
             MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): dropping inbound OTA packet, pool at/below ordinary-traffic reserve", getLogDateTime());
             _mgr->free(pkt);
             pkt = NULL;
-          } else {
+          } else
+#endif
+          {
             pkt->_snr = _radio->getLastSNR() * 4.0f;
             score = _radio->packetScore(_radio->getLastSNR(), len);
             air_time = _radio->getEstAirtimeFor(len);
@@ -319,7 +315,9 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
     _mgr->free(pkt);
   } else if (action == ACTION_MANUAL_HOLD) {
     // sub-class is wanting to manually hold Packet instance, and call releasePacket() at appropriate time
-  } else if (mesh::ota::isOtaPacket(pkt) && _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
+#if MESHCORE_LORA_OTA
+  } else if (mesh::ota::isOtaPacket(pkt) &&
+             (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve)) {
     // ACTION_RETRANSMIT* for an OTA packet (relay/forward), but the pool is
     // at/below the ordinary-traffic reserve: queueing this for outbound
     // relay would hold its buffer for as long as it sits in the send queue
@@ -329,11 +327,12 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
     // retry/repair-capable, ordinary traffic is not allowed to be starved.
     MESH_DEBUG_PRINTLN("%s Dispatcher::processRecvPacket(): dropping relayed OTA packet, pool at/below ordinary-traffic reserve", getLogDateTime());
     _mgr->free(pkt);
+#endif
   } else {   // ACTION_RETRANSMIT*
     uint8_t priority = (action >> 24) - 1;
     uint32_t _delay = action & 0xFFFFFF;
 
-    _mgr->queueOutbound(pkt, priority, futureMillis(_delay));
+    sendPacket(pkt, priority, _delay);
   }
 }
 
@@ -369,7 +368,13 @@ void Dispatcher::checkSend() {
   }
   cad_busy_start = 0;  // reset busy state
 
-  outbound = _mgr->getNextOutbound(_ms->getMillis(), &outbound_priority);
+#if MESHCORE_LORA_OTA
+  outbound = _mgr->supportsOtaQueue()
+      ? _mgr->getNextOutboundWithPriority(_ms->getMillis(), &outbound_priority)
+      : _mgr->getNextOutbound(_ms->getMillis());
+#else
+  outbound = _mgr->getNextOutbound(_ms->getMillis());
+#endif
   if (outbound) {
     int len = 0;
     uint8_t raw[MAX_TRANS_UNIT];
@@ -390,34 +395,29 @@ void Dispatcher::checkSend() {
       memcpy(&raw[len], outbound->payload, outbound->payload_len); len += outbound->payload_len;
 
       uint32_t prospective_airtime = _radio->getEstAirtimeFor(len);
+#if MESHCORE_LORA_OTA
       updateTxBudget();
-      if (tx_budget_ms < prospective_airtime) {
+      // Ordinary traffic retains dev's half-MTU-airtime admission threshold.
+      // Only OTA must also fit its entire prospective airtime in the budget.
+      if (mesh::ota::isOtaPacket(outbound) && tx_budget_ms < prospective_airtime) {
         float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
         unsigned long needed = prospective_airtime - tx_budget_ms;
         unsigned long delay = duty_cycle > 0.0f ? (unsigned long)(needed / duty_cycle) : getDutyCycleWindowMs();
         Packet* held = outbound;
-        // Preserve the packet's ORIGINAL queue priority on requeue instead
-        // of collapsing every non-OTA packet to priority 1: that used to
-        // silently discard direct/high-priority/path/trace/flood ordering
-        // for any packet that happened to be budget-gated even once.
-        uint8_t held_priority = held->getPayloadType() == PAYLOAD_TYPE_LORA_OTA
-                                    ? mesh::ota::kOtaForwardPriority
-                                    : outbound_priority;
         outbound = NULL;
-        sendPacket(held, held_priority, delay);
-        // Retry again soon (not after the full duty-cycle `delay`): other,
-        // smaller/lower-priority-numbered packets already in the queue may
-        // still be immediately budget-admissible even though this one
-        // isn't yet, and they must not be starved for the whole `delay`
-        // window just because this pass happened to select the larger
-        // packet first.
-        next_tx_time = futureMillis(delay < 1000 ? delay : 1000);
+        sendPacket(held, outbound_priority, delay);
+        // Only this OTA packet is delayed; ordinary traffic remains runnable.
         return;
       }
 
-#if MESHCORE_LORA_OTA
       outbound_is_ota = mesh::ota::isOtaPacket(outbound);
       if (outbound_is_ota) {
+        if (!_mgr->supportsOtaQueue()) {
+          releasePacket(outbound);
+          outbound = nullptr;
+          outbound_is_ota = false;
+          return;
+        }
         using meshcore::ota::protocol::OtaMessageType;
         using meshcore::ota::protocol::OtaAirtimeCategory;
         outbound_ota_category = OtaAirtimeCategory::Control;
@@ -486,7 +486,15 @@ void Dispatcher::checkSend() {
 }
 
 Packet* Dispatcher::obtainNewPacket(bool is_ota_bulk) {
-  auto pkt = _mgr->allocNew(is_ota_bulk);  // TODO: zero out all fields
+  Packet* pkt = nullptr;
+  if (!is_ota_bulk) {
+    pkt = _mgr->allocNew();
+  }
+#if MESHCORE_LORA_OTA
+  else if (_mgr->supportsOtaQueue()) {
+    pkt = _mgr->allocOtaPacket();
+  }
+#endif
   if (pkt == NULL) {
     _err_flags |= ERR_EVENT_FULL;
   } else {
@@ -501,13 +509,28 @@ void Dispatcher::releasePacket(Packet* packet) {
 }
 
 bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis) {
+  if (packet == nullptr) return false;
   if (!Packet::isValidPathLen(packet->path_len) || packet->payload_len > MAX_PACKET_PAYLOAD) {
     MESH_DEBUG_PRINTLN("%s Dispatcher::sendPacket(): ERROR: invalid packet... path_len=%d, payload_len=%d", getLogDateTime(), (uint32_t) packet->path_len, (uint32_t) packet->payload_len);
     _mgr->free(packet);
     return false;
-  } else {
-    return _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));
   }
+#if MESHCORE_LORA_OTA
+  if (mesh::ota::isOtaPacket(packet)) {
+    if (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
+      _mgr->free(packet);
+      return false;
+    }
+    priority = mesh::ota::kOtaForwardPriority;
+  }
+#endif
+  if (_mgr->supportsOtaQueue()) {
+    if (_mgr->tryQueueOutbound(packet, priority, futureMillis(delay_millis))) return true;
+    _mgr->free(packet);
+    return false;
+  }
+  _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));
+  return true;  // Legacy submission consumes but cannot report enqueue failure.
 }
 
 #if MESHCORE_LORA_OTA
@@ -524,7 +547,9 @@ bool Dispatcher::hasQueuedNormalTraffic() {
   const uint32_t now = _ms->getMillis();
   const int total = _mgr->getOutboundTotal();
   for (int i = 0; i < total; ++i) {
-    if ((int32_t)(_mgr->getOutboundScheduledForByIdx(i) - now) > 0) continue;  // not ready yet
+    uint32_t scheduled_for;
+    if (!_mgr->getOutboundScheduleByIdx(i, scheduled_for)) return true;  // fail closed
+    if ((int32_t)(scheduled_for - now) > 0) continue;  // not ready yet
     Packet* packet = _mgr->getOutboundByIdx(i);
     if (packet != nullptr && !mesh::ota::isOtaPacket(packet)) return true;
   }
@@ -532,11 +557,14 @@ bool Dispatcher::hasQueuedNormalTraffic() {
 }
 
 bool Dispatcher::hasQueuedOtaTraffic() {
+  if (!_mgr->supportsOtaQueue()) return false;
   if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;
   const uint32_t now = _ms->getMillis();
   const int total = _mgr->getOutboundTotal();
   for (int i = 0; i < total; ++i) {
-    if ((int32_t)(_mgr->getOutboundScheduledForByIdx(i) - now) > 0) continue;  // not ready yet
+    uint32_t scheduled_for;
+    if (!_mgr->getOutboundScheduleByIdx(i, scheduled_for)) return false;
+    if ((int32_t)(scheduled_for - now) > 0) continue;  // not ready yet
     Packet* packet = _mgr->getOutboundByIdx(i);
     if (packet != nullptr && mesh::ota::isOtaPacket(packet)) return true;
   }

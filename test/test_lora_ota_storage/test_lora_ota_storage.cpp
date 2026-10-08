@@ -194,7 +194,7 @@ TEST(OtaCandidateStoreTest, ResetLoadAndNewestAppendRoundTrip) {
   ASSERT_TRUE(store.reset(first));
 
   OtaCandidateStore::Snapshot loaded;
-  ASSERT_TRUE(store.load(loaded));
+  ASSERT_EQ(OtaCandidateStore::LoadResult::Found, store.load(loaded));
   EXPECT_TRUE(loaded.valid);
   EXPECT_EQ(OtaCandidateStore::Phase::Receiving, loaded.phase);
   EXPECT_EQ(first.campaignId, loaded.campaignId);
@@ -212,7 +212,7 @@ TEST(OtaCandidateStoreTest, ResetLoadAndNewestAppendRoundTrip) {
   ASSERT_TRUE(store.append(second));
 
   OtaCandidateStore::Snapshot newest;
-  ASSERT_TRUE(store.load(newest));
+  ASSERT_EQ(OtaCandidateStore::LoadResult::Found, store.load(newest));
   EXPECT_EQ(OtaCandidateStore::Phase::Ready, newest.phase);
   EXPECT_GT(newest.sequence, loaded.sequence);
 }
@@ -271,9 +271,19 @@ TEST(OtaCandidateStoreTest, AppendAfterPartialEraseUsesNewestValidSuffixNotTheFi
         ASSERT_TRUE(ota::platform::isOk(region.read(2 * Store::kRecordBytes, record, sizeof(record))));
         std::memset(record + 8, 0xff, 4);
         ASSERT_TRUE(ota::platform::isOk(region.program(Store::kRecordBytes, record, sizeof(record))));
+        // A marked record whose CRC no longer matches is unexplained
+        // corruption, not erase residue: never skip past it.
+        Store::Snapshot blocked;
+        const auto programs = flash.programOpCount();
+        EXPECT_EQ(OtaCandidateStore::LoadResult::IoError, store.load(blocked));
+        EXPECT_FALSE(blocked.valid);
+        snapshot.phase = phase;
+        EXPECT_FALSE(store.append(snapshot));
+        EXPECT_EQ(programs, flash.programOpCount());
+        continue;
       }
       Store::Snapshot surviving;
-      ASSERT_TRUE(store.load(surviving));
+      ASSERT_EQ(OtaCandidateStore::LoadResult::Found, store.load(surviving));
       ASSERT_EQ(Store::Phase::Ready, surviving.phase);
       ASSERT_EQ(3u, surviving.sequence);
       surviving.phase = phase; ++surviving.sessionId;
@@ -281,7 +291,7 @@ TEST(OtaCandidateStoreTest, AppendAfterPartialEraseUsesNewestValidSuffixNotTheFi
       ASSERT_TRUE(store.append(surviving));
       Store cold(region);
       Store::Snapshot reloaded;
-      ASSERT_TRUE(cold.load(reloaded));
+      ASSERT_EQ(OtaCandidateStore::LoadResult::Found, cold.load(reloaded));
       EXPECT_EQ(phase, reloaded.phase);
       EXPECT_EQ(4u, reloaded.sequence);
       EXPECT_EQ(18u, reloaded.sessionId);
@@ -312,9 +322,302 @@ TEST(OtaCandidateStoreTest, AppendCannotGuessSequenceWhenAValidSuffixIsUnreadabl
   EXPECT_EQ(programs, flash.programOpCount());
   flash.clearFault();
   Store cold(region);
-  ASSERT_TRUE(cold.load(snapshot));
+  ASSERT_EQ(OtaCandidateStore::LoadResult::Found, cold.load(snapshot));
   EXPECT_EQ(Store::Phase::Ready, snapshot.phase);
   EXPECT_EQ(3u, snapshot.sequence);
+}
+
+namespace {
+OtaCandidateStore::Snapshot nonceBoundSnapshot() {
+  OtaCandidateStore::Snapshot s;
+  s.valid = true; s.phase = OtaCandidateStore::Phase::Receiving;
+  s.totalBlocks = 2; s.exactSizeBytes = 100; s.sessionId = 3; s.attemptId = 1;
+  for (size_t i = 0; i < sizeof(s.beginNonce); ++i) s.beginNonce[i] = static_cast<uint8_t>(0xD0 + i);
+  return s;
+}
+}  // namespace
+
+TEST(OtaCandidateStoreTest, V2RecordPersistsBeginNonceAcrossColdReload) {
+  using Store = OtaCandidateStore;
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  auto s = nonceBoundSnapshot();
+  ASSERT_TRUE(store.reset(s));
+  uint8_t raw[Store::kRecordBytes];
+  ASSERT_TRUE(ota::platform::isOk(region.read(0, raw, sizeof(raw))));
+  EXPECT_EQ(2u, raw[4] | (raw[5] << 8));
+  EXPECT_EQ(0, std::memcmp(raw + Store::kNonceOffset, s.beginNonce, 16));
+  Store cold(region);
+  Store::Snapshot loaded;
+  ASSERT_EQ(Store::LoadResult::Found, cold.load(loaded));
+  EXPECT_EQ(0, std::memcmp(s.beginNonce, loaded.beginNonce, 16));
+}
+
+TEST(OtaCandidateStoreTest, LegacyV1RecordStaysAuthoritativeButUnbound) {
+  using Store = OtaCandidateStore;
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  auto s = nonceBoundSnapshot();
+  s.phase = Store::Phase::Ready;
+  ASSERT_TRUE(store.reset(s));
+  uint8_t raw[Store::kRecordBytes];
+  ASSERT_TRUE(ota::platform::isOk(region.read(0, raw, sizeof(raw))));
+  // Rewrite as the exact pre-nonce v1 layout: CRC(0..183)@184, marker@188.
+  raw[4] = 1; raw[5] = 0;
+  std::memset(raw + 184, 0xff, sizeof(raw) - 184);
+  const uint32_t crc = ota::storage::Crc32::computeFinalized(raw, 184);
+  for (int i = 0; i < 4; ++i) raw[184 + i] = static_cast<uint8_t>(crc >> (8 * i));
+  for (int i = 0; i < 4; ++i) raw[188 + i] = static_cast<uint8_t>(Store::kCommitMarker >> (8 * i));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, raw, sizeof(raw))));
+  Store::Snapshot loaded;
+  ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+  EXPECT_EQ(Store::Phase::Ready, loaded.phase);
+  const uint8_t zero[16] = {};
+  EXPECT_EQ(0, std::memcmp(zero, loaded.beginNonce, 16));
+  // Newer appends continue the sequence in v2.
+  ASSERT_TRUE(store.append(loaded));
+  ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+  EXPECT_EQ(2u, loaded.sequence);
+}
+
+TEST(OtaCandidateStoreTest, IntactUnsupportedVersionIsUnavailableNeverEmpty) {
+  using Store = OtaCandidateStore;
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  auto s = nonceBoundSnapshot();
+  ASSERT_TRUE(store.reset(s));
+  s.phase = Store::Phase::Ready;
+  ASSERT_TRUE(store.append(s));
+  uint8_t raw[Store::kRecordBytes];
+  ASSERT_TRUE(ota::platform::isOk(region.read(Store::kRecordBytes, raw, sizeof(raw))));
+  raw[4] = 9;
+  const uint32_t crc = ota::storage::Crc32::computeFinalized(raw, Store::kCrcOffset);
+  for (int i = 0; i < 4; ++i) raw[Store::kCrcOffset + i] = static_cast<uint8_t>(crc >> (8 * i));
+  uint8_t first[Store::kRecordBytes];
+  ASSERT_TRUE(ota::platform::isOk(region.read(0, first, sizeof(first))));
+  ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+  ASSERT_TRUE(ota::platform::isOk(region.program(0, first, sizeof(first))));
+  ASSERT_TRUE(ota::platform::isOk(region.program(Store::kRecordBytes, raw, sizeof(raw))));
+  Store::Snapshot loaded;
+  EXPECT_EQ(Store::LoadResult::IoError, store.load(loaded));
+  EXPECT_FALSE(loaded.valid);
+  EXPECT_FALSE(store.append(s));
+}
+
+TEST(OtaCandidateStoreTest, AnyUnreadableSlotOrBitmapIsIoErrorNotEmptyOrOlderPhase) {
+  using Store = OtaCandidateStore;
+  for (uint32_t read_index = 0; read_index < Store::kRecordSlots + 1; ++read_index) {
+    SCOPED_TRACE(read_index);
+    FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+    FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+    Store store(region);
+    auto s = nonceBoundSnapshot();
+    ASSERT_TRUE(store.reset(s));
+    s.phase = Store::Phase::Verifying;
+    ASSERT_TRUE(store.append(s));
+    flash.armFault({FakeNorFlash::OpKind::Read, FakeNorFlash::InjectionTiming::Before,
+                    flash.readOpCount() + 1 + read_index});
+    Store::Snapshot loaded;
+    EXPECT_EQ(Store::LoadResult::IoError, store.load(loaded));
+    EXPECT_FALSE(loaded.valid);
+    flash.clearFault();
+    ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+    EXPECT_EQ(Store::Phase::Verifying, loaded.phase);
+  }
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store empty(region);
+  Store::Snapshot loaded;
+  EXPECT_EQ(Store::LoadResult::Empty, empty.load(loaded));
+  flash.armFault({FakeNorFlash::OpKind::Read, FakeNorFlash::InjectionTiming::Before, flash.readOpCount() + 3});
+  EXPECT_EQ(Store::LoadResult::IoError, empty.load(loaded));
+}
+
+TEST(OtaCandidateStoreTest, MarkedCorruptionOfNewestAbortNeverResurrectsOlderReady) {
+  using Store = OtaCandidateStore;
+  const auto put32 = [](uint8_t* p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (8 * i)); };
+  enum class Damage { BodyBit, MagicBit, MarkerExtraZero, MarkerPartlyErased, LegacyBodyBit,
+                      TornMarkerProgram, MarkerFullyErased, LegacyMarkerErased, TornBody };
+  for (const auto damage : {Damage::BodyBit, Damage::MagicBit, Damage::MarkerExtraZero,
+                            Damage::MarkerPartlyErased, Damage::LegacyBodyBit,
+                            Damage::TornMarkerProgram, Damage::MarkerFullyErased,
+                            Damage::LegacyMarkerErased, Damage::TornBody}) {
+    SCOPED_TRACE(static_cast<int>(damage));
+    FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+    FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+    Store store(region);
+    auto s = nonceBoundSnapshot();
+    ASSERT_TRUE(store.reset(s));
+    ASSERT_TRUE(store.markReceived(0)); ASSERT_TRUE(store.markReceived(1));
+    s.phase = Store::Phase::Ready; ASSERT_TRUE(store.append(s));
+    s.phase = Store::Phase::Aborted; ASSERT_TRUE(store.append(s));
+    Store::Snapshot loaded;
+    ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+    ASSERT_EQ(Store::Phase::Aborted, loaded.phase);
+    std::vector<uint8_t> sector(Store::kSectorBytes);
+    ASSERT_TRUE(ota::platform::isOk(region.read(0, sector.data(), sector.size())));
+    uint8_t* abort = sector.data() + 2 * Store::kRecordBytes;
+    const bool legacy = damage == Damage::LegacyBodyBit || damage == Damage::LegacyMarkerErased;
+    if (legacy) {
+      // Rewrite all three as exact v1 records first: v1 must fail the same way.
+      for (uint32_t slot = 0; slot < 3; ++slot) {
+        uint8_t* r = sector.data() + slot * Store::kRecordBytes;
+        r[4] = 1; r[5] = 0;
+        std::memset(r + 184, 0xff, Store::kRecordBytes - 184);
+        put32(r + 184, ota::storage::Crc32::computeFinalized(r, 184));
+        put32(r + 188, Store::kCommitMarker);
+      }
+    }
+    switch (damage) {
+      case Damage::BodyBit: case Damage::LegacyBodyBit: abort[40] ^= 0x01; break;
+      case Damage::MagicBit: abort[0] ^= 0x01; break;
+      case Damage::MarkerExtraZero: put32(abort + Store::kMarkerOffset, 0); break;
+      case Damage::MarkerPartlyErased:
+        abort[40] ^= 0x01; put32(abort + Store::kMarkerOffset, Store::kCommitMarker | 0x00FF0000u); break;
+      case Damage::TornMarkerProgram: put32(abort + Store::kMarkerOffset, Store::kCommitMarker | 0x00FF0000u); break;
+      case Damage::MarkerFullyErased: put32(abort + Store::kMarkerOffset, 0xFFFFFFFFu); break;
+      case Damage::LegacyMarkerErased: put32(abort + Store::kLegacyMarkerOffset, Store::kCommitMarker | 0xFF000000u); break;
+      case Damage::TornBody:
+        // Equally a torn ABORT body program or erase damage to a durable
+        // ABORT (marker fully erased, CRC broken): never fall back to READY.
+        std::memset(abort + 100, 0xff, Store::kRecordBytes - 100); break;
+    }
+    ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+    ASSERT_TRUE(ota::platform::isOk(region.program(0, sector.data(), sector.size())));
+    const auto programs = flash.programOpCount();
+    const auto erases = flash.eraseOpCount();
+    Store cold(region);
+    if (damage == Damage::TornMarkerProgram || damage == Damage::MarkerFullyErased ||
+        damage == Damage::LegacyMarkerErased) {
+      // A torn marker program and erase damage to only the marker look the
+      // same; honouring the verified ABORT body is safe under both.
+      ASSERT_EQ(Store::LoadResult::Found, cold.load(loaded));
+      EXPECT_EQ(Store::Phase::Aborted, loaded.phase);
+      EXPECT_EQ(3u, loaded.sequence);
+      uint8_t zero[16] = {};
+      EXPECT_EQ(0, std::memcmp(legacy ? zero : s.beginNonce, loaded.beginNonce, 16));
+      // A later append never ties with the unmarked revocation.
+      s.phase = Store::Phase::Receiving;
+      ASSERT_TRUE(cold.append(s));
+      ASSERT_EQ(Store::LoadResult::Found, cold.load(loaded));
+      EXPECT_EQ(Store::Phase::Receiving, loaded.phase);
+      EXPECT_EQ(4u, loaded.sequence);
+      continue;
+    }
+    EXPECT_EQ(Store::LoadResult::IoError, cold.load(loaded));
+    EXPECT_FALSE(loaded.valid);
+    EXPECT_FALSE(cold.append(s));
+    EXPECT_EQ(programs, flash.programOpCount());
+    EXPECT_EQ(erases, flash.eraseOpCount());
+  }
+}
+
+TEST(OtaCandidateStoreTest, TornForwardPhaseMarkerFallsBackButTornRevocationIsHonoured) {
+  using Store = OtaCandidateStore;
+  for (const auto phase : {Store::Phase::Verifying, Store::Phase::Ready, Store::Phase::Committed,
+                           Store::Phase::Idle, Store::Phase::Aborted, Store::Phase::Failed}) {
+    SCOPED_TRACE(static_cast<int>(phase));
+    FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+    FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+    Store store(region);
+    auto s = nonceBoundSnapshot();
+    ASSERT_TRUE(store.reset(s));
+    s.phase = phase;
+    flash.armFault({FakeNorFlash::OpKind::Program, FakeNorFlash::InjectionTiming::Before,
+                    flash.programOpCount() + 2});
+    EXPECT_FALSE(store.append(s));
+    flash.clearFault();
+    const bool revocation = phase == Store::Phase::Idle || phase == Store::Phase::Aborted ||
+                            phase == Store::Phase::Failed;
+    Store::Snapshot loaded;
+    ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+    EXPECT_EQ(revocation ? phase : Store::Phase::Receiving, loaded.phase);
+    EXPECT_EQ(revocation ? 2u : 1u, loaded.sequence);
+  }
+}
+
+// reset() tombstones (zeroes) every non-blank slot before its unordered
+// sector erase, so no interrupted reset can leave an older READY newest.
+TEST(OtaCandidateStoreTest, InterruptedResetReadsEmptyAndNeverRevivesOlderSlots) {
+  using Store = OtaCandidateStore;
+  using Fake = FakeNorFlash;
+  for (int cut = 0; cut < 6; ++cut) {
+    SCOPED_TRACE(cut);
+    Fake flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+    FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+    Store store(region);
+    auto s = nonceBoundSnapshot();
+    ASSERT_TRUE(store.reset(s));
+    s.phase = Store::Phase::Ready;
+    ASSERT_TRUE(store.append(s));
+    s.phase = Store::Phase::Aborted;
+    ASSERT_TRUE(store.append(s));
+    const auto programs = flash.programOpCount();
+    if (cut == 2) {
+      flash.armFault({Fake::OpKind::Program, Fake::InjectionTiming::Before, programs + 2});  // 2nd tombstone
+    } else if (cut == 3) {
+      flash.armFault({Fake::OpKind::Program, Fake::InjectionTiming::Mid, programs + 1, 100});  // torn 1st
+    } else if (cut == 4) {
+      flash.armFault({Fake::OpKind::Erase, Fake::InjectionTiming::Mid, flash.eraseOpCount() + 1, 300});
+    } else {
+      flash.armFault({Fake::OpKind::Erase, Fake::InjectionTiming::Before, flash.eraseOpCount() + 1});
+    }
+    s.phase = Store::Phase::Receiving;
+    EXPECT_FALSE(store.reset(s));
+    flash.clearFault();
+    if (cut == 0) EXPECT_EQ(programs + 3, flash.programOpCount());  // blank slots untouched
+    if (cut == 1) {
+      // Unordered erase that blanked only the newest (ABORTED) slot.
+      std::vector<uint8_t> sector(Store::kSectorBytes);
+      ASSERT_TRUE(ota::platform::isOk(region.read(0, sector.data(), sector.size())));
+      std::memset(sector.data() + 2 * Store::kRecordBytes, 0xFF, Store::kRecordBytes);
+      ASSERT_TRUE(ota::platform::isOk(region.eraseSector(0)));
+      ASSERT_TRUE(ota::platform::isOk(region.program(0, sector.data(), sector.size())));
+    }
+    if (cut == 5) flash.armFault({Fake::OpKind::Read, Fake::InjectionTiming::Before, flash.readOpCount() + 2});
+    Store::Snapshot loaded;
+    const auto result = store.load(loaded);
+    flash.clearFault();
+    // A torn first tombstone leaves no proof that the reset began: unexplained
+    // bytes in front of marked records fail closed; unreadable stays IoError.
+    EXPECT_EQ(cut == 3 || cut == 5 ? Store::LoadResult::IoError : Store::LoadResult::Empty, result);
+    EXPECT_FALSE(loaded.valid);
+    const auto writes = flash.programOpCount() + flash.eraseOpCount();
+    EXPECT_FALSE(store.append(s));
+    EXPECT_EQ(writes, flash.programOpCount() + flash.eraseOpCount());
+    if (cut == 3) continue;
+    // A fresh authenticated BEGIN's reset proceeds from the tombstoned state.
+    ASSERT_TRUE(store.reset(s));
+    ASSERT_EQ(Store::LoadResult::Found, store.load(loaded));
+    EXPECT_EQ(Store::Phase::Receiving, loaded.phase);
+    EXPECT_EQ(1u, loaded.sequence);
+  }
+}
+
+TEST(OtaCandidateStoreTest, PremarkerResidueIsEmptyAndExactlyRecognized) {
+  using Store = OtaCandidateStore;
+  FakeNorFlash flash(Store::kExpectedRegionBytes, Store::kSectorBytes);
+  FlashRegion region(flash, 0, Store::kExpectedRegionBytes);
+  Store store(region);
+  auto s = nonceBoundSnapshot();
+  // Cut exactly at the marker program: body verified, marker still erased.
+  flash.armFault({FakeNorFlash::OpKind::Program, FakeNorFlash::InjectionTiming::Before,
+                  flash.programOpCount() + 2});
+  EXPECT_FALSE(store.reset(s));
+  flash.clearFault();
+  Store::Snapshot loaded, residue;
+  EXPECT_EQ(Store::LoadResult::Empty, store.load(loaded));
+  ASSERT_TRUE(store.readPremarkerResidue(0, residue));
+  EXPECT_EQ(0, std::memcmp(s.beginNonce, residue.beginNonce, 16));
+  EXPECT_FALSE(store.readPremarkerResidue(1, residue));
+  // A damaged body is not residue.
+  uint8_t zero = 0;
+  ASSERT_TRUE(ota::platform::isOk(region.program(Store::kNonceOffset, &zero, 1)));
+  EXPECT_FALSE(store.readPremarkerResidue(0, residue));
 }
 
 // -----------------------------------------------------------------------

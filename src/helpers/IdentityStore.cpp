@@ -1,5 +1,44 @@
 #include "IdentityStore.h"
 #include "IdentityIntegrityCodec.h"
+#if defined(ESP32)
+#include <errno.h>
+#include <sys/stat.h>
+#endif
+
+identity_io::LoadStatus IdentityStore::loadWithStatus(const char* name, mesh::LocalIdentity& id,
+                                                     bool mounted) {
+  if (!mounted) return identity_io::LoadStatus::Unavailable;
+  char filename[40];
+  const int filename_len = snprintf(filename, sizeof(filename), "%s/%s.id", _dir, name);
+  if (filename_len < 0 || filename_len >= (int)sizeof(filename)) return identity_io::LoadStatus::Unreadable;
+  identity_io::LoadStatus status;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  struct lfs_info info;
+  status = identity_io::classifyPathResult(true, lfs_stat(_fs->_getFS(), filename, &info),
+                                          LFS_ERR_NOENT);
+#elif defined(ESP32)
+  if (_vfs_mount) {
+    char vfs_filename[64];
+    const int len = snprintf(vfs_filename, sizeof(vfs_filename), "%s%s", _vfs_mount, filename);
+    if (len < 0 || len >= (int)sizeof(vfs_filename)) return identity_io::LoadStatus::Unreadable;
+    struct stat info;
+    const int result = stat(vfs_filename, &info);
+    status = identity_io::classifyPathResult(true, result == 0 ? 0 : errno, ENOENT);
+  } else {
+    status = _fs->exists(filename) ? identity_io::LoadStatus::Unchecked
+                                  : identity_io::LoadStatus::Unreadable;
+  }
+#else
+  // This backend exposes no error-bearing stat: a failed exists() is unknown.
+  status = _fs->exists(filename) ? identity_io::LoadStatus::Unchecked
+                                : identity_io::LoadStatus::Unreadable;
+#endif
+  if (status != identity_io::LoadStatus::Unchecked) return status;
+  mesh::LocalIdentity loaded;
+  if (!load(name, loaded)) return identity_io::LoadStatus::Unreadable;
+  id = loaded;
+  return identity_io::LoadStatus::Loaded;
+}
 
 bool IdentityStore::load(const char *name, mesh::LocalIdentity& id) {
   bool loaded = false;

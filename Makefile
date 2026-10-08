@@ -10,6 +10,9 @@ export TMP = $(TMPDIR)
 ENV ?=
 NATIVE_TEST_ENVS ?= native native_kiss_modem
 OTA_TEST_FILTER ?= test_lora_ota_*
+# Optional Google Test selector for native OTA targets, e.g. OTA_GTEST_FILTER='LoraOtaRoutedRetry.*'.
+OTA_GTEST_FILTER ?=
+OTA_GTEST_ENV = $(if $(strip $(OTA_GTEST_FILTER)),GTEST_FILTER='$(OTA_GTEST_FILTER)')
 OTA_NRF52_TARGET_ENVS ?= Xiao_nrf52_companion_radio_ota_usb Xiao_nrf52_repeater_ota_usb SenseCap_Solar_companion_radio_ota_usb SenseCap_Solar_repeater_ota_usb
 OTA_ESP32_TARGET_ENVS ?= Xiao_S3_WIO_companion_radio_ota_usb Xiao_S3_WIO_repeater_ota_usb
 OTA_TARGET_ENVS ?= $(OTA_NRF52_TARGET_ENVS) $(OTA_ESP32_TARGET_ENVS)
@@ -18,7 +21,8 @@ OTA_DEPLOY_TRANSPORT ?= native
 OTA_DEPLOY_CLIENT_PORT ?=
 OTA_DEPLOY_CLIENT_DTR ?= 0
 OTA_DEPLOY_INSTALL_TIMEOUT ?= 300
-OTA_DEPLOY_ROUTED_RETRY ?= 0
+# Directed/background deploys always use attempt-diverse reliable framing; 0 is refused for on-mesh modes.
+OTA_DEPLOY_ROUTED_RETRY ?= 1
 OTA_UPLOAD_IMAGE ?=
 OTA_UPLOAD_MANIFEST ?=
 OTA_UPLOAD_BOARD ?=
@@ -58,7 +62,7 @@ XIAO_OTA_TEST_ROLE_ID ?= $(if $(strip $(XIAO_OTA_ROLE_ID)),$(XIAO_OTA_ROLE_ID),0
 XIAO_OTA_UPSTREAM ?= $(XIAO_OTA_VENDOR)
 OTA_NRF_REMOTE_BOOT_PROOF_PREFIX ?=
 
-.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-deploy test-ota-stock-companion build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
+.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-ota-deploy test-ota-stock-companion build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
 
 build: tmpdir
 	@test -n "$(strip $(ENV))" || { echo 'Select one firmware environment with ENV=... .' >&2; exit 1; }
@@ -73,7 +77,7 @@ tmpdir:
 	@mkdir -p "$(TMPDIR)"
 test: tmpdir test-ota-host
 	$(PLATFORMIO) test $(foreach e,$(NATIVE_TEST_ENVS),-e $(e))
-test-ota: test-ota-host test-ota-native test-xiao-ota-bootloader
+test-ota: test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-xiao-ota-bootloader
 test-ota-host: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_*.py'
 test-ota-deploy: tmpdir
@@ -81,7 +85,13 @@ test-ota-deploy: tmpdir
 test-ota-stock-companion: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_stock_companion.py'
 test-ota-native: tmpdir
-	$(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
+	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
+# Real Mesh/Dispatcher/PacketManager behaviour with MESHCORE_LORA_OTA=0 (ordinary firmware is unchanged).
+test-ota-disabled: tmpdir
+	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native_lora_ota_disabled -f test_lora_ota_disabled
+# The same fixture with OTA compiled in: queue reserve, priorities and ownership stay compatible.
+test-ota-queue-compatibility: tmpdir
+	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native_lora_ota_queue -f test_lora_ota_disabled
 ESP32_OTA_IMAGE_ARGS ?=
 .PHONY: test-ota-esp32-image
 test-ota-esp32-image: tmpdir
@@ -91,7 +101,7 @@ OTA_LAYERS := protocol runtime storage trust integration esp32
 test-ota-boot: test-xiao-ota-bootloader
 .PHONY: $(addprefix test-ota-,$(OTA_LAYERS))
 $(addprefix test-ota-,$(OTA_LAYERS)): test-ota-%: tmpdir
-	$(PLATFORMIO) test -e native -f 'test_lora_ota_$*'
+	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native -f 'test_lora_ota_$*'
 build-ota-targets: tmpdir
 	@set -e; for env in $(OTA_TARGET_ENVS); do $(PLATFORMIO) run -e "$$env"; done
 build-ota-nrf52-targets:
@@ -115,7 +125,7 @@ ifeq ($(OTA_DEPLOY_TRANSPORT),native)
 	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
 	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" \
 	  --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --duty-milli-percent "$(OTA_UPLOAD_DUTY_MILLI_PERCENT)" \
-	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 1,$(OTA_DEPLOY_ROUTED_RETRY)),--routed-retry)
+	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
 else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
 	@test -n "$(OTA_ARTIFACT_DIR)" && test -n "$(OTA_STOCK_BINDING)" && test -n "$(OTA_STOCK_SERIAL)" && test -n "$(OTA_STOCK_SENDER_KEY)" && test "$(OTA_UPLOAD_MODE)" = direct || { echo 'Stock requires a new artifact directory, binding, serial, sender key and direct mode.' >&2; exit 1; }
 	$(PYTHON) scripts/ota_stock_companion.py deploy --by-id "$(OTA_DEPLOY_CLIENT_PORT)" --serial "$(OTA_STOCK_SERIAL)" \
@@ -125,7 +135,7 @@ else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
 	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
 	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(OTA_UPLOAD_LEASE_MS)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
 	  --normal-duty-percent "$$( $(PYTHON) -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)' )" \
-	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 1,$(OTA_DEPLOY_ROUTED_RETRY)),--routed-retry)
+	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload)
 else
 	@echo 'OTA_DEPLOY_TRANSPORT must be native or stock.' >&2; exit 1
 endif
@@ -232,7 +242,7 @@ test-ota-rf-to-boot: tmpdir
 	  done
 	env -u GTEST_FILTER -u OTA_NRF_ORIGINAL_FAILED_PROOF_DIR \
 	  OTA_NRF_REMOTE_BOOT_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
-	  $(MAKE) --no-print-directory test-ota-integration
+	  $(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER=
 	@set -eu; \
 	  for board in xiao_nrf52840 sensecap_solar_p1; do \
 	    case "$$board" in \
@@ -250,7 +260,7 @@ test-ota-rf-to-boot: tmpdir
 	  GTEST_FILTER='LoraOtaQualifiedOriginal.FullColdFailedMaxBothSdkPoliciesRestoreAfterCommandReplacementAndBindNextCommit' \
 	  GTEST_OUTPUT="json:$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)" \
 	  OTA_NRF_ORIGINAL_FAILED_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
-	  $(MAKE) --no-print-directory test-ota-integration
+	  $(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER=
 	@# Google Test accepts an empty filter; require the actual returned-proof test.
 	@python3 -c 'import json, sys; report = json.load(open(sys.argv[1])); cases = [case for suite in report["testsuites"] for case in suite["testsuite"]]; valid = report["tests"] == 1 and report["failures"] == 0 and len(cases) == 1 and cases[0]["status"] == "RUN" and cases[0]["result"] == "COMPLETED"; sys.exit(0 if valid else "Returned FailedMax proof did not execute exactly one complete passing test")' "$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)"
 

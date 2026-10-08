@@ -198,24 +198,6 @@ void tick(Pending& pending, uint32_t now, bool tx_active, bool outbound_queued,
 // Copied from simple_repeater
 #define CTL_TYPE_NODE_DISCOVER_REQ      0x80
 #define CTL_TYPE_NODE_DISCOVER_RESP     0x90
-#if MESHCORE_LORA_OTA
-// ContactInfo::flags bit layout: bit0 (0x01) is the pre-existing
-// 'favourite' flag; bits1-3 (0x02/0x04/0x08) are the pre-existing
-// per-contact telemetry permission mask (see onContactRequest() below
-// and SensorManager.h's TELEM_PERM_BASE/LOCATION/ENVIRONMENT, which are
-// compared against `contact.flags >> 1`). Bit4 (0x10) is NEW and otherwise
-// unused by any existing consumer: it marks this contact as locally
-// authorized to issue OTA admin control commands (abort/rollback/mode/
-// duty/commit) over an authenticated pairwise session -- being merely a
-// contact is NEVER sufficient on its own. See DataStoreRecordCodec.h's
-// per-record format marker for why a legacy/short on-disk record can
-// never silently grant this bit, and MyMesh::handleCommand()'s
-// OTA_CTRL_SET_ADMIN handler for the only way this bit may be set,
-// which requires the request to already be local-owner/admin-trusted
-// AND an actual saveContacts() success before replying OK.
-#define CONTACT_FLAG_OTA_ADMIN          0x10
-#endif
-
 struct AdvertPath {
   uint8_t pubkey_prefix[7];
   uint8_t path_len;
@@ -252,19 +234,11 @@ public:
   // by main.cpp strictly BEFORE this call), loadPrefs()'s legacy
   // /new_prefs migration is read-only (no migration write). Defaults to
   // true (unchanged legacy behavior) for any caller that never passes it.
-  // \param allow_identity_generation -- DELIBERATELY SEPARATE permit from
-  // the above (never derive one from the other): even a future boot
-  // classification that permits ordinary existing-userdata behavior
-  // (e.g. a positively-certified stock baseline) must NOT thereby also authorize
-  // creating a brand-new identity or persisting it -- that requires its
-  // own, still-unwired install/counter authority. When false, a failed
-  // loadMainIdentity() does NOT regenerate+persist a new identity (a
-  // merely-transiently-unreadable original secret must survive a
-  // subsequent trial rollback); self_id is left unset and
-  // identity-dependent mesh dispatch is suppressed for the rest of this
-  // boot. Defaults to true (unchanged legacy behavior) for any caller
-  // that never passes it.
-  void begin(bool allow_destructive_boot_writes = true, bool allow_identity_generation = true);
+  // Startup grants generation only with positive Normal boot evidence,
+  // initialized radio, mounted storage and a positively absent identity.
+  // A preloaded status avoids rereading the key after storage initialization.
+  void begin(bool allow_destructive_boot_writes = true, bool allow_identity_generation = true,
+             identity_io::LoadStatus identity_status = identity_io::LoadStatus::Unchecked);
   void startInterface(BaseSerialInterface &serial);
   void setListener(Listener* listener) { _listener = listener; }
 
@@ -291,15 +265,13 @@ public:
 
   // Dispatches CMD_OTA_CONTROL subops 0x10..0x18 (the lean local-USB
   // uploader/status wire contract; see helpers/ota/OtaUsbProtocol.h).
-  // Writes the fixed 90-byte ABI2 reply via _serial directly; does not use
+  // Writes the fixed 107-byte ABI3 reply via _serial directly; does not use
   // writeOKFrame()/writeErrFrame() (those are 1-2 byte legacy shapes,
   // incompatible with this contract's fixed-layout reply requirement).
   void handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int len);
   bool isOtaAdminKey(const uint8_t key[32]) const;
   static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #if MESHCORE_LORA_OTA
-  void signOtaCommitMessage(const uint8_t target[32], const uint8_t manifest_hash[32],
-                            uint32_t counter, uint8_t signature[64]);
   bool attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
                                 meshcore::ota::runtime::IOtaStagingSink& staging_sink);
   // Genuine trial-boot health confirmation: setOtaTrialBootHealthSignals()
@@ -535,7 +507,7 @@ private:
 #endif
   }
   // Returns the real, synchronous result of the underlying filesystem
-  // write (never a fabricated/optimistic true) -- see OTA_CTRL_SET_ADMIN
+  // write (never a fabricated/optimistic true) -- see UsbOtaOp::SetContactAdmin
   // in handleCommand(), which must not reply OK for an admin-flag change
   // that did not actually make it to durable storage.
   bool saveContacts();

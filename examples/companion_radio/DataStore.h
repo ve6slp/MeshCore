@@ -47,7 +47,8 @@ public:
   // boot can read/write existing userdata yet still must not be able to
   // wipe it. Defaults to true (unchanged legacy behavior) for every
   // existing caller/build that never passes this.
-  void begin(bool allow_destructive_writes = true, bool allow_format = true);
+  void begin(bool allow_destructive_writes = true, bool allow_format = true,
+             bool filesystem_ready = true);
   // Explicit, separately-queryable policy state (distinct from any
   // individual method's genuine I/O success/failure): true for the rest
   // of this boot once begin(false) has been called. Callers that wrap
@@ -59,6 +60,7 @@ public:
   // not consult this predicate would otherwise misread an intentional,
   // expected refusal as a genuine storage fault.
   bool destructiveWritesDisallowed() const { return _destructive_writes_disallowed_; }
+  void disallowDestructiveWrites() { _destructive_writes_disallowed_ = true; }
   // Separate from destructiveWritesDisallowed(): true whenever this boot
   // was not granted explicit format authority (see allow_format above),
   // REGARDLESS of whether ordinary userdata writes are permitted. A
@@ -70,6 +72,7 @@ public:
   FILESYSTEM* getPrimaryFS() const { return _fs; }
   FILESYSTEM* getSecondaryFS() const { return _fsExtra; }
   bool loadMainIdentity(mesh::LocalIdentity &identity);
+  identity_io::LoadStatus loadMainIdentityStatus(mesh::LocalIdentity& identity, bool mounted);
   bool saveMainIdentity(const mesh::LocalIdentity &identity);
   // Returns false on a genuine open/read FAULT (an existing, mandatory-
   // format /prefs.json that can't be opened, or whose loadSerial() genuinely

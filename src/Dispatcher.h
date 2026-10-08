@@ -149,70 +149,34 @@ public:
 */
 class PacketManager {
 public:
-  // Shared threshold (buffers) below which OTA traffic must yield to
-  // ordinary traffic. This single constant is enforced at FIVE distinct
-  // points so that no single path can starve the pool out from under the
-  // ordinary sender / raw radio ingress / delayed-RX / relay paths:
-  //  1. OTA's own outbound bulk allocation (is_ota_bulk=true, allocNew()
-  //     below fails closed -- see StaticPoolPacketManager::allocNew()).
-  //  2/3. Raw radio ingress + delayed-RX: Dispatcher::checkRecv() frees an
-  //     incoming packet immediately, without processing it, the instant it
-  //     is classified (post-parse) as OTA and accepting it would leave the
-  //     pool at or below this reserve (see Dispatcher::checkRecv()).
-  //  4. Relay: Dispatcher::processRecvPacket() drops (instead of queueing
-  //     for retransmit/relay) an OTA packet under the same condition, so a
-  //     relayed OTA packet can never occupy a buffer for the (potentially
-  //     long, duty-budget-gated) duration it sits in the outbound queue
-  //     awaiting airtime (see Dispatcher::processRecvPacket()).
-  //  5. Locally-originated raw packet injection (CMD_SEND_RAW_PACKET):
-  //     the payload type is not known until after allocNew(false)+parse,
-  //     exactly like raw radio ingress above, so the caller must re-check
-  //     and release the packet post-parse under the same condition instead
-  //     of queueing it for send (see MyMesh's CMD_SEND_RAW_PACKET handler).
-  //     Without this, OTA traffic sent via this path bypasses the reserve
-  //     entirely (since allocNew() only fails-closed when is_ota_bulk=true
-  //     is passed at allocation time) and can exhaust the whole pool,
-  //     starving even CMD_SEND_SELF_ADVERT's own allocation.
-  // OTA is inherently retry/repair-capable, so dropping under pressure at
-  // any of these points is safe; ordinary (non-OTA) traffic is NEVER
-  // subject to this reserve check.
+  // OTA yields these buffers to ordinary traffic. allocOtaPacket() protects
+  // allocation; Dispatcher additionally checks parsed ingress, delayed RX,
+  // relay and local raw injection before those paths can retain OTA buffers.
   static constexpr int kOtaAllocReserve = 4;
 
-  // `is_ota_bulk` marks an allocation as OTA's own outbound bulk traffic
-  // (chunks/census/repair/etc, see Mesh::createOtaData()). Implementations
-  // should fail closed (return nullptr) for these once the free pool is at
-  // or below a small reserve, so a burst of background OTA traffic can
-  // never starve the ordinary sender / raw radio ingress / delayed-RX /
-  // relay paths (which all call allocNew(false), the default) of buffers.
-  virtual Packet* allocNew(bool is_ota_bulk = false) = 0;
+  virtual Packet* allocNew() = 0;
   virtual void free(Packet* packet) = 0;
 
-  // Returns true if the packet was actually queued, false if it was
-  // dropped (e.g. send queue full) -- in which case the implementation
-  // must have already freed it back to the pool. Callers that need to
-  // surface enqueue failure to a user/host (rather than silently
-  // reporting success for a packet that was never actually queued for
-  // transmission) must check this return value; see
-  // Dispatcher::sendPacket() / Mesh::sendFlood().
-  virtual bool queueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) = 0;
-  // by priority; when out_priority is non-null, the priority of the
-  // packet actually popped is written back through it (needed so callers
-  // that must requeue a popped-but-not-yet-sent packet, e.g. due to
-  // insufficient airtime budget, can preserve its original queue priority
-  // instead of guessing/collapsing it).
-  virtual Packet* getNextOutbound(uint32_t now, uint8_t* out_priority = nullptr) = 0;
+  // Legacy submission always consumes the packet, including queue-full drops.
+  virtual void queueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) = 0;
+  virtual Packet* getNextOutbound(uint32_t now) = 0;    // by priority
   virtual int getOutboundCount(uint32_t now) const = 0;
   virtual int getOutboundTotal() const = 0;
   virtual int getFreeCount() const = 0;
   virtual Packet* getOutboundByIdx(int i) = 0;
-  // Scheduled-for timestamp of the still-queued entry at index i, used to
-  // filter out not-yet-ready (future-scheduled) entries when scanning the
-  // full queue for readiness (see Dispatcher::hasQueuedNormalTraffic()/
-  // hasQueuedOtaTraffic()).
-  virtual uint32_t getOutboundScheduledForByIdx(int i) const = 0;
   virtual Packet* removeOutboundByIdx(int i) = 0;
   virtual void queueInbound(Packet* packet, uint32_t scheduled_for) = 0;
   virtual Packet* getNextInbound(uint32_t now) = 0;
+
+  // Opt in only when reserve allocation, confirmed enqueue, exact dequeue
+  // priority and queue schedules are all supported. Legacy managers remain
+  // usable for ordinary traffic; unsupported OTA operations fail closed.
+  virtual bool supportsOtaQueue() const { return false; }
+  virtual Packet* allocOtaPacket() { return nullptr; }
+  // Success transfers ownership; failure leaves ownership with the caller.
+  virtual bool tryQueueOutbound(Packet*, uint8_t, uint32_t) { return false; }
+  virtual Packet* getNextOutboundWithPriority(uint32_t, uint8_t*) { return nullptr; }
+  virtual bool getOutboundScheduleByIdx(int, uint32_t&) const { return false; }
 };
 
 typedef uint32_t  DispatcherAction;
@@ -232,9 +196,9 @@ typedef uint32_t  DispatcherAction;
 */
 class Dispatcher {
   Packet* outbound;  // current outbound packet
-  uint8_t outbound_priority;  // priority the outbound packet was originally queued with
   unsigned long outbound_expiry, outbound_start, total_air_time, rx_air_time;
 #if MESHCORE_LORA_OTA
+  uint8_t outbound_priority;
   bool outbound_is_ota;
   meshcore::ota::protocol::OtaAirtimeCategory outbound_ota_category;
   mesh::ota::OtaFirmwareIntegration dispatcher_ota;
@@ -266,8 +230,8 @@ protected:
     : _radio(&radio), _ms(&ms), _mgr(&mgr)
   {
     outbound = NULL;
-    outbound_priority = 0;
 #if MESHCORE_LORA_OTA
+    outbound_priority = 0;
     outbound_is_ota = false;
     outbound_ota_category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
     active_ota = &dispatcher_ota;
@@ -312,12 +276,11 @@ public:
 
   Packet* obtainNewPacket(bool is_ota_bulk = false);
   void releasePacket(Packet* packet);
-  // Returns true if the packet was actually queued for transmission,
+  // Always consumes a non-null packet. Returns true if actually queued,
   // false if it was invalid or dropped (queue full) -- in either failure
-  // case the packet has already been freed back to the pool. Callers
-  // that unconditionally report success without checking this can end up
-  // reporting an ordinary-looking OK for a packet that never actually got
-  // queued (see Mesh::sendFlood()).
+  // case the packet has already been freed back to the pool. Legacy managers
+  // cannot report queue-full drops: true means submitted to their consuming
+  // queueOutbound(), not confirmed enqueue.
   bool sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis=0);
 #if MESHCORE_LORA_OTA
   bool hasQueuedNormalTraffic();

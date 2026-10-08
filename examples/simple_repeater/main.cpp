@@ -1,3 +1,4 @@
+#if !defined(MESHCORE_EXAMPLE_STARTUP_NATIVE)
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 
@@ -14,7 +15,7 @@
 // Declared here (not exposed via MyMesh.h), same reasoning as
 // examples/companion_radio/main.cpp: must be queried strictly BEFORE
 // store.load()/the_mesh.begin() ever touch identity/filesystem state.
-bool otaBoardEarlyBootTrialOrUnknown();
+bool otaBoardEarlyBootNormalProven();
 #endif
 
 
@@ -36,6 +37,7 @@ MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, 
 void halt() {
   while (1) ;
 }
+#endif
 
 static char command[160];
 #ifdef ETHERNET_ENABLED
@@ -83,10 +85,18 @@ void setup() {
   // loop()'s RF-touching operations (see MyMesh.h's _radio_available_
   // doc comment), and fast_rng falls back to a millis()-based seed
   // rather than calling getRngSeed() against a known-failed radio.
+#if MESHCORE_LORA_OTA
+  const bool radio_ok = radio_init() && radio_driver.probeDriverStatus();
+#else
   const bool radio_ok = radio_init();
+#endif
   if (!radio_ok) {
+#if MESHCORE_LORA_OTA
     MESH_DEBUG_PRINTLN("Radio init failed! Continuing in degraded (maintenance-only) mode.");
     the_mesh.notifyRadioUnavailableForDispatch();
+#else
+    halt();
+#endif
   }
 
   fast_rng.begin(radio_ok ? radio_driver.getRngSeed() : (uint32_t)millis());
@@ -96,7 +106,7 @@ void setup() {
   // mid-trial" is NOT the same as "positively proven safe" -- every case
   // except a positively verified stock boot or genuine qualified
   // baseline reports true (block ordinary filesystem writes this boot).
-  const bool ota_allow_destructive_boot_writes = !otaBoardEarlyBootTrialOrUnknown();
+  const bool ota_allow_destructive_boot_writes = otaBoardEarlyBootNormalProven();
   if (!ota_allow_destructive_boot_writes) {
     // Same policy MyMesh's own identity-generation path below already
     // honours -- also propagate it to loop()'s acl.save(_fs) (contacts
@@ -107,16 +117,7 @@ void setup() {
 #else
   const bool ota_allow_destructive_boot_writes = true;
 #endif
-  // Format permission is a separate, independently-verified permit, not
-  // an alias of ota_allow_destructive_boot_writes -- see
-  // examples/companion_radio/main.cpp's identical doc comment. No such
-  // authority is wired anywhere in this tree yet, so it stays false for
-  // every MESHCORE_LORA_OTA=1 boot.
-#if MESHCORE_LORA_OTA
-  const bool ota_allow_format = false;
-#else
-  const bool ota_allow_format = true;
-#endif
+  const bool ota_allow_format = ota_allow_destructive_boot_writes && radio_ok;
 
   FILESYSTEM* fs;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -132,16 +133,17 @@ void setup() {
   fs = &InternalFS;
   IdentityStore store(InternalFS, "");
 #elif defined(ESP32)
-  bool filesystem_ok = SPIFFS.begin(ota_allow_format);
+  bool filesystem_ok = ota_fs_mount::mountTrialSafe(ota_allow_format,
+      [](){ return SPIFFS.begin(false); }, [](){ return SPIFFS.begin(true); });
   fs = &SPIFFS;
-  IdentityStore store(SPIFFS, "/identity");
+  IdentityStore store(SPIFFS, "/identity", "/spiffs");
 #elif defined(RP2040_PLATFORM)
   // arduino-pico's LittleFS.begin(bool formatOnFail = false) already
   // defaults to a non-destructive mount-only attempt.
   bool filesystem_ok = LittleFS.begin();
   fs = &LittleFS;
   IdentityStore store(LittleFS, "/identity");
-  store.begin();
+  if (ota_allow_destructive_boot_writes && filesystem_ok) store.begin();
 #else
   #error "need to define filesystem"
 #endif
@@ -154,7 +156,16 @@ void setup() {
   // radio_ok result, never a literal `true`.
   the_mesh.setOtaTrialBootHealthSignals(radio_ok, filesystem_ok);
 #endif
-  bool identity_loaded = store.load("_main", the_mesh.self_id);
+#if MESHCORE_LORA_OTA
+  const identity_io::LoadStatus identity_status =
+      store.loadWithStatus("_main", the_mesh.self_id, filesystem_ok);
+  const bool identity_loaded = identity_status == identity_io::LoadStatus::Loaded;
+  if (!radio_ok || !identity_io::canWriteUserdata(ota_allow_destructive_boot_writes, filesystem_ok, identity_status)) {
+    the_mesh.notifyDestructiveWritesDisallowed();
+  }
+#else
+  const bool identity_loaded = store.load("_main", the_mesh.self_id);
+#endif
   if (!identity_loaded) {
 #if MESHCORE_LORA_OTA
     // Same unconditional latch as examples/companion_radio/MyMesh.cpp's
@@ -175,8 +186,8 @@ void setup() {
     // only) instead of inventing a second decision path or promoting
     // millis-seeded entropy into an identity.
 #if MESHCORE_LORA_OTA
-    // A verified stock boot permits ordinary writes, not replacement of an unreadable identity.
-    const bool identity_generation_safe = false;
+    const bool identity_generation_safe = identity_io::canProvisionIdentity(
+        ota_allow_destructive_boot_writes, radio_ok, filesystem_ok, identity_status);
 #else
     const bool identity_generation_safe = ota_allow_destructive_boot_writes && radio_ok;
 #endif
@@ -211,13 +222,12 @@ void setup() {
 #endif
     }
 #if MESHCORE_LORA_OTA
-    // Only a genuinely PERSISTED fresh identity counts as "confirmed
-    // loaded" -- a RAM-only one (not reachable here: the IdentityUnavailable
-    // branch above handles the no-identity case, and generation
-    // failure-to-save isn't possible without allow_destructive_boot_writes
-    // being true, which is exactly when a save is actually attempted) is
-    // never silently treated as durably bound. See
-    // notifyOtaIdentityConfirmedLoaded()'s doc comment in MyMesh.h.
+    if (identity_outcome == ota_identity_boot::Outcome::GeneratedRamOnlyNoWrites) {
+      the_mesh.self_id = mesh::LocalIdentity();
+      the_mesh.notifyIdentityUnavailableForDispatch();
+      the_mesh.notifyDestructiveWritesDisallowed();
+    }
+    // A generated but unpersisted key is not a usable OTA identity.
     the_mesh.notifyOtaIdentityConfirmedLoaded(identity_outcome == ota_identity_boot::Outcome::GeneratedAndSaved);
 #endif
   } else {

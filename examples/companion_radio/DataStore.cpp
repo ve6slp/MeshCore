@@ -14,6 +14,8 @@ DataStore::DataStore(FILESYSTEM& fs, mesh::RTCClock& clock) : _fs(&fs), _fsExtra
     identity_store(fs, "")
 #elif defined(RP2040_PLATFORM)
     identity_store(fs, "/identity")
+#elif defined(ESP32)
+    identity_store(fs, "/identity", "/spiffs")
 #else
     identity_store(fs, "/identity")
 #endif
@@ -26,6 +28,8 @@ DataStore::DataStore(FILESYSTEM& fs, FILESYSTEM& fsExtra, mesh::RTCClock& clock)
     identity_store(fs, "")
 #elif defined(RP2040_PLATFORM)
     identity_store(fs, "/identity")
+#elif defined(ESP32)
+    identity_store(fs, "/identity", "/spiffs")
 #else
     identity_store(fs, "/identity")
 #endif
@@ -48,9 +52,10 @@ static File openWrite(FILESYSTEM* fs, const char* filename) {
   static uint32_t _ContactsChannelsTotalBlocks = 0;
 #endif
 
-void DataStore::begin(bool allow_destructive_writes, bool allow_format) {
-  _destructive_writes_disallowed_ = !allow_destructive_writes;
-  _format_disallowed_ = !allow_format;
+void DataStore::begin(bool allow_destructive_writes, bool allow_format, bool filesystem_ready) {
+  _destructive_writes_disallowed_ = !allow_destructive_writes || !filesystem_ready;
+  _format_disallowed_ = !allow_format || !filesystem_ready;
+  if (!filesystem_ready) return;
 #if defined(RP2040_PLATFORM)
   // IdentityStore::begin() unconditionally mkdir()s its identity
   // directory -- an OTA trial/unknown boot must not create it either;
@@ -201,6 +206,26 @@ bool DataStore::formatFileSystem() {
 
 bool DataStore::loadMainIdentity(mesh::LocalIdentity &identity) {
   return identity_store.load("_main", identity);
+}
+
+identity_io::LoadStatus DataStore::loadMainIdentityStatus(mesh::LocalIdentity& identity, bool mounted) {
+  const auto primary = identity_store.loadWithStatus("_main", identity, mounted);
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  if (_fsExtra && (primary == identity_io::LoadStatus::Loaded ||
+                   primary == identity_io::LoadStatus::Absent)) {
+    // Legacy devices may still hold the key on secondary storage.
+    // Absence must be proven on BOTH stores before generating a key.
+    IdentityStore secondary(*_fsExtra, "");
+    mesh::LocalIdentity secondary_identity;
+    const auto extra = secondary.loadWithStatus("_main", secondary_identity, mounted);
+    if (extra == identity_io::LoadStatus::Loaded) {
+      identity = secondary_identity;
+      return extra;
+    }
+    if (extra != identity_io::LoadStatus::Absent) return extra;
+  }
+#endif
+  return primary;
 }
 
 bool DataStore::saveMainIdentity(const mesh::LocalIdentity &identity) {
@@ -528,20 +553,20 @@ void DataStore::migrateToSecondaryFS() {
   }
   // cleanup nodes which have been testing the extra fs, copy _main.id and new_prefs back to primary
   if (_fsExtra->exists("/_main.id")) {
-      if (_fs->exists("/_main.id")) {_fs->remove("/_main.id");}
-      File oldFile = openRead(_fsExtra, "/_main.id");
-      File newFile = openWrite(_fs, "/_main.id");
-
-      if (oldFile && newFile) {
-        uint8_t buf[64];
-        int n;
-        while ((n = oldFile.read(buf, sizeof(buf))) > 0) {
-          newFile.write(buf, n);
-        }
-      }
-      if (oldFile) oldFile.close();
-      if (newFile) newFile.close();
-      _fsExtra->remove("/_main.id");
+    IdentityStore secondary(*_fsExtra, "");
+    mesh::LocalIdentity migrating;
+    const bool loaded = secondary.loadWithStatus("_main", migrating, true) == identity_io::LoadStatus::Loaded;
+    const bool migrated = loaded && identity_io::migrateIdentityChecked(
+        [&](){ return identity_store.save("_main_migrate", migrating); },
+        [&](){ return identity_store.checkIntegrity("_main_migrate", migrating); },
+        [&](){ return _fs->rename("/_main_migrate.id", "/_main.id"); },
+        [&](){ return identity_store.checkIntegrity("_main", migrating); },
+        [&](){ return _fsExtra->remove("/_main.id"); });
+    if (!migrated) {
+      _blob_io_fault_observed = true;
+      _destructive_writes_disallowed_ = true;
+      return;
+    }
   }
   if (_fsExtra->exists("/new_prefs")) {
     if (_fs->exists("/new_prefs")) {_fs->remove("/new_prefs");}

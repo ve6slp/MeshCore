@@ -30,6 +30,7 @@ struct FakeContactRecord {
   char name[32];
   uint8_t type;
   uint8_t flags;
+  uint8_t ota_permissions;
   uint8_t out_path_len;
   uint8_t out_path[64];
   uint32_t last_advert_timestamp;
@@ -297,7 +298,7 @@ TEST(DataStoreRecordCodecTest, ReadAllContactsCleanEofAfterCompleteRecordsIsHeal
   EXPECT_EQ(0x22, host.loaded()[1].id.pub_key[0]);
 }
 
-TEST(DataStoreRecordCodecTest, OnlyRecognizedFormatPreservesOtaAdminAuthority) {
+TEST(DataStoreRecordCodecTest, LegacyAndUnknownMarkersNeverGrantOtaAndOnlyAmbiguousMarkerDropsCli) {
   FakeContactRecord contact = makeContact(0xF3);
   for (uint8_t marker : {0, 1, 2, 255}) {
     std::vector<uint8_t> bytes = encodeContacts({contact});
@@ -305,9 +306,55 @@ TEST(DataStoreRecordCodecTest, OnlyRecognizedFormatPreservesOtaAdminAuthority) {
     FakeCodecReadFile file(bytes);
     FakeContactLoadHost host;
     ASSERT_TRUE((datastore_io::readAllContacts<FakeCodecReadFile, FakeContactLoadHost,
-                 FakeContactRecord>(file, &host, 0x10)));
+                 FakeContactRecord>(file, &host)));
     ASSERT_EQ(1u, host.loaded().size());
-    EXPECT_EQ(marker == 1 ? 0xF3 : 0xE3, host.loaded()[0].flags);
+    EXPECT_EQ(marker == 1 ? 0xE3 : 0xF3, host.loaded()[0].flags);
+    EXPECT_EQ(0, host.loaded()[0].ota_permissions);
+  }
+}
+
+TEST(DataStoreRecordCodecTest, PrivatePermissionRoundtripNeverBorrowsPublicFlagsOrGrowsRecord) {
+  for (uint8_t flags : {0x00, 0x0F, 0x10, 0x1F, 0xFF}) {
+    for (uint8_t permissions : {0x00, 0x01}) {
+      FakeContactRecord contact = makeContact(0x42);
+      contact.flags = flags;
+      contact.ota_permissions = permissions;
+      const auto bytes = encodeContacts({contact});
+      ASSERT_EQ(kContactRecordBytes, bytes.size());
+      EXPECT_EQ(flags, bytes[65]);
+      EXPECT_EQ(0xA0 | permissions, bytes[66]);
+      FakeCodecReadFile file(bytes);
+      FakeContactLoadHost host;
+      ASSERT_TRUE((datastore_io::readAllContacts<FakeCodecReadFile, FakeContactLoadHost,
+          FakeContactRecord>(file, &host)));
+      ASSERT_EQ(1u, host.loaded().size());
+      EXPECT_EQ(flags, host.loaded()[0].flags);
+      EXPECT_EQ(permissions, host.loaded()[0].ota_permissions);
+    }
+  }
+}
+
+TEST(DataStoreRecordCodecTest, ExplicitRegrantMigratesLegacyRecordAndRevocationRemainsDurable) {
+  FakeContactRecord contact = makeContact(0x42);
+  contact.flags = 0x1F;
+  auto legacy = encodeContacts({contact});
+  legacy[66] = 1;
+  FakeCodecReadFile legacy_file(legacy);
+  FakeContactLoadHost legacy_host;
+  ASSERT_TRUE((datastore_io::readAllContacts<FakeCodecReadFile, FakeContactLoadHost,
+      FakeContactRecord>(legacy_file, &legacy_host)));
+  contact = legacy_host.loaded()[0];
+  EXPECT_EQ(0x0F, contact.flags);
+  EXPECT_EQ(0, contact.ota_permissions);
+  contact.ota_permissions = 1;  // explicit SetContactAdmin, not a public flags update
+  for (uint8_t enabled : {1, 0}) {
+    contact.ota_permissions = enabled;
+    FakeCodecReadFile new_file(encodeContacts({contact}));
+    FakeContactLoadHost new_host;
+    ASSERT_TRUE((datastore_io::readAllContacts<FakeCodecReadFile, FakeContactLoadHost,
+        FakeContactRecord>(new_file, &new_host)));
+    EXPECT_EQ(0x0F, new_host.loaded()[0].flags);
+    EXPECT_EQ(enabled, new_host.loaded()[0].ota_permissions);
   }
 }
 

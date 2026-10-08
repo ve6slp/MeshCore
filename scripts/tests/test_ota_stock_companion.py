@@ -53,18 +53,41 @@ def binding(c=None):
 BINDING = binding()
 
 
-def census(c, first=0, received=None, generation=10, lifecycle=None, floor=4):
+NONCE = bytes.fromhex("a1b2c3d4e5f60718293a4b5c6d7e8f90")
+CHALLENGE = 0x5EED0001
+
+
+def census(c, first=0, received=None, generation=10, lifecycle=None, floor=4, nonce=NONCE,
+           challenge=CHALLENGE):
     if received is None:
         received = set(range(c.total))
     bits = sum(1 << (i - first) for i in received if first <= i < first + 128)
     ready = len(received) == c.total
     return (b"\x0b" + TARGET + c.digest + struct.pack(">H", first) + bits.to_bytes(16, "little")
             + struct.pack(">HHBIBBII", len(received), c.total, 3 if ready else 1, generation,
-                          (5 if ready else 3) if lifecycle is None else lifecycle, 1, floor, c.counter))
+                          (5 if ready else 3) if lifecycle is None else lifecycle, 1, floor, c.counter)
+            + bytes([ota.WIRE_VERSION]) + nonce + struct.pack(">I", challenge))
 
-def pending_census(c, generation=9, floor=4):
-    frame = census(c, received=set(), generation=generation, lifecycle=9, floor=floor)
+
+def legacy_census(c, **options):
+    return census(c, **options)[:102]
+
+
+def pending_census(c, generation=9, floor=4, nonce=NONCE):
+    frame = census(c, received=set(), generation=generation, lifecycle=9, floor=floor, nonce=nonce,
+                   challenge=0)
     return frame[:87] + b"\x05" + frame[88:]
+
+
+# Well-formed ordinary MeshCore 1.17.1 pushes the stock uploader never consumes.
+ORDINARY_PUSHES = (
+    b"\x80" + bytes(32), b"\x81" + bytes(32), b"\x82" + bytes(8), b"\x83",
+    b"\x84\x10\xc0\xff" + bytes(10), b"\x85" + bytes(7), b"\x85" + bytes(13), b"\x86" + bytes(7),
+    b"\x87" + bytes(20), b"\x89" + bytes(14), b"\x8a" + bytes(147), b"\x8b" + bytes(12),
+    b"\x8c" + bytes(9), b"\x8d" + bytes(11), b"\x8e\x10\xc0\x00" + bytes(6), b"\x8f" + bytes(32),
+    b"\x90",
+    b"\x88\x10\xc0\x11\x00" + bytes(100),  # ordinary flood ADVERT RF log, not OTA payload type 0x0C
+)
 
 
 class Clock:
@@ -101,7 +124,12 @@ class FakeSerial:
         self.signing = bytearray()
         self.switch = self.expiry = 0
         self.tokens = []
+        self.rejected_tokens = []
+        self.nonce = NONCE
+        self.challenge = CHALLENGE
+        self.legacy_receiver = False
         self.commit_count = 0
+        self.denied_commits = 0
         self.drop_census = self.drop_blocks = 0
         self.drop_ack = 0
         self.bad_ack = False
@@ -256,9 +284,12 @@ class FakeSerial:
             assert rf[1:33] == TARGET and rf[33:65] == c.digest
             first = struct.unpack_from(">H", rf, 65)[0]
             if self.prepared:
-                report = pending_census(c, self.generation, self.floor)
+                report = pending_census(c, self.generation, self.floor, self.nonce)
             else:
-                report = census(c, first, self.received, self.generation, floor=self.floor)
+                report = census(c, first, self.received, self.generation, floor=self.floor,
+                                nonce=self.nonce, challenge=self.challenge)
+            if self.legacy_receiver:
+                report = report[:102]
             if self.activation_reports and self.reupload_count:
                 report = self.activation_reports.pop(0)
             self.last_census = report
@@ -278,8 +309,13 @@ class FakeSerial:
                 self.direct_bandwidth = 250000
             assert frequency_word == self.direct_frequency
             token = struct.unpack_from(">I", rf, 103)[0]
+            if token != self.challenge:
+                # Replayed, stale or guessed challenge: no ACK and no retune.
+                self.rejected_tokens.append(token)
+                return
             assert token not in self.tokens
             self.tokens.append(token)
+            self.challenge = (self.challenge * 1103515245 + 12345) & 0xFFFFFFFF or 1
             ack = (b"\x10" if rf[0] == 15 else b"\x0d") + rf[1:107]
             signer = OWNER_PRIVATE if self.bad_ack else TARGET_PRIVATE
             ack += signer.sign(domain + ack)
@@ -301,10 +337,14 @@ class FakeSerial:
             else:
                 self.received.add(index)
         elif rf[0] == 3:
+            assert len(rf) == 153
             assert self.received == set(range(c.total))
             assert rf[1:33] == TARGET and rf[33:65] == c.digest
             assert struct.unpack_from(">I", rf, 65)[0] == c.counter
-            ota.verify(OWNER, ota.COMMIT_DOMAIN + rf[1:69], rf[69:])
+            ota.verify(OWNER, b"MeshCore/OTA/commit/v2" + rf[1:89], rf[89:])
+            if rf[69:89] != struct.pack(">I", self.generation) + self.nonce:
+                self.denied_commits += 1
+                return
             self.commit_count += 1
         elif rf[0] == 14:
             assert len(rf) == 165
@@ -317,6 +357,8 @@ class FakeSerial:
                 return
             self.local_cache = self.aborted = self.prepared = False
             self.generation += 1
+            self.nonce = hashlib.sha256(self.nonce).digest()[:16]
+            self.challenge = (self.challenge ^ 0xA5A5A5A5) or 1
             self.received.clear()
             self.admitted = True
             self.reupload_count += 1
@@ -624,11 +666,15 @@ class ProtocolTests(unittest.TestCase):
     def test_rx_flood_direct_encoded_paths_and_native_path_boundaries(self):
         payload = census(candidate())
         for route in (1, 2):
-            for size, count in ((1, 0), (2, 0), (3, 0), (1, 2), (2, 2), (3, 2), (2, 32), (3, 21)):
+            # A 123-byte v3 report leaves 48 path bytes inside stock's 176-byte frame.
+            for size, count in ((1, 0), (2, 0), (3, 0), (1, 2), (2, 2), (3, 2), (1, 48), (2, 24), (3, 16)):
                 path = bytes(i % 256 for i in range(size * count))
                 packet = bytes([0x30 | route, ((size - 1) << 6) | count]) + path + payload
                 with self.subTest(route=route, size=size, count=count):
+                    self.assertEqual(len(b"\x88\x08\x40" + packet) <= ota.MAX_FRAME, True)
                     self.assertEqual(ota.raw_rx(b"\x88\x08\x40" + packet), payload)
+            with self.assertRaisesRegex(ota.Error, "oversize"):
+                ota.raw_rx(b"\x88\x08\x40" + bytes([0x30 | route, 49]) + bytes(49) + payload)
         for encoded in (0xC0, 0xC1, 0x7F, 0x96):
             with self.subTest(encoded=encoded):
                 self.assertIsNone(ota.raw_rx(b"\x88\x08\x40\x31" + bytes([encoded]) + payload))
@@ -651,7 +697,7 @@ class ProtocolTests(unittest.TestCase):
     def test_split_frames_and_oversize_rejected_immediately(self):
         clock, stream, _, _ = setup()
         frames = ota.Frames(stream, clock)
-        wire = b"noise>" + struct.pack("<H", 176) + bytes([0x88]) + bytes(175)
+        wire = b"noise>" + struct.pack("<H", 176) + b"\x88\x00\x00\x32\x00" + bytes(171)
         for byte in wire:
             frames.feed(bytes([byte]))
         self.assertEqual(len(frames.pending[0][1]), 176)
@@ -659,6 +705,63 @@ class ProtocolTests(unittest.TestCase):
         for length in (0, 177, 65535):
             with self.subTest(length=length), self.assertRaises(ota.Error):
                 ota.Frames(stream, clock).feed(b">" + struct.pack("<H", length))
+
+    def test_recognized_unused_pushes_are_discarded_before_the_bound(self):
+        clock, stream, stock, _ = setup()
+        frames = ota.Frames(stream, clock)
+        for _ in range(ota.PENDING_LIMIT * 2):
+            for push in ORDINARY_PUSHES:
+                frames.feed(b">" + struct.pack("<H", len(push)) + push)
+        self.assertEqual(frames.pending, [])
+        expected = {}
+        for push in ORDINARY_PUSHES:
+            expected[push[0]] = expected.get(push[0], 0) + ota.PENDING_LIMIT * 2
+        self.assertEqual(frames.ignored, expected)
+
+    def test_rf_census_ack_errors_signatures_and_unknown_frames_are_retained(self):
+        clock, stream, _, _ = setup()
+        c = candidate()
+        frames = ota.Frames(stream, clock)
+        kept = [b"\x88\x08\x40\x31\x00" + census(c),            # OTA census reply
+                b"\x88\x08\x40\x32\x00" + b"\x0d" + bytes(170),  # OTA lease ACK
+                b"\x88\x08\x40\x31", b"\x88\x08\x40\x71\x00" + bytes(4),  # malformed/unknown-version RF
+                b"\x01\x03", b"\x14" + bytes(64), b"\x00",            # sync error, signature, OK
+                b"\x91\x00", b"\xff"]                                 # unknown/future pushes
+        for frame in kept:
+            frames.feed(b">" + struct.pack("<H", len(frame)) + frame)
+        self.assertEqual([frame for _, frame in frames.pending], kept)
+        self.assertEqual(frames.ignored, {})
+
+    def test_malformed_recognized_push_is_fatal_not_silently_eaten(self):
+        clock, stream, _, _ = setup()
+        for push in (b"\x80" + bytes(31), b"\x82" + bytes(9), b"\x83\x00", b"\x85" + bytes(8),
+                     b"\x8a" + bytes(146), b"\x84\x00\x00", b"\x90\x00"):
+            with self.subTest(code=push[0]), self.assertRaisesRegex(ota.Error, "malformed stock push"):
+                ota.Frames(stream, clock).feed(b">" + struct.pack("<H", len(push)) + push)
+
+    def test_unknown_async_backlog_remains_bounded(self):
+        clock, stream, _, _ = setup()
+        frames = ota.Frames(stream, clock)
+        for _ in range(ota.PENDING_LIMIT):
+            frames.feed(b">\x01\x00\x91")
+        with self.assertRaisesRegex(ota.Error, "backlog overflow"):
+            frames.feed(b">\x01\x00\x91")
+
+    def test_refusal_and_signature_survive_interleaved_ordinary_pushes(self):
+        _, stream, stock, _ = setup()
+        original = stream.reply
+
+        def noisy(data):
+            for push in ORDINARY_PUSHES:
+                original(push)
+            original(data)
+        stream.reply = noisy
+        signature = stock.sign(b"message", 1000)
+        ota.verify(OWNER, b"message", signature)
+        stream.fail_restore = True
+        with self.assertRaises(ota.Refused):
+            stock.ok(b"\x0b" + struct.pack("<II", *NORMAL[:2]) + bytes(NORMAL[2:]))
+        self.assertEqual([frame[0] for _, frame in stock.frames.pending], [])
 
     def test_stale_usb_response_not_used(self):
         _, stream, stock, _ = setup()
@@ -888,6 +991,10 @@ class ProtocolTests(unittest.TestCase):
         stream.drop_ack = 1
         sender.negotiate()
         self.assertEqual(len(set(stream.tokens)), 2)
+        self.assertEqual(stream.rejected_tokens, [])
+        # The lost-ACK lease consumed the challenge; a new census supplies the next one.
+        kinds = [rf[0] for _, _, rf in stream.rf_packets]
+        self.assertEqual(kinds[kinds.index(12) + 1:kinds.index(12, kinds.index(12) + 1)], [10])
         requests = [t for t, _, rf in stream.rf_packets if rf[0] == 12]
         self.assertGreaterEqual(requests[1] - requests[0], 82)
         self.assertGreater(clock(), 87)
@@ -985,16 +1092,106 @@ class ProtocolTests(unittest.TestCase):
     def test_commit_wrong_receipt_and_not_ready(self):
         _, stream, _, sender = setup()
         receipt = sender.receipt("ready-observed-unsigned")
-        receipt["generation"] = 10
+        receipt.update(generation=10, begin_nonce=NONCE.hex())
         for field, value in (("target_public_key", OWNER.hex()), ("sender_public_key", TARGET.hex()),
-                             ("manifest_hash", bytes(32).hex()), ("counter", 6), ("generation", 9)):
+                             ("manifest_hash", bytes(32).hex()), ("counter", 6), ("generation", 9),
+                             ("begin_nonce", None), ("begin_nonce", bytes(16).hex()),
+                             ("begin_nonce", NONCE.hex().upper()), ("schema", 1)):
             wrong = dict(receipt, **{field: value})
-            with self.subTest(field=field), self.assertRaises(ota.Error):
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ota.Error, "receipt"):
                 sender.commit(wrong)
         stream.admitted = True
-        with self.assertRaisesRegex(ota.Error, "READY"):
+        with self.assertRaisesRegex(ota.Error, "fresh READY required"):
             sender.commit(receipt)
         self.assertEqual(stream.commit_count, 0)
+        self.assertFalse(any(rf[0] == 3 for _, _, rf in stream.rf_packets))
+
+    def test_commit_binds_observed_attempt_and_is_idempotent_across_reset(self):
+        clock, stream, stock, sender = setup()
+        receipt = sender.upload()
+        self.assertEqual((receipt["schema"], receipt["begin_nonce"]), (2, NONCE.hex()))
+        # A fresh process after host/receiver reset: same durable nonce, new lease challenge.
+        stream.challenge = 0x0BADC0DE
+        for _ in range(2):
+            fresh = ota.Sender(stock, BINDING, sender.candidate, NORMAL, clock() + 10000, 919000,
+                               clock=clock, sleep=clock.sleep)
+            fresh.commit(receipt)
+        commits = [rf for _, _, rf in stream.rf_packets if rf[0] == 3]
+        self.assertEqual([len(rf) for rf in commits], [153, 153])
+        self.assertEqual(commits[0][65:89], struct.pack(">II", 5, 10) + NONCE)
+        self.assertEqual((stream.commit_count, stream.denied_commits), (2, 0))
+
+    def test_commit_after_abort_and_identical_reupload_is_refused_and_replay_denied(self):
+        clock, stream, stock, sender = setup()
+        receipt = sender.upload()
+        captured = None
+        fresh = ota.Sender(stock, BINDING, sender.candidate, NORMAL, clock() + 10000, 919000,
+                           clock=clock, sleep=clock.sleep)
+        fresh.commit(receipt)
+        captured = [rf for _, _, rf in stream.rf_packets if rf[0] == 3][-1]
+        # ABORT + reupload of the identical image draws a new BEGIN nonce.
+        stream.nonce = bytes(reversed(NONCE))
+        stream.commit_count = 0
+        before = len(stream.rf_packets)
+        stale = ota.Sender(stock, BINDING, sender.candidate, NORMAL, clock() + 10000, 919000,
+                           clock=clock, sleep=clock.sleep)
+        with self.assertRaisesRegex(ota.Error, "different BEGIN attempt"):
+            stale.commit(receipt)
+        self.assertFalse(any(rf[0] == 3 for _, _, rf in stream.rf_packets[before:]))
+        stream.remote(captured)
+        self.assertEqual((stream.commit_count, stream.denied_commits), (0, 1))
+
+    def test_legacy_receiver_is_refused_on_first_census_before_lease_or_blocks(self):
+        _, stream, _, sender = setup()
+        stream.legacy_receiver = True
+        with self.assertRaisesRegex(ota.Error, "wire version is unsupported"):
+            sender.upload()
+        kinds = [rf[0] for _, _, rf in stream.rf_packets]
+        self.assertEqual(kinds, [8, 10])
+        for frame in (census(sender.candidate)[:102], census(sender.candidate)[:102] + bytes(21),
+                      census(sender.candidate)[:102] + b"\x02" + census(sender.candidate)[103:],
+                      census(sender.candidate) + b"\x00"):
+            with self.subTest(length=len(frame), version=frame[102:103]), \
+                    self.assertRaisesRegex(ota.Error, "wire version"):
+                sender.parse_census(frame, 0)
+
+    def test_unbound_or_changed_nonce_census_is_refused(self):
+        _, _, _, sender = setup()
+        with self.assertRaisesRegex(ota.Error, "unbound or different"):
+            sender.parse_census(census(sender.candidate, nonce=bytes(16)), 0)
+        sender.parse_census(census(sender.candidate), 0)
+        with self.assertRaisesRegex(ota.Error, "unbound or different"):
+            sender.parse_census(census(sender.candidate, nonce=bytes(reversed(NONCE))), 0)
+
+    def test_lease_token_is_single_use_receiver_challenge(self):
+        clock, stream, _, sender = setup(duty=1)
+        stream.admitted = True
+        sender.authorize()
+        first_challenge = stream.challenge
+        sender.negotiate()
+        requests = [rf for _, _, rf in stream.rf_packets if rf[0] == 12]
+        self.assertEqual(struct.unpack_from(">I", requests[0], 103)[0], first_challenge)
+        self.assertNotEqual(stream.challenge, first_challenge)
+        # Captured request replay (A/B/A) and identical retry: no ACK and no retune.
+        stream.switch = stream.expiry = 0
+        stream.profile = NORMAL
+        acks = len(stream.rx_packets)
+        stream.remote(requests[0])
+        self.assertEqual(len(stream.rx_packets), acks)
+        self.assertEqual(stream.rejected_tokens, [first_challenge])
+        self.assertEqual(stream.switch, 0)
+
+    def test_stale_challenge_after_receiver_reset_recensuses_for_new_token(self):
+        clock, stream, _, sender = setup(duty=1)
+        stream.admitted = True
+        sender.authorize()
+        stale = stream.challenge
+        stream.challenge = 0x0BADC0DE  # receiver rebooted after reporting the old challenge
+        sender.negotiate()
+        tokens = [struct.unpack_from(">I", rf, 103)[0] for _, _, rf in stream.rf_packets if rf[0] == 12]
+        self.assertEqual(tokens, [stale, 0x0BADC0DE])
+        self.assertEqual(stream.rejected_tokens, [stale])
+        self.assertEqual(stream.profile[:4], (919000, 250000, 5, 5))
 
     def test_block_geometry_role_package_floor_guards(self):
         c = candidate()
@@ -1312,7 +1509,8 @@ class ReuploadTests(unittest.TestCase):
 
     def test_activation_waits_erasing_to_receiving_without_reuploading_new_generation(self):
         _, stream, _, sender = self.prepared_setup()
-        stream.activation_reports = [census(sender.candidate, received=set(), lifecycle=2)]
+        fresh_nonce = hashlib.sha256(stream.nonce).digest()[:16]  # REUPLOAD draws a new BEGIN nonce
+        stream.activation_reports = [census(sender.candidate, received=set(), lifecycle=2, nonce=fresh_nonce)]
         sender.upload()
         self.assertEqual(stream.reupload_count, 1)
         self.assertEqual(sum(rf[0] == 14 for _, _, rf in stream.rf_packets), 1)
@@ -1708,6 +1906,8 @@ void dump(const unsigned char* p, size_t n) {
 }
 int main() {
   unsigned char owner[32], target[32], hash[32], canonical[59], sig[64], data[84], out[256], msg[256];
+  unsigned char nonce[16];
+  for(int i=0;i<16;i++)nonce[i]=i+200;
   for(int i=0;i<32;i++){owner[i]=i;target[i]=i+32;hash[i]=i+64;}
   for(int i=0;i<59;i++)canonical[i]=i;
   for(int i=0;i<64;i++)sig[i]=i+128;
@@ -1721,12 +1921,13 @@ int main() {
   out[0]=13; n=buildOtaDirectMessage(out,msg); dump(msg,n);
   mesh::Packet ack;ack.header=0x32;ack.path_len=0;ack.payload_len=171;std::memcpy(ack.payload,out,171);
   unsigned char ackwire[256];n=ack.writeTo(ackwire);dump(ackwire,n);
-  n=usb::buildCommitSignedMessage(target,hash,5,msg); dump(msg,n);
-  n=encodeOtaCommitFrame(target,hash,5,sig,out,sizeof(out)); dump(out,n);
+  n=usb::buildCommitSignedMessage(target,hash,5,0x0A0B0C0D,nonce,msg); dump(msg,n);
+  n=encodeOtaCommitFrame(target,hash,5,0x0A0B0C0D,nonce,sig,out,sizeof(out)); dump(out,n);
   n=encodeOtaCensusPoll(target,hash,128,out,sizeof(out)); dump(out,n);
   OtaCensusReport r; std::memcpy(r.reporter,target,32); std::memcpy(r.manifestHash,hash,32);
   r.first=128;r.bitmap[0]=3;r.received=2;r.total=130;r.phase=1;r.generation=10;
   r.lifecyclePhase=usb::UsbOtaPhase::Receiving;r.floorKnown=true;r.confirmedFloor=4;r.counter=5;
+  std::memcpy(r.beginNonce,nonce,16);r.leaseChallenge=0x5EED0001;
   n=encodeOtaCensusReport(r,out,sizeof(out));dump(out,n);
   mesh::Packet p;p.header=0x32;p.path_len=0;p.payload_len=n;std::memcpy(p.payload,out,n);
   unsigned char wire[256];n=p.writeTo(wire);dump(wire,n);
@@ -1740,6 +1941,13 @@ int main() {
   out[0]=14;std::memcpy(out+1,owner,32);std::memcpy(out+33,target,32);std::memcpy(out+65,hash,32);
   usb::putBE32(out+97,9);dump(out,101);n=buildOtaReuploadMessage(out,msg);dump(msg,n);
   std::memcpy(out+101,sig,64);dump(out,165);
+  n=encodeOtaDirectProfileFrame(15,OtaDirectProfile::Bw500,owner,target,hash,919000,60000,0x12345678,out,sizeof(out));
+  n=buildOtaDirectMessage(out,msg); dump(msg,n);
+  usb::UsbOtaReply u; u.requestOp=0x17; u.result=usb::UsbOtaResult::Ok; u.phase=usb::UsbOtaPhase::Ready;
+  u.flags=usb::kReplyFlagSnapshotValid|usb::kReplyFlagRemote; std::memcpy(u.target,target,32);
+  std::memcpy(u.manifestHash,hash,32); u.durableReceivedBlocks=2; u.totalBlocks=2; u.counter=5;
+  u.statusAgeMs=0; u.retryAfterMs=0; u.generation=0x0A0B0C0D; std::memcpy(u.beginNonce,nonce,16);
+  u.wireVersion=usb::kOtaWireVersion; n=usb::encodeUsbOtaReply(u,out); dump(out,n);
 }'''
         path = self.directory / "golden.cpp"
         path.write_text(cpp)
@@ -1753,9 +1961,14 @@ int main() {
         owner, target, digest = bytes(range(32)), bytes(range(32, 64)), bytes(range(64, 96))
         canonical, signature, data = bytes(range(59)), bytes(range(128, 192)), bytes(range(1, 85))
         direct = b"\x0c" + owner + target + digest + struct.pack(">IHI", 919000, 60000, 0x12345678)
-        body = target + digest + struct.pack(">I", 5)
+        nonce = bytes(range(200, 216))
+        body = target + digest + struct.pack(">II", 5, 0x0A0B0C0D) + nonce
         report = (b"\x0b" + target + digest + struct.pack(">H", 128) + b"\x03" + bytes(15)
-                  + struct.pack(">HHBIBBII", 2, 130, 1, 10, 3, 1, 4, 5))
+                  + struct.pack(">HHBIBBII", 2, 130, 1, 10, 3, 1, 4, 5)
+                  + b"\x03" + nonce + struct.pack(">I", 0x5EED0001))
+        profile = b"\x0f" + owner + target + digest + struct.pack(">IHI", 0x020E05D8, 60000, 0x12345678)
+        reply = (bytes([30, 3, 0x17, 0, 5, 3]) + target + digest
+                 + struct.pack(">HHIIII", 2, 2, 5, 0, 0, 0x0A0B0C0D) + nonce + b"\x03")
         fixture_candidate = ota.Candidate(canonical, bytes(84 * 0x1234) + data, digest, 5, 0x1235)
         block_message, block_prefix = ota.block_message(fixture_candidate, 0x1234)
         expected = [
@@ -1769,8 +1982,17 @@ int main() {
             b"\x0e" + owner + target + digest + struct.pack(">I", 9),
             ota.REUPLOAD_DOMAIN + b"\x0e" + owner + target + digest + struct.pack(">I", 9),
             b"\x0e" + owner + target + digest + struct.pack(">I", 9) + signature,
+            ota.DIRECT_PROFILE_DOMAIN + profile, reply,
         ]
         self.assertEqual(actual, [blob.hex() for blob in expected])
+        # Exact wire sizes and the 176-byte stock frame ceiling.
+        self.assertEqual((len(ota.COMMIT_DOMAIN + body), len(b"\x03" + body + signature), len(report), len(reply)),
+                         (110, 153, 123, 107))
+        self.assertLessEqual(len(ota.packet(report)) + 3, ota.MAX_FRAME)
+        import ota_uploader as native
+        decoded = native.decode_reply(reply)
+        self.assertEqual((decoded.generation, decoded.begin_nonce, decoded.wire_version, decoded.attempt_bound),
+                         (0x0A0B0C0D, nonce, 3, True))
 
 
 if __name__ == "__main__":

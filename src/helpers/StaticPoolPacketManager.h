@@ -29,21 +29,24 @@ class StaticPoolPacketManager : public mesh::PacketManager {
 public:
   StaticPoolPacketManager(int pool_size);
 
-  // Shared reserve threshold -- see mesh::PacketManager::kOtaAllocReserve
-  // for the full rationale (enforced at four separate points, not just
-  // this allocation-time check).
+  // Dispatcher also enforces this reserve after ingress parsing and on relay.
   static constexpr int kOtaAllocReserve = mesh::PacketManager::kOtaAllocReserve;
 
-  mesh::Packet* allocNew(bool is_ota_bulk = false) override;
+  mesh::Packet* allocNew() override;
   void free(mesh::Packet* packet) override;
-  bool queueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) override;
-  mesh::Packet* getNextOutbound(uint32_t now, uint8_t* out_priority = nullptr) override;
+  void queueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) override;
+  mesh::Packet* getNextOutbound(uint32_t now) override;
   int getOutboundCount(uint32_t now) const override;
   int getOutboundTotal() const override;
   int getFreeCount() const override;
   mesh::Packet* getOutboundByIdx(int i) override;
-  uint32_t getOutboundScheduledForByIdx(int i) const override;
   mesh::Packet* removeOutboundByIdx(int i) override;
   void queueInbound(mesh::Packet* packet, uint32_t scheduled_for) override;
   mesh::Packet* getNextInbound(uint32_t now) override;
+
+  bool supportsOtaQueue() const override { return true; }
+  mesh::Packet* allocOtaPacket() override;
+  bool tryQueueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) override;
+  mesh::Packet* getNextOutboundWithPriority(uint32_t now, uint8_t* out_priority) override;
+  bool getOutboundScheduleByIdx(int i, uint32_t& scheduled_for) const override;
 };

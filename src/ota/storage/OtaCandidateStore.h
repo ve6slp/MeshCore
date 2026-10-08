@@ -37,11 +37,35 @@ public:
     uint8_t canonical[mesh::ota::kOtaCanonicalManifestBytes] = {0};
     uint8_t ownerPublicKey[32] = {0};
     uint8_t signature[64] = {0};
+    // Fresh per-BEGIN attempt nonce (record v2). All-zero means a legacy
+    // v1 record: still authoritative state, but never COMMIT-authorizable.
+    uint8_t beginNonce[16] = {0};
     uint16_t receivedBlocks = 0;
   };
 
+  // Found: newest committed slot decoded and its bitmap counted. A
+  // CRC-valid body whose marker is incomplete (a torn marker program, or an
+  // interrupted erase that moved only marker bits toward erased) counts only
+  // when it revokes (Idle/Aborted/Failed): either reading then leaves less
+  // authority, so a revoked READY/nonce can never be resurrected.
+  // Empty: every slot is blank or a CRC-valid unmarked non-revoking body,
+  // or reset() began (any exact tombstone; all other slots are superseded).
+  // IoError: some slot/bitmap could not be read, or (without a tombstone) a
+  // non-blank slot is not a CRC-valid supported body (see classifyRecord);
+  // never fall back to an older slot.
+  enum class LoadResult : uint8_t { Found = 0, Empty = 1, IoError = 2 };
+
   static constexpr uint32_t kMagic = 0x4F544341u;  // OTCA
-  static constexpr uint16_t kVersion = 1u;
+  static constexpr uint16_t kVersion = 2u;
+  static constexpr uint16_t kLegacyVersion = 1u;
+  // v2 layout: 0..183 as v1, 184..199 beginNonce16, 200 CRC32(0..199),
+  // 204 commit marker, 208..255 erased. v1: 184 CRC32(0..183), 188 marker.
+  static constexpr uint32_t kNonceOffset = 184u;
+  static constexpr uint32_t kCrcOffset = 200u;
+  static constexpr uint32_t kMarkerOffset = 204u;
+  static constexpr uint32_t kLegacyCrcOffset = 184u;
+  static constexpr uint32_t kLegacyMarkerOffset = 188u;
+  static constexpr uint32_t kDecodedBytes = kMarkerOffset + 4u;
   static constexpr uint32_t kCommitMarker = 0x43414E44u;  // CAND
   static constexpr uint32_t kSectorBytes = 4096u;
   static constexpr uint32_t kExpectedRegionBytes = 8192u;
@@ -60,7 +84,7 @@ public:
 
   bool reset(const Snapshot& snapshot) {
     if (!isValid() || !snapshot.valid || snapshot.totalBlocks == 0 || snapshot.totalBlocks > kMaxBlocks) return false;
-    if (!eraseMetadataSector() || !eraseBitmapSector()) return false;
+    if (!tombstoneRecords() || !eraseMetadataSector() || !eraseBitmapSector()) return false;
     return append(snapshot);
   }
 
@@ -85,39 +109,66 @@ public:
     std::memcpy(record + 29, snapshot.canonical, sizeof(snapshot.canonical));
     std::memcpy(record + 88, snapshot.ownerPublicKey, sizeof(snapshot.ownerPublicKey));
     std::memcpy(record + 120, snapshot.signature, sizeof(snapshot.signature));
-    putU32(record + 184, Crc32::computeFinalized(record, 184));
-    putU32(record + 188, kCommitMarker);
+    std::memcpy(record + kNonceOffset, snapshot.beginNonce, sizeof(snapshot.beginNonce));
+    putU32(record + kCrcOffset, Crc32::computeFinalized(record, kCrcOffset));
+    putU32(record + kMarkerOffset, kCommitMarker);
 
     const uint32_t slot_offset = kMetadataSectorOffset + slot * kRecordBytes;
-    if (!platform::isOk(region_.program(slot_offset, record, 188))) return false;
-    uint8_t verify[188];
-    if (!platform::isOk(region_.read(slot_offset, verify, 188))) return false;
-    if (std::memcmp(record, verify, 188) != 0) return false;
-    if (!platform::isOk(region_.program(slot_offset + 188, record + 188, 4))) return false;
+    if (!platform::isOk(region_.program(slot_offset, record, kMarkerOffset))) return false;
+    uint8_t verify[kMarkerOffset];
+    if (!platform::isOk(region_.read(slot_offset, verify, kMarkerOffset))) return false;
+    if (std::memcmp(record, verify, kMarkerOffset) != 0) return false;
+    if (!platform::isOk(region_.program(slot_offset + kMarkerOffset, record + kMarkerOffset, 4))) return false;
     uint8_t marker[4];
-    if (!platform::isOk(region_.read(slot_offset + 188, marker, 4))) return false;
+    if (!platform::isOk(region_.read(slot_offset + kMarkerOffset, marker, 4))) return false;
     if (getU32(marker) != kCommitMarker) return false;
     return true;
   }
 
-  bool load(Snapshot& out) const {
+  LoadResult load(Snapshot& out) const {
     out = Snapshot();
-    if (!isValid()) return false;
-    bool found = false;
+    if (!isValid()) return LoadResult::IoError;
+    bool found = false, best_marked = false, tombstone = false, unexplained = false;
     uint32_t best_sequence = 0;
     Snapshot best;
     for (uint32_t slot = 0; slot < kRecordSlots; ++slot) {
       Snapshot current;
-      if (!readSlot(slot, current)) continue;
-      if (!found || current.sequence >= best_sequence) {
+      const auto state = readSlot(slot, current);
+      if (state == SlotState::Unreadable) return LoadResult::IoError;
+      if (state == SlotState::Unexplained) unexplained = true;
+      if (state == SlotState::Tombstone) tombstone = true;
+      if (state != SlotState::Valid && state != SlotState::TornRevocation) continue;
+      const bool marked = state == SlotState::Valid;
+      if (!found || current.sequence > best_sequence || (current.sequence == best_sequence && (marked || !best_marked))) {
         found = true;
+        best_marked = marked;
         best_sequence = current.sequence;
         best = current;
       }
     }
-    if (!found) return false;
-    best.receivedBlocks = countReceived(best.totalBlocks);
+    // Our own reset began: everything older is superseded, and other slots
+    // are its partly tombstoned or partly erased bytes.
+    if (tombstone) return LoadResult::Empty;
+    if (unexplained) return LoadResult::IoError;
+    if (!found) return LoadResult::Empty;
+    if (!readReceivedCount(best.totalBlocks, best.receivedBlocks)) return LoadResult::IoError;
     out = best;
+    return LoadResult::Found;
+  }
+
+  // Exact SYN-06 residue: the append wrote and verified a complete v2 body
+  // (magic, version, CRC) but power failed before the commit marker, which
+  // is still fully erased. Its manifest is returned only for caller-side
+  // authentication; it never becomes candidate state.
+  bool readPremarkerResidue(uint32_t slot, Snapshot& out) const {
+    out = Snapshot();
+    if (!isValid() || slot >= kRecordSlots) return false;
+    uint8_t record[kDecodedBytes];
+    if (!platform::isOk(region_.read(kMetadataSectorOffset + slot * kRecordBytes, record, sizeof(record)))) return false;
+    if (getU32(record) != kMagic || getU16(record + 4) != kVersion || getU16(record + 6) != kRecordBytes ||
+        getU32(record + kMarkerOffset) != 0xFFFFFFFFu ||
+        Crc32::computeFinalized(record, kCrcOffset) != getU32(record + kCrcOffset)) return false;
+    decode(record, out);
     return true;
   }
 
@@ -159,22 +210,62 @@ public:
   }
 
   uint16_t countReceived(uint16_t total_blocks) const {
-    if (!isValid() || total_blocks == 0) return 0;
     uint16_t total = 0;
+    return readReceivedCount(total_blocks, total) ? total : 0;
+  }
+
+  bool readReceivedCount(uint16_t total_blocks, uint16_t& total) const {
+    total = 0;
+    if (!isValid()) return false;
+    if (total_blocks == 0) return true;
     const uint32_t bytes = (static_cast<uint32_t>(total_blocks) + 7u) / 8u;
     for (uint32_t i = 0; i < bytes; ++i) {
       uint8_t current = 0xFFu;
-      if (!platform::isOk(region_.read(kBitmapSectorOffset + i, &current, 1))) return 0;
+      if (!platform::isOk(region_.read(kBitmapSectorOffset + i, &current, 1))) { total = 0; return false; }
       for (uint8_t bit = 0; bit < 8u; ++bit) {
         const uint32_t block = i * 8u + bit;
         if (block >= total_blocks) break;
         if ((current & static_cast<uint8_t>(1u << bit)) == 0u) ++total;
       }
     }
-    return total;
+    return true;
+  }
+
+  enum class RecordClass : uint8_t { Valid, Residue, Tombstone, Unexplained };
+
+  // Classifies one slot's first kDecodedBytes. Residue is only a blank slot
+  // or a supported, CRC-valid body whose marker is incomplete (a torn marker
+  // program or marker-only erase damage; see load()). Any other non-blank
+  // content (a bad CRC/header with any marker, including an erased one, a
+  // marker with bits outside CAND, or an unsupported version) cannot be told
+  // apart from damage to newer, possibly revoking state: callers must block,
+  // never skip it and fall back to an older slot. A torn body program is
+  // therefore unavailable until an authenticated USB recovery. Tombstone is
+  // an exact all-zero slot written only by reset() (see tombstoneRecords()).
+  static RecordClass classifyRecord(const uint8_t* record) {
+    bool blank = true, zero = true;
+    for (uint32_t i = 0; i < kDecodedBytes; ++i) {
+      blank = blank && record[i] == 0xFFu;
+      zero = zero && record[i] == 0u;
+    }
+    if (blank) return RecordClass::Residue;
+    if (zero) return RecordClass::Tombstone;
+    const uint16_t version = getU16(record + 4);
+    const bool supported = getU32(record) == kMagic && getU16(record + 6) == kRecordBytes &&
+                           (version == kVersion || version == kLegacyVersion);
+    if (!supported) return RecordClass::Unexplained;
+    const uint32_t marker_at = version == kLegacyVersion ? kLegacyMarkerOffset : kMarkerOffset;
+    const uint32_t crc_at = version == kLegacyVersion ? kLegacyCrcOffset : kCrcOffset;
+    const uint32_t marker = getU32(record + marker_at);
+    if (Crc32::computeFinalized(record, crc_at) != getU32(record + crc_at)) return RecordClass::Unexplained;
+    if (marker == kCommitMarker) return RecordClass::Valid;
+    if ((marker & kCommitMarker) == kCommitMarker) return RecordClass::Residue;
+    return RecordClass::Unexplained;
   }
 
 private:
+  enum class SlotState : uint8_t { Valid, TornRevocation, Ignored, Tombstone, Unexplained, Unreadable };
+
   static void putU16(uint8_t* out, uint16_t value) {
     out[0] = static_cast<uint8_t>(value & 0xFFu);
     out[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
@@ -197,6 +288,31 @@ private:
            (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
   }
 
+  // A NOR sector erase interrupted by power loss is unordered: it may blank
+  // only the newest (e.g. ABORTED) slot while older READY slots survive. So
+  // before erasing, reset() overwrites every non-blank slot with zeros and
+  // verifies it (program only clears bits). An interrupted reset can then
+  // leave only exact tombstones, blank slots, untouched records (a cut while
+  // tombstoning) or partly programmed/erased bytes, never a revived older
+  // record once the reset began: any exact tombstone makes load() report
+  // Empty (the authenticated BEGIN that started the reset superseded every
+  // slot). Without a tombstone, unexplained bytes stay IoError.
+  bool tombstoneRecords() {
+    static const uint8_t kZero[kDecodedBytes] = {};
+    for (uint32_t slot = 0; slot < kRecordSlots; ++slot) {
+      const uint32_t offset = kMetadataSectorOffset + slot * kRecordBytes;
+      uint8_t record[kDecodedBytes];
+      if (!platform::isOk(region_.read(offset, record, sizeof(record)))) return false;
+      const auto kind = classifyRecord(record);
+      if (kind == RecordClass::Tombstone) continue;
+      if (kind == RecordClass::Residue && getU32(record) != kMagic) continue;  // blank
+      if (!platform::isOk(region_.program(offset, kZero, sizeof(kZero))) ||
+          !platform::isOk(region_.read(offset, record, sizeof(record))) ||
+          std::memcmp(record, kZero, sizeof(kZero)) != 0) return false;
+    }
+    return true;
+  }
+
   bool eraseMetadataSector() {
     return platform::isOk(region_.eraseSector(kMetadataSectorOffset));
   }
@@ -211,12 +327,13 @@ private:
     uint32_t first_free = kRecordSlots;
     for (uint32_t slot = 0; slot < kRecordSlots; ++slot) {
       Snapshot current;
-      bool unreadable = false;
-      if (readSlot(slot, current, &unreadable)) {
+      const auto state = readSlot(slot, current);
+      if (state == SlotState::Valid || state == SlotState::TornRevocation) {
         if (current.sequence >= out_previous_sequence) out_previous_sequence = current.sequence;
         continue;
       }
-      if (unreadable) return false;
+      if (state == SlotState::Unreadable || state == SlotState::Unexplained || state == SlotState::Tombstone)
+        return false;
       uint8_t first4[4] = {0, 0, 0, 0};
       if (!platform::isOk(region_.read(kMetadataSectorOffset + slot * kRecordBytes, first4, 4))) return false;
       if (first_free == kRecordSlots &&
@@ -229,19 +346,28 @@ private:
     return true;
   }
 
-  bool readSlot(uint32_t slot, Snapshot& out, bool* unreadable = nullptr) const {
-    if (slot >= kRecordSlots) return false;
-    uint8_t record[192];
+  SlotState readSlot(uint32_t slot, Snapshot& out) const {
+    if (slot >= kRecordSlots) return SlotState::Unreadable;
+    uint8_t record[kDecodedBytes];
     const uint32_t offset = kMetadataSectorOffset + slot * kRecordBytes;
-    if (!platform::isOk(region_.read(offset, record, sizeof(record)))) {
-      if (unreadable) *unreadable = true;
-      return false;
+    if (!platform::isOk(region_.read(offset, record, sizeof(record)))) return SlotState::Unreadable;
+    const auto kind = classifyRecord(record);
+    if (kind == RecordClass::Unexplained) return SlotState::Unexplained;
+    if (kind == RecordClass::Tombstone) return SlotState::Tombstone;
+    const bool legacy = getU16(record + 4) == kLegacyVersion;
+    if (kind == RecordClass::Residue) {
+      // Blank, or a CRC-valid unmarked body: only a revocation phase counts.
+      const uint8_t phase = record[12] & 0x7Fu;
+      if (getU32(record) != kMagic ||
+          (phase != static_cast<uint8_t>(Phase::Idle) && phase != static_cast<uint8_t>(Phase::Aborted) &&
+           phase != static_cast<uint8_t>(Phase::Failed))) return SlotState::Ignored;
     }
-    if (getU32(record + 0) != kMagic) return false;
-    if (getU16(record + 4) != kVersion) return false;
-    if (getU16(record + 6) != kRecordBytes) return false;
-    if (getU32(record + 188) != kCommitMarker) return false;
-    if (Crc32::computeFinalized(record, 184) != getU32(record + 184)) return false;
+    decode(record, out);
+    if (legacy) std::memset(out.beginNonce, 0, sizeof(out.beginNonce));
+    return kind == RecordClass::Valid ? SlotState::Valid : SlotState::TornRevocation;
+  }
+
+  static void decode(const uint8_t* record, Snapshot& out) {
     out = Snapshot();
     out.valid = true;
     out.sequence = getU32(record + 8);
@@ -255,7 +381,7 @@ private:
     std::memcpy(out.canonical, record + 29, sizeof(out.canonical));
     std::memcpy(out.ownerPublicKey, record + 88, sizeof(out.ownerPublicKey));
     std::memcpy(out.signature, record + 120, sizeof(out.signature));
-    return true;
+    std::memcpy(out.beginNonce, record + kNonceOffset, sizeof(out.beginNonce));
   }
 
   platform::FlashRegion& region_;

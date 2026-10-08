@@ -10,6 +10,7 @@ struct ContactInfo {
   char name[32];
   uint8_t type;   // on of ADV_TYPE_*
   uint8_t flags;
+  uint8_t ota_permissions = 0;  // private persisted permissions, never part of the public flags byte
   uint8_t out_path_len;
   mutable bool shared_secret_valid; // flag to indicate if shared_secret has been calculated
   uint8_t out_path[MAX_PATH_SIZE];
@@ -31,6 +32,11 @@ struct ContactInfo {
   bool isTelemLocAllowed() const { return flags & 0x04; }
   bool isTelemEnvAllowed() const { return flags & 0x08; }
   bool isRemoteCLIAllowed() const { return flags & 0x10; }
+  bool isOtaAdmin() const { return (ota_permissions & 0x01) != 0; }
+  void setOtaAdmin(bool allowed) {
+    if (allowed) ota_permissions |= 0x01;
+    else ota_permissions &= (uint8_t)~0x01;
+  }
 
 private:
   mutable uint8_t shared_secret[PUB_KEY_SIZE];

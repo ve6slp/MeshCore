@@ -8,24 +8,35 @@ namespace ota {
 
 static constexpr uint8_t kOtaForwardPriority = 250;
 
+#if defined(MESHCORE_LORA_OTA) && MESHCORE_LORA_OTA
+static constexpr bool kOtaMeshEnabled = true;
+#else
+static constexpr bool kOtaMeshEnabled = false;
+#endif
+
+// OFF builds: payload type 0x0C is ordinary/unknown traffic, never OTA.
 inline bool isOtaPayloadType(uint8_t payload_type) {
-  return payload_type == PAYLOAD_TYPE_LORA_OTA;
+  return kOtaMeshEnabled && payload_type == PAYLOAD_TYPE_LORA_OTA;
 }
 
 inline bool isOtaPacket(const Packet* packet) {
   return packet != nullptr && isOtaPayloadType(packet->getPayloadType());
 }
 
+// Local-origin flood priority (legacy: PATH 2, ADVERT 3, others 1). Relayed
+// ordinary floods keep Mesh's hop-count priority and never use this helper.
 inline uint8_t floodPriorityForPayload(uint8_t payload_type, uint8_t path_hash_count) {
   (void)path_hash_count;
-  if (payload_type == PAYLOAD_TYPE_LORA_OTA) return kOtaForwardPriority;
+  if (isOtaPayloadType(payload_type)) return kOtaForwardPriority;
   if (payload_type == PAYLOAD_TYPE_PATH) return 2;
   if (payload_type == PAYLOAD_TYPE_ADVERT) return 3;
   return 1;
 }
 
+// sendDirect priority (legacy: PATH 1, others 0). sendZeroHop is always 0
+// in Mesh and must not use this helper.
 inline uint8_t directPriorityForPayload(uint8_t payload_type) {
-  if (payload_type == PAYLOAD_TYPE_LORA_OTA) return kOtaForwardPriority;
+  if (isOtaPayloadType(payload_type)) return kOtaForwardPriority;
   if (payload_type == PAYLOAD_TYPE_PATH) return 1;
   return 0;
 }

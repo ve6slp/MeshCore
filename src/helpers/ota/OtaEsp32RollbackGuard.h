@@ -136,26 +136,37 @@ inline Esp32ConfigureOutcome configureEsp32OtaBackend(
   ::ota::platform::FlashRegion metadata(checked, Esp32OtaPolicy::kCandidateBytes, 8192);
   Store checked_store(metadata);
   Store::Snapshot snapshot;
-  const bool existing = checked_store.load(snapshot);
-  if (checked.failed()) {
+  const auto loaded = checked_store.load(snapshot);
+  const bool existing = loaded == Store::LoadResult::Found;
+  if (checked.failed() || loaded == Store::LoadResult::IoError) {
     capability = "OTA_DISABLED: ESP candidate metadata unreadable";
     return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
         ? Outcome::IoError : Outcome::Refused;
   }
   if (!existing) {
-    uint8_t first[4];
-    if (!::ota::platform::isOk(metadata.read(0, first, sizeof(first)))) {
-      capability = "OTA_DISABLED: ESP candidate metadata unreadable";
-      return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
-          ? Outcome::IoError : Outcome::Refused;
+    // Empty attaches (and a later BEGIN erases) only a completely erased
+    // metadata region (records, bitmap, selection marker) or the exact
+    // SYN-06 residue; any other byte, or any unreadable chunk, denies.
+    bool erased = true;
+    uint8_t chunk[64];
+    for (uint32_t offset = 0; offset < Store::kExpectedRegionBytes && erased; offset += sizeof(chunk)) {
+      if (!::ota::platform::isOk(metadata.read(offset, chunk, sizeof(chunk)))) {
+        capability = "OTA_DISABLED: ESP candidate metadata unreadable";
+        return flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+            ? Outcome::IoError : Outcome::Refused;
+      }
+      for (const auto byte : chunk) if (byte != 0xffu) { erased = false; break; }
     }
-    if (first[0] != 0xff || first[1] != 0xff || first[2] != 0xff || first[3] != 0xff) {
+    if (!erased &&
+        (!esp32PremarkerResidueRecoverable(checked_store, metadata, policy, signatures) || checked.failed())) {
       capability = "OTA_DISABLED: ESP candidate metadata damaged";
-      return Outcome::Refused;
+      return checked.failed() && flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk
+          ? Outcome::IoError : Outcome::Refused;
     }
   }
   if (existing && (snapshot.phase == Store::Phase::Committed || snapshot.phase == Store::Phase::Failed)) {
-    if (!sink.recoverUnsuccessfulSelection() || !checked_store.load(snapshot) || checked.failed()) {
+    if (!sink.recoverUnsuccessfulSelection() || checked_store.load(snapshot) != Store::LoadResult::Found ||
+        checked.failed()) {
       capability = "OTA_DISABLED: ESP install recovery refused";
       return sink.storageIoFaultObserved() ||
              flash.lastRefusal() == ::ota::platform::Esp32FlashAdapter::Refusal::Sdk

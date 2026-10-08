@@ -139,9 +139,47 @@ public:
       const auto len = encodeOtaTargetAuthorization(selected(), st.ownerPublicKey, canonical, signature, frame, sizeof(frame));
       if (transmit(integration, ctx, send, route(), selected(), frame, len, Category::Control)) {
         if (++target_ == count_) {
-          target_ = 0; stage_ = Stage::Initial;
+          target_ = 0;
+          // Direct mode negotiates through its own census+lease handshake.
+          stage_ = mode_ == usb::kStartModeDirect ? Stage::Initial : Stage::Negotiate;
+          waiting_poll_ = false;
           last_admission_ms_ = now; last_admission_index_ = 0;
         }
+      }
+      return;
+    }
+    if (stage_ == Stage::Negotiate) {
+      // Capability negotiation before the long sweep: at least one target
+      // must prove the nonce-bound wire with a v3 census report; legacy
+      // receivers never produce one and so never cost a whole image.
+      for (uint8_t i = 0; i < count_; ++i) {
+        OtaFirmwareIntegration::TargetObservation observation;
+        integration.targetObservation(targets_ + 32u * i, now, observation);
+        // A v3 report for an upgraded receiver's legacy v1 attempt carries
+        // a zero nonce and can never COMMIT; wait for a fresh bound attempt.
+        if (observation.haveBitmap && observation.wireVersion == usb::kOtaWireVersion &&
+            usb::beginNonceBound(observation.beginNonce) &&
+            !std::memcmp(observation.manifestHash, st.manifestHash, 32)) {
+          stage_ = Stage::Initial; target_ = 0; waiting_poll_ = false;
+          last_admission_ms_ = now; last_admission_index_ = 0;
+          return;
+        }
+      }
+      if (waiting_poll_ && now - last_poll_ < 15000u) return;
+      if (waiting_poll_) {
+        uint8_t canonical[59], signature[64];
+        if (!lean.exportCandidateForUpload(canonical, signature)) return;
+        const auto len = encodeOtaTargetAuthorization(selected(), st.ownerPublicKey, canonical, signature, frame, sizeof(frame));
+        // A target whose route keeps refusing must not hold the fleet.
+        if (!transmit(integration, ctx, send, route(), selected(), frame, len, Category::Control) &&
+            now - last_poll_ < 30000u) return;
+        waiting_poll_ = false;
+        if (++target_ == count_) target_ = 0;
+        return;
+      }
+      const auto len = encodeOtaCensusPoll(selected(), st.manifestHash, 0, frame, sizeof(frame));
+      if (transmit(integration, ctx, send, route(), selected(), frame, len, Category::Control)) {
+        waiting_poll_ = true; last_poll_ = now;
       }
       return;
     }
@@ -204,7 +242,13 @@ public:
         }
         return;
       }
-      const auto len = integration.buildDirectRequest(targets_, frequency_, lease_, ++token_, frame, sizeof(frame), profile_);
+      // The request must answer the receiver's current single-use challenge.
+      if (!observation.leaseChallenge || observation.wireVersion != usb::kOtaWireVersion) {
+        normal_stage_ = 0;
+        return;
+      }
+      const auto len = integration.buildDirectRequest(targets_, frequency_, lease_, observation.leaseChallenge,
+                                                      frame, sizeof(frame), profile_);
       if (len && transmit(integration, ctx, send, OtaRfRoute::ZeroHop, targets_, frame, len, Category::Control)) {
         last_direct_request_ = now; normal_stage_ = 0;
       }
@@ -300,7 +344,7 @@ public:
   }
 
 private:
-  enum class Stage { Admission, Initial, Census, Repair };
+  enum class Stage { Admission, Negotiate, Initial, Census, Repair };
   static bool transmit(OtaFirmwareIntegration& integration, void* ctx, SendFn send, OtaRfRoute route,
                          const uint8_t target[32], const uint8_t* frame, size_t len,
                          meshcore::ota::protocol::OtaAirtimeCategory category) {

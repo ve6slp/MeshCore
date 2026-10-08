@@ -65,26 +65,13 @@ __attribute__((weak)) bool otaBoardTrialHealthWindowActive() {
 }
 
 // Genuine EARLIEST-boot-phase preflight, called from main.cpp strictly
-// BEFORE store.begin()/the_mesh.begin() ever touch identity/prefs/blob
-// storage: true iff this device is qualified AND a persisted OTA
-// trial-boot record is genuinely TRIAL-phase, OR the qualified device's
-// trial state cannot yet be established (fail closed -- "unknown" is
-// never treated as "definitely not a trial"). The weak default here
-// covers a build with MESHCORE_LORA_OTA=1 but NO board-specific
-// Ota*Backend.cpp linked in at all (e.g. variants/xiao_s3_wio, which
-// currently sets the feature flag with no QSPI backend written yet):
-// such a build claims OTA capability but has no bootloader-tracked
-// trial/qualification concept actually wired -- there is no positive
-// evidence available of ANY kind, so it must stay UNKNOWN (fail closed,
-// block destructive identity/prefs/migration writes for the whole boot)
-// rather than being silently treated as ordinary legacy/no-OTA-concept
-// hardware. Only a genuinely unqualified board's REAL backend
-// implementation (resolveOtaBoardStartupDecision()'s NotQualified
-// reason, reached via the real variants/*/Ota*Backend.cpp code, not this
-// weak stub) is permitted to report Unknown-but-otherwise-ordinary via
-// its own explicit qualification check.
+// A missing backend is unknown, never positive Normal authority.
+// Startup asks NormalProven before any destructive userdata operation.
 __attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
   return true;
+}
+__attribute__((weak)) bool otaBoardEarlyBootNormalProven() {
+  return false;
 }
 
 // True once the wrapped staging sink has observed a genuine IoError on
@@ -1085,10 +1072,28 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 #endif
 }
 
-void MyMesh::begin(bool allow_destructive_boot_writes, bool allow_identity_generation) {
+void MyMesh::begin(bool allow_destructive_boot_writes, bool allow_identity_generation,
+                   identity_io::LoadStatus identity_status) {
   BaseChatMesh::begin();
 
-  const bool identity_initially_loaded = _store->loadMainIdentity(self_id);
+#if MESHCORE_LORA_OTA
+  const bool normal_proven = otaBoardEarlyBootNormalProven();
+  const bool radio_ready = _ota_trial_radio_ready && _radio != nullptr && _radio->probeDriverStatus();
+  _ota_trial_radio_ready = radio_ready;
+  if (identity_status == identity_io::LoadStatus::Unchecked) {
+    identity_status = _store->loadMainIdentityStatus(self_id, _ota_trial_filesystem_ready);
+  }
+  allow_destructive_boot_writes = allow_destructive_boot_writes && radio_ready &&
+      identity_io::canWriteUserdata(normal_proven, _ota_trial_filesystem_ready, identity_status);
+  if (!allow_destructive_boot_writes) _store->disallowDestructiveWrites();
+  allow_identity_generation = allow_identity_generation &&
+      allow_destructive_boot_writes && identity_io::canProvisionIdentity(
+          normal_proven, radio_ready, _ota_trial_filesystem_ready, identity_status);
+  const bool identity_initially_loaded = identity_status == identity_io::LoadStatus::Loaded;
+#else
+  const bool identity_initially_loaded = identity_status == identity_io::LoadStatus::Unchecked
+      ? _store->loadMainIdentity(self_id) : identity_status == identity_io::LoadStatus::Loaded;
+#endif
 #if MESHCORE_LORA_OTA
   // Hoisted so the fallback branch below can also update it from the
   // actual resolveIdentityTrialSafe() outcome (see after the branch).
@@ -1135,6 +1140,13 @@ void MyMesh::begin(bool allow_destructive_boot_writes, bool allow_identity_gener
     } else if (outcome == ota_identity_boot::Outcome::GeneratedAndSaved ||
                outcome == ota_identity_boot::Outcome::GeneratedRamOnlyNoWrites) {
 #if MESHCORE_LORA_OTA
+      const bool identity_write_disallowed = _store->destructiveWritesDisallowed();
+      if (outcome == ota_identity_boot::Outcome::GeneratedRamOnlyNoWrites) {
+        _identity_available_ = false;
+        self_id = mesh::LocalIdentity();
+        _store->disallowDestructiveWrites();
+        allow_destructive_boot_writes = false;
+      }
       // Real, already-performed ordinary filesystem write at boot -- its
       // ACTUAL outcome is genuine trial-boot-health evidence (see
       // tickOtaTrialHealth()); this runs before configureCompanionFirmware
@@ -1145,7 +1157,7 @@ void MyMesh::begin(bool allow_destructive_boot_writes, bool allow_identity_gener
       // never a policy refusal -- the destructiveWritesDisallowed()
       // check inside noteIdentityResolution() is defensive/future-
       // proofing only, kept consistent with every other save-site below.)
-      _ota_service_.noteIdentityResolution(outcome, _store->destructiveWritesDisallowed());
+      _ota_service_.noteIdentityResolution(outcome, identity_write_disallowed);
 #else
       (void)save_ok;
 #endif
@@ -1399,7 +1411,7 @@ bool MyMesh::isOtaAdminKey(const uint8_t key[32]) const {
   if (key == nullptr) return false;
   if (_identity_available_ && std::memcmp(key, self_id.pub_key, PUB_KEY_SIZE) == 0) return true;
   ContactInfo* contact = const_cast<MyMesh*>(this)->lookupContactByPubKey(key, PUB_KEY_SIZE);
-  return contact != nullptr && (contact->flags & CONTACT_FLAG_OTA_ADMIN) != 0;
+  return contact != nullptr && contact->isOtaAdmin();
 #else
   (void)key;
   return false;
@@ -1573,12 +1585,16 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         reply.result = UsbOtaResult::NotFound;
         break;
       }
-      const uint8_t prev_flags = recipient->flags;
-      if (enable) recipient->flags |= CONTACT_FLAG_OTA_ADMIN;
-      else recipient->flags &= ~CONTACT_FLAG_OTA_ADMIN;
+      const uint8_t prev_permissions = recipient->ota_permissions;
+      const uint32_t prev_lastmod = recipient->lastmod;
+      recipient->setOtaAdmin(enable);
       recipient->lastmod = getRTCClock()->getCurrentTime();
       if (saveContacts()) reply.result = UsbOtaResult::Ok;
-      else { recipient->flags = prev_flags; reply.result = UsbOtaResult::IoError; }
+      else {
+        recipient->ota_permissions = prev_permissions;
+        recipient->lastmod = prev_lastmod;
+        reply.result = UsbOtaResult::IoError;
+      }
       break;
     }
     case UsbOtaOp::CacheBegin: {
@@ -1715,8 +1731,6 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         break;
       }
       const uint8_t* target = &cmd_frame[2];
-      const uint8_t* manifest_hash = &cmd_frame[2 + kPubKeyBytes];
-      const uint32_t counter = getBE32(&cmd_frame[2 + kPubKeyBytes + kHashBytes]);
       std::memcpy(reply.target, target, kPubKeyBytes);
       const bool local_target = _identity_available_ && std::memcmp(target, self_id.pub_key, kPubKeyBytes) == 0;
       if (!local_target) reply.flags |= kReplyFlagRemote;
@@ -1724,13 +1738,9 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
         reply.result = UsbOtaResult::Unavailable;
         break;
       }
-      const auto snap = lean.status();
       if (local_target) {
-        if (!snap.valid) { reply.result = UsbOtaResult::NotFound; break; }
-        if (std::memcmp(snap.manifestHash, manifest_hash, kHashBytes) != 0) { reply.result = UsbOtaResult::Mismatch; break; }
-        uint8_t signature[64] = {};
-        signOtaCommitMessage(target, manifest_hash, counter, signature);
-        reply.result = getOtaIntegration().commitAndDeferReboot(counter, signature, _ms->getMillis());
+        reply.result = getOtaIntegration().handleUsbLocalCommit(
+            cmd_frame, static_cast<size_t>(len), this, &MyMesh::otaSelfIdSignThunk, _ms->getMillis());
         fillLocalSnapshot();
         break;
       }
@@ -1823,6 +1833,8 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
       reply.statusAgeMs = obs.ageMs;
       reply.counter = obs.haveLifecycle ? obs.counter : local_snap.counter;
       reply.generation = obs.generation;
+      std::memcpy(reply.beginNonce, obs.beginNonce, sizeof(reply.beginNonce));
+      reply.wireVersion = obs.wireVersion;
       break;
     }
     default:
@@ -1839,15 +1851,6 @@ void MyMesh::handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int le
   encodeUsbOtaReply(reply, out);
   _serial->writeFrame(out, kReplyBytes);
 }
-
-#if MESHCORE_LORA_OTA
-__attribute__((noinline)) void MyMesh::signOtaCommitMessage(
-    const uint8_t target[32], const uint8_t manifest_hash[32], uint32_t counter, uint8_t signature[64]) {
-  uint8_t message[mesh::ota::usb::kCommitSignedBytes] = {};
-  const size_t message_len = mesh::ota::usb::buildCommitSignedMessage(target, manifest_hash, counter, message);
-  self_id.sign(signature, message, static_cast<int>(message_len));
-}
-#endif
 
 void MyMesh::replyUf2Reboot(companion_usb_uf2::Reply reply) {
   using Reply = companion_usb_uf2::Reply;
@@ -2233,34 +2236,13 @@ void MyMesh::handleOrdinaryCmdFrame(size_t len) {
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     uint32_t last_mod = getRTCClock()->getCurrentTime();  // fallback value if not present in cmd_frame
     if (recipient) {
-      // This generic update path is reachable from any app/import flow,
-      // not only the dedicated OTA_CTRL_SET_ADMIN toggle below -- an
-      // app sending a stale/full flags byte must never be able to
-      // silently grant OR revoke OTA admin as a side effect of an
-      // unrelated name/path/favourite edit. Preserve whatever this
-      // contact's OTA-admin bit already was, regardless of what the
-      // wire frame's flags byte says.
-#if MESHCORE_LORA_OTA
-      const bool was_ota_admin = (recipient->flags & CONTACT_FLAG_OTA_ADMIN) != 0;
-#endif
       updateContactFromFrame(*recipient, last_mod, cmd_frame, len);
-#if MESHCORE_LORA_OTA
-      if (was_ota_admin) recipient->flags |= CONTACT_FLAG_OTA_ADMIN;
-      else recipient->flags &= ~CONTACT_FLAG_OTA_ADMIN;
-#endif
       recipient->lastmod = last_mod;
       dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
       writeOKFrame();
     } else {
       ContactInfo contact;
       updateContactFromFrame(contact, last_mod, cmd_frame, len);
-#if MESHCORE_LORA_OTA
-      // A brand new contact (or an import masquerading as one) must
-      // NEVER be born with OTA admin privilege -- that can only be
-      // granted afterwards via the dedicated, locally-trusted
-      // OTA_CTRL_SET_ADMIN toggle.
-      contact.flags &= ~CONTACT_FLAG_OTA_ADMIN;
-#endif
       contact.lastmod = last_mod;
       contact.sync_since = 0;
       if (addContact(contact)) {
@@ -3248,7 +3230,7 @@ void MyMesh::handleOrdinaryCmdFrame(size_t len) {
       }
     } else if (op >= 0x10 && op <= 0x18) {
       // Lean local-USB uploader/status wire contract (see
-      // helpers/ota/OtaUsbProtocol.h) -- fixed 90-byte ABI2 reply shape, NOT
+      // helpers/ota/OtaUsbProtocol.h) -- fixed 107-byte ABI3 reply shape, NOT
       // writeOKFrame()/writeErrFrame().
       handleUsbOtaProtocolOp(op, cmd_frame, len);
     } else {

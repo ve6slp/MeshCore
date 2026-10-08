@@ -45,6 +45,9 @@ __attribute__((weak)) mesh::ota::OtaBoardTrialHealthOutcome otaBoardTryConfirmHe
 __attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
   return true;
 }
+__attribute__((weak)) bool otaBoardEarlyBootNormalProven() {
+  return false;
+}
 // Weak default matches examples/companion_radio/MyMesh.cpp's declaration
 // exactly; strong board-level overrides (variants/xiao_nrf52/OtaProductionBackend.cpp,
 // variants/sensecap_solar/OtaProductionBackend.cpp) are linked in board-wide

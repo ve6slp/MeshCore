@@ -22,6 +22,8 @@ public:
   using AdminCheckFn = bool (*)(void*, const uint8_t[32]);
   using TerminalCheckFn = bool (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&);
   using UnadmittedAbortFn = Result (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&, bool);
+  // Must fill `len` bytes from a hardware/CSPRNG source or return false.
+  using EntropyFn = bool (*)(void*, uint8_t*, size_t);
 
   struct Status {
     bool valid = false;
@@ -35,6 +37,10 @@ public:
     uint8_t ownerPublicKey[32] = {0};
     uint8_t manifestHash[32] = {0};
     uint8_t imageHash[32] = {0};
+    uint8_t beginNonce[usb::kBeginNonceBytes] = {0};
+    // Candidate storage could not be read authoritatively; every other
+    // field is meaningless and no candidate operation may proceed.
+    bool storageUnavailable = false;
   };
 
   void attachTrustProvider(meshcore::ota::runtime::IOtaTrustProvider* provider) { trust_provider_ = provider; }
@@ -42,6 +48,17 @@ public:
   void attachOwnerSignatureVerifier(const ::ota::trust::SignatureVerifier* verifier) { owner_signature_verifier_ = verifier; }
   void attachTerminalCheck(void* ctx, TerminalCheckFn fn) { terminal_ctx_ = ctx; terminal_check_ = fn; }
   void attachUnadmittedAbort(void* ctx, UnadmittedAbortFn fn) { unadmitted_ctx_ = ctx; unadmitted_abort_ = fn; }
+  void attachEntropy(void* ctx, EntropyFn fn) { entropy_ctx_ = ctx; entropy_ = fn; }
+  bool fillEntropy(uint8_t* out, size_t len) const { return entropy_ && out && entropy_(entropy_ctx_, out, len); }
+  bool storageUnavailable() const { return storage_unavailable_; }
+  // Authoritative reload after a storage read failure; true once state is known.
+  bool reloadStorage() {
+    if (!storage_unavailable_) return true;
+    restore();
+    if (storage_unavailable_) return false;
+    tryResumeSink();
+    return true;
+  }
 
   void attachCandidateStore(::ota::storage::OtaCandidateStore* store) {
     store_ = store;
@@ -142,14 +159,24 @@ public:
     seal_pending_ = false;
     commit_started_ = false;
     commit_sink_done_ = false;
+    storage_unavailable_ = false;
     candidate_ = ::ota::storage::OtaCandidateStore::Snapshot();
     if (store_ == nullptr) return;
-    if (!store_->load(candidate_)) return;
+    const auto loaded = store_->load(candidate_);
+    if (loaded == ::ota::storage::OtaCandidateStore::LoadResult::IoError) {
+      // Never fall back to an older slot or "no candidate" behind unreadable state.
+      candidate_ = ::ota::storage::OtaCandidateStore::Snapshot();
+      storage_unavailable_ = true;
+      return;
+    }
+    if (loaded != ::ota::storage::OtaCandidateStore::LoadResult::Found) return;
     seal_pending_ = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Verifying;
   }
 
   __attribute__((noinline)) Status status() const {
-    return snapshotStatus(candidate_);
+    auto out = snapshotStatus(candidate_);
+    out.storageUnavailable = storage_unavailable_;
+    return out;
   }
 
   static Status snapshotStatus(const ::ota::storage::OtaCandidateStore::Snapshot& candidate) {
@@ -161,6 +188,7 @@ public:
     out.totalBlocks = candidate.totalBlocks;
     out.generation = candidate.sessionId;
     std::memcpy(out.ownerPublicKey, candidate.ownerPublicKey, sizeof(out.ownerPublicKey));
+    std::memcpy(out.beginNonce, candidate.beginNonce, sizeof(out.beginNonce));
     if (candidate.valid) {
       meshcore::ota::runtime::OtaSessionId session;
       session.campaignId = candidate.campaignId;
@@ -186,6 +214,7 @@ public:
         owner_public_key == nullptr || canonical == nullptr || signature == nullptr) {
       return Result::Unavailable;
     }
+    if (!reloadStorage()) return Result::Unavailable;
 
     meshcore::ota::protocol::OtaDescriptor descriptor;
     if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(
@@ -213,7 +242,12 @@ public:
     const bool terminal = candidate_.valid && !candidate_.localCache &&
         (candidate_.phase == Phase::Committed || candidate_.phase == Phase::Ready || candidate_.phase == Phase::Failed) &&
         terminal_check_ && terminal_check_(terminal_ctx_, candidate_);
-    if (!reupload && same_candidate &&
+    // A legacy v1 attempt (zero nonce) can never COMMIT; a fresh signed BEGIN
+    // for the same image restarts it as a nonce-bound attempt.
+    const bool unbound_attempt = same_candidate && !usb::beginNonceBound(candidate_.beginNonce) &&
+        (candidate_.phase == Phase::Receiving || candidate_.phase == Phase::Verifying ||
+         candidate_.phase == Phase::Ready);
+    if (!reupload && same_candidate && !unbound_attempt &&
         (candidate_.phase == Phase::Receiving || candidate_.phase == Phase::Verifying ||
          candidate_.phase == Phase::Ready || (candidate_.phase == Phase::Committed && !terminal))) {
       candidate_.receivedBlocks = store_->countReceived(candidate_.totalBlocks);
@@ -227,7 +261,7 @@ public:
         if (!reupload) return same_candidate ? Result::Denied : Result::Busy;
       } else {
         if (!same_content_owner) return Result::Busy;
-        if (!reupload) return Result::Denied;
+        if (!reupload && !unbound_attempt) return Result::Denied;
       }
     }
     if (candidate_.valid && candidate_.phase == Phase::Aborted && !candidate_.localCache && unadmitted_abort_) {
@@ -238,21 +272,42 @@ public:
     }
     if (!terminal && (commit_started_ || (candidate_.valid && candidate_.phase == Phase::Committed)))
       return Result::TooLate;
+    // Every new attempt gets fresh durable entropy before any side effect;
+    // generation alone restarts at 1 after an empty store.
+    uint8_t begin_nonce[usb::kBeginNonceBytes];
+    if (!drawBeginNonce(manifest_hash, begin_nonce)) return Result::Unavailable;
 
     const auto begin_result = staging_sink_->beginSession(descriptor);
     if (begin_result == meshcore::ota::runtime::IOtaStagingSink::Result::Rejected) return Result::Busy;
     if (begin_result == meshcore::ota::runtime::IOtaStagingSink::Result::IoError) return Result::IoError;
 
-    return publishBegin(descriptor, manifest_hash, canonical, owner_public_key, signature, local_cache);
+    return publishBegin(descriptor, manifest_hash, canonical, owner_public_key, signature, local_cache, begin_nonce);
   }
 
 private:
   __attribute__((noinline)) bool candidateImageMatches(const uint8_t hash[32]) const {
     return !std::memcmp(status().imageHash, hash, 32);
   }
+  __attribute__((noinline)) bool drawBeginNonce(const uint8_t manifest_hash[32],
+                                                uint8_t out[usb::kBeginNonceBytes]) const {
+    static constexpr char kDomain[] = "MeshCore/OTA/begin-nonce/v1";
+    uint8_t entropy[32], digest[32];
+    if (!fillEntropy(entropy, sizeof(entropy))) return false;
+    ::ota::trust::Sha256 hash;
+    hash.reset();
+    hash.update(reinterpret_cast<const uint8_t*>(kDomain), sizeof(kDomain) - 1);
+    hash.update(entropy, sizeof(entropy));
+    hash.update(manifest_hash, 32);
+    hash.finish(digest);
+    std::memset(entropy, 0, sizeof(entropy));
+    std::memcpy(out, digest, usb::kBeginNonceBytes);
+    // All-zero is reserved for unbound legacy records.
+    return usb::beginNonceBound(out);
+  }
+
   __attribute__((noinline)) Result publishBegin(const meshcore::ota::protocol::OtaDescriptor& descriptor,
       const uint8_t manifest_hash[32], const uint8_t canonical[59], const uint8_t owner_public_key[32],
-      const uint8_t signature[64], bool local_cache) {
+      const uint8_t signature[64], bool local_cache, const uint8_t begin_nonce[usb::kBeginNonceBytes]) {
     ::ota::storage::OtaCandidateStore::Snapshot next;
     next.valid = true;
     next.localCache = local_cache;
@@ -265,8 +320,13 @@ private:
     std::memcpy(next.canonical, canonical, sizeof(next.canonical));
     std::memcpy(next.ownerPublicKey, owner_public_key, sizeof(next.ownerPublicKey));
     std::memcpy(next.signature, signature, sizeof(next.signature));
+    std::memcpy(next.beginNonce, begin_nonce, sizeof(next.beginNonce));
     if (!store_->reset(next)) {
       staging_sink_->abort();
+      // The failed reset may have tombstoned or erased slots: adopt durable
+      // state exactly as a cold boot would, never the stale RAM candidate.
+      restore();
+      if (!storage_unavailable_) tryResumeSink();
       return Result::IoError;
     }
     candidate_ = next;
@@ -286,11 +346,13 @@ private:
 
 public:
   Result putBlock(uint16_t index, const uint8_t* data, size_t data_len) {
+    if (storage_unavailable_) return Result::Unavailable;
     return acceptBlock(index, data, data_len);
   }
 
   Result handleUsbCacheFrame(const uint8_t* frame, size_t len, const uint8_t local_owner[32]) {
     if (!frame || len < 2 || frame[0] != usb::kCommand) return Result::BadRequest;
+    if (!reloadStorage()) return Result::Unavailable;
     switch (static_cast<usb::UsbOtaOp>(frame[1])) {
       case usb::UsbOtaOp::CacheBegin: {
         if (len != usb::kCacheBeginTotalBytes || (frame[2] & ~usb::kCacheBeginFlagReupload)) {
@@ -319,6 +381,7 @@ public:
   }
 
   __attribute__((noinline)) Result handleSignedBlockFrame(const uint8_t* frame, size_t frame_len) {
+    if (storage_unavailable_) return Result::Unavailable;
     if (!candidate_.valid || candidate_.localCache ||
         (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Receiving &&
          candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Verifying &&
@@ -357,6 +420,7 @@ public:
   }
 
   Result requestSeal() {
+    if (storage_unavailable_) return Result::Unavailable;
     if (!candidate_.valid) return Result::NotFound;
     if (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Ready) return Result::Ok;
     if (candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Verifying) return Result::Pending;
@@ -372,6 +436,7 @@ public:
   }
 
   void loop() {
+    if (storage_unavailable_) return;
     if (!seal_pending_ && candidate_.valid && !candidate_.localCache &&
         candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Receiving &&
         candidate_.receivedBlocks == candidate_.totalBlocks) requestSeal();
@@ -396,12 +461,15 @@ public:
   }
 
   __attribute__((noinline)) Result commit(uint32_t counter, const uint8_t signature[64]) {
+    if (!reloadStorage()) return Result::Unavailable;
     if (!candidate_.valid) return Result::NotFound;
     if (candidate_.localCache) return Result::Denied;
     const bool already_committed = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
     if (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready && !already_committed) return Result::TooLate;
     if (!have_target_public_key_ || signature == nullptr) return Result::BadRequest;
     if (!isCurrentAdmin(candidate_.ownerPublicKey)) return Result::Denied;
+    // Legacy/unbound records can never be committed; a fresh BEGIN replaces them.
+    if (!usb::beginNonceBound(candidate_.beginNonce)) return Result::Denied;
     if (!commitSignatureValid(counter, signature)) return Result::Denied;
     if (counter != usb::getBE32(candidate_.canonical + 45)) return Result::Mismatch;
     if (already_committed) return Result::Ok;
@@ -427,7 +495,8 @@ private:
     uint8_t manifest_hash[32] = {};
     computeOtaManifestHash(candidate_.canonical, manifest_hash);
     uint8_t message[usb::kCommitSignedBytes] = {};
-    const size_t message_len = usb::buildCommitSignedMessage(target_public_key_, manifest_hash, counter, message);
+    const size_t message_len = usb::buildCommitSignedMessage(target_public_key_, manifest_hash, counter,
+                                                             candidate_.sessionId, candidate_.beginNonce, message);
     return verifyOwnerSignature(candidate_.ownerPublicKey, message, message_len, signature);
   }
 
@@ -447,6 +516,7 @@ private:
 public:
   Result abort(const uint8_t signer_public_key[32], const uint8_t signature[64], const uint8_t image_hash[32],
                 uint32_t generation, bool local_owner_trusted = false) {
+    if (!reloadStorage()) return Result::Unavailable;
     if (!candidate_.valid) return Result::NotFound;
     static std::atomic_flag busy = ATOMIC_FLAG_INIT;
     OtaBoardProofScratchLease lease(busy);
@@ -599,6 +669,9 @@ private:
   TerminalCheckFn terminal_check_ = nullptr;
   void* unadmitted_ctx_ = nullptr;
   UnadmittedAbortFn unadmitted_abort_ = nullptr;
+  void* entropy_ctx_ = nullptr;
+  EntropyFn entropy_ = nullptr;
+  bool storage_unavailable_ = false;
   uint8_t target_public_key_[32] = {0};
   bool have_target_public_key_ = false;
   bool seal_pending_ = false;

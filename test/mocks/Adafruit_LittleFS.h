@@ -80,6 +80,14 @@ public:
   bool exists(const char* name) const { return files.count(name) != 0; }
   bool mkdir(const char*) { return true; }
   bool remove(const char* name) { ++removes; return files.erase(name) != 0; }
+  bool rename(const char* from, const char* to) {
+    auto it = files.find(from);
+    if (it == files.end()) return false;
+    auto bytes = it->second;
+    files.erase(it);
+    files[to] = bytes;
+    return true;
+  }
   bool format() { ++formats; files.clear(); return true; }
   Adafruit_LittleFS_Namespace::File open(const char* name, int mode = Adafruit_LittleFS_Namespace::FILE_O_READ) {
     if (!exists(name)) {

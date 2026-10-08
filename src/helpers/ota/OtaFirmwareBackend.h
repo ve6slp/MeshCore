@@ -592,7 +592,7 @@ inline bool verifyEsp32CandidateProvenance(
   snapshot = ::ota::storage::OtaCandidateStore::Snapshot();
   descriptor = meshcore::ota::protocol::OtaDescriptor();
   const Esp32OtaPolicy image_policy{policy.role};
-  return store.load(snapshot) && snapshot.phase == phase && !snapshot.localCache &&
+  return store.load(snapshot) == ::ota::storage::OtaCandidateStore::LoadResult::Found && snapshot.phase == phase && !snapshot.localCache &&
          meshcore::ota::protocol::decodeOtaDescriptorCanonical(
              snapshot.canonical, sizeof(snapshot.canonical), descriptor) ==
              meshcore::ota::protocol::OtaDescriptorCodecResult::Ok &&
@@ -601,6 +601,41 @@ inline bool verifyEsp32CandidateProvenance(
          snapshot.receivedBlocks == snapshot.totalBlocks &&
          signatures.verify(snapshot.signature, sizeof(snapshot.signature), snapshot.canonical,
                            sizeof(snapshot.canonical), snapshot.ownerPublicKey, sizeof(snapshot.ownerPublicKey));
+}
+
+// SYN-06: a power cut inside the first append after reset() leaves exactly
+// one CRC-valid v2 body without its commit marker in slot 0, an otherwise
+// erased metadata sector and an erased bitmap. Only that causal residue,
+// signed by its embedded owner for this board/role, is recoverable, and only
+// by a later fresh signed BEGIN (whose reset() erases it). Anything else,
+// including unreadable flash, stays fail-closed.
+inline bool esp32PremarkerResidueRecoverable(
+    ::ota::storage::OtaCandidateStore& store, ::ota::platform::FlashRegion& metadata,
+    const Esp32OtaPolicy& policy, const ::ota::trust::SignatureVerifier& signatures) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  Store::Snapshot residue;
+  if (!store.readPremarkerResidue(0, residue) || residue.phase != Store::Phase::Receiving ||
+      residue.localCache || residue.sequence != 1u || residue.attemptId != 1u) return false;
+  uint8_t nonce_bits = 0;
+  for (const auto byte : residue.beginNonce) nonce_bits |= byte;
+  if (!nonce_bits) return false;
+  meshcore::ota::protocol::OtaDescriptor d;
+  const Esp32OtaPolicy image_policy{policy.role};
+  if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(residue.canonical, sizeof(residue.canonical), d) !=
+          meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
+      !image_policy.accepts(d) || residue.exactSizeBytes != d.exactSizeBytes ||
+      residue.totalBlocks != (d.exactSizeBytes + kOtaBlockMaxDataBytes - 1) / kOtaBlockMaxDataBytes ||
+      !signatures.verify(residue.signature, sizeof(residue.signature), residue.canonical,
+                         sizeof(residue.canonical), residue.ownerPublicKey, sizeof(residue.ownerPublicKey)))
+    return false;
+  uint8_t chunk[64];
+  for (uint32_t offset = Store::kDecodedBytes; offset < Store::kExpectedRegionBytes; offset += sizeof(chunk)) {
+    const uint32_t take = Store::kExpectedRegionBytes - offset < sizeof(chunk)
+        ? Store::kExpectedRegionBytes - offset : static_cast<uint32_t>(sizeof(chunk));
+    if (!::ota::platform::isOk(metadata.read(offset, chunk, take))) return false;
+    for (uint32_t i = 0; i < take; ++i) if (chunk[i] != 0xffu) return false;
+  }
+  return true;
 }
 
 inline bool verifyEsp32RunningCandidate(
@@ -799,7 +834,7 @@ public:
   InstallOutcome activateDurableCommit() {
     if (installation_attempted_ || !lease_.storageHeld()) return InstallOutcome::None;
     Store::Snapshot durable;
-    if (!store_.load(durable) || durable.phase != Store::Phase::Committed) return InstallOutcome::None;
+    if (store_.load(durable) != Store::LoadResult::Found || durable.phase != Store::Phase::Committed) return InstallOutcome::None;
     uint8_t marker[4];
     if (!::ota::platform::isOk(metadata_.read(kSelectionMarkerOffset, marker, sizeof(marker))))
       return refused();
@@ -825,7 +860,7 @@ public:
       return false;
     };
     Store::Snapshot s;
-    if (!checked_store.load(s) || checked.failed()) return refuseIo();
+    if (checked_store.load(s) != Store::LoadResult::Found || checked.failed()) return refuseIo();
     if (s.phase != Store::Phase::Committed && s.phase != Store::Phase::Failed) return true;
     meshcore::ota::protocol::OtaDescriptor d;
     const auto phase = s.phase;
@@ -875,7 +910,7 @@ private:
            d.exactSizeBytes <= Esp32OtaPolicy::kMaxImageBytes;
   }
   bool loadVerified(Store::Snapshot& s, Store::Phase phase) {
-    if (!store_.load(s) || !s.valid || s.localCache || s.phase != phase) return false;
+    if (store_.load(s) != Store::LoadResult::Found || !s.valid || s.localCache || s.phase != phase) return false;
     meshcore::ota::protocol::OtaDescriptor d;
     if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(s.canonical, sizeof(s.canonical), d) !=
         meshcore::ota::protocol::OtaDescriptorCodecResult::Ok || !policy_.accepts(d) ||

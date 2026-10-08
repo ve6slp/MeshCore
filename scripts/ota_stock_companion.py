@@ -29,7 +29,6 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 import signal
 import stat
 import struct
@@ -39,9 +38,16 @@ import time
 MAX_FRAME = 176
 BLOCK = 84
 MIN_LEASE = 30000
-DIRECT_DOMAIN = b"MeshCore/OTA/direct/v1"
-COMMIT_DOMAIN = b"MeshCore/OTA/commit/v1"
+# OTA wire version 3: census reports carry the receiver's durable per-BEGIN
+# nonce and a single-use lease challenge; COMMIT binds generation + nonce.
+WIRE_VERSION = 3
+CENSUS_REPORT_BYTES = 123
+NONCE_BYTES = 16
+DIRECT_DOMAIN = b"MeshCore/OTA/direct/v3"
+DIRECT_PROFILE_DOMAIN = b"MeshCore/OTA/direct-profile/v3"
+COMMIT_DOMAIN = b"MeshCore/OTA/commit/v2"
 REUPLOAD_DOMAIN = b"MeshCore/OTA/reupload/v1"
+RECEIPT_SCHEMA = 2
 
 
 class Error(RuntimeError):
@@ -291,12 +297,56 @@ def block_message(candidate, index):
     return message, prefix
 
 
+# Ordinary MeshCore 1.17.1 companion pushes (examples/companion_radio/MyMesh.cpp)
+# that this uploader never consumes, with the exact lengths that firmware emits.
+# 0x88 LOG_RX_DATA is absent: it carries RF census/ACK replies.
+UNUSED_PUSH_LENGTHS = {
+    0x80: range(33, 34),              # ADVERT: code + public key
+    0x81: range(33, 34),              # PATH_UPDATED: code + public key
+    0x82: range(9, 10),               # SEND_CONFIRMED: code + ack + trip time
+    0x83: range(1, 2),                # MSG_WAITING
+    0x84: range(4, MAX_FRAME + 1),    # RAW_DATA: code + SNR + RSSI + reserved + payload
+    0x85: (8, 14),                    # LOGIN_SUCCESS: legacy or v7
+    0x86: range(8, 9),                # LOGIN_FAIL
+    0x87: range(9, MAX_FRAME + 1),    # STATUS_RESPONSE
+    0x89: range(13, MAX_FRAME + 1),   # TRACE_DATA
+    0x8A: range(148, 149),            # NEW_ADVERT: full contact record
+    0x8B: range(8, MAX_FRAME + 1),    # TELEMETRY_RESPONSE
+    0x8C: range(7, MAX_FRAME + 1),    # BINARY_RESPONSE
+    0x8D: range(10, MAX_FRAME + 1),   # PATH_DISCOVERY_RESPONSE
+    0x8E: range(4, MAX_FRAME + 1),    # CONTROL_DATA
+    0x8F: range(33, 34),              # CONTACT_DELETED: code + public key
+    0x90: range(1, 2),                # CONTACTS_FULL
+}
+PENDING_LIMIT = 256
+
+
+def unused_push(frame):
+    """True only for well-formed pushes that can never answer an OTA exchange.
+
+    Ordinary non-OTA RF log pushes are unused; OTA-typed, malformed or
+    unknown frames stay queued (bounded) so they are observed, not eaten.
+    """
+    code = frame[0]
+    if code == 0x88:
+        if len(frame) < 5 or frame[3] >> 6:
+            return False
+        return (frame[3] >> 2) & 15 != 12
+    lengths = UNUSED_PUSH_LENGTHS.get(code)
+    if lengths is None:
+        return False
+    if len(frame) not in lengths:
+        raise Error(f"malformed stock push 0x{code:02x}; raw USB fields withheld")
+    return True
+
+
 class Frames:
     """Bounded stock USB framing; no logging of opaque USB/DeviceQuery fields."""
     def __init__(self, stream, clock=time.monotonic):
         self.stream, self.clock = stream, clock
         self.buffer = bytearray()
         self.pending = []
+        self.ignored = {}
 
     def feed(self, data):
         self.buffer.extend(data)
@@ -315,7 +365,10 @@ class Frames:
                 return
             frame = bytes(self.buffer[3:3 + length])
             del self.buffer[:3 + length]
-            if len(self.pending) >= 256:
+            if unused_push(frame):
+                self.ignored[frame[0]] = self.ignored.get(frame[0], 0) + 1
+                continue
+            if len(self.pending) >= PENDING_LIMIT:
                 raise Error("USB response backlog overflow")
             self.pending.append((self.clock(), frame))
 
@@ -513,6 +566,8 @@ class Sender:
         self.lease_end = 0
         self.target_normal_after = 0
         self.generation = None
+        self.begin_nonce = None
+        self.challenge = None
         self.previous = {}
         self.received = 0
         self.attempts = {}
@@ -619,10 +674,15 @@ class Sender:
 
     def parse_census(self, frame, first, allow_pending=False, post_commit=False):
         c, b = self.candidate, self.binding
-        if len(frame) != 102 or frame[:1] != b"\x0b" or frame[1:33] != b.target or frame[33:65] != c.digest:
-            raise Error("RF census target/full manifest mismatch or legacy status")
+        if frame[:1] != b"\x0b" or frame[1:33] != b.target or frame[33:65] != c.digest:
+            raise Error("RF census target/full manifest mismatch")
+        if len(frame) != CENSUS_REPORT_BYTES or frame[102] != WIRE_VERSION:
+            raise Error("receiver OTA wire version is unsupported (legacy census report); "
+                        "update the receiver firmware before uploading")
         start = struct.unpack_from(">H", frame, 65)[0]
         received, total, phase, generation, lifecycle, known, floor, counter = struct.unpack_from(">HHBIBBII", frame, 83)
+        nonce = frame[103:119]
+        self.challenge = struct.unpack_from(">I", frame, 119)[0] or None
         bits = int.from_bytes(frame[67:83], "little")
         count = min(128, c.total - first)
         previous = self.previous.get(first)
@@ -641,6 +701,8 @@ class Sender:
                 raise Error("invalid post-COMMIT native lifecycle/progress/floor")
             if lifecycle == 8 and (known != 1 or floor != c.counter):
                 raise Error("native INSTALLED requires matching confirmed floor")
+            if self.begin_nonce is None or nonce != self.begin_nonce or not any(nonce):
+                raise Error("post-COMMIT status belongs to a different BEGIN attempt")
             return {"first": first, "bits": bits, "received": received, "total": total,
                     "generation": generation, "lifecycle": lifecycle, "phase": phase,
                     "floor_known": bool(known), "confirmed_floor": floor}
@@ -669,6 +731,9 @@ class Sender:
                 or (previous and (received < previous["received"] or bits & previous["bits"] != previous["bits"]))
                 or (lifecycle == 5 and (phase != 3 or received != total or bits != (1 << count) - 1))):
             raise Error("RF progress/generation/cache/floor/bitmap mismatch")
+        if not any(nonce) or (self.begin_nonce is not None and nonce != self.begin_nonce):
+            raise Error("RF census belongs to an unbound or different BEGIN attempt")
+        self.begin_nonce = nonce
         self.generation = generation
         self.received = received
         self.pending_reupload = False
@@ -693,11 +758,19 @@ class Sender:
         kind, ack_kind = b"\x0c", b"\x0d"
         domain = DIRECT_DOMAIN
         frequency_word = self.frequency
-        prefix = (kind + b.sender + b.target + c.digest
-                  + struct.pack(">IHI", frequency_word, self.lease_ms, secrets.randbits(32)))
-        request = prefix + self.stock.sign(domain + prefix, self.deadline)
         observer = self.rf_observer("lease")
         for attempt in range(1, 4):
+            # The token is the receiver's current single-use challenge from a
+            # census report; it rotates on every accepted request, BEGIN and boot.
+            if self.challenge is None:
+                self.census()
+            if self.challenge is None:
+                self.emit("lease_no_challenge", attempt=attempt)
+                continue
+            prefix = (kind + b.sender + b.target + c.digest
+                      + struct.pack(">IHI", frequency_word, self.lease_ms, self.challenge))
+            self.challenge = None
+            request = prefix + self.stock.sign(domain + prefix, self.deadline)
             self.stock.frames.discard_rf(observer, b.target, c.digest)
             self.emit("lease_request", attempt=attempt, frequency_khz=self.frequency, lease_ms=self.lease_ms,
                       bandwidth_hz=self.direct_bandwidth)
@@ -713,8 +786,6 @@ class Sender:
             except TimeoutError:
                 self.emit("lease_timeout", attempt=attempt)
                 self.wait_until(max(self.target_normal_after, self.next_normal))
-                prefix = prefix[:103] + struct.pack(">I", secrets.randbits(32))
-                request = prefix + self.stock.sign(domain + prefix, self.deadline)
                 continue
             if len(ack) != 171 or ack[:1] != ack_kind or ack[1:107] != request[1:107]:
                 raise Error("direct ACK target/owner/manifest/profile/token mismatch")
@@ -818,18 +889,27 @@ class Sender:
             # Polling is bounded by stock TX completion and receiver reply wait.
 
     def receipt(self, outcome):
-        return {"schema": 1, "outcome": outcome, "serial": self.binding.serial,
+        return {"schema": RECEIPT_SCHEMA, "outcome": outcome, "serial": self.binding.serial,
                 "sender_public_key": self.binding.sender.hex(), "target_public_key": self.binding.target.hex(),
                 "manifest_hash": self.candidate.digest.hex(), "counter": self.candidate.counter,
-                "generation": self.generation, "installation_confirmed": False}
+                "generation": self.generation,
+                "begin_nonce": None if self.begin_nonce is None else self.begin_nonce.hex(),
+                "installation_confirmed": False}
 
     def commit(self, receipt):
         expected = self.receipt("ready-observed-unsigned")
         expected["generation"] = receipt.get("generation")
+        expected["begin_nonce"] = receipt.get("begin_nonce")
+        nonce = receipt.get("begin_nonce")
         if (receipt != expected or type(receipt.get("generation")) is not int
-                or receipt["generation"] < self.binding.min_generation):
-            raise Error("commit requires matching target/owner/manifest/counter READY receipt")
+                or receipt["generation"] < self.binding.min_generation
+                or type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                or not any(bytes.fromhex(nonce))):
+            raise Error("commit requires matching target/owner/manifest/counter/attempt READY receipt")
         self.generation = receipt["generation"]
+        # Fresh census must show this exact BEGIN attempt; an ABORT/reupload since
+        # the receipt has a new nonce and is refused here and by the receiver.
+        self.begin_nonce = bytes.fromhex(nonce)
         # No admission/reupload in commit. Obtain current full-manifest RF READY.
         for first in range(0, self.candidate.total, 128):
             if self.census(first)["lifecycle"] != 5:
@@ -837,9 +917,13 @@ class Sender:
         return self._send_commit()
 
     def _send_commit(self):
-        body = self.binding.target + self.candidate.digest + struct.pack(">I", self.candidate.counter)
+        if self.generation is None or self.begin_nonce is None or not any(self.begin_nonce):
+            raise Error("COMMIT requires the generation and BEGIN nonce of an observed READY attempt")
+        body = (self.binding.target + self.candidate.digest
+                + struct.pack(">II", self.candidate.counter, self.generation) + self.begin_nonce)
         signature = self.stock.sign(COMMIT_DOMAIN + body, self.deadline)
-        self.emit("commit_request", generation=self.generation, counter=self.candidate.counter)
+        self.emit("commit_request", generation=self.generation, counter=self.candidate.counter,
+                  begin_nonce=self.begin_nonce.hex())
         self.send(b"\x03" + body + signature)
         self.emit("commit_sent", tx_evidence="aggregate-counters", installation_confirmed=False)
         return self.receipt("signed-commit-aggregate-tx-observed-not-install-confirmed")

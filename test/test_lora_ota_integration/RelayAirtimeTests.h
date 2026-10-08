@@ -148,9 +148,10 @@ std::vector<uint8_t> relayFrame(RelayFrame kind, uint32_t generation = 1) {
     }
     case RelayFrame::Commit: {
       uint8_t message[usb::kCommitSignedBytes];
-      const auto len = usb::buildCommitSignedMessage(target, hash, 5, message);
+      const uint8_t nonce[usb::kBeginNonceBytes] = {0x5A};
+      const auto len = usb::buildCommitSignedMessage(target, hash, 5, generation, nonce, message);
       owner.sign(message, len, signature);
-      size = encodeOtaCommitFrame(target, hash, 5, signature, out, sizeof(out));
+      size = encodeOtaCommitFrame(target, hash, 5, generation, nonce, signature, out, sizeof(out));
       break;
     }
     case RelayFrame::Abort: {

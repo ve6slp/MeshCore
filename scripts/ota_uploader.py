@@ -5,7 +5,11 @@ cache only signs/stages a local image and observes CACHE_SEALED. It never starts
 RF, selects a remote target, commits or proves installation/airtime.
 deploy stages one board/role-bound image, waits for READY, commits and waits for
 the receiver's native INSTALLED status. upload and commit remain separate modes.
-ABORT requires ABI2 fresh STATUS generation and durable ABORTED readback.
+ABORT requires a fresh STATUS generation and durable ABORTED readback.
+Companions must speak USB OTA ABI 3 (wire version 3): a local STATUS probe
+refuses older companions before CACHE_BEGIN. COMMIT carries the generation and
+per-BEGIN nonce observed in the fresh READY status, so it binds that exact
+attempt; there is no unbound fallback.
 """
 
 import argparse
@@ -66,8 +70,10 @@ class Phase(IntEnum):
 
 
 REPLY_CODE = 30
-ABI_VERSION = 2
-REPLY_BYTES = 90
+ABI_VERSION = 3
+REPLY_BYTES = 107
+WIRE_VERSION = 3
+NONCE_BYTES = 16
 BLOCK_BYTES = 84
 LOCAL_TARGET = bytes(32)
 SNAPSHOT_VALID = 1
@@ -94,6 +100,8 @@ class Reply:
     age_ms: int
     retry_after_ms: int
     generation: int
+    begin_nonce: bytes = bytes(NONCE_BYTES)
+    wire_version: int = 0
 
     @property
     def valid(self):
@@ -109,11 +117,19 @@ class Reply:
             "received": self.received, "total": self.total, "counter": self.counter,
             "snapshot_valid": self.valid, "remote": bool(self.flags & REMOTE),
             "snapshot_age_ms": self.age_ms, "retry_after_ms": self.retry_after_ms,
-            "generation": self.generation,
+            "generation": self.generation, "begin_nonce": self.begin_nonce.hex(),
+            "wire_version": self.wire_version,
         }
+
+    @property
+    def attempt_bound(self):
+        return self.valid and self.wire_version == WIRE_VERSION and any(self.begin_nonce)
 
 
 def decode_reply(frame):
+    if len(frame) >= 2 and frame[0] == REPLY_CODE and frame[1] < ABI_VERSION:
+        raise UploaderError(f"companion OTA ABI version {frame[1]} is unsupported; "
+                            f"update the companion to wire version {WIRE_VERSION}")
     if len(frame) != REPLY_BYTES or frame[:2] != bytes([REPLY_CODE, ABI_VERSION]):
         raise UploaderError("invalid OTA reply length, code or ABI version")
     try:
@@ -122,12 +138,17 @@ def decode_reply(frame):
         raise UploaderError("unknown OTA reply opcode, result or phase") from exc
     received, total, counter, age, retry = struct.unpack_from(">HHIII", frame, 70)
     reply = Reply(op, result, phase, frame[5], frame[6:38], frame[38:70],
-                  received, total, counter, age, retry, struct.unpack_from(">I", frame, 86)[0])
+                  received, total, counter, age, retry, struct.unpack_from(">I", frame, 86)[0],
+                  frame[90:106], frame[106])
     if reply.flags & ~(SNAPSHOT_VALID | REMOTE) or received > total:
         raise UploaderError("invalid OTA reply flags or durable block counts")
+    if reply.wire_version not in (0, WIRE_VERSION) or (
+            reply.target == LOCAL_TARGET and reply.wire_version != WIRE_VERSION):
+        raise UploaderError("unsupported OTA wire version in reply")
     if not reply.valid:
         if (phase != Phase.UNKNOWN or reply.manifest_hash != bytes(32)
-                or received or total or counter or age != AGE_UNKNOWN or reply.generation):
+                or received or total or counter or age != AGE_UNKNOWN or reply.generation
+                or any(reply.begin_nonce)):
             raise UploaderError("invalid OTA no-snapshot reply")
     elif age == AGE_UNKNOWN:
         raise UploaderError("OTA snapshot has no known age")
@@ -171,9 +192,20 @@ def deploy_manifest(image, board, role_id, counter, canonical=None):
     return expected
 
 
-def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, routed_retry=False):
+def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, routed_retry=None):
+    """Directed/background START always selects attempt-diverse reliable framing.
+
+    Legacy unframed on-mesh delivery can stall behind relays that have already
+    seen a lost packet, so it is refused rather than offered as a fallback.
+    Direct mode is zero-hop on a leased channel and never carries the flag.
+    """
+    if routed_retry is None:
+        routed_retry = mode != "direct"
     if type(routed_retry) is not bool or (routed_retry and mode == "direct"):
         raise ValueError("routed-retry requires directed/background mode")
+    if not routed_retry and mode != "direct":
+        raise ValueError("directed/background OTA requires reliable attempt-diverse framing; "
+                         "legacy unframed on-mesh delivery is unsupported")
     if mode not in MODES or not 0 <= channel <= 255:
         raise ValueError("invalid OTA mode or channel")
     if not 0 < duty_milli_percent <= 100000:
@@ -244,7 +276,7 @@ class Uploader:
         return min(self.command_timeout, remaining)
 
     def wait_phase(self, target, phase, manifest_hash, counter, since, deadline, generation=None,
-                   prior_generation=None):
+                   prior_generation=None, begin_nonce=None):
         while time.monotonic() < deadline:
             reply = self.status(target, timeout=self.remaining(deadline))
             if reply.valid and bool(reply.flags & REMOTE) != (target != LOCAL_TARGET):
@@ -257,6 +289,11 @@ class Uploader:
                     and not (phase == Phase.ABORTED and prior_generation is not None
                              and reply.generation == prior_generation and reply.phase != Phase.ABORTED)):
                 raise UploaderError("OTA status belongs to a different generation")
+            # Firmware retains the BEGIN nonce in every post-READY snapshot; a zero
+            # nonce is an unknown attempt, never a match.
+            if fresh and begin_nonce is not None and (reply.begin_nonce != begin_nonce
+                                                      or not any(reply.begin_nonce)):
+                raise UploaderError("OTA status belongs to a different BEGIN attempt")
             if fresh and (reply.phase == Phase.FAILED
                           or (reply.phase == Phase.ABORTED and phase != Phase.ABORTED)):
                 raise UploaderError(f"OTA candidate is {reply.phase.name}")
@@ -267,9 +304,17 @@ class Uploader:
             time.sleep(min(max(0.1, reply.retry_after_ms / 1000), max(0.0, deadline - now)))
         raise TimeoutError(f"no fresh {phase.name} snapshot for target {target.hex()}")
 
+    def require_wire_version(self, deadline):
+        # decode_reply refuses older ABIs; this runs before any state-changing command.
+        reply = self.status(LOCAL_TARGET, timeout=self.remaining(deadline))
+        if reply.wire_version != WIRE_VERSION:
+            raise UploaderError("companion does not report OTA wire version 3")
+        return reply
+
     def cache(self, canonical, image, owner_public_key, deadline, reupload=False):
         validate_image(canonical, image)
         self.remaining(deadline)
+        self.require_wire_version(deadline)
         signature = lab.sign_manifest(self.node, canonical, owner_public_key, deadline=deadline)
         manifest_hash = hashlib.sha256(canonical).digest()
         counter = struct.unpack_from(">I", canonical, 45)[0]
@@ -301,8 +346,8 @@ class Uploader:
             raise ValueError("select 1..32 distinct full target identities")
         if mode != "background" and len(targets) != 1:
             raise ValueError("direct and directed campaigns require exactly one target")
-        if (mode not in MODES or len(body) not in (12, 14) or body[0] != MODES[mode]
-                or (len(body) == 14 and (mode == "direct" or body[12:] != b"\x00\x01"))):
+        if (mode not in MODES or len(body) != (12 if mode == "direct" else 14) or body[0] != MODES[mode]
+                or (len(body) == 14 and body[12:] != b"\x00\x01")):
             raise ValueError("campaign mode does not match the START body")
         for target in targets:
             self.require_accepted(self.exchange(Op.ADD_TARGET, target, target, self.remaining(deadline)))
@@ -315,12 +360,17 @@ class Uploader:
         counter = struct.unpack_from(">I", canonical, 45)[0]
         since = time.monotonic()
         options = {} if generation is None else {"generation": generation}
-        self.wait_phase(target, Phase.READY, manifest_hash, counter, since, deadline, **options)
-        return self._send_commit(target, manifest_hash, counter, deadline)
+        ready = self.wait_phase(target, Phase.READY, manifest_hash, counter, since, deadline, **options)
+        return self._send_commit(target, manifest_hash, counter, ready, deadline)
 
-    def _send_commit(self, target, manifest_hash, counter, deadline):
+    def _send_commit(self, target, manifest_hash, counter, ready, deadline):
+        # Bind COMMIT to the exact BEGIN attempt observed READY; never sign an unbound one.
+        if not ready.attempt_bound:
+            raise UploaderError("READY target is not attempt-bound (OTA wire version 3 BEGIN nonce "
+                                "missing); update the receiver firmware")
         return self.require_accepted(self.exchange(
-            Op.COMMIT, target + manifest_hash + struct.pack(">I", counter), target, self.remaining(deadline)))
+            Op.COMMIT, target + manifest_hash + struct.pack(">II", counter, ready.generation)
+            + ready.begin_nonce, target, self.remaining(deadline)))
 
     def deploy(self, target, canonical, image, owner_public_key, body, mode, deadline,
                reupload=False, install_timeout=300):
@@ -338,10 +388,10 @@ class Uploader:
         if ready.total != blocks:
             raise UploaderError("READY block geometry does not match the selected image")
         committed = time.monotonic()
-        self._send_commit(target, manifest_hash, counter, deadline)
+        self._send_commit(target, manifest_hash, counter, ready, deadline)
         installed = self.wait_phase(target, Phase.INSTALLED, manifest_hash, counter, committed,
                                     min(deadline, time.monotonic() + install_timeout),
-                                    generation=ready.generation)
+                                    generation=ready.generation, begin_nonce=ready.begin_nonce)
         if installed.received != blocks or installed.total != blocks:
             raise UploaderError("INSTALLED block geometry does not match the selected image")
         return installed
@@ -408,7 +458,11 @@ def parser():
         command.add_argument("--channel", type=int, default=255)
         command.add_argument("--frequency-khz", type=int, default=0)
         command.add_argument("--lease-ms", type=int, default=0)
-        command.add_argument("--routed-retry", action="store_true", help="opt-in attempt-diverse directed/background RF; requires upgraded receivers")
+        framing = command.add_mutually_exclusive_group()
+        framing.add_argument("--routed-retry", dest="routed_retry", action="store_true", default=None,
+                             help="attempt-diverse reliable framing; already the default for directed/background")
+        framing.add_argument("--no-routed-retry", dest="routed_retry", action="store_false",
+                             help="legacy unframed delivery; accepted only for zero-hop direct mode")
         command.add_argument("--duty-milli-percent", type=int, default=2000)
     upload.add_argument("--wait-ready", action="store_true")
     status = commands.add_parser("status")

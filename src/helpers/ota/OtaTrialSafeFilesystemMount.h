@@ -25,16 +25,14 @@ namespace ota_fs_mount {
 // addition to its legacy format-on-fail `begin()`. When destructive boot
 // writes are disallowed, ALWAYS use the mount-only path and NEVER invoke
 // `legacy_format_on_fail_mount_fn`, regardless of the mount-only outcome.
-// When allowed, preserve prior behaviour exactly by calling the legacy
-// path (which itself still performs the mount-only attempt internally).
+// Even with positive Normal authority, the destructive retry is only
+// reachable AFTER a genuine failed mount-only attempt.
 template <typename MountOnlyFn, typename LegacyFormatOnFailMountFn>
 bool mountTrialSafe(bool allow_destructive_boot_writes,
                      MountOnlyFn&& mount_only_fn,
                      LegacyFormatOnFailMountFn&& legacy_format_on_fail_mount_fn) {
-  if (!allow_destructive_boot_writes) {
-    return mount_only_fn();
-  }
-  return legacy_format_on_fail_mount_fn();
+  if (mount_only_fn()) return true;
+  return allow_destructive_boot_writes && legacy_format_on_fail_mount_fn();
 }
 
 // Case 2: the backend's ONLY public entry point performs peripheral

@@ -181,6 +181,11 @@ public:
     lean_.attachStagingSink(sink);
   }
   void attachCandidateStore(::ota::storage::OtaCandidateStore* store) { lean_.attachCandidateStore(store); }
+  // Hardware entropy for durable BEGIN nonces and single-use lease challenges.
+  void attachEntropy(void* ctx, OtaLeanReceiver::EntropyFn fn) {
+    lean_.attachEntropy(ctx, fn);
+    direct_challenge_valid_ = false;
+  }
   void attachLeanSignatureVerifier(const ::ota::trust::SignatureVerifier* verifier) { lean_.attachOwnerSignatureVerifier(verifier); }
   void setLeanAdminCheck(void* ctx, OtaLeanReceiver::AdminCheckFn fn) { lean_.setAdminCheck(ctx, fn); }
   void setLeanTargetPublicKey(const uint8_t key[32]) { lean_.setTargetPublicKey(key); }
@@ -297,6 +302,26 @@ public:
     }
     return reply;
   }
+  // Local USB COMMIT (90B): the request must name this node's current
+  // nonce-bound attempt; the companion then signs commit/v2 with its key.
+  usb::UsbOtaResult handleUsbLocalCommit(const uint8_t* command, size_t len, void* sign_ctx,
+                                        SignFn sign, uint32_t now_ms) {
+    usb::UsbCommitRequest request;
+    if (!usb::parseCommitRequest(command, len, request)) return usb::UsbOtaResult::BadRequest;
+    if (!sign || !lean_.haveTargetPublicKey() || !lean_.reloadStorage()) return usb::UsbOtaResult::Unavailable;
+    if (std::memcmp(request.target, lean_.targetPublicKey(), usb::kPubKeyBytes)) return usb::UsbOtaResult::BadRequest;
+    const auto st = lean_.status();
+    if (!st.valid) return usb::UsbOtaResult::NotFound;
+    if (std::memcmp(st.manifestHash, request.manifestHash, usb::kHashBytes) ||
+        request.generation != st.generation ||
+        std::memcmp(request.beginNonce, st.beginNonce, usb::kBeginNonceBytes)) return usb::UsbOtaResult::Mismatch;
+    if (!usb::beginNonceBound(st.beginNonce)) return usb::UsbOtaResult::Denied;
+    uint8_t message[usb::kCommitSignedBytes], signature[64];
+    const auto message_len = usb::buildCommitSignedMessage(request.target, request.manifestHash, request.counter,
+                                                           request.generation, request.beginNonce, message);
+    sign(sign_ctx, message, message_len, signature);
+    return commitAndDeferReboot(request.counter, signature, now_ms);
+  }
   using UsbRemoteControlSendFn = bool (*)(void*, const uint8_t[32], const uint8_t*, size_t);
   // A queued remote command is not evidence of the target's durable state.
   usb::UsbOtaReply handleUsbRemoteControl(const uint8_t* command, size_t len,
@@ -322,14 +347,19 @@ public:
     size_t message_len, frame_len;
     if (op == usb::UsbOtaOp::Commit) {
       const auto st = lean_.status();
-      if (!st.valid || std::memcmp(st.manifestHash, hash, usb::kHashBytes)) {
+      usb::UsbCommitRequest request;
+      if (!usb::parseCommitRequest(command, len, request)) return reply;
+      if (!st.valid || std::memcmp(st.manifestHash, hash, usb::kHashBytes) ||
+          !usb::beginNonceBound(request.beginNonce)) {
         reply.result = usb::UsbOtaResult::Mismatch;
         return reply;
       }
-      const auto counter = usb::getBE32(hash + usb::kHashBytes);
-      message_len = usb::buildCommitSignedMessage(target, hash, counter, message);
+      // The host binds COMMIT to the exact attempt it observed READY.
+      message_len = usb::buildCommitSignedMessage(target, hash, request.counter, request.generation,
+                                                  request.beginNonce, message);
       rf_sign_(rf_ctx_, message, message_len, signature);
-      frame_len = encodeOtaCommitFrame(target, hash, counter, signature, frame, sizeof(frame));
+      frame_len = encodeOtaCommitFrame(target, hash, request.counter, request.generation, request.beginNonce,
+                                       signature, frame, sizeof(frame));
     } else {
       const auto generation = usb::getBE32(command + 66);
       message_len = usb::buildAbortSignedMessage(target, hash, generation, message);
@@ -410,6 +440,13 @@ public:
     return out;
   }
   void fillUsbReadback(usb::UsbOtaReply& reply) const {
+    reply.wireVersion = usb::kOtaWireVersion;
+    if (lean_.storageUnavailable()) {
+      // Unreadable candidate state is never "no candidate" or an older phase.
+      reply.result = usb::UsbOtaResult::Unavailable;
+      reply.setNoSnapshot();
+      return;
+    }
     const auto view = readback();
     const auto& st = view.snapshot;
     if (!st.valid) return;
@@ -420,6 +457,7 @@ public:
     reply.totalBlocks = st.totalBlocks;
     reply.counter = st.counter;
     reply.generation = st.generation;
+    std::memcpy(reply.beginNonce, st.beginNonce, sizeof(reply.beginNonce));
     reply.statusAgeMs = 0;
   }
   usb::UsbOtaPhase reportedPhase(const OtaBootLifecycleEvidence& boot) const {
@@ -514,6 +552,9 @@ public:
     usb::UsbOtaPhase lifecyclePhase = usb::UsbOtaPhase::Unknown;
     bool haveLifecycle = false, floorKnown = false;
     uint32_t confirmedFloor = 0, counter = 0;
+    uint8_t wireVersion = 0;
+    uint8_t beginNonce[usb::kBeginNonceBytes] = {};
+    uint32_t leaseChallenge = 0;
   };
 
   void trackOtaTarget(const uint8_t target_pk[32]) {
@@ -560,6 +601,9 @@ public:
         out.floorKnown = targets_[i].floorKnown;
         out.confirmedFloor = targets_[i].confirmedFloor;
         out.counter = targets_[i].counter;
+        out.wireVersion = targets_[i].wireVersion;
+        std::memcpy(out.beginNonce, targets_[i].beginNonce, sizeof(out.beginNonce));
+        out.leaseChallenge = targets_[i].leaseChallenge;
       }
       return true;
     }
@@ -872,6 +916,9 @@ private:
     usb::UsbOtaPhase lifecyclePhase = usb::UsbOtaPhase::Unknown;
     bool haveLifecycle = false, floorKnown = false;
     uint32_t confirmedFloor = 0, counter = 0;
+    uint8_t wireVersion = 0;
+    uint8_t beginNonce[usb::kBeginNonceBytes] = {};
+    uint32_t leaseChallenge = 0;
   };
 
   // Dispatches the 4 real-mesh lean control-frame kinds (Authorization /
@@ -923,7 +970,8 @@ private:
     static OtaLeanReceiver::Status st;
     captureLeanStatus(st);
     if (!lean_.haveTargetPublicKey() || std::memcmp(parsed.target, lean_.targetPublicKey(), 32) ||
-        !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32)) return LeanControlResult::Rejected;
+        !st.valid || std::memcmp(parsed.manifestHash, st.manifestHash, 32) || parsed.generation != st.generation ||
+        std::memcmp(parsed.beginNonce, st.beginNonce, usb::kBeginNonceBytes)) return LeanControlResult::Rejected;
     const auto r = commitAndDeferReboot(parsed.counter, parsed.signature, now_ms);
     if (r == usb::UsbOtaResult::Ok) {
       uint8_t tag[kOtaManifestTagBytes];
@@ -1016,6 +1064,8 @@ private:
         r.lifecyclePhase = pending ? usb::UsbOtaPhase::Aborted : view.phase;
         r.floorKnown = boot.floorKnown; r.confirmedFloor = boot.confirmedFloor;
         r.counter = st.counter;
+        std::memcpy(r.beginNonce, st.beginNonce, sizeof(r.beginNonce));
+        r.leaseChallenge = pending || view.bootCandidate ? 0 : leaseChallenge(st);
         pending_control_frame_len_ = encodeOtaCensusReport(r, pending_control_frame_, sizeof(pending_control_frame_));
         pending_control_frame_valid_ = pending_control_frame_len_ != 0;
         pending_control_due_ms_ = now_ms + ((r.reporter[0] * 17u + r.reporter[31]) % 250u);
@@ -1036,6 +1086,8 @@ private:
           t.generation = r.generation;
           t.lifecyclePhase = r.lifecyclePhase; t.haveLifecycle = r.haveLifecycle;
           t.floorKnown = r.floorKnown; t.confirmedFloor = r.confirmedFloor; t.counter = r.counter;
+          t.wireVersion = r.wireVersion; std::memcpy(t.beginNonce, r.beginNonce, sizeof(t.beginNonce));
+          t.leaseChallenge = r.leaseChallenge;
         }
         return LeanControlResult::Handled;
       }
@@ -1054,6 +1106,27 @@ private:
       default:
         return LeanControlResult::NotControlFrame;
     }
+  }
+
+  bool leaseChallengeBound(const OtaLeanReceiver::Status& st) const {
+    return !std::memcmp(direct_challenge_nonce_, st.beginNonce, sizeof(direct_challenge_nonce_));
+  }
+  // RAM-only receiver challenge: fresh at boot, on every new BEGIN nonce
+  // and after each accepted request. 0 means none (no entropy/candidate).
+  uint32_t leaseChallenge(const OtaLeanReceiver::Status& st) {
+    if (!st.valid || !usb::beginNonceBound(st.beginNonce)) return 0;
+    if (direct_challenge_valid_ && leaseChallengeBound(st)) return direct_challenge_;
+    direct_challenge_valid_ = false;
+    uint8_t bytes[4];
+    for (int tries = 0; tries < 4; ++tries) {
+      if (!lean_.fillEntropy(bytes, sizeof(bytes))) return 0;
+      direct_challenge_ = usb::getBE32(bytes);
+      if (direct_challenge_) break;
+    }
+    if (!direct_challenge_) return 0;
+    std::memcpy(direct_challenge_nonce_, st.beginNonce, sizeof(direct_challenge_nonce_));
+    direct_challenge_valid_ = true;
+    return direct_challenge_;
   }
 
   LeanControlResult handleDirectFrame(const uint8_t* frame, size_t len, uint32_t now) {
@@ -1084,10 +1157,12 @@ private:
                st.phase != ::ota::storage::OtaCandidateStore::Phase::Ready) ||
               !lean_.verifySignature(frame + 1, message, mlen, frame + 107)) return LeanControlResult::Rejected;
           if (direct_active_ || direct_pending_ || pending_control_frame_valid_) return LeanControlResult::Handled;
-          // A repeated signed request must not renew a lease after a timeout.
-          const uint32_t token = usb::getBE32(frame + 103);
-          if (direct_have_token_ && token == direct_last_token_) return LeanControlResult::Rejected;
-          direct_have_token_ = true; direct_last_token_ = token;
+          // Single-use, candidate-bound challenge: any replay (A/B/A, an
+          // identical retry or a pre-reboot capture) carries a stale value.
+          const uint32_t challenge = usb::getBE32(frame + 103);
+          if (!direct_challenge_valid_ || !leaseChallengeBound(st) || challenge != direct_challenge_)
+            return LeanControlResult::Rejected;
+          direct_challenge_valid_ = false;
           std::memcpy(pending_control_frame_, frame, len);
           pending_control_frame_[0] = frame[0] == kOtaDirectRequestKind ? kOtaDirectAckKind : kOtaDirectProfileAckKind;
           const auto ack_len = buildOtaDirectMessage(pending_control_frame_, message);
@@ -1619,9 +1694,10 @@ private:
   OtaDirectProfile direct_profile_ = OtaDirectProfile::Legacy250;
   uint32_t normal_freq_khz_ = 0, direct_freq_khz_ = 0;
   uint16_t direct_lease_ms_ = 0;
-  uint32_t direct_apply_ms_ = 0, direct_expiry_ms_ = 0, direct_last_token_ = 0;
+  uint32_t direct_apply_ms_ = 0, direct_expiry_ms_ = 0, direct_challenge_ = 0;
   uint32_t direct_transition_deadline_ = 0;
-  bool direct_active_ = false, direct_pending_ = false, direct_waiting_ack_ = false, direct_have_token_ = false;
+  uint8_t direct_challenge_nonce_[usb::kBeginNonceBytes] = {};
+  bool direct_active_ = false, direct_pending_ = false, direct_waiting_ack_ = false, direct_challenge_valid_ = false;
   bool direct_ack_tx_wait_ = false;
   uint8_t direct_request_[107] = {};
   meshcore::ota::runtime::OtaAirtimeLimiter airtime_;

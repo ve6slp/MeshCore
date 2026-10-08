@@ -17,6 +17,9 @@ bool IdentityStore::save(const char*, const mesh::LocalIdentity&) { ADD_FAILURE(
 bool IdentityStore::checkIntegrity(const char*, mesh::LocalIdentity&) const {
   ADD_FAILURE() << "Unexpected identity integrity probe"; return false;
 }
+identity_io::LoadStatus IdentityStore::loadWithStatus(const char*, mesh::LocalIdentity&, bool) {
+  ADD_FAILURE() << "Unexpected identity status load"; return identity_io::LoadStatus::Unavailable;
+}
 
 namespace {
 using StockProof = mesh::ota::OtaBoardStockBootPreflight;
@@ -51,7 +54,7 @@ struct StockBootFixture {
         ::ota::storage::XiaoOtaBootInfoReader::classify(marker, sizeof(marker), info), info, board, role, 1);
     fx.admins.add(owner.publicKey());
     stock_cache_blocked = proof() != StockProof::Result::Healthy;
-    EXPECT_TRUE(backend.attach(fx.integration, fx.sig_verifier));
+    EXPECT_TRUE((backend.attach(fx.integration, fx.sig_verifier) && attachOtaTestEntropy(fx.integration)));
   }
   StockProof::Result proof() {
     return StockProof::check(qualification, running, journal);
@@ -179,7 +182,7 @@ TEST(LoraOtaStockBoot, PositiveSdkBlankInstallJournalAndAuthenticatedCacheDriveR
       if (phase == Phase::Ready) {
         const auto status = f.fx.integration.leanReceiver().status();
         uint8_t message[usb::kCommitSignedBytes], signature[64];
-        usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, message);
+        usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, status.generation, status.beginNonce, message);
         f.owner.sign(message, sizeof(message), signature);
         EXPECT_EQ(usb::UsbOtaResult::Denied, f.fx.integration.leanReceiver().commit(status.counter, signature));
       }
@@ -215,16 +218,16 @@ TEST(LoraOtaStockBoot, VendorDisabledCrcAllowsRealEarlyDataStoreAclAndCacheButNe
     stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
     ASSERT_FALSE(stock_cache_blocked);
     ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()));
-    ASSERT_TRUE(f.backend.attach(f.fx.integration, f.fx.sig_verifier));
+    ASSERT_TRUE((f.backend.attach(f.fx.integration, f.fx.sig_verifier) && attachOtaTestEntropy(f.fx.integration)));
     f.cache(::ota::storage::OtaCandidateStore::Phase::Ready);
     ASSERT_FALSE(HasFatalFailure());
     ::ota::storage::OtaCandidateStore::Snapshot durable;
-    ASSERT_TRUE(f.fx.candidate_store.load(durable));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(durable));
     EXPECT_TRUE(durable.localCache);
     EXPECT_EQ(::ota::storage::OtaCandidateStore::Phase::Ready, durable.phase);
     uint8_t message[usb::kCommitSignedBytes], signature[64];
     const auto status = f.fx.integration.leanReceiver().status();
-    usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, message);
+    usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, status.generation, status.beginNonce, message);
     f.owner.sign(message, sizeof(message), signature);
     EXPECT_EQ(usb::UsbOtaResult::Denied, f.fx.integration.leanReceiver().commit(status.counter, signature));
     ASSERT_TRUE(f.running.read(after));
@@ -349,7 +352,7 @@ TEST(LoraOtaStockBoot, UnprovenStockCacheAttachmentNeverBecomesReceiverOrInstall
       OtaFirmwareIntegration integration;
       stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
       ASSERT_TRUE(stock_cache_blocked);
-      EXPECT_FALSE(!stock_cache_blocked && f.backend.attach(integration, f.fx.sig_verifier));
+      EXPECT_FALSE(!stock_cache_blocked && (f.backend.attach(integration, f.fx.sig_verifier) && attachOtaTestEntropy(integration)));
       EXPECT_FALSE(integration.backendAvailable());
       const uint8_t image[40] = {0x38};
       uint8_t canonical[59], signature[64];
@@ -418,7 +421,7 @@ TEST(LoraOtaStockBoot, StoreIgnoredCacheDamageAllowsResetButCrcValidPolicyAndBit
     SCOPED_TRACE(::testing::Message() << fault << '/' << torn);
     StockBootFixture f;
     f.cache(Store::Phase::Ready); ASSERT_FALSE(HasFatalFailure());
-    Store::Snapshot snapshot; ASSERT_TRUE(f.fx.candidate_store.load(snapshot));
+    Store::Snapshot snapshot; ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(snapshot));
     if (fault == 0) snapshot.localCache = false;
     if (fault == 1) snapshot.phase = Store::Phase::Committed;
     if (fault == 2) snapshot.signature[0] ^= 1;
@@ -462,7 +465,9 @@ TEST(LoraOtaStockBoot, StoreIgnoredCacheDamageAllowsResetButCrcValidPolicyAndBit
       append();
     }
     const auto cache_result = f.cacheProof();
-    const bool store_ignored = fault == 3 || fault == 4 || fault == 10;
+    // Fault 3 damages a marked record and fault 10 leaves a torn body that is
+    // indistinguishable from erase damage to a newer record: never reset past.
+    const bool store_ignored = fault == 4;
     EXPECT_EQ(store_ignored ? StockProof::Result::CacheNeedsReset : StockProof::Result::InvalidCache, cache_result);
     EXPECT_EQ(store_ignored, StockProof::cacheAttachAllowed(cache_result));
     const auto programs = f.fx.candidate_flash.programOpCount(), erases = f.fx.candidate_flash.eraseOpCount();
@@ -470,11 +475,41 @@ TEST(LoraOtaStockBoot, StoreIgnoredCacheDamageAllowsResetButCrcValidPolicyAndBit
     ASSERT_FALSE(HasFatalFailure());
     OtaFirmwareIntegration cold;
     stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
-    EXPECT_EQ(store_ignored, StockProof::cacheAttachAllowed(cache_result) && f.backend.attach(cold, f.fx.sig_verifier));
+    EXPECT_EQ(store_ignored, StockProof::cacheAttachAllowed(cache_result) && (f.backend.attach(cold, f.fx.sig_verifier) && attachOtaTestEntropy(cold)));
     EXPECT_EQ(store_ignored, cold.backendAvailable());
     EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
     EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
   }
+}
+
+TEST(LoraOtaStockBoot, MarkedCorruptionOfNewestAbortedCacheRecordRefusesAdmissionNotOlderReady) {
+  using Store = ::ota::storage::OtaCandidateStore;
+  StockBootFixture f;
+  f.cache(Store::Phase::Aborted); ASSERT_FALSE(HasFatalFailure());
+  Store::Snapshot loaded;
+  ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(loaded));
+  ASSERT_EQ(Store::Phase::Aborted, loaded.phase);
+  std::vector<uint8_t> sector(Store::kSectorBytes);
+  ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.read(0, sector.data(), sector.size())));
+  int newest = -1;
+  for (uint32_t slot = 0; slot < Store::kRecordSlots; ++slot) {
+    const uint8_t* r = sector.data() + slot * Store::kRecordBytes;
+    if (Store::classifyRecord(r) == Store::RecordClass::Valid && (r[12] & 0x7f) == uint8_t(Store::Phase::Aborted))
+      newest = int(slot);
+  }
+  ASSERT_GT(newest, 0);
+  sector[newest * Store::kRecordBytes + 40] ^= 0x01;  // body only; CAND marker retained
+  ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.eraseSector(0)));
+  ASSERT_TRUE(::ota::platform::isOk(f.fx.candidate_store_region.program(0, sector.data(), sector.size())));
+  const auto programs = f.fx.candidate_flash.programOpCount(), erases = f.fx.candidate_flash.eraseOpCount();
+  EXPECT_EQ(Store::LoadResult::IoError, f.fx.candidate_store.load(loaded));
+  const auto cache_result = f.cacheProof();
+  EXPECT_EQ(StockProof::Result::InvalidCache, cache_result);
+  EXPECT_FALSE(StockProof::cacheAttachAllowed(cache_result));
+  expectOrdinaryStockWrites(f);
+  ASSERT_FALSE(HasFatalFailure());
+  EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
 }
 
 TEST(LoraOtaStockBoot, CacheReadFaultsRemainUnavailableWithoutBlockingIndependentlyProvenOrdinaryWrites) {
@@ -546,8 +581,23 @@ TEST(LoraOtaStockBoot, RealCacheAppendAndResetCutsColdBootWritableAndRecoverOnly
       }
       f.fx.candidate_flash.clearFault();
       Store::Snapshot durable;
-      const bool owned = f.fx.candidate_store.load(durable);
-      ASSERT_EQ(cut == 3 || cut == 4 || cut == 7 || cut == 9 || cut == 10 || cut == 11, owned);
+      if (cut == 8 || cut == 9) {
+        // A torn body program is indistinguishable from damage to newer state
+        // that may have superseded the surviving slots. Fail closed; only an
+        // authenticated USB recovery restores availability. (Reset cuts 10-12
+        // leave exact tombstones, so they read Empty, never older state.)
+        const auto programs = f.fx.candidate_flash.programOpCount(), erases = f.fx.candidate_flash.eraseOpCount();
+        EXPECT_EQ(Store::LoadResult::IoError, f.fx.candidate_store.load(durable));
+        EXPECT_EQ(StockProof::Result::InvalidCache, f.cacheProof());
+        EXPECT_FALSE(StockProof::cacheAttachAllowed(f.cacheProof()));
+        expectOrdinaryStockWrites(f);
+        ASSERT_FALSE(HasFatalFailure());
+        EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+        EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
+        continue;
+      }
+      const bool owned = f.fx.candidate_store.load(durable) == Store::LoadResult::Found;
+      ASSERT_EQ(cut == 3 || cut == 4 || cut == 7, owned);
       const auto programs = f.fx.candidate_flash.programOpCount(), erases = f.fx.candidate_flash.eraseOpCount();
       const auto image_programs = f.fx.image_flash.programOpCount(), image_erases = f.fx.image_flash.eraseOpCount();
       std::vector<uint8_t> retained(f.fx.candidate_flash.rawBuffer(),
@@ -563,7 +613,7 @@ TEST(LoraOtaStockBoot, RealCacheAppendAndResetCutsColdBootWritableAndRecoverOnly
       cold.setLeanTargetPublicKey(f.fx.target_public_key);
       OtaBoardCacheOnlyBackend backend(f.fx.image_region, f.fx.candidate_store_region,
                                       +[]() { return stock_cache_blocked; });
-      ASSERT_TRUE(StockProof::cacheAttachAllowed(cache_result) && backend.attach(cold, f.fx.sig_verifier));
+      ASSERT_TRUE(StockProof::cacheAttachAllowed(cache_result) && (backend.attach(cold, f.fx.sig_verifier) && attachOtaTestEntropy(cold)));
       auto& cache = cold.leanReceiver();
       ASSERT_EQ(owned, cache.status().valid);
       EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
@@ -608,7 +658,7 @@ TEST(LoraOtaStockBoot, RealCacheAppendAndResetCutsColdBootWritableAndRecoverOnly
       EXPECT_EQ(StockProof::Result::Healthy, f.cacheProof());
       uint8_t message[usb::kCommitSignedBytes], signature[64];
       const auto status = cache.status();
-      usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, message);
+      usb::buildCommitSignedMessage(f.fx.target_public_key, status.manifestHash, status.counter, status.generation, status.beginNonce, message);
       f.owner.sign(message, sizeof(message), signature);
       EXPECT_EQ(usb::UsbOtaResult::Denied, cache.commit(status.counter, signature));
       EXPECT_EQ(0u, f.journal_flash.programOpCount());
@@ -617,76 +667,52 @@ TEST(LoraOtaStockBoot, RealCacheAppendAndResetCutsColdBootWritableAndRecoverOnly
   }
 }
 
-TEST(LoraOtaStockBoot, PartialEraseOwnedSuffixKeepsSignedAbortDurableAcrossColdBootUntilExplicitRestart) {
+// A signed reupload's own reset tombstones every slot before erasing, so an
+// interrupted erase that leaves a still-marked READY suffix never revives it.
+TEST(LoraOtaStockBoot, PartialOwnResetEraseNeverRevivesOwnedSuffixUntilExplicitRestart) {
   using Flash = ::ota::test::FakeNorFlash;
   using Store = ::ota::storage::OtaCandidateStore;
   for (uint32_t board : {0x584e3430u, 0x53435031u}) for (uint8_t role : {0, 1})
-    for (bool vendor_zero : {false, true}) for (bool another_admin : {false, true}) {
-      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << vendor_zero << '/' << another_admin);
+    for (bool vendor_zero : {false, true}) for (uint32_t partial : {96u, 512u, 2048u}) {
+      SCOPED_TRACE(::testing::Message() << board << '/' << unsigned(role) << '/' << vendor_zero << '/' << partial);
       StockBootFixture f(board, role);
       f.running.vendorCrcDisabled = vendor_zero;
       f.cache(Store::Phase::Ready); ASSERT_FALSE(HasFatalFailure());
       Store::Snapshot original;
-      ASSERT_TRUE(f.fx.candidate_store.load(original));
+      ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(original));
       ASSERT_EQ(Store::Phase::Ready, original.phase);
       uint8_t begin[158] = {usb::kCommand, uint8_t(usb::UsbOtaOp::CacheBegin), usb::kCacheBeginFlagReupload};
       std::memcpy(begin + 3, original.ownerPublicKey, 32);
       std::memcpy(begin + 35, original.canonical, 59);
       std::memcpy(begin + 94, original.signature, 64);
       f.fx.candidate_flash.armFault({Flash::OpKind::Erase, Flash::InjectionTiming::Mid,
-                                    f.fx.candidate_flash.eraseOpCount() + 1, 512});
+                                    f.fx.candidate_flash.eraseOpCount() + 1, partial});
       ASSERT_EQ(usb::UsbOtaResult::IoError,
                 f.fx.integration.leanReceiver().handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
       f.fx.candidate_flash.clearFault();
+      // Slots the cut did not erase are tombstones: the old READY never
+      // becomes authority again.
+      Store::Snapshot durable;
+      EXPECT_EQ(Store::LoadResult::Empty, f.fx.candidate_store.load(durable));
       ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
       expectOrdinaryStockWrites(f); ASSERT_FALSE(HasFatalFailure());
       stock_cache_blocked = f.proof() != StockProof::Result::Healthy;
+      const auto erases = f.fx.candidate_flash.eraseOpCount(), programs = f.fx.candidate_flash.programOpCount();
       OtaFirmwareIntegration cold;
       cold.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
       cold.setLeanTargetPublicKey(f.fx.target_public_key);
       OtaBoardCacheOnlyBackend backend(f.fx.image_region, f.fx.candidate_store_region,
                                       +[]() { return stock_cache_blocked; });
-      ASSERT_TRUE(backend.attach(cold, f.fx.sig_verifier));
-      const auto before = cold.leanReceiver().status();
-      ASSERT_EQ(Store::Phase::Ready, before.phase);
-      EXPECT_EQ(1u, before.receivedBlocks);
-      EXPECT_EQ(0, std::memcmp(original.ownerPublicKey, before.ownerPublicKey, 32));
-      const uint8_t admin_seed[32] = {0x79};
-      ::ota::test::Ed25519TestSigner admin(admin_seed);
-      f.fx.admins.add(admin.publicKey());
-      const auto& signer = another_admin ? admin : f.owner;
-      uint8_t message[usb::kAbortSignedBytes], signature[64];
-      usb::buildAbortSignedMessage(f.fx.target_public_key, before.imageHash, before.generation, message);
-      signer.sign(message, sizeof(message), signature);
-      const auto erases = f.fx.candidate_flash.eraseOpCount();
-      ASSERT_EQ(usb::UsbOtaResult::Ok,
-                cold.leanReceiver().abort(signer.publicKey(), signature, before.imageHash, before.generation));
-      EXPECT_EQ(Store::Phase::Aborted, cold.leanReceiver().status().phase);
-      EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
-
-      OtaFirmwareIntegration rebooted;
-      rebooted.setLeanAdminCheck(&f.fx.admins, &leanAdminCheckThunk);
-      rebooted.setLeanTargetPublicKey(f.fx.target_public_key);
-      OtaBoardCacheOnlyBackend rebooted_backend(f.fx.image_region, f.fx.candidate_store_region,
-                                               +[]() { return stock_cache_blocked; });
-      ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()) && rebooted_backend.attach(rebooted, f.fx.sig_verifier));
-      auto& cache = rebooted.leanReceiver();
-      ASSERT_EQ(Store::Phase::Aborted, cache.status().phase);
-      EXPECT_EQ(1u, cache.status().receivedBlocks);
-      Store::Snapshot aborted;
-      ASSERT_TRUE(f.fx.candidate_store.load(aborted));
-      EXPECT_EQ(original.sessionId + 1, aborted.sessionId);
-      EXPECT_GT(aborted.sequence, original.sequence);
-      EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, cache.status().ownerPublicKey, 32));
-      begin[2] = 0;
-      EXPECT_EQ(usb::UsbOtaResult::Denied, cache.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
+      ASSERT_TRUE((backend.attach(cold, f.fx.sig_verifier) && attachOtaTestEntropy(cold)));
+      auto& cache = cold.leanReceiver();
+      EXPECT_FALSE(cache.status().valid);
+      EXPECT_NE(Store::Phase::Ready, cache.status().phase);
       for (uint8_t mode : {usb::kStartModeDirect, usb::kStartModeDirected, usb::kStartModeBackground}) {
         OtaRfUploader uploader;
-        EXPECT_FALSE(uploader.start(rebooted, mode, f.fx.target_public_key, 1, 908525, 60, 7, false));
+        EXPECT_FALSE(uploader.start(cold, mode, f.fx.target_public_key, 1, 908525, 60, 7, false));
       }
-      EXPECT_EQ(Store::Phase::Aborted, cache.status().phase);
       EXPECT_EQ(erases, f.fx.candidate_flash.eraseOpCount());
-      begin[2] = usb::kCacheBeginFlagReupload;
+      EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
       ASSERT_EQ(usb::UsbOtaResult::Ok, cache.handleUsbCacheFrame(begin, sizeof(begin), f.owner.publicKey()));
       EXPECT_EQ(Store::Phase::Receiving, cache.status().phase);
       EXPECT_EQ(0u, cache.status().receivedBlocks);
@@ -727,7 +753,7 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
       cold.setLeanTargetPublicKey(f.fx.target_public_key);
       OtaBoardCacheOnlyBackend backend(f.fx.image_region, f.fx.candidate_store_region,
                                       +[]() { return stock_cache_blocked; });
-      ASSERT_TRUE(backend.attach(cold, f.fx.sig_verifier));
+      ASSERT_TRUE((backend.attach(cold, f.fx.sig_verifier) && attachOtaTestEntropy(cold)));
       auto& cache = cold.leanReceiver();
       ASSERT_EQ(Store::Phase::Verifying, cache.status().phase);
       if (heal_ready) {
@@ -737,7 +763,7 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
         ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
       }
       Store::Snapshot before;
-      ASSERT_TRUE(f.fx.candidate_store.load(before));
+      ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(before));
       const uint8_t admin_seed[32] = {0x79}, other_seed[32] = {0x78}, outsider_seed[32] = {0x7b};
       ::ota::test::Ed25519TestSigner admin(admin_seed), other(other_seed), outsider(outsider_seed);
       f.fx.admins.add(admin.publicKey());
@@ -772,8 +798,9 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
         retry.setLeanTargetPublicKey(f.fx.target_public_key);
         OtaBoardCacheOnlyBackend retry_backend(f.fx.image_region, f.fx.candidate_store_region,
                                                +[]() { return stock_cache_blocked; });
-        ASSERT_TRUE(retry_backend.attach(retry, f.fx.sig_verifier));
-        EXPECT_EQ(before.phase, retry.leanReceiver().status().phase);
+        ASSERT_TRUE((retry_backend.attach(retry, f.fx.sig_verifier) && attachOtaTestEntropy(retry)));
+        // The verified ABORT body with an unwritten marker is a durable revocation.
+        EXPECT_EQ(Store::Phase::Aborted, retry.leanReceiver().status().phase);
         ASSERT_EQ(usb::UsbOtaResult::Ok,
                   retry.leanReceiver().abort(signer.publicKey(), signature, status.imageHash, status.generation));
         ASSERT_EQ(StockProof::Result::CacheNeedsReset, f.cacheProof());
@@ -783,12 +810,12 @@ TEST(LoraOtaStockBoot, TornReadySealRetryOrDirectSignedAbortKeepsColdSuppression
       rebooted.setLeanTargetPublicKey(f.fx.target_public_key);
       OtaBoardCacheOnlyBackend rebooted_backend(f.fx.image_region, f.fx.candidate_store_region,
                                                +[]() { return stock_cache_blocked; });
-      ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()) && rebooted_backend.attach(rebooted, f.fx.sig_verifier));
+      ASSERT_TRUE(StockProof::cacheAttachAllowed(f.cacheProof()) && (rebooted_backend.attach(rebooted, f.fx.sig_verifier) && attachOtaTestEntropy(rebooted)));
       auto& resumed = rebooted.leanReceiver();
       ASSERT_EQ(Store::Phase::Aborted, resumed.status().phase);
       EXPECT_EQ(1u, resumed.status().receivedBlocks);
       Store::Snapshot aborted;
-      ASSERT_TRUE(f.fx.candidate_store.load(aborted));
+      ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(aborted));
       EXPECT_EQ(before.sessionId + 1, aborted.sessionId);
       EXPECT_EQ(0, std::memcmp(before.ownerPublicKey, aborted.ownerPublicKey, 32));
       begin[2] = 0;
@@ -819,7 +846,7 @@ TEST(LoraOtaStockBoot, TornCacheBindingIgnoresOnlySessionAttemptWhileCompetingOw
     StockBootFixture f;
     f.cache(Store::Phase::Ready); ASSERT_FALSE(HasFatalFailure());
     Store::Snapshot snapshot;
-    ASSERT_TRUE(f.fx.candidate_store.load(snapshot));
+    ASSERT_EQ(::ota::storage::OtaCandidateStore::LoadResult::Found, f.fx.candidate_store.load(snapshot));
     for (int torn = 0; torn < 2; ++torn) {
       ++snapshot.sessionId;
       ++snapshot.attemptId;

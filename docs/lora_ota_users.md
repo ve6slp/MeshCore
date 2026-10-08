@@ -6,11 +6,29 @@ Direct nRF52840 updates have succeeded on hardware, including normal-radio
 restoration. ESP32-S3 and SenseCAP Solar hardware updates, routed delivery and
 fleet/background deployments have **not yet been tested on hardware**.
 
-OTA preserves existing Ed25519 MeshCore administrator authorization. A contact
-or channel secret alone does not grant permission. Receivers reject mismatched
+OTA uses existing Ed25519 MeshCore identities plus a separate, private
+OTA-administrator permission on the receiver. It is independent of the ordinary
+remote-CLI contact permission: granting or revoking one never changes the other.
+A contact or channel secret alone does not grant permission. Receivers reject mismatched
 board/role/image descriptors and counters at or below their confirmed floor.
 The host never automatically takes over, aborts another candidate or treats a
 queued COMMIT as an installation.
+
+### Version 3 compatibility
+
+This release uses OTA wire version 3. Update **all** OTA receivers, OTA-enabled
+companions and host checkouts (`scripts/ota_uploader.py`,
+`scripts/ota_stock_companion.py`) together; there is no mixed-version fallback
+and no unbound legacy COMMIT.
+
+- The native host first reads the companion's local status. It refuses a
+  companion that does not report OTA USB ABI 3 before signing or staging anything.
+- A receiver running an earlier OTA build never sends a version-3 census
+  report. An updated OTA companion does not start the block transfer without
+  one. The stock host refuses the first legacy report before negotiating a
+  lease or sending any block.
+- Earlier hosts cannot drive updated firmware. Native status replies are now
+  107 bytes, and COMMIT and direct-lease signatures use new domains.
 
 ## Install and build
 
@@ -61,12 +79,58 @@ Before updating, install the appropriate platform backend on the receiver:
 Keep known-good ordinary application recovery files. Add the intended sender's
 contact on the receiver and explicitly grant its OTA-administrator permission.
 Admission and COMMIT both check that permission and the owner's Ed25519 signature.
-Local OTA-enabled companion contact permissions can also be set explicitly:
+On an OTA-enabled companion receiver, grant (`--enabled 1`) or revoke
+(`--enabled 0`) it over USB; success means the setting was durably saved:
 
 ```sh
 python3 scripts/ota_uploader.py --client-port "$RECEIVER_PORT" --client-dtr \
   admin --target "$SENDER_PUBLIC_KEY" --enabled 1
 ```
+
+The OTA-administrator permission is stored privately per contact. Ordinary
+contact edits (the app's add/update contact command, including the remote-CLI
+flag) never grant, revoke or clear it.
+
+### Permission migration from earlier OTA builds
+
+Earlier OTA builds reused contact flag `0x10`, which ordinary firmware also uses
+for remote-CLI access. On first load, an updated OTA receiver migrates each saved
+contact fail-closed:
+
+| Saved contact record | Remote CLI (`0x10`) after update | OTA administrator after update |
+|---|---|---|
+| Ordinary/unmarked record | Preserved exactly | Not granted |
+| Earlier OTA-build record (ambiguous `0x10`) | Cleared; other flags preserved | Not granted |
+| New-format record | Preserved | As saved |
+| Unrecognized format marker | Preserved | Not granted |
+
+After upgrading a receiver that used an earlier OTA build, explicitly regrant
+OTA administration with the `admin` command above, and re-enable remote CLI for
+contacts that should keep it through your normal contact-permission workflow.
+Nothing is escalated automatically. Ordinary (OTA-disabled) builds keep the
+private permission byte unchanged when they load and save contacts.
+
+### Receiver identity and storage provisioning
+
+A freshly converted receiver initializes its filesystem and identity only after a
+positively proven Normal boot. On every boot the receiver first only mounts its
+filesystem. It formats only after that mount fails, and only on a proven Normal
+boot with a healthy radio. It generates a new identity only when all of these
+hold:
+
+- a proven Normal boot;
+- a successful radio initialization and probe;
+- every required filesystem is mounted;
+- the identity file is reported absent (not merely unreadable).
+
+A companion checks both its current and its legacy identity location before
+and after migrating stored data.
+
+During a trial boot, an unknown boot state or a pending rollback, the receiver
+never formats storage, generates an identity or rewrites provisioning data. It
+also never does so after a short read or other storage I/O error. Reprovision
+after the device reports Normal operation. A runtime factory reset never grants
+OTA permission; regrant it explicitly.
 
 ## Inspect USB without changing settings
 
@@ -101,14 +165,39 @@ make ota-deploy \
 
 Omit `OTA_DEPLOY_CLIENT_DTR=1` for ESP. Choose legal radio settings yourself;
 there is no private RF profile, key or device-path default. Native `directed`
-uses the normal mesh; `background` requires `OTA_UPLOAD_CHANNEL` set to an
-existing multicast channel. Those transports are software-tested only.
+(the default `OTA_UPLOAD_MODE`) uses the normal mesh; `background` requires
+`OTA_UPLOAD_CHANNEL` set to an existing multicast channel. Those transports are
+software-tested only.
+
+Directed and background delivery always use reliable attempt-diverse framing,
+so a retried packet can pass relays that already saw a lost copy instead of
+stalling the transfer. This is the default for `make ota-deploy` and
+`scripts/ota_uploader.py`; `--routed-retry` is accepted but redundant. The legacy
+unframed on-mesh path is no longer offered: `OTA_DEPLOY_ROUTED_RETRY=0` (or
+`--no-routed-retry`) is refused for directed/background and has no effect on
+zero-hop `direct` mode, which never uses relays. Receivers must run an OTA build
+that understands the framing.
 `OTA_UPLOAD_DUTY_MILLI_PERCENT` controls normal-channel airtime share (2000 means
 2%); it does not override local spectrum rules.
 
 The host builds the shared canonical descriptor in memory, asks the companion
 to Ed25519-sign it, stages the image, waits for fresh complete READY, sends one
-signed COMMIT and waits for matching native Installed status. A supplied
+signed COMMIT and waits for matching native Installed status.
+
+Every fresh BEGIN, including a reupload of an identical image after ABORT, gets a
+random 16-byte BEGIN nonce. The receiver stores it with the candidate and
+reports it with READY. COMMIT is signed over the target, descriptor hash, counter,
+generation and that nonce, so it installs only the exact attempt the host saw
+READY. Repeating COMMIT for the same attempt is harmless, for example after a
+lost acknowledgment or a host or receiver restart. A COMMIT captured from an
+earlier attempt is denied. The host never commits a READY that has no nonce.
+
+Direct mode leases the off-normal frequency with a single-use receiver challenge.
+The challenge comes from the receiver's latest census report and is redrawn at
+boot, at BEGIN and as soon as a lease request is accepted. Replayed, stale or
+identical retried requests get no acknowledgment and do not retune the receiver.
+After a lost acknowledgment, the sender waits out the possible lease, polls the
+census for the new challenge and asks again. A supplied
 `OTA_UPLOAD_MANIFEST` must match the chosen board, role, image and counter exactly.
 Refusal, FAILED, ABORTED, inconsistent status, timeout or loss of transport is
 an explicit failure, not success. Deadlines are `OTA_UPLOAD_TIMEOUT` and
@@ -149,6 +238,12 @@ candidate. Duplicate USB serials require an explicit unique physical
 `--by-path` anchor and corresponding `by_path`, `id_path`, `usb_vid`, `usb_pid`
 binding fields; pass these additional arguments using `OTA_STOCK_ARGS`.
 
+A separate stock `upload` writes a schema-2 READY receipt. The receipt includes
+the receiver's generation and `begin_nonce`. `commit --ready-receipt` refuses a
+schema-1 receipt, and also refuses one whose nonce no longer matches the
+receiver's fresh READY (for example after ABORT and reupload). Run `upload` again
+to get a current receipt. `deploy` handles this internally.
+
 ```sh
 make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=direct \
   OTA_DEPLOY_CLIENT_PORT="$CLIENT_PORT" \
@@ -159,6 +254,15 @@ make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=direct \
   OTA_UPLOAD_ROLE_ID=0 OTA_UPLOAD_COUNTER="$NEXT_COUNTER" \
   OTA_UPLOAD_TARGET="$TARGET_PUBLIC_KEY" OTA_UPLOAD_FREQ_KHZ="$OFF_NORMAL_FREQ_KHZ"
 ```
+
+The stock companion keeps sending its ordinary notifications (adverts, path
+updates, message tickles, ordinary received-packet logs and similar) during a
+long transfer. The uploader discards only well-formed notifications of the
+known MeshCore 1.17.1 kinds it never uses, so a busy mesh cannot fill its
+256-frame response queue. It keeps received OTA packets (census replies and
+lease acknowledgments), command replies, errors and signatures. A malformed
+known notification is a fatal error, and unknown or future notification kinds
+still count against the bound and fail explicitly if they accumulate.
 
 Stock captures the sender's exact original radio/repeat settings and TX power,
 persists `original-radio.json` before changing radio, accounts for physical TX
@@ -182,6 +286,46 @@ are available via `python3 scripts/ota_uploader.py --help`. ABORT requires a fre
 generation and durable ABORTED readback. Prepared ABORTED candidates require an
 explicit reupload; stock additionally requires `allow_reupload: true` in its
 binding. No host command silently clears receiver state.
+
+Candidate state is fail-closed. If the receiver cannot read it, or finds
+metadata it cannot positively explain, status reports result `UNAVAILABLE` (5)
+with no snapshot, never Idle or "no candidate". The receiver never falls back to
+an older candidate state or approval. BEGIN, ABORT, COMMIT and erase are all
+refused. Causes include:
+
+- a power cut while a candidate record was being written (torn record);
+- an interrupted metadata erase;
+- a damaged committed record;
+- unreadable flash.
+
+Power-cycle once to rule out a transient read failure. If `UNAVAILABLE` persists,
+OTA stays unavailable on that receiver. This availability cost is deliberate: it
+guarantees an ABORT or revoked approval can never come back. Ordinary USB/DFU
+application restoration may restore ordinary service, but it does not establish
+persistent OTA metadata recovery. On nRF, the external-QSPI candidate records are
+not cleared by an ordinary APP ZIP DFU or a filesystem erase. No supported
+metadata-repair procedure is currently provided for unknown, torn-record or
+tombstoned ESP cases. Do not mass-erase or wipe user data in an attempt to clear
+it.
+
+A power cut while a fresh signed BEGIN or reupload is clearing the previous
+candidate normally leaves the receiver empty (no candidate), never an earlier
+READY. Upload again. If the cut came at the very start of that clearing step,
+status is `UNAVAILABLE` as above. On ESP32-S3, OTA stays disabled after any such
+interrupted clear, with no supported metadata repair.
+
+A power cut while the receiver only marks a completed record has a narrower
+effect. An interrupted ABORT, failure or retirement still takes effect. An
+interrupted forward step (receiving, verifying, READY, commit) reverts to the
+previous state of the same attempt.
+
+On ESP32-S3, a power cut during the first write of a new BEGIN can leave a
+partial candidate record. OTA stays available only if that record verifies
+exactly: it is signed by its owner for this board and role, and all the
+remaining candidate metadata reads back erased. The next fresh signed BEGIN then
+erases it. Anything else disables OTA on that receiver
+(`OTA_DISABLED: ESP candidate metadata damaged` or `... unreadable`) instead of
+being treated as empty.
 
 If stock restoration failed, retain the run directory and restore explicitly:
 

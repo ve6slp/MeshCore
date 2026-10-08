@@ -64,8 +64,9 @@ static constexpr uint8_t kOtaDirectProfileAckKind = 0x10u;
 static constexpr size_t kOtaCensusWindowBlocks = 128;
 static constexpr size_t kOtaCensusBitmapBytes = kOtaCensusWindowBlocks / 8;
 static constexpr size_t kOtaCensusPollBytes = 67;
-static constexpr size_t kOtaLegacyCensusReportBytes = 92;
-static constexpr size_t kOtaCensusReportBytes = 102;
+// Only the nonce-bound v3 report is accepted; 92B/102B reports come from
+// receivers that cannot authorize COMMIT/lease under the current domains.
+static constexpr size_t kOtaCensusReportBytes = 123;
 static constexpr size_t kOtaDirectFrameBytes = 171;
 static constexpr size_t kOtaReuploadFrameBytes = 165;
 
@@ -101,6 +102,9 @@ struct OtaCensusReport {
   uint32_t confirmedFloor = 0;
   uint32_t counter = 0;
   bool haveLifecycle = false;
+  uint8_t wireVersion = 0;
+  uint8_t beginNonce[usb::kBeginNonceBytes] = {};
+  uint32_t leaseChallenge = 0;
 };
 
 struct OtaBootLifecycleEvidence {
@@ -155,12 +159,15 @@ inline size_t encodeOtaCensusReport(const OtaCensusReport& r, uint8_t* out, size
   out[93] = r.floorKnown ? 1 : 0;
   usb::putBE32(out + 94, r.confirmedFloor);
   usb::putBE32(out + 98, r.counter);
+  out[102] = usb::kOtaWireVersion;
+  std::memcpy(out + 103, r.beginNonce, usb::kBeginNonceBytes);
+  usb::putBE32(out + 119, r.leaseChallenge);
   return kOtaCensusReportBytes;
 }
 
 inline bool parseOtaCensusReport(const uint8_t* frame, size_t len, OtaCensusReport& r) {
-  if (!frame || (len != kOtaCensusReportBytes && len != kOtaLegacyCensusReportBytes) ||
-      frame[0] != kOtaCensusReportKind) return false;
+  if (!frame || len != kOtaCensusReportBytes || frame[0] != kOtaCensusReportKind ||
+      frame[102] != usb::kOtaWireVersion) return false;
   r = OtaCensusReport();
   std::memcpy(r.reporter, frame + 1, 32);
   std::memcpy(r.manifestHash, frame + 33, 32);
@@ -170,25 +177,27 @@ inline bool parseOtaCensusReport(const uint8_t* frame, size_t len, OtaCensusRepo
   r.total = usb::getBE16(frame + 85);
   r.phase = frame[87];
   r.generation = usb::getBE32(frame + 88);
-  if (len == kOtaCensusReportBytes) {
-    if (frame[92] > static_cast<uint8_t>(usb::UsbOtaPhase::CacheSealed) || frame[93] > 1) return false;
-    r.haveLifecycle = true;
-    r.lifecyclePhase = static_cast<usb::UsbOtaPhase>(frame[92]);
-    r.floorKnown = frame[93] != 0;
-    r.confirmedFloor = usb::getBE32(frame + 94);
-    r.counter = usb::getBE32(frame + 98);
-    if (r.lifecyclePhase == usb::UsbOtaPhase::Installed &&
-        (!r.floorKnown || r.confirmedFloor != r.counter)) return false;
-  }
+  if (frame[92] > static_cast<uint8_t>(usb::UsbOtaPhase::CacheSealed) || frame[93] > 1) return false;
+  r.haveLifecycle = true;
+  r.lifecyclePhase = static_cast<usb::UsbOtaPhase>(frame[92]);
+  r.floorKnown = frame[93] != 0;
+  r.confirmedFloor = usb::getBE32(frame + 94);
+  r.counter = usb::getBE32(frame + 98);
+  if (r.lifecyclePhase == usb::UsbOtaPhase::Installed &&
+      (!r.floorKnown || r.confirmedFloor != r.counter)) return false;
+  r.wireVersion = frame[102];
+  std::memcpy(r.beginNonce, frame + 103, usb::kBeginNonceBytes);
+  r.leaseChallenge = usb::getBE32(frame + 119);
   return true;
 }
 
-// Request and ACK sign different kinds; V1/V2 use distinct domains. Both bind full target, manifest,
-// off-frequency profile and one volatile negotiation token. No durable
-// sequence registry: duplicates never extend an already scheduled lease.
+// Request and ACK sign different kinds under v3 domains. Both bind full target, manifest,
+// off-frequency profile and the receiver's current single-use lease
+// challenge (token field). The receiver rotates the challenge on boot,
+// BEGIN and every acceptance, so captured requests can never retune it.
 inline size_t buildOtaDirectMessage(const uint8_t* frame, uint8_t* out) {
-  static constexpr char domain[] = "MeshCore/OTA/direct/v1";
-  static constexpr char profile_domain[] = "MeshCore/OTA/direct-profile/v2";
+  static constexpr char domain[] = "MeshCore/OTA/direct/v3";
+  static constexpr char profile_domain[] = "MeshCore/OTA/direct-profile/v3";
   if (frame[0] == kOtaDirectProfileRequestKind || frame[0] == kOtaDirectProfileAckKind) {
     std::memcpy(out, profile_domain, sizeof(profile_domain) - 1);
     std::memcpy(out + sizeof(profile_domain) - 1, frame, 107);
@@ -255,7 +264,7 @@ inline size_t buildOtaReuploadMessage(const uint8_t* frame, uint8_t* out) {
 
 static constexpr size_t kOtaAuthorizationFrameBytes =
     1u + 32u + kOtaCanonicalManifestBytes + 64u;  // 1+32+59+64 = 156
-static constexpr size_t kOtaCommitFrameBytes = 1u + 32u + 32u + 4u + 64u;        // 133
+static constexpr size_t kOtaCommitFrameBytes = 1u + 32u + 32u + 4u + 4u + 16u + 64u;  // 153
 static constexpr size_t kOtaAbortFrameBytes = 1u + 32u + 32u + 32u + 4u + 64u;   // 165
 // StatusReport carries the reporting device's own public key: unlike a
 // signed frame, PAYLOAD_TYPE_LORA_OTA packets carry no implicit sender
@@ -298,7 +307,7 @@ inline bool validOtaRetryInner(const uint8_t* frame, size_t len) {
     case kOtaStatusReportKind: return len == kOtaStatusReportFrameBytes;
     case kOtaCensusPollKind: return len == kOtaCensusPollBytes;
     case kOtaCensusReportKind:
-      return len == kOtaCensusReportBytes || len == kOtaLegacyCensusReportBytes;
+      return len == kOtaCensusReportBytes;
     default: return false;
   }
 }
@@ -346,6 +355,8 @@ struct OtaCommitFrame {
   uint8_t target[32] = {0};
   uint8_t manifestHash[32] = {0};
   uint32_t counter = 0;
+  uint32_t generation = 0;
+  uint8_t beginNonce[usb::kBeginNonceBytes] = {0};
   uint8_t signature[64] = {0};
 };
 
@@ -389,18 +400,20 @@ inline bool parseOtaAuthorizationFrame(const uint8_t* frame, size_t frame_len, O
   return true;
 }
 
+// [0]=0x03 [1]target32 [33]manifestHash32 [65]counterBE32 [69]generationBE32
+// [73]beginNonce16 [89]signature64 over usb::buildCommitSignedMessage().
 inline size_t encodeOtaCommitFrame(const uint8_t target[32], const uint8_t manifest_hash[32],
-                                   uint32_t counter, const uint8_t signature[64],
+                                   uint32_t counter, uint32_t generation,
+                                   const uint8_t begin_nonce[usb::kBeginNonceBytes], const uint8_t signature[64],
                                    uint8_t* out, size_t out_capacity) {
-  if (out == nullptr || out_capacity < kOtaCommitFrameBytes) return 0;
+  if (out == nullptr || out_capacity < kOtaCommitFrameBytes || begin_nonce == nullptr) return 0;
   size_t i = 0;
   out[i++] = kOtaCommitKind;
   std::memcpy(&out[i], target, 32); i += 32;
   std::memcpy(&out[i], manifest_hash, 32); i += 32;
-  out[i++] = static_cast<uint8_t>((counter >> 24) & 0xFFu);
-  out[i++] = static_cast<uint8_t>((counter >> 16) & 0xFFu);
-  out[i++] = static_cast<uint8_t>((counter >> 8) & 0xFFu);
-  out[i++] = static_cast<uint8_t>(counter & 0xFFu);
+  usb::putBE32(&out[i], counter); i += 4;
+  usb::putBE32(&out[i], generation); i += 4;
+  std::memcpy(&out[i], begin_nonce, usb::kBeginNonceBytes); i += usb::kBeginNonceBytes;
   std::memcpy(&out[i], signature, 64); i += 64;
   return i;
 }
@@ -410,9 +423,9 @@ inline bool parseOtaCommitFrame(const uint8_t* frame, size_t frame_len, OtaCommi
   size_t i = 1;
   std::memcpy(out.target, &frame[i], 32); i += 32;
   std::memcpy(out.manifestHash, &frame[i], 32); i += 32;
-  out.counter = (static_cast<uint32_t>(frame[i]) << 24) | (static_cast<uint32_t>(frame[i + 1]) << 16) |
-                (static_cast<uint32_t>(frame[i + 2]) << 8) | static_cast<uint32_t>(frame[i + 3]);
-  i += 4;
+  out.counter = usb::getBE32(&frame[i]); i += 4;
+  out.generation = usb::getBE32(&frame[i]); i += 4;
+  std::memcpy(out.beginNonce, &frame[i], usb::kBeginNonceBytes); i += usb::kBeginNonceBytes;
   std::memcpy(out.signature, &frame[i], 64); i += 64;
   return true;
 }

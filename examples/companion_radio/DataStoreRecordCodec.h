@@ -29,6 +29,21 @@ struct ChannelDetails;
 // source changes to the logic itself.
 namespace datastore_io {
 
+constexpr uint8_t kContactPrivateVersion = 0xA0;
+constexpr uint8_t kContactOtaAdmin = 0x01;
+
+inline uint8_t encodeContactPrivatePermissions(uint8_t permissions) {
+  return kContactPrivateVersion | (permissions & kContactOtaAdmin);
+}
+
+inline uint8_t decodeContactPrivatePermissions(uint8_t marker, uint8_t& public_flags) {
+  // Marker 1 used the remote-CLI bit for OTA. Its provenance is ambiguous:
+  // neither privilege may be inferred, so both require an explicit regrant.
+  if (marker == 1) public_flags &= (uint8_t)~0x10;
+  return marker == kContactPrivateVersion || marker == (kContactPrivateVersion | kContactOtaAdmin)
+      ? marker & kContactOtaAdmin : 0;
+}
+
 // True iff exactly `len` bytes were reported written.
 template <typename File>
 inline bool writeExact(File& file, const void* data, size_t len) {
@@ -55,13 +70,6 @@ template <typename File, typename Host, typename Filter, typename Contact = Cont
 inline bool writeAllContacts(File& file, Host* host, Filter filter) {
   uint32_t idx = 0;
   Contact c;
-  // Only OTA builds stamp authority provenance into the existing pad byte.
-#if MESHCORE_LORA_OTA
-  uint8_t format_marker = 1;
-#else
-  uint8_t format_marker = 0;
-#endif
-
   while (host->getContactForSave(idx, c)) {
     if (filter && !filter(c)) {
       idx++;  // advance to next contact
@@ -71,6 +79,7 @@ inline bool writeAllContacts(File& file, Host* host, Filter filter) {
     success = success && writeExact(file, (uint8_t *)&c.name, 32);
     success = success && writeExact(file, &c.type, 1);
     success = success && writeExact(file, &c.flags, 1);
+    const uint8_t format_marker = encodeContactPrivatePermissions(c.ota_permissions);
     success = success && writeExact(file, &format_marker, 1);
     success = success && writeExact(file, (uint8_t *)&c.sync_since, 4);
     success = success && writeExact(file, (uint8_t *)&c.out_path_len, 1);
@@ -139,21 +148,11 @@ inline bool writeAllChannels(File& file, Host* host) {
 // directly into `c.id.pub_key` (a plain byte array on both the real
 // `mesh::Identity` and native fake types), so no `mesh::Identity`
 // constructor call is needed here.
-// `legacy_privileged_flag_mask` identifies bit(s) in `flags` that only a
-// format-marker==1 record may legitimately carry (production default:
-// 0x10, the companion CONTACT_FLAG_OTA_ADMIN bit -- see MyMesh.cpp). A
-// legacy or unrecognized format marker has those bit(s) forced OFF before
-// ever reaching the host, so stale/undefined on-disk bits from a legacy
-// file can never silently grant a privilege that did not exist when the
-// file was written.
+// The existing padding byte carries private permission version/provenance.
+// Public flags retain their legacy meaning, except the ambiguous marker-1
+// remote-CLI/OTA bit, which must be explicitly regranted after migration.
 template <typename File, typename Host, typename Contact = ContactInfo>
-inline bool readAllContacts(File& file, Host* host, uint8_t legacy_privileged_flag_mask =
-#if MESHCORE_LORA_OTA
-    0x10
-#else
-    0
-#endif
-) {
+inline bool readAllContacts(File& file, Host* host) {
   bool full = false;
   while (!full) {
     Contact c;
@@ -188,12 +187,7 @@ inline bool readAllContacts(File& file, Host* host, uint8_t legacy_privileged_fl
 
     if (!success) return false;  // genuine fault: partial record after first field.
 
-    if (format_marker != 1) {
-      // Legacy/short record predating this marker: strip any bit this
-      // build considers privilege-bearing rather than trust whatever
-      // garbage/undefined value happens to be on disk there.
-      c.flags &= (uint8_t)~legacy_privileged_flag_mask;
-    }
+    c.ota_permissions = decodeContactPrivatePermissions(format_marker, c.flags);
 
     if (!host->onContactLoaded(c)) full = true;
   }

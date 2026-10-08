@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import io
 import pathlib
+import re
 import struct
 import sys
 import tempfile
@@ -24,14 +25,18 @@ from types import SimpleNamespace
 TARGET = bytes(range(32))
 OTHER_TARGET = bytes(reversed(TARGET))
 HASH = b"\xa5" * 32
+NONCE = bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
 
 
 def frame(op=ota.Op.STATUS, result=ota.Result.OK, phase=ota.Phase.READY,
           flags=3, target=TARGET, manifest_hash=HASH, received=2, total=2,
-          counter=7, age=0, retry=0, generation=0):
-    return (bytes([ota.REPLY_CODE, 2, op, result, phase, flags]) + target + manifest_hash
+          counter=7, age=0, retry=0, generation=0, nonce=None, wire=None):
+    valid = bool(flags & ota.SNAPSHOT_VALID)
+    nonce = (NONCE if valid else bytes(16)) if nonce is None else nonce
+    wire = (3 if valid or target == ota.LOCAL_TARGET else 0) if wire is None else wire
+    return (bytes([ota.REPLY_CODE, 3, op, result, phase, flags]) + target + manifest_hash
             + struct.pack(">HHIII", received, total, counter, age, retry)
-            + struct.pack(">I", generation))
+            + struct.pack(">I", generation) + nonce + bytes([wire]))
 
 
 def manifest(image):
@@ -138,8 +143,24 @@ class ReplyTests(unittest.TestCase):
                          (0x1234, 0x5678, 0x12345678, 0x23456789, 0x3456789A))
         self.assertEqual(decoded.generation, 0xFEDCBA98)
         self.assertEqual(decoded.summary()["generation"], 0xFEDCBA98)
-        self.assertEqual(len(frame()), 90)
+        self.assertEqual(len(frame()), 107)
         self.assertEqual(frame(generation=0xFEDCBA98)[86:90], bytes.fromhex("fedcba98"))
+        self.assertEqual((decoded.begin_nonce, decoded.wire_version), (NONCE, 3))
+        self.assertEqual(frame()[90:107], NONCE + b"\x03")
+        self.assertTrue(decoded.attempt_bound)
+
+    def test_wire_version_and_nonce_shapes(self):
+        legacy_v2 = frame()[:90]
+        legacy_v2 = legacy_v2[:1] + b"\x02" + legacy_v2[2:]
+        with self.assertRaisesRegex(ota.UploaderError, "ABI version 2 is unsupported"):
+            ota.decode_reply(legacy_v2)
+        for data in (frame(wire=2), frame(wire=4), frame(target=ota.LOCAL_TARGET, flags=1, wire=0),
+                     frame(flags=2, phase=ota.Phase.UNKNOWN, manifest_hash=bytes(32), received=0,
+                           total=0, counter=0, age=ota.AGE_UNKNOWN, nonce=NONCE)):
+            with self.subTest(data=data[86:]), self.assertRaises(ota.UploaderError):
+                ota.decode_reply(data)
+        self.assertFalse(ota.decode_reply(frame(wire=0)).attempt_bound)
+        self.assertFalse(ota.decode_reply(frame(nonce=bytes(16))).attempt_bound)
 
     def test_valid_wrapped_zero_generation_and_legacy_abi_refusal(self):
         self.assertTrue(ota.decode_reply(frame(generation=0)).valid)
@@ -214,15 +235,41 @@ class RequestTests(unittest.TestCase):
                     ota.validate_image(bad_manifest, bad_image)
 
     def test_all_modes_and_configurable_lower_airtime_share(self):
+        # Product default: on-mesh START carries profile 0 + reliable attempt-diverse framing flag 1.
         self.assertEqual(ota.start_body("directed", 255, 0, 0, 125),
-                         bytes.fromhex("01ff0000000000000000007d"))
+                         bytes.fromhex("01ff0000000000000000007d0001"))
         self.assertEqual(ota.start_body("background", 2, 0, 0, 2000),
-                         bytes.fromhex("0202000000000000000007d0"))
+                         bytes.fromhex("0202000000000000000007d00001"))
         self.assertEqual(ota.start_body("direct", 255, 908525, 60000, 100000),
                          struct.pack(">BBIHI", 0, 255, 908525, 60000, 100000))
         for duty in (1, 2000, 5000, 100000):
             self.assertEqual(struct.unpack_from(">I", ota.start_body("directed", 255, 0, 0, duty), 8)[0],
                              duty)
+
+    def test_legacy_unframed_on_mesh_is_refused_and_direct_never_carries_framing(self):
+        for mode, channel in (("directed", 255), ("background", 2)):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "reliable attempt-diverse"):
+                ota.start_body(mode, channel, 0, 0, 2000, routed_retry=False)
+            self.assertEqual(ota.start_body(mode, channel, 0, 0, 2000, routed_retry=True),
+                             ota.start_body(mode, channel, 0, 0, 2000))
+        direct = struct.pack(">BBIHI", 0, 255, 908525, 60000, 2000)
+        self.assertEqual(ota.start_body("direct", 255, 908525, 60000, 2000, routed_retry=False), direct)
+        with self.assertRaisesRegex(ValueError, "directed/background"):
+            ota.start_body("direct", 255, 908525, 60000, 2000, routed_retry=True)
+
+    def test_default_parser_selects_reliable_directed_framing(self):
+        arguments = ota.parser().parse_args(["--client-port", "/dev/serial/by-id/x", "deploy",
+                                            "--image", "a.bin", "--board", "xiao_nrf52840", "--role-id", "0",
+                                            "--counter", "1", "--target", TARGET.hex()])
+        self.assertEqual(arguments.mode, "directed")
+        self.assertIsNone(arguments.routed_retry)
+        body = ota.start_body(arguments.mode, arguments.channel, arguments.frequency_khz, arguments.lease_ms,
+                              arguments.duty_milli_percent, arguments.routed_retry)
+        self.assertEqual(len(body), 14)
+        self.assertEqual(body[12:], b"\x00\x01")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ota.parser().parse_args(["--client-port", "x", "upload", "--manifest", "m", "--image", "i",
+                                     "--target", TARGET.hex(), "--routed-retry", "--no-routed-retry"])
 
     def test_invalid_profiles_fail_before_transmission(self):
         for args in (("bad", 255, 0, 0, 2000), ("directed", 254, 0, 0, 2000),
@@ -301,6 +348,8 @@ class LifecycleTests(unittest.TestCase):
         self.manifest_hash = hashlib.sha256(self.canonical).digest()
         self.good = ota.decode_reply(frame())
         self.uploader.exchange = mock.Mock(return_value=self.good)
+        # The ABI probe is covered by WireVersionProbeTests and CLI tests.
+        self.uploader.require_wire_version = mock.Mock()
 
     def test_cache_signs_canonical_manifest_uses_84_byte_blocks_and_never_commits(self):
         self.uploader.wait_phase = mock.Mock(return_value=self.good)
@@ -433,7 +482,9 @@ class LifecycleTests(unittest.TestCase):
         for body, mode in ((legacy + b"\x00", "direct"), (legacy + b"\x03", "direct"),
                            (legacy + b"\xff", "direct"), (legacy + b"\x02\x00", "direct"),
                            (ota.start_body("directed", 255, 0, 0, 2000) + b"\x02", "directed"),
-                           (ota.start_body("background", 0, 0, 0, 2000) + b"\x02", "background")):
+                           (ota.start_body("background", 0, 0, 0, 2000) + b"\x02", "background"),
+                           (ota.start_body("directed", 255, 0, 0, 2000)[:12], "directed"),
+                           (ota.start_body("background", 0, 0, 0, 2000)[:12], "background")):
             with self.subTest(body=body, mode=mode), self.assertRaises(ValueError):
                 self.uploader.start([TARGET], body, mode, time.monotonic() + 10)
         self.uploader.exchange.assert_not_called()
@@ -458,7 +509,18 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.uploader.wait_phase.call_args.args[:4],
                          (TARGET, ota.Phase.READY, self.manifest_hash, 7))
         self.assertEqual(self.uploader.exchange.call_args.args[:3],
-                         (ota.Op.COMMIT, TARGET + self.manifest_hash + b"\x00\x00\x00\x07", TARGET))
+                         (ota.Op.COMMIT, TARGET + self.manifest_hash + b"\x00\x00\x00\x07"
+                          + bytes(4) + NONCE, TARGET))
+        self.assertEqual(2 + len(self.uploader.exchange.call_args.args[1]), 90)
+
+    def test_commit_refuses_ready_without_bound_attempt_identity(self):
+        for fields in ({"wire": 0}, {"nonce": bytes(16)}):
+            with self.subTest(fields=fields):
+                self.uploader.exchange.reset_mock()
+                self.uploader.wait_phase = mock.Mock(return_value=ota.decode_reply(frame(**fields)))
+                with self.assertRaisesRegex(ota.UploaderError, "not attempt-bound"):
+                    self.uploader.commit(TARGET, self.canonical, time.monotonic() + 10)
+                self.uploader.exchange.assert_not_called()
 
     def test_no_ready_prevents_commit(self):
         self.uploader.wait_phase = mock.Mock(side_effect=TimeoutError("not READY"))
@@ -634,6 +696,7 @@ class CliLifecycleTests(unittest.TestCase):
         self.local_status = {}
         self.cache_already_sealed = False
         self.local_phase = ota.Phase.CACHE_SEALED
+        self.probe_pending = False
         self.generation = 0x12345678
         self.reply_mutator = None
         self.drop_abort_reply = False
@@ -687,6 +750,9 @@ class CliLifecycleTests(unittest.TestCase):
         elif op == ota.Op.CACHE_SEAL:
             self.local_phase = phase = ota.Phase.CACHE_SEALED
         elif op == ota.Op.COMMIT:
+            self.assertEqual(len(payload), 90)
+            if payload[70:90] != struct.pack(">I", self.generation) + NONCE:
+                result = ota.Result.MISMATCH
             phase = ota.Phase.COMMIT_PENDING
         elif op == ota.Op.ABORT:
             self.assertEqual(len(payload), 70)
@@ -709,7 +775,9 @@ class CliLifecycleTests(unittest.TestCase):
         fields = dict(op=op, result=result, phase=phase, target=target, flags=flags,
                       manifest_hash=self.manifest_hash, received=received, total=blocks,
                       counter=struct.unpack_from(">I", self.canonical, 45)[0], generation=self.generation)
-        if op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
+        if op == ota.Op.STATUS and target == ota.LOCAL_TARGET and self.probe_pending:
+            self.probe_pending = False
+        elif op == ota.Op.STATUS and target == ota.LOCAL_TARGET:
             fields.update(self.local_status)
         response = frame(**fields)
         if self.reply_mutator is not None:
@@ -724,6 +792,8 @@ class CliLifecycleTests(unittest.TestCase):
         return selected
 
     def run_cli(self, arguments, serial=None):
+        # Fault injection targets post-BEGIN status, not the initial ABI probe.
+        self.probe_pending = arguments[0] in ("cache", "upload", "deploy")
         argv = ["ota_uploader.py", "--artifact-dir", str(self.directory), "--timeout", "10",
                 "--client-port", "/dev/serial/by-id/synthetic-client", *arguments]
         @contextmanager
@@ -745,8 +815,20 @@ class CliLifecycleTests(unittest.TestCase):
             self.evidence_open, self.client_open = evidence_open, client_open
             ota.main()
 
+    PROBE = bytes([ota.lab.CMD_OTA_CONTROL, ota.Op.STATUS]) + ota.LOCAL_TARGET
+
     def sent_payloads(self):
-        return [call.args[0] for call in self.node.write_frame.call_args_list]
+        """Payloads after the mandatory local ABI probe that precedes every CACHE_BEGIN."""
+        payloads = [call.args[0] for call in self.node.write_frame.call_args_list]
+        stripped = []
+        for index, payload in enumerate(payloads):
+            following = payloads[index + 1] if index + 1 < len(payloads) else b""
+            if payload == self.PROBE and following[1:2] == bytes([ota.Op.CACHE_BEGIN]):
+                continue
+            if payload[1:2] == bytes([ota.Op.CACHE_BEGIN]):
+                self.assertEqual(payloads[index - 1] if index else b"", self.PROBE)
+            stripped.append(payload)
+        return stripped
 
     def upload_arguments(self):
         return ["upload", "--manifest", str(self.manifest_path), "--image", str(self.image_path),
@@ -924,6 +1006,24 @@ class CliLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
                 self.node.close.assert_called_once()
 
+    def test_old_companion_abi_is_refused_before_signing_or_cache_begin(self):
+        def legacy(op, response):
+            return response[:1] + b"\x02" + response[2:90]
+
+        def unbound(op, response):
+            return response[:106] + b"\x00"
+
+        for mutator, message in ((legacy, "ABI version 2 is unsupported"), (unbound, "wire version")):
+            for arguments in (self.cache_arguments(), self.upload_arguments()):
+                with self.subTest(mutator=mutator.__name__, command=arguments[0]):
+                    self.setUp()
+                    self.reply_mutator = mutator
+                    with self.assertRaisesRegex(ota.UploaderError, message):
+                        self.run_cli(arguments)
+                    self.assertEqual([call.args[0] for call in self.node.write_frame.call_args_list],
+                                     [self.PROBE])
+                    self.node.command.assert_not_called()
+
     def test_cache_reupload_is_explicit_and_never_sends_abort_or_replaces_refused_cache(self):
         self.run_cli([*self.cache_arguments(), "--reupload"])
         self.assertEqual(self.sent_payloads()[0][2], 1)
@@ -1007,7 +1107,7 @@ class CliLifecycleTests(unittest.TestCase):
                     self.signature_override = bytes(64)
                 with self.assertRaises(error):
                     self.run_cli(self.cache_arguments())
-                self.assertTrue(all(payload[1] in (0x10, 0x11, 0x12)
+                self.assertTrue(all(payload[1] in (0x10, 0x11, 0x12) or payload == self.PROBE
                                     for payload in self.sent_payloads()))
                 self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
                 self.node.close.assert_called_once()
@@ -1047,11 +1147,37 @@ class CliLifecycleTests(unittest.TestCase):
                 starts = [payload for payload in payloads if payload[1] == ota.Op.START]
                 self.assertEqual(len(starts), 1)
                 self.assertEqual(starts[0][2], ota.MODES[mode])
+                # Default CLI: on-mesh 16-byte framed START, direct legacy 14-byte START.
+                self.assertEqual(len(starts[0]), 14 if mode == "direct" else 16)
+                if mode != "direct":
+                    self.assertEqual(starts[0][14:], b"\x00\x01")
                 self.assertNotIn(ota.Op.COMMIT, [payload[1] for payload in payloads])
                 self.assertEqual([call.args[0][0] for call in self.node.command.call_args_list],
                                  [33, 34, 35])
                 self.node.close.assert_called_once()
                 self.evidence.finish.assert_called_once_with(None)
+
+    def test_default_cli_start_frames_are_the_real_relay_integration_goldens(self):
+        # The native two-real-relay loss test feeds these arrays through the
+        # companion's production START parser; the real CLI defaults must emit them.
+        source = (pathlib.Path(__file__).resolve().parents[2]
+                  / "test/test_lora_ota_integration/test_lora_ota_integration.cpp").read_text()
+        goldens = {}
+        for name in ("kHostDefaultDirectedStart", "kHostDefaultBackgroundStart"):
+            found = re.findall(r"\b" + name + r"\[\]\s*=\s*\{([^}]*)\}", source)
+            self.assertEqual(len(found), 1, name)
+            goldens[name] = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{1,2})", found[0]))
+        for name, extra in (("kHostDefaultDirectedStart", []),
+                            ("kHostDefaultBackgroundStart",
+                             ["--mode", "background", "--channel", "2", "--target", OTHER_TARGET.hex()])):
+            with self.subTest(golden=name):
+                self.node.reset_mock()
+                self.evidence.reset_mock()
+                self.received = 0
+                self.run_cli([*self.upload_arguments(), *extra])
+                starts = [payload for payload in self.sent_payloads() if payload[1] == ota.Op.START]
+                self.assertEqual(starts, [goldens[name]])
+                self.assertEqual(starts[0][-2:], b"\x00\x01")
 
     def test_upload_without_ready_wait_reports_start_only_and_never_commits(self):
         self.run_cli(self.upload_arguments())
@@ -1064,7 +1190,7 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual(self.sent_payloads(),
                          [bytes([ota.lab.CMD_OTA_CONTROL, ota.Op.STATUS]) + TARGET,
                           bytes([ota.lab.CMD_OTA_CONTROL, ota.Op.COMMIT]) + TARGET + self.manifest_hash
-                          + struct.pack(">I", 7)])
+                          + struct.pack(">II", 7, self.generation) + NONCE])
         self.node.command.assert_not_called()
         self.assertEqual(self.evidence.log.call_args.kwargs["phase"], ota.Phase.COMMIT_PENDING.name)
 
@@ -1427,7 +1553,8 @@ class CliLifecycleTests(unittest.TestCase):
         self.signature_override = bytes(64)
         with self.assertRaises(InvalidSignature):
             self.run_cli(self.upload_arguments())
-        self.node.write_frame.assert_not_called()
+        # Only the read-only ABI probe precedes signing; no cache write is sent.
+        self.assertEqual([call.args[0] for call in self.node.write_frame.call_args_list], [self.PROBE])
         self.assertEqual(self.evidence.log.call_args.args, ("fatal",))
         self.node.close.assert_called_once()
 

@@ -3,8 +3,10 @@ from contextlib import contextmanager, redirect_stdout
 import hashlib
 import io
 import json
+import shlex
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -36,7 +38,7 @@ class NativeDeployTests(unittest.TestCase):
             original(payload)
             if op == native.Op.COMMIT:
                 self.assertEqual(payload[2:], native_fixture.TARGET + self.f.manifest_hash
-                                 + struct.pack(">I", 9))
+                                 + struct.pack(">II", 9, self.f.generation) + native_fixture.NONCE)
                 self.commits += 1
                 self.f.remote_phase = self.after_commit
             if op == native.Op.STATUS and payload[2:34] == native_fixture.TARGET:
@@ -124,7 +126,7 @@ class NativeDeployTests(unittest.TestCase):
         self.assertEqual(self.commits, 0)
 
     def test_wrong_generation_hash_counter_and_scope_cannot_report_installed(self):
-        for offset in (5, 38, 74, 86):
+        for offset in (5, 38, 74, 86, 90, 105):
             with self.subTest(offset=offset):
                 self.setUp()
                 def change(response):
@@ -134,6 +136,29 @@ class NativeDeployTests(unittest.TestCase):
                 self.mutate_installed = change
                 with self.assertRaises(native.UploaderError):
                     self.f.run_cli(self.args())
+
+    def test_installed_with_zero_or_different_nonce_is_never_success(self):
+        for name, nonce in (("zero", bytes(16)), ("other", bytes(reversed(native_fixture.NONCE)))):
+            with self.subTest(name=name):
+                self.setUp()
+                self.mutate_installed = lambda response, n=nonce: response[:90] + n + response[106:]
+                with self.assertRaisesRegex(native.UploaderError, "different BEGIN attempt"):
+                    self.f.run_cli(self.args())
+                self.assertEqual(self.commits, 1)
+
+    def test_ready_from_unbound_or_pre_v3_receiver_never_commits(self):
+        original = self.f.reply_mutator
+        for name, mutate in (("pre-v3", lambda r: r[:106] + b"\x00"),
+                             ("zero-nonce", lambda r: r[:90] + bytes(16) + r[106:])):
+            with self.subTest(name=name):
+                self.setUp()
+                self.f.reply_mutator = (lambda op, r, mutate=mutate:
+                                        mutate(r) if r[6:38] == native_fixture.TARGET else r)
+                with self.assertRaisesRegex(native.UploaderError, "not attempt-bound"):
+                    self.f.run_cli(self.args())
+                self.assertEqual(self.commits, 0)
+                self.assertNotIn(native.Op.COMMIT, [p[1] for p in self.f.sent_payloads()])
+        self.f.reply_mutator = original
 
     def test_explicit_manifest_must_match_board_role_counter_before_open(self):
         wrong = native.deploy_manifest(self.f.image, self.board, 1, 9)
@@ -245,6 +270,26 @@ class StockDeployTests(stock_fixture.Scratch):
         self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
         self.assertTrue((self.artifacts / "restored.json").exists())
 
+    def test_deploy_succeeds_with_more_than_256_interleaved_ordinary_notifications(self):
+        original = self.serial.reply
+        injected = {"count": 0}
+
+        def noisy(data):
+            # A burst larger than the whole bound before the first reply, then steady interleaving.
+            pushes = stock_fixture.ORDINARY_PUSHES * (20 if not injected["count"] else 1)
+            for push in pushes:
+                original(push)
+            injected["count"] += len(pushes)
+            original(data)
+        self.serial.reply = noisy
+        result = self.guarded_deploy()
+        self.assertGreater(injected["count"], 2 * stock.PENDING_LIMIT)
+        self.assertEqual(sum(self.stock.frames.ignored.values()), injected["count"])
+        self.assertEqual(result["lifecycle"], 8)
+        self.assertEqual(self.serial.commit_count, 1)
+        self.assertEqual(self.serial.received, set(range(self.candidate.total)))
+        self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
+
     def test_deploy_one_complete_ready_and_one_normal_return_census_no_bitmap_rescan(self):
         self.candidate = stock_fixture.candidate(size=84 * 257)
         self.serial = DeploySerial(self.clock, self.candidate)
@@ -287,7 +332,8 @@ class StockDeployTests(stock_fixture.Scratch):
 
     def test_installed_without_matching_new_floor_or_valid_candidate_rejected(self):
         self.sender.generation = 10
-        for offset, value in ((93, 0), (87, 1), (98, 1), (88, 1)):
+        self.sender.begin_nonce = stock_fixture.NONCE
+        for offset, value in ((93, 0), (87, 1), (98, 1), (88, 1), (103, stock_fixture.NONCE[0] ^ 1)):
             with self.subTest(offset=offset):
                 report = bytearray(stock_fixture.census(self.candidate, lifecycle=8,
                                                        floor=self.candidate.counter))
@@ -295,6 +341,11 @@ class StockDeployTests(stock_fixture.Scratch):
                 report[offset] = value
                 with self.assertRaises(stock.Error):
                     self.sender.parse_census(bytes(report), 0, post_commit=True)
+        for phase in (6, 7, 8):
+            with self.subTest(zero_nonce_lifecycle=phase), \
+                    self.assertRaisesRegex(stock.Error, "different BEGIN attempt"):
+                self.sender.parse_census(stock_fixture.census(self.candidate, lifecycle=phase,
+                    floor=self.candidate.counter, nonce=bytes(16)), 0, post_commit=True)
         report = stock_fixture.census(self.candidate, lifecycle=8, floor=self.candidate.counter)
         self.assertEqual(self.sender.parse_census(report, 0, post_commit=True)["lifecycle"], 8)
 
@@ -339,6 +390,49 @@ class StockDeployTests(stock_fixture.Scratch):
         self.assertEqual(result["lifecycle"], 8)
         self.assertEqual(self.serial.commit_count, 1)
         self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
+
+
+class MakeDeployDefaultTests(unittest.TestCase):
+    """The product-default Make command line, expanded without executing it."""
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def expand(self, *overrides):
+        command = ["make", "--no-print-directory", "-n", "-C", str(self.ROOT), "ota-deploy",
+                   "OTA_DEPLOY_CLIENT_PORT=/dev/serial/by-id/usb-x", "OTA_UPLOAD_IMAGE=app.bin",
+                   "OTA_UPLOAD_TARGET=" + native_fixture.TARGET.hex(), "OTA_UPLOAD_BOARD=xiao_nrf52840",
+                   "OTA_UPLOAD_ROLE_ID=0", "OTA_UPLOAD_COUNTER=9", *overrides]
+        output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+        return [line for line in output.replace("\\\n", " ").splitlines() if "scripts/ota_" in line]
+
+    def native_args(self, *overrides):
+        (line,) = self.expand(*overrides)
+        words = shlex.split(line)
+        return native.parser().parse_args(words[words.index("scripts/ota_uploader.py") + 1:])
+
+    def test_default_make_deploy_is_directed_with_reliable_framing(self):
+        arguments = self.native_args()
+        self.assertEqual(arguments.mode, "directed")
+        self.assertIsNone(arguments.routed_retry)
+        body = native.start_body(arguments.mode, arguments.channel, arguments.frequency_khz,
+                                 arguments.lease_ms, arguments.duty_milli_percent, arguments.routed_retry)
+        self.assertEqual(body[12:], b"\x00\x01")
+
+    def test_make_legacy_opt_out_is_refused_for_directed_and_inert_for_direct(self):
+        arguments = self.native_args("OTA_DEPLOY_ROUTED_RETRY=0")
+        self.assertIs(arguments.routed_retry, False)
+        with self.assertRaisesRegex(ValueError, "reliable attempt-diverse"):
+            native.start_body(arguments.mode, arguments.channel, arguments.frequency_khz,
+                              arguments.lease_ms, arguments.duty_milli_percent, arguments.routed_retry)
+        direct = self.native_args("OTA_UPLOAD_MODE=direct", "OTA_UPLOAD_FREQ_KHZ=908525")
+        self.assertEqual(len(native.start_body(direct.mode, direct.channel, direct.frequency_khz, direct.lease_ms,
+                                               direct.duty_milli_percent, direct.routed_retry)), 12)
+
+    def test_make_stock_deploy_never_requests_unsupported_routed_framing(self):
+        (line,) = self.expand("OTA_DEPLOY_TRANSPORT=stock", "OTA_UPLOAD_MODE=direct", "OTA_ARTIFACT_DIR=a",
+                              "OTA_STOCK_BINDING=b", "OTA_STOCK_SERIAL=s",
+                              "OTA_STOCK_SENDER_KEY=" + native_fixture.TARGET.hex())
+        self.assertIn("scripts/ota_stock_companion.py deploy", line)
+        self.assertNotIn("routed-retry", line)
 
 
 if __name__ == "__main__":

@@ -76,15 +76,17 @@ StaticPoolPacketManager::StaticPoolPacketManager(int pool_size): unused(pool_siz
   }
 }
 
-mesh::Packet* StaticPoolPacketManager::allocNew(bool is_ota_bulk) {
-#if MESHCORE_LORA_OTA
-  if (is_ota_bulk && unused.count() <= kOtaAllocReserve) {
-    // Fail closed: below the reserve, only non-OTA callers (sender, raw
-    // ingress, delayed RX, relay) may take the remaining buffers.
-    return nullptr;
-  }
-#endif
+mesh::Packet* StaticPoolPacketManager::allocNew() {
   return unused.removeByIdx(0);  // just get first one (returns NULL if empty)
+}
+
+mesh::Packet* StaticPoolPacketManager::allocOtaPacket() {
+#if MESHCORE_LORA_OTA
+  if (unused.count() <= kOtaAllocReserve) return nullptr;
+  return allocNew();
+#else
+  return nullptr;
+#endif
 }
 
 void StaticPoolPacketManager::free(mesh::Packet* packet) {
@@ -94,18 +96,22 @@ void StaticPoolPacketManager::free(mesh::Packet* packet) {
   }
 }
 
-bool StaticPoolPacketManager::queueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) {
-  if (packet == NULL) return false;
-  if (!send_queue.add(packet, priority, scheduled_for)) {
+void StaticPoolPacketManager::queueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) {
+  if (!tryQueueOutbound(packet, priority, scheduled_for)) {
     MESH_DEBUG_PRINTLN("queueOutbound: send queue full, dropping packet");
     free(packet);
-    return false;
   }
-  return true;
 }
 
-mesh::Packet* StaticPoolPacketManager::getNextOutbound(uint32_t now, uint8_t* out_priority) {
-  //send_queue.sort();   // sort by scheduled_for/priority first
+bool StaticPoolPacketManager::tryQueueOutbound(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for) {
+  return packet != nullptr && send_queue.add(packet, priority, scheduled_for);
+}
+
+mesh::Packet* StaticPoolPacketManager::getNextOutbound(uint32_t now) {
+  return send_queue.get(now);
+}
+
+mesh::Packet* StaticPoolPacketManager::getNextOutboundWithPriority(uint32_t now, uint8_t* out_priority) {
   return send_queue.get(now, out_priority);
 }
 
@@ -124,8 +130,10 @@ int StaticPoolPacketManager::getFreeCount() const {
 mesh::Packet* StaticPoolPacketManager::getOutboundByIdx(int i) {
   return send_queue.itemAt(i);
 }
-uint32_t StaticPoolPacketManager::getOutboundScheduledForByIdx(int i) const {
-  return send_queue.scheduledForAt(i);
+bool StaticPoolPacketManager::getOutboundScheduleByIdx(int i, uint32_t& scheduled_for) const {
+  if (i < 0 || i >= send_queue.count()) return false;
+  scheduled_for = send_queue.scheduledForAt(i);
+  return true;
 }
 mesh::Packet* StaticPoolPacketManager::removeOutboundByIdx(int i) {
   return send_queue.removeByIdx(i);

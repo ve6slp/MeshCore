@@ -42,7 +42,7 @@ TEST(OtaUsbProtocolTest, RetryStartIsExplicitAndCannotReplaceLegacyOr500ProfileS
     EXPECT_FALSE(parseStartOptions(command, len, profile, retry));
 }
 
-TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed90ByteAbi2Contract) {
+TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed107ByteAbi3Contract) {
   UsbOtaReply reply;
   reply.requestOp = static_cast<uint8_t>(UsbOtaOp::Status);
   reply.result = UsbOtaResult::Ok;
@@ -56,6 +56,8 @@ TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed90ByteAbi2Contract) {
   reply.statusAgeMs = 42;
   reply.retryAfterMs = 0;
   reply.generation = 0xA1B2C3D4;
+  for (int i = 0; i < 16; i++) reply.beginNonce[i] = (uint8_t)(0xC0 + i);
+  reply.wireVersion = kOtaWireVersion;
 
   uint8_t out[kReplyBytes];
   ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, out));
@@ -75,8 +77,11 @@ TEST(OtaUsbProtocolTest, ReplyLayoutMatchesFixed90ByteAbi2Contract) {
   EXPECT_EQ(getBE32(&out[74]), 0x01020304u);
   EXPECT_EQ(getBE32(&out[78]), 42u);
   EXPECT_EQ(getBE32(&out[82]), 0u);
-  EXPECT_EQ(2u, out[1]);
+  EXPECT_EQ(3u, out[1]);
   EXPECT_EQ(0xA1B2C3D4u, getBE32(&out[86]));
+  EXPECT_EQ(0xC0, out[90]);
+  EXPECT_EQ(0xC0 + 15, out[105]);
+  EXPECT_EQ(3u, out[106]);
 }
 
 TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
@@ -89,6 +94,7 @@ TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
   reply.counter = 55;
   reply.statusAgeMs = 3;
   reply.generation = 99;
+  reply.beginNonce[0] = 0x44;
 
   reply.setNoSnapshot();
 
@@ -100,6 +106,7 @@ TEST(OtaUsbProtocolTest, NoSnapshotShapeIsCanonical) {
   EXPECT_EQ(0u, reply.counter);
   EXPECT_EQ(kStatusAgeUnknown, reply.statusAgeMs);
   EXPECT_EQ(0u, reply.generation);
+  EXPECT_FALSE(beginNonceBound(reply.beginNonce));
 }
 
 TEST(OtaUsbProtocolTest, BigEndianRoundTrip) {
@@ -134,6 +141,7 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         reply.statusAgeMs = 4;
         reply.retryAfterMs = 442;
         reply.generation = 0x01020304;
+        std::memset(reply.beginNonce, 0x6B, sizeof(reply.beginNonce));
         uint8_t encoded[kReplyBytes];
         ASSERT_EQ(kReplyBytes, encodeUsbOtaReply(reply, encoded));
         EXPECT_EQ(op, encoded[2]);
@@ -146,6 +154,8 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         EXPECT_EQ(kStatusAgeUnknown, getBE32(encoded + 78));
         EXPECT_EQ(442u, getBE32(encoded + 82));
         EXPECT_EQ(0u, getBE32(encoded + 86));
+        const uint8_t no_nonce[16] = {};
+        EXPECT_EQ(0, std::memcmp(no_nonce, encoded + 90, sizeof(no_nonce)));
         EXPECT_EQ(UsbOtaPhase::Ready, reply.phase);
         EXPECT_EQ(0x5A, reply.manifestHash[0]);  // Encoding does not mutate the working reply.
         reply.flags |= kReplyFlagSnapshotValid;
@@ -159,19 +169,24 @@ TEST(OtaUsbProtocolTest, EverySubopResultEncodesNoSnapshotWithoutEchoAndPreserve
         EXPECT_EQ(4u, getBE32(encoded + 78));
         EXPECT_EQ(442u, getBE32(encoded + 82));
         EXPECT_EQ(0x01020304u, getBE32(encoded + 86));
+        EXPECT_EQ(0, std::memcmp(reply.beginNonce, encoded + 90, sizeof(reply.beginNonce)));
       }
     }
   }
 }
 
-TEST(OtaUsbProtocolTest, CommitSignedMessageBindsDomainTargetHashAndCounter) {
+TEST(OtaUsbProtocolTest, CommitSignedMessageBindsDomainTargetHashCounterGenerationAndNonce) {
   uint8_t target[kPubKeyBytes];
   uint8_t hash[kHashBytes];
+  uint8_t nonce[kBeginNonceBytes];
   for (int i = 0; i < 32; i++) { target[i] = (uint8_t)i; hash[i] = (uint8_t)(100 + i); }
+  for (int i = 0; i < 16; i++) nonce[i] = (uint8_t)(200 + i);
 
   uint8_t msg[kCommitSignedBytes];
-  size_t n = buildCommitSignedMessage(target, hash, 0x11223344, msg);
+  size_t n = buildCommitSignedMessage(target, hash, 0x11223344, 0x55667788, nonce, msg);
+  ASSERT_EQ(110u, n);
   ASSERT_EQ(kCommitSignedBytes, n);
+  EXPECT_STREQ("MeshCore/OTA/commit/v2", kCommitDomain);
 
   // domain prefix, no NUL terminator included.
   EXPECT_EQ(0, std::memcmp(msg, kCommitDomain, kCommitDomainLen));
@@ -181,6 +196,33 @@ TEST(OtaUsbProtocolTest, CommitSignedMessageBindsDomainTargetHashAndCounter) {
   EXPECT_EQ(0, std::memcmp(msg + kCommitDomainLen + kPubKeyBytes, hash, kHashBytes));
   // counter (big-endian) is the final 4 bytes.
   EXPECT_EQ(getBE32(msg + kCommitDomainLen + kPubKeyBytes + kHashBytes), 0x11223344u);
+  EXPECT_EQ(getBE32(msg + kCommitDomainLen + kPubKeyBytes + kHashBytes + 4), 0x55667788u);
+  EXPECT_EQ(0, std::memcmp(msg + kCommitDomainLen + kPubKeyBytes + kHashBytes + 8, nonce, sizeof(nonce)));
+
+  // A new BEGIN nonce for the identical image yields a different message.
+  uint8_t other[kCommitSignedBytes];
+  nonce[15] ^= 1;
+  buildCommitSignedMessage(target, hash, 0x11223344, 0x55667788, nonce, other);
+  EXPECT_NE(0, std::memcmp(msg, other, sizeof(msg)));
+}
+
+TEST(OtaUsbProtocolTest, CommitRequestParsesOnlyExact90ByteNonceBoundForm) {
+  uint8_t command[kCommitTotalBytes] = {kCommand, static_cast<uint8_t>(UsbOtaOp::Commit)};
+  for (int i = 0; i < 32; i++) { command[2 + i] = 0x10; command[34 + i] = 0x20; }
+  putBE32(command + 66, 9);
+  putBE32(command + 70, 0x0A0B0C0D);
+  for (int i = 0; i < 16; i++) command[74 + i] = (uint8_t)(0x30 + i);
+  UsbCommitRequest request;
+  ASSERT_TRUE(parseCommitRequest(command, sizeof(command), request));
+  EXPECT_EQ(command + 2, request.target);
+  EXPECT_EQ(command + 34, request.manifestHash);
+  EXPECT_EQ(9u, request.counter);
+  EXPECT_EQ(0x0A0B0C0Du, request.generation);
+  EXPECT_EQ(command + 74, request.beginNonce);
+  EXPECT_FALSE(parseCommitRequest(command, 70, request));
+  EXPECT_FALSE(parseCommitRequest(command, sizeof(command) - 1, request));
+  command[1] = static_cast<uint8_t>(UsbOtaOp::Abort);
+  EXPECT_FALSE(parseCommitRequest(command, sizeof(command), request));
 }
 
 TEST(OtaUsbProtocolTest, DifferentTargetProducesDifferentSignedMessage) {
@@ -190,11 +232,12 @@ TEST(OtaUsbProtocolTest, DifferentTargetProducesDifferentSignedMessage) {
   uint8_t targetA[kPubKeyBytes]; std::memset(targetA, 0xAA, sizeof(targetA));
   uint8_t targetB[kPubKeyBytes]; std::memset(targetB, 0xBB, sizeof(targetB));
   uint8_t hash[kHashBytes]; std::memset(hash, 0x55, sizeof(hash));
+  uint8_t nonce[kBeginNonceBytes]; std::memset(nonce, 0x77, sizeof(nonce));
 
   uint8_t msgA[kCommitSignedBytes];
   uint8_t msgB[kCommitSignedBytes];
-  buildCommitSignedMessage(targetA, hash, 7, msgA);
-  buildCommitSignedMessage(targetB, hash, 7, msgB);
+  buildCommitSignedMessage(targetA, hash, 7, 1, nonce, msgA);
+  buildCommitSignedMessage(targetB, hash, 7, 1, nonce, msgB);
 
   EXPECT_NE(0, std::memcmp(msgA, msgB, kCommitSignedBytes));
 }
@@ -205,11 +248,13 @@ TEST(OtaUsbProtocolTest, FixedWireSizesMatchContract) {
   EXPECT_EQ(2u, kCacheSealTotalBytes);
   EXPECT_EQ(34u, kAddTargetTotalBytes);
   EXPECT_EQ(14u, kStartTotalBytes);
-  EXPECT_EQ(70u, kCommitTotalBytes);
+  EXPECT_EQ(90u, kCommitTotalBytes);
   EXPECT_EQ(70u, kAbortTotalBytes);
   EXPECT_EQ(34u, kStatusTotalBytes);
   EXPECT_EQ(35u, kSetContactAdminTotalBytes);
-  EXPECT_EQ(90u, kReplyBytes);
+  EXPECT_EQ(107u, kReplyBytes);
+  EXPECT_EQ(3u, kAbiVersion);
+  EXPECT_EQ(3u, kOtaWireVersion);
 }
 
 TEST(OtaUsbProtocolTest, AbortSignedMessageBindsV2DomainTargetImageHashAndGeneration) {

@@ -31,6 +31,7 @@ public:
   Esp32SdkError inspectError = kEsp32Ok;
   Esp32SdkError readError = kEsp32Ok;
   Esp32SdkError eraseError = kEsp32Ok;
+  uint32_t eraseErrorOffset = UINT32_MAX;  // fail only the erase of this partition offset
   FaultTiming writeFault = FaultTiming::None;
   uint32_t writeErrorCall = 0;
   uint32_t tornBytes = 0;
@@ -81,6 +82,7 @@ public:
   Esp32SdkError erase(const Esp32PartitionIdentity& p, uint32_t offset, uint32_t len) override {
     if (!valid(p, offset, len) || offset % 4096 != 0 || len != 4096) return kEsp32InvalidArgument;
     if (eraseError != kEsp32Ok) return eraseError;
+    if (offset == eraseErrorOffset) return -1;
     erasedOffsets.push_back(offset);
     std::fill(bytes.begin() + p.address + offset, bytes.begin() + p.address + offset + len, 0xff);
     return kEsp32Ok;

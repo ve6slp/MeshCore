@@ -6,6 +6,12 @@
 #include <esp_image_format.h>
 #include <esp_ota_ops.h>
 #include <esp_attr.h>
+#include <esp_random.h>
+#include <bootloader_random.h>
+#include <esp_bt.h>
+#include <esp_rom_sys.h>
+#include <esp_wifi.h>
+#include <cstring>
 #include <esp_partition.h>
 #include <nvs.h>
 #include <nvs_flash.h>
@@ -44,6 +50,49 @@ bool otaBoardApplyRfProfile(float frequency, float bandwidth, uint8_t sf, uint8_
 }
 
 namespace {
+
+// BEGIN nonce entropy. IDF 4.4 esp_random() is only a true RNG while WiFi/BT
+// RF runs or the SAR ADC entropy source is enabled; these OTA builds keep RF
+// off, so without this the post-cold-boot nonce would rest on unspecified
+// pseudo-random state. Guarantee, with no pseudo-random fallback:
+//  - WiFi not initialised (esp_wifi_get_mode: NOT_INIT) and BT controller
+//    IDLE, as in the USB OTA images: enable the documented SAR ADC/8 MHz
+//    source (bootloader_random_enable), wait 128 us before every 32-bit word
+//    (8x the IDF bootloader's 1 bit per 40 APB cycles at 80 MHz), then
+//    disable it again within this same synchronous loop-task call (~1.3 ms
+//    for the 32-byte BEGIN draw). Disable restores the
+//    bootloader hand-off state (ADC1 back on RTC control, SAR power off,
+//    APB SARADC gated), which Arduino's per-read ADC/tsens setup expects.
+//    The SX1262 is on SPI and is untouched.
+//  - BT controller enabled: RF is on, so esp_fill_random() is the
+//    documented true RNG; the ADC source must not be enabled with RF on.
+//  - WiFi initialised or BT controller in a transitional state: indeterminate,
+//    so return false and BEGIN reports Unavailable.
+
+bool otaEspEntropy(void*, uint8_t* out, size_t len) {
+  static constexpr size_t kMaxEntropyBytes = 64;
+  static constexpr uint32_t kSourceWarmupUs = 200;
+  static constexpr uint32_t kWordRefillUs = 128;
+  if (out == nullptr || len == 0 || len > kMaxEntropyBytes) return false;
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_ERR_WIFI_NOT_INIT) return false;
+  const auto bt = esp_bt_controller_get_status();
+  if (bt == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    esp_fill_random(out, len);
+    return true;
+  }
+  if (bt != ESP_BT_CONTROLLER_STATUS_IDLE) return false;
+  bootloader_random_enable();
+  esp_rom_delay_us(kSourceWarmupUs);
+  for (size_t i = 0; i < len; i += 4) {
+    esp_rom_delay_us(kWordRefillUs);
+    const uint32_t word = esp_random();
+    const size_t n = len - i < 4 ? len - i : 4;
+    std::memcpy(out + i, &word, n);
+  }
+  bootloader_random_disable();
+  return true;
+}
 
 using namespace mesh::ota;
 using ::ota::storage::Esp32ImageState;
@@ -301,6 +350,11 @@ bool otaBoardEarlyBootTrialOrUnknown() {
   return trial.activeOrUnknown();
 }
 
+// Positive Normal proof for provisioning/format decisions: every false
+// return of otaBoardEarlyBootTrialOrUnknown() is a positive proof path;
+// IO, layout, identity and unknown-state paths all answer false here.
+bool otaBoardEarlyBootNormalProven() { return !otaBoardEarlyBootTrialOrUnknown(); }
+
 bool otaBoardTrialHealthWindowActive() { return trial.activeOrUnknown(); }
 bool otaBoardUnknownStartupRecoveryHeld() { return trial.unknownServiceHeld(); }
 bool otaBoardStorageIoFaultObserved() { return storage_fault || sink.storageIoFaultObserved(); }
@@ -472,6 +526,7 @@ bool configureCompanionFirmwareOtaBackend(OtaFirmwareIntegration& target) {
                                                flash, lease, store, sink, trust, signatures, capability);
   if (outcome == Esp32ConfigureOutcome::IoError) storage_fault = true;
   if (outcome != Esp32ConfigureOutcome::Configured) return false;
+  target.attachEntropy(nullptr, &otaEspEntropy);
   integration = &target;
   return true;
 }
