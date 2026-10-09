@@ -24,8 +24,14 @@ the union of their missing bitmaps drives common selective repairs. Individual
 COMMITs bind each target's own generation/nonce. Channel 255 is an unscoped
 normal-radio flood, not a native companion's configured multicast channel.
 It never retunes, re-BEGINs, REUPLOADs, takes over or resets a target.
+Explicit paired schema-3 attempt receipts can resume the same two Receiving
+or READY candidates. Both receipts and fresh attempt-bound censuses are checked
+before signing data; resume sends only their common missing-block union.
 Cancellation stops the whole campaign immediately, retaining prior unsigned
 outcomes in a non-success result before normal-profile/UART cleanup.
+Valid unsolicited stock pushes and OTA data/request echoes are counted with
+bounded metadata-only logging, not queued as replies. Census/lease replies
+remain pending. Cleanup readback failure is recorded, never assumed unchanged.
 Stable USB selection and flock prevent endpoint races/concurrent readers; normal
 115200 serial is opened with RTS false and caller-selected DTR before open.
 """
@@ -359,6 +365,8 @@ def rf_metadata(frame, payload, target, manifest):
             "payload_type": (header >> 2) & 15 if header is not None else None,
             "decoded": payload is not None, "kind": kind,
             "payload_length": len(payload) if payload is not None else None,
+            "block_index": struct.unpack_from(">H", payload, 5)[0]
+            if kind == 1 and len(payload) >= 7 else None,
             "target_match": payload[target_offset:target_offset + 32] == target
             if target_offset is not None and target is not None else None,
             "manifest_match": payload[hash_offset:hash_offset + 32] == manifest
@@ -380,7 +388,7 @@ def block_message(candidate, index):
 
 # Ordinary MeshCore 1.17.1 companion pushes (examples/companion_radio/MyMesh.cpp)
 # that this uploader never consumes, with the exact lengths that firmware emits.
-# 0x88 LOG_RX_DATA is absent: it carries RF census/ACK replies.
+# 0x88 LOG_RX_DATA needs payload-aware demux: it also carries census/ACK replies.
 UNUSED_PUSH_LENGTHS = {
     0x80: range(33, 34),              # ADVERT: code + public key
     0x81: range(33, 34),              # PATH_UPDATED: code + public key
@@ -402,17 +410,25 @@ UNUSED_PUSH_LENGTHS = {
 PENDING_LIMIT = 256
 
 
+def ota_nonreply(payload):
+    if not payload or payload[0] in (11, 13, 16):
+        return False
+    return (valid_retry_inner(payload) or
+            (payload[0] in (12, 15) and len(payload) == 171) or
+            (payload[0] == 9 and 100 <= len(payload) <= 183))
+
+
 def unused_push(frame):
     """True only for well-formed pushes that can never answer an OTA exchange.
 
-    Ordinary non-OTA RF log pushes are unused; OTA-typed, malformed or
-    unknown frames stay queued (bounded) so they are observed, not eaten.
+    Ordinary pushes and valid OTA requests/data echoes cannot answer a host
+    exchange. Census/lease replies, malformed and unknown frames stay queued.
     """
     code = frame[0]
     if code == 0x88:
         if len(frame) < 5 or frame[3] >> 6:
             return False
-        return (frame[3] >> 2) & 15 != 12
+        return (frame[3] >> 2) & 15 != 12 or ota_nonreply(raw_rx(frame))
     lengths = UNUSED_PUSH_LENGTHS.get(code)
     if lengths is None:
         return False
@@ -423,11 +439,40 @@ def unused_push(frame):
 
 class Frames:
     """Bounded stock USB framing; no logging of opaque USB/DeviceQuery fields."""
-    def __init__(self, stream, clock=time.monotonic):
+    def __init__(self, stream, clock=time.monotonic, *, event_callback=None):
         self.stream, self.clock = stream, clock
         self.buffer = bytearray()
         self.pending = []
         self.ignored = {}
+        self.unsolicited = {}
+        self.event_callback = event_callback
+
+    def observe_unused(self, frame):
+        self.ignored[frame[0]] = self.ignored.get(frame[0], 0) + 1
+        payload = raw_rx(frame) if frame[0] == 0x88 else None
+        kind = payload[0] if payload else None
+        key = f"0x{frame[0]:02x}" + (f"/ota-{kind}" if kind is not None else "")
+        count = self.unsolicited[key] = self.unsolicited.get(key, 0) + 1
+        # First observation and powers of two bound log volume independently
+        # of image size. Final aggregate artifacts retain the exact counts.
+        if self.event_callback is not None and count & (count - 1) == 0:
+            event = {"event": "usb_unsolicited_observed", "usb_code": frame[0],
+                     "usb_length": len(frame), "count": count, "counter_key": key}
+            if frame[0] == 0x88:
+                event.update(rf_metadata(frame, payload, None, None))
+            self.event_callback(event)
+
+    def backlog(self):
+        codes, kinds = {}, {}
+        for _, frame in self.pending:
+            code = f"0x{frame[0]:02x}"
+            codes[code] = codes.get(code, 0) + 1
+            if frame[0] == 0x88:
+                payload = raw_rx(frame)
+                kind = str(payload[0]) if payload else "unparsed"
+                kinds[kind] = kinds.get(kind, 0) + 1
+        return {"pending_limit": PENDING_LIMIT, "pending_count": len(self.pending),
+                "pending_codes": codes, "pending_ota_kinds": kinds}
 
     def feed(self, data):
         self.buffer.extend(data)
@@ -447,9 +492,12 @@ class Frames:
             frame = bytes(self.buffer[3:3 + length])
             del self.buffer[:3 + length]
             if unused_push(frame):
-                self.ignored[frame[0]] = self.ignored.get(frame[0], 0) + 1
+                self.observe_unused(frame)
                 continue
             if len(self.pending) >= PENDING_LIMIT:
+                if self.event_callback is not None:
+                    self.event_callback({"event": "usb_backlog_overflow", "incoming_code": frame[0],
+                                         "incoming_length": len(frame), **self.backlog()})
                 raise Error("USB response backlog overflow")
             self.pending.append((self.clock(), frame))
 
@@ -482,21 +530,33 @@ class Frames:
             self.poll(min(0.1, deadline - self.clock()))
         raise NoUsbResponse("USB command deadline; no response")
 
-    def discard_rf(self, observer=None, target=None, manifest=None):
+    def discard_rf(self, observer=None, target=None, manifest=None, *, preserve_other_targets=False):
         self.poll(0)
-        if observer is not None:
-            for _, frame in self.pending:
-                if frame[0] == 0x88:
+        kept = []
+        for timestamp, frame in self.pending:
+            if frame[0] == 0x88:
+                payload = raw_rx(frame)
+                offset = {11: 1, 13: 33, 16: 33}.get(payload[0]) if payload else None
+                if (preserve_other_targets and offset is not None
+                        and payload[offset:offset + 32] != target):
+                    kept.append((timestamp, frame))
+                    continue
+                if observer is not None:
                     observer({"event": "rf_discard", **rf_metadata(frame, raw_rx(frame), target, manifest)})
-        self.pending = [(t, f) for t, f in self.pending if f[0] != 0x88]
+            else:
+                kept.append((timestamp, frame))
+        self.pending = kept
 
     def receive(self, predicate, since, deadline, observer=None, target=None, manifest=None,
-                route_predicate=None):
+                route_predicate=None, preserve_unmatched=False):
         while self.clock() < deadline:
             for i, (timestamp, frame) in enumerate(self.pending):
                 if frame[0] == 0x88:
-                    self.pending.pop(i)
                     payload = raw_rx(frame)
+                    if (preserve_unmatched and payload and payload[0] in (11, 13, 16)
+                            and timestamp >= since and not predicate(payload)):
+                        continue
+                    self.pending.pop(i)
                     if observer is not None:
                         observer({"event": "rf_rx", "fresh": timestamp >= since,
                                   **rf_metadata(frame, payload, target, manifest)})
@@ -627,6 +687,40 @@ def airtime(raw_length, profile):
     payload_symbols = 8 + max(0, math.ceil((8 * raw_length - 4 * sf + 28 + 16) / (4 * (sf - 2 * de))) * cr)
     # Margin covers driver/low-SF differences; stats supply actual elapsed TX.
     return (preamble + 4.25 + payload_symbols) * symbol * 1.5
+
+
+def attempt_fields(binding, candidate, profile, tx_power, duty, report):
+    return {"schema": ATTEMPT_RECEIPT_SCHEMA,
+            "image_sha256": hashlib.sha256(candidate.image).hexdigest(),
+            "image_size": len(candidate.image), "total_blocks": candidate.total,
+            "floor": binding.floor, "min_generation": binding.min_generation,
+            "normal_duty_percent": duty * 100,
+            "normal_profile": list(binding.normal), "sender_profile": list(profile),
+            "tx_power_dbm": tx_power, "by_path": binding.by_path,
+            "id_path": binding.id_path, "usb_vid": binding.usb_vid, "usb_pid": binding.usb_pid,
+            "sender_name": binding.sender_name,
+            "first": report["first"], "received_blocks": report["received"],
+            "bitmap": report["bits"].to_bytes(16, "little").hex(),
+            "status_authenticated": False}
+
+
+def resume_progress(receipt, binding, candidate):
+    if not isinstance(receipt, dict):
+        raise Error("resume requires an original attempt receipt")
+    generation, nonce = receipt.get("generation"), receipt.get("begin_nonce")
+    received, bitmap = receipt.get("received_blocks"), receipt.get("bitmap")
+    old_duty = receipt.get("normal_duty_percent")
+    if (type(generation) is not int or not binding.min_generation <= generation <= 0xFFFFFFFF
+            or not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+            or not any(bytes.fromhex(nonce))
+            or type(received) is not int or not 0 <= received <= candidate.total
+            or type(old_duty) not in (int, float) or not math.isfinite(old_duty) or not 0 < old_duty <= 100
+            or not isinstance(bitmap, str) or not re.fullmatch(r"[0-9a-f]{32}", bitmap)):
+        raise Error("resume requires original generation, BEGIN nonce and bounded progress")
+    bits = int.from_bytes(bytes.fromhex(bitmap), "little")
+    if bits >> min(128, candidate.total) or bits.bit_count() > received:
+        raise Error("resume receipt bitmap/progress mismatch")
+    return generation, nonce, old_duty, {"first": 0, "received": received, "bits": bits}
 
 
 class Sender:
@@ -773,7 +867,8 @@ class Sender:
         c, b = self.candidate, self.binding
         observer = self.rf_observer("census")
         for attempt in range(1, retries + 1):
-            self.stock.frames.discard_rf(observer, b.target, c.digest)
+            self.stock.frames.discard_rf(observer, b.target, c.digest,
+                                         preserve_other_targets=self.mode == "background")
             self.emit("census_request", attempt=attempt, first=first, allow_pending=allow_pending,
                       channel="direct" if self.lease_end else "normal")
             since = self.send(b"\x0a" + b.target + c.digest + struct.pack(">H", first))
@@ -783,7 +878,8 @@ class Sender:
                 _, frame = self.stock.frames.receive(
                     lambda p: p[:1] == b"\x0b" and (self.mode != "background" or p[1:33] == b.target), since,
                     min(self.deadline, self.clock() + reply_wait, self.lease_end or self.deadline),
-                    observer, b.target, c.digest, route_predicate=self.reply_route)
+                    observer, b.target, c.digest, route_predicate=self.reply_route,
+                    preserve_unmatched=self.mode == "background")
             except TimeoutError:
                 self.emit("census_timeout", attempt=attempt, first=first)
                 self.room(15)
@@ -1052,46 +1148,21 @@ class Sender:
 
     def attempt_receipt(self, report):
         result = self.receipt("attempt-observed-unsigned")
-        result.update(schema=ATTEMPT_RECEIPT_SCHEMA,
-                      image_sha256=hashlib.sha256(self.candidate.image).hexdigest(),
-                      image_size=len(self.candidate.image), total_blocks=self.candidate.total,
-                      floor=self.binding.floor, min_generation=self.binding.min_generation,
-                      normal_duty_percent=self.duty * 100,
-                      normal_profile=list(self.binding.normal), sender_profile=list(self.original),
-                      tx_power_dbm=self.stock.tx_power, by_path=self.binding.by_path,
-                      id_path=self.binding.id_path, usb_vid=self.binding.usb_vid, usb_pid=self.binding.usb_pid,
-                      sender_name=self.binding.sender_name,
-                      first=report["first"], received_blocks=report["received"],
-                      bitmap=report["bits"].to_bytes(16, "little").hex(),
-                      status_authenticated=False)
+        result.update(attempt_fields(self.binding, self.candidate, self.original,
+                                     self.stock.tx_power, self.duty, report))
         return result
 
     def bind_resume(self, receipt):
-        if self.mode != "directed" or self.reupload_enabled:
-            raise Error("resume requires directed mode without REUPLOAD; no admission fallback")
-        if not isinstance(receipt, dict):
-            raise Error("resume requires an original attempt receipt")
-        generation, nonce = receipt.get("generation"), receipt.get("begin_nonce")
-        received, bitmap = receipt.get("received_blocks"), receipt.get("bitmap")
-        old_duty = receipt.get("normal_duty_percent")
-        if (type(generation) is not int or not self.binding.min_generation <= generation <= 0xFFFFFFFF
-                or not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
-                or not any(bytes.fromhex(nonce))
-                or type(received) is not int or not 0 <= received <= self.candidate.total
-                or type(old_duty) not in (int, float) or not math.isfinite(old_duty) or not 0 < old_duty <= 100
-                or not isinstance(bitmap, str) or not re.fullmatch(r"[0-9a-f]{32}", bitmap)):
-            raise Error("resume requires original generation, BEGIN nonce and bounded progress")
-        bits = int.from_bytes(bytes.fromhex(bitmap), "little")
-        if bits >> min(128, self.candidate.total) or bits.bit_count() > received:
-            raise Error("resume receipt bitmap/progress mismatch")
-        report = {"first": 0, "received": received, "bits": bits}
+        if self.mode not in ("directed", "background") or self.reupload_enabled:
+            raise Error("resume requires directed/background mode without REUPLOAD; no admission fallback")
+        generation, nonce, old_duty, report = resume_progress(receipt, self.binding, self.candidate)
         expected = self.attempt_receipt(report)
         expected.update(generation=generation, begin_nonce=nonce, normal_duty_percent=old_duty)
-        if receipt != expected:
+        if receipt != expected or (self.mode == "background" and old_duty != self.duty * 100):
             raise Error("resume receipt identity/image/manifest/profile/floor/route binding mismatch")
-        self.generation, self.begin_nonce, self.received = generation, bytes.fromhex(nonce), received
+        self.generation, self.begin_nonce, self.received = generation, bytes.fromhex(nonce), report["received"]
         self.previous[0] = report
-        self.emit("resume_expected", generation=generation, begin_nonce=nonce, received=received,
+        self.emit("resume_expected", generation=generation, begin_nonce=nonce, received=report["received"],
                   previous_duty_percent=old_duty, normal_duty_percent=self.duty * 100, status_authenticated=False)
 
     def capture_resume(self, original_radio, expected_generation, *, min_received=0):
@@ -1219,6 +1290,43 @@ class BackgroundCampaign:
             if not b.floor < candidate.counter:
                 raise Error("common candidate counter must exceed both measured target floors")
 
+    @staticmethod
+    def validate_resume_receipts(bindings, candidate, receipts, duty, *, profile=None, tx_power=None):
+        BackgroundCampaign.validate_bindings(bindings, candidate)
+        if not isinstance(receipts, (list, tuple)) or len(receipts) != 2:
+            raise Error("background resume requires both original schema-3 attempt receipts")
+        sender_profiles, powers = [], []
+        for binding, receipt in zip(bindings, receipts):
+            generation, nonce, old_duty, report = resume_progress(receipt, binding, candidate)
+            saved_profile, saved_power = receipt.get("sender_profile"), receipt.get("tx_power_dbm")
+            if not isinstance(saved_profile, list):
+                raise Error("background resume requires the original sender profile")
+            validate_profile(saved_profile)
+            if (tuple(saved_profile[:4]) != binding.normal
+                    or type(saved_power) is not int or not -128 <= saved_power <= 127
+                    or old_duty != duty * 100
+                    or (profile is not None and tuple(saved_profile) != tuple(profile))
+                    or (tx_power is not None and saved_power != tx_power)):
+                raise Error("background resume sender profile/TX power/duty budget mismatch")
+            expected = {"schema": RECEIPT_SCHEMA, "outcome": "attempt-observed-unsigned",
+                        "serial": binding.serial, "sender_public_key": binding.sender.hex(),
+                        "target_public_key": binding.target.hex(), "manifest_hash": candidate.digest.hex(),
+                        "counter": candidate.counter, "generation": generation, "begin_nonce": nonce,
+                        "installation_confirmed": False, "mode": "background", "request_route": "flood",
+                        "channel": 255}
+            expected.update(attempt_fields(binding, candidate, saved_profile, saved_power, duty, report))
+            expected["normal_duty_percent"] = old_duty
+            normal = receipt.get("normal_profile")
+            validate_profile(normal + [0] if isinstance(normal, list) else ())
+            if (receipt.keys() != expected.keys()
+                    or any(type(receipt[key]) is not type(value) or receipt[key] != value
+                           for key, value in expected.items())):
+                raise Error("background resume receipt identity/image/manifest/physical/floor/route binding mismatch")
+            sender_profiles.append(saved_profile)
+            powers.append(saved_power)
+        if sender_profiles[0] != sender_profiles[1] or powers[0] != powers[1]:
+            raise Error("background resume receipts must bind the same sender profile and TX power")
+
     def __init__(self, stock, bindings, candidate, profile, deadline, duty=0.02,
                  clock=time.monotonic, sleep=time.sleep, event_callback=None, attempt_callback=None):
         self.validate_bindings(bindings, candidate)
@@ -1235,6 +1343,7 @@ class BackgroundCampaign:
         self.outcomes = [None, None]
         self.stage = "admission"
         self.error = None
+        self.resuming = False
 
     def result(self, outcome, complete=False):
         return {"schema": 1, "mode": "background", "outcome": outcome, "operation_complete": complete,
@@ -1244,6 +1353,9 @@ class BackgroundCampaign:
                 "counter": self.transport.candidate.counter, "channel": 255, "target_count": 2,
                 "initial_block_transmissions": self.initial_sent,
                 "repair_block_transmissions": self.repair_sent,
+                "transfer_strategy": "shared-missing-union-resume" if self.resuming else "shared-initial-flood",
+                "usb_unsolicited_counts": dict(self.transport.stock.frames.unsolicited),
+                "usb_backlog": self.transport.stock.frames.backlog(),
                 "error": self.error,
                 "status_authenticated": False, "installation_confirmed": False,
                 "targets": [
@@ -1274,38 +1386,58 @@ class BackgroundCampaign:
                   total=wire.candidate.total, tx_evidence="aggregate-counters",
                   initial_block_transmissions=self.initial_sent, repair_block_transmissions=self.repair_sent)
 
-    def upload(self):
+    def upload(self, *, resume_receipts=None):
         current = 0
         try:
-            for current, target in enumerate(self.targets):
-                # Only one BEGIN per target. Missing permission/census never
-                # triggers another BEGIN, takeover or retirement operation.
-                report = target.authorize(retries=1)
-                while report["lifecycle"] == 2:
+            if resume_receipts is not None:
+                self.resuming = True
+                self.stage = "resume-validation"
+                current = None
+                self.validate_resume_receipts(
+                    [target.binding for target in self.targets], self.transport.candidate, resume_receipts,
+                    self.transport.duty, profile=self.transport.original, tx_power=self.transport.stock.tx_power)
+                for target, receipt in zip(self.targets, resume_receipts):
+                    target.bind_resume(receipt)
+                self.stage = "resume-census-preflight"
+                for current, target in enumerate(self.targets):
                     report = target.census()
-            self.stage = "initial-shared-flood"
-            current = None
-            keys = [target.binding.target.hex() for target in self.targets]
-            for index in range(self.transport.candidate.total):
-                self.send_block(index, initial=True, needed_by=keys)
+                    if report["lifecycle"] not in (3, 5):
+                        raise Error("background resume requires the same Receiving or READY attempt; no terminal fallback")
+                    target.emit("resume_matched_unsigned", generation=target.generation,
+                                received=report["received"], total=report["total"],
+                                begin_nonce=target.begin_nonce.hex(), status_authenticated=False)
+            else:
+                for current, target in enumerate(self.targets):
+                    # Only one BEGIN per target. Missing permission/census never
+                    # triggers another BEGIN, takeover or retirement operation.
+                    report = target.authorize(retries=1)
+                    while report["lifecycle"] == 2:
+                        report = target.census()
+                self.stage = "initial-shared-flood"
+                current = None
+                keys = [target.binding.target.hex() for target in self.targets]
+                for index in range(self.transport.candidate.total):
+                    self.send_block(index, initial=True, needed_by=keys)
             self.stage = "census-selective-repair"
             windows = tuple(range(0, self.transport.candidate.total, 128))
             while True:
                 all_ready = True
+                missing = {}
                 for first in windows:
-                    missing = {}
                     for current, target in enumerate(self.targets):
                         report = target.census(first)
                         all_ready &= report["lifecycle"] == 5
                         for index in range(first, min(first + 128, target.candidate.total)):
                             if not report["bits"] & (1 << (index - first)):
                                 missing.setdefault(index, []).append(target.binding.target.hex())
-                    for index, needed_by in sorted(missing.items()):
-                        current = None
-                        self.repairs[index] = self.repairs.get(index, 0) + 1
-                        if self.repairs[index] > 8:
-                            raise Error("shared RF block repair retries exhausted")
-                        self.send_block(index, initial=False, needed_by=needed_by)
+                # Verify the complete pair of bitmap surveys before signing any
+                # repair, including windows beyond the first receipt snapshot.
+                for index, needed_by in sorted(missing.items()):
+                    current = None
+                    self.repairs[index] = self.repairs.get(index, 0) + 1
+                    if self.repairs[index] > 8:
+                        raise Error("shared RF block repair retries exhausted")
+                    self.send_block(index, initial=False, needed_by=needed_by)
                 if all_ready:
                     break
             self.outcomes = [target.receipt("ready-observed-unsigned") for target in self.targets]
@@ -1322,6 +1454,7 @@ class BackgroundCampaign:
 
     def commit(self, receipt):
         c = self.transport.candidate
+        strategy = receipt.get("transfer_strategy", "shared-initial-flood") if isinstance(receipt, dict) else None
         if (not isinstance(receipt, dict) or receipt.get("schema") != 1
                 or receipt.get("mode") != "background" or receipt.get("target_count") != 2
                 or receipt.get("outcome") != "shared-ready-observed-unsigned"
@@ -1333,8 +1466,9 @@ class BackgroundCampaign:
                 or receipt.get("status_authenticated") is not False
                 or receipt.get("installation_confirmed") is not False
                 or not isinstance(receipt.get("targets"), list) or len(receipt["targets"]) != 2
+                or strategy not in ("shared-initial-flood", "shared-missing-union-resume")
                 or type(receipt.get("initial_block_transmissions")) is not int
-                or receipt["initial_block_transmissions"] != c.total
+                or receipt["initial_block_transmissions"] != (0 if strategy == "shared-missing-union-resume" else c.total)
                 or type(receipt.get("repair_block_transmissions")) is not int
                 or receipt["repair_block_transmissions"] < 0):
             raise Error("background COMMIT requires this common-image two-target READY receipt")
@@ -1352,6 +1486,7 @@ class BackgroundCampaign:
                 raise Error("background COMMIT individual identity/floor/attempt READY mismatch")
         self.initial_sent = receipt["initial_block_transmissions"]
         self.repair_sent = receipt["repair_block_transmissions"]
+        self.resuming = strategy == "shared-missing-union-resume"
         self.stage = "individual-signed-commit"
         for current, (target, ready) in enumerate(zip(self.targets, receipt["targets"])):
             try:
@@ -1366,10 +1501,10 @@ class BackgroundCampaign:
         return self.result("shared-signed-commits-not-install-confirmed" if complete
                            else "shared-campaign-incomplete", complete=complete)
 
-    def deploy(self, install_timeout=300):
+    def deploy(self, install_timeout=300, *, resume_receipts=None):
         if not math.isfinite(install_timeout) or install_timeout <= 0:
             raise Error("positive finite installation timeout required")
-        ready = self.upload()
+        ready = self.upload(resume_receipts=resume_receipts)
         if not ready["operation_complete"]:
             return ready
         committed = self.commit(ready)
@@ -1436,9 +1571,22 @@ def radio_guard(stock, binding, directory, restoring=False, mode="direct"):
             restore_radio(stock, original)
             private_write(directory / "restored.json", {"restored": True})
         else:
-            if stock.identify() != original:
-                raise Error(f"{mode} sender radio/repeat changed; not restored or retuned")
-            private_write(directory / "radio-unchanged.json", {"normal_profile_unchanged": True})
+            primary_error = sys.exc_info()[1]
+            readback_available = False
+            try:
+                current = stock.identify()
+                readback_available = True
+                if current != original:
+                    raise Error(f"{mode} sender radio/repeat changed; not restored or retuned")
+                private_write(directory / "radio-unchanged.json", {"normal_profile_unchanged": True})
+            except (Error, OSError, ValueError, TimeoutError) as exc:
+                if mode != "background":
+                    raise
+                private_write(directory / "radio-cleanup-failed.json",
+                              {"normal_profile_unchanged": False, "readback_available": readback_available,
+                               "error": str(exc)})
+                if primary_error is None:
+                    raise
 
 
 def restore_radio(stock, profile):
@@ -1558,6 +1706,50 @@ def termination_cleanup():
             signal.signal(signum, handler)
 
 
+def background_operation(stock, bindings, candidate, args, receipt):
+    campaign = result = None
+    try:
+        with radio_guard(stock, bindings[0], args.artifacts, mode="background") as profile:
+            campaign = BackgroundCampaign(
+                stock, bindings, candidate, profile, time.monotonic() + args.timeout,
+                args.normal_duty_percent / 100, event_callback=public_event,
+                attempt_callback=lambda observed: private_write(
+                    args.artifacts / ("attempt-" + observed["target_public_key"] + ".json"), observed))
+            try:
+                resume_options = {"resume_receipts": receipt} if args.resume_receipt is not None else {}
+                result = (campaign.deploy(args.install_timeout, **resume_options) if args.operation == "deploy" else
+                          campaign.upload(**resume_options) if args.operation == "upload" else campaign.commit(receipt))
+            except Cancelled as exc:
+                campaign.cancel(exc)
+                result = campaign.result("shared-campaign-cancelled")
+                raise
+    except (Error, OSError, ValueError, TimeoutError) as exc:
+        if campaign is not None:
+            stage = "radio-cleanup" if result is not None else campaign.stage
+            result = result or campaign.result("shared-campaign-incomplete")
+            result["operation_complete"] = False
+            if result["outcome"] != "shared-campaign-cancelled":
+                result["outcome"] = "shared-campaign-incomplete"
+            if result["error"] is None:
+                result["error"] = {"stage": stage, "reason": str(exc)}
+            failed_readback = args.artifacts / "radio-cleanup-failed.json"
+            if failed_readback.exists():
+                result["radio_cleanup"] = private_read(failed_readback)
+            else:
+                unchanged = (args.artifacts / "radio-unchanged.json").exists()
+                result["radio_cleanup"] = {"normal_profile_unchanged": unchanged,
+                                           "readback_available": unchanged}
+            result["usb_unsolicited_counts"] = dict(stock.frames.unsolicited)
+            result["usb_backlog"] = stock.frames.backlog()
+            private_write(args.artifacts / "result.json", result)
+            print(json.dumps(result, sort_keys=True))
+        raise
+    result["radio_cleanup"] = {"normal_profile_unchanged": True, "readback_available": True}
+    result["usb_unsolicited_counts"] = dict(stock.frames.unsolicited)
+    result["usb_backlog"] = stock.frames.backlog()
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("operation", choices=("upload", "commit", "deploy", "restore", "inspect"))
@@ -1581,7 +1773,9 @@ def main(argv=None):
     parser.add_argument("--install-timeout", type=float, default=300)
     parser.add_argument("--ready-receipt", type=Path)
     parser.add_argument("--resume-receipt", type=Path,
-                        help="directed upload/deploy only: original schema-3 attempt receipt; never sends BEGIN/REUPLOAD")
+                        help="directed/background upload/deploy: original schema-3 attempt receipt; no BEGIN/REUPLOAD")
+    parser.add_argument("--second-resume-receipt", type=Path,
+                        help="background resume only: second target's original owned 0600 schema-3 attempt receipt")
     retirement = parser.add_mutually_exclusive_group()
     retirement.add_argument("--reupload", action="store_true", help="upload only; binding allow_reupload:true, generation learned only from fresh RF census")
     retirement.add_argument("--reupload-generation", type=int, help="legacy upload-only strict expectation; signing still uses fresh RF-observed generation")
@@ -1600,16 +1794,18 @@ def main(argv=None):
     if args.mode == "background":
         if (args.operation not in ("upload", "commit", "deploy")
                 or args.second_target is None or args.second_binding is None
-                or args.reupload or args.reupload_generation is not None or args.resume_receipt is not None):
-            raise Error("background requires two explicit targets/bindings and upload/commit/deploy; no REUPLOAD/resume")
+                or args.reupload or args.reupload_generation is not None):
+            raise Error("background requires two explicit targets/bindings and upload/commit/deploy; no REUPLOAD")
         if args.second_target == args.target:
             raise Error("background requires exactly two distinct targets")
-    elif args.second_target is not None or args.second_binding is not None:
-        raise Error("second target/binding requires background mode")
+        if (args.resume_receipt is None) != (args.second_resume_receipt is None):
+            raise Error("background resume requires both --resume-receipt and --second-resume-receipt")
+    elif args.second_target is not None or args.second_binding is not None or args.second_resume_receipt is not None:
+        raise Error("second target/binding/resume receipt requires background mode")
     if args.resume_receipt is not None and (
-            args.operation not in ("upload", "deploy") or args.mode != "directed"
+            args.operation not in ("upload", "deploy") or args.mode not in ("directed", "background")
             or args.reupload or args.reupload_generation is not None):
-        raise Error("resume requires directed upload/deploy without REUPLOAD")
+        raise Error("resume requires directed/background upload/deploy without REUPLOAD")
     if args.routed_retry and args.mode == "direct":
         raise Error("routed-retry requires directed/background mode; no legacy fallback")
     if args.no_routed_retry and args.mode != "direct":
@@ -1661,12 +1857,20 @@ def main(argv=None):
             receipt = private_read(args.ready_receipt)
         elif args.resume_receipt is not None:
             receipt = private_read(args.resume_receipt)
+            if args.mode == "background":
+                receipt = [receipt, private_read(args.second_resume_receipt)]
+                BackgroundCampaign.validate_resume_receipts([binding, second_binding], candidate, receipt,
+                                                              args.normal_duty_percent / 100)
         args.artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
         if args.resume_receipt is not None:
-            encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            private_write(args.artifacts / "resume-source.json",
-                          {"source_receipt": str(args.resume_receipt.resolve()),
-                           "canonical_json_sha256": hashlib.sha256(encoded).hexdigest(), "receipt": receipt})
+            sources = ([(args.resume_receipt, receipt[0], "resume-source.json"),
+                        (args.second_resume_receipt, receipt[1], "second-resume-source.json")]
+                       if args.mode == "background" else [(args.resume_receipt, receipt, "resume-source.json")])
+            for source, saved, name in sources:
+                encoded = json.dumps(saved, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                private_write(args.artifacts / name,
+                              {"source_receipt": str(source.resolve()),
+                               "canonical_json_sha256": hashlib.sha256(encoded).hexdigest(), "receipt": saved})
     elif args.operation == "inspect":
         args.artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
     directory = args.artifacts
@@ -1676,6 +1880,7 @@ def main(argv=None):
     with termination_cleanup():
         with validated_stock_uart(binding, args.by_id, dtr=args.client_dtr) as stream:
             stock = Stock(Frames(stream), binding.sender, expected_name=binding.sender_name)
+            stock.frames.event_callback = public_event
             if args.operation == "inspect":
                 profile = stock.identify()
                 result = {"outcome": "read-only-identity-profile-match-no-rf-readiness",
@@ -1688,23 +1893,13 @@ def main(argv=None):
                 return
             result = None
             guard_options = {"mode": args.mode} if args.mode != "direct" else {}
-            with radio_guard(stock, binding, directory, args.operation == "restore", **guard_options) as profile:
-                if candidate and args.mode == "background":
-                    campaign = BackgroundCampaign(
-                        stock, [binding, second_binding], candidate, profile, time.monotonic() + args.timeout,
-                        args.normal_duty_percent / 100, event_callback=public_event,
-                        attempt_callback=lambda observed: private_write(
-                            directory / ("attempt-" + observed["target_public_key"] + ".json"), observed))
-                    try:
-                        result = (campaign.deploy(args.install_timeout) if args.operation == "deploy" else
-                                  campaign.upload() if args.operation == "upload" else campaign.commit(receipt))
-                    except Cancelled as exc:
-                        campaign.cancel(exc)
-                        result = campaign.result("shared-campaign-cancelled")
-                        private_write(directory / "result.json", result)
-                        print(json.dumps(result, sort_keys=True))
-                        raise
-                elif candidate:
+            if candidate and args.mode == "background":
+                result = background_operation(stock, [binding, second_binding], candidate, args, receipt)
+            else:
+                with radio_guard(stock, binding, directory, args.operation == "restore", **guard_options) as profile:
+                    if not candidate:
+                        print("Original stock radio and repeat setting restored and read back.")
+                        return
                     sender = Sender(stock, binding, candidate, profile, time.monotonic() + args.timeout,
                                     frequency, lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,

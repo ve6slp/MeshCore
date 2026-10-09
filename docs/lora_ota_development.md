@@ -230,7 +230,18 @@ administrator entry.
 
 This proves a full routed single-target installation, bounded real-loss repair
 and durable floor advancement, not authenticated RF status or a two-target
-shared-flood installation. The latter remains the next hardware experiment.
+shared-flood installation.
+
+The two-installer background experiment subsequently admitted both Sense
+targets to the same counter-3 image and 6,031-block descriptor. Its first sender
+run stopped after 187 common block transmissions because the USB response queue
+overflowed, before any COMMIT. With the host queue fix, strict paired resume
+matched both original schema-3 attempts using fresh censuses: generation 1 on
+the newly commissioned target and generation 3 on the existing target, with
+159/6,031 received blocks each. Their BEGIN nonces and previous floors were
+retained. Resume repairs the union of missing bits instead of restarting the
+full stream. Both installations and durable post-reboot qualification remain
+outstanding; the first-run log and partial artifacts are preserved unchanged.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:

@@ -493,8 +493,24 @@ The stock CLI also supports two-target `upload` and separate
 `commit --ready-receipt`; their aggregate outcomes are
 `shared-ready-observed-unsigned` and
 `shared-signed-commits-not-install-confirmed`, respectively. Neither means
-installation was confirmed. Background `--resume-receipt` is intentionally
-refused; the directed resume procedure below does not apply.
+installation was confirmed.
+
+Resume an interrupted shared transfer with **both** original owned schema-3
+attempt receipts. Set `OTA_STOCK_RESUME_RECEIPT` to target 1's receipt and add
+`--second-resume-receipt` for target 2 in `OTA_STOCK_ARGS`, retaining the same
+targets, bindings, image, board, role, counter, physical sender, normal profile,
+TX power and duty budget. Select a new artifact directory; do not overwrite the
+original run. Append the second receipt argument to the original
+`OTA_STOCK_ARGS`; preserve its second-target/binding and any physical anchor or
+sender-name arguments.
+
+Both receipts and fresh attempt-bound censuses must match each receiver's
+existing generation and BEGIN nonce. Resume supports Receiving or READY
+candidates, not committed, installing or Installed continuation. Missing,
+unpaired or stale receipts fail closed. It sends no BEGIN, ABORT, REUPLOAD or
+initial full-image pass: independent fresh bitmaps determine the union of
+missing blocks, then each target retains its own READY and signed COMMIT.
+The directed resume procedure below is separate.
 
 SIGINT/SIGTERM stops further OTA signing, transmissions and target processing,
 records `shared-campaign-cancelled` with `operation_complete:false`, and unwinds
@@ -604,8 +620,18 @@ one sample needed a census retry. These observations do not authenticate RF stat
 
 The stock sender's final radio/repeat/TX2 readbacks were unchanged, and only its
 temporary receiver authorization was revoked; the original administrator entry
-was preserved. Two-target shared-flood background collection and installation
-remain unverified; this completed campaign used one installer and one relay.
+was preserved. This completed campaign used one installer and one relay.
+
+The subsequent two-installer background campaign admitted both Sense targets
+against the same 506,524-byte image, counter 3 and 6,031-block descriptor. Its
+first host run failed with a USB response-backlog overflow after 187 common
+block transmissions; neither receiver was committed. After the host fix, strict
+paired resume used both original schema-3 receipts. Fresh censuses matched the
+original independent generations and BEGIN nonces and reported 159/6,031
+received blocks on each target. The resume sends only union-bitmap repairs,
+without a new BEGIN or receiver reset. Shared-flood completion, both durable
+installations and post-reboot qualification remain outstanding; these
+admission and resume observations are not installation proof.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
