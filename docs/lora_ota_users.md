@@ -636,11 +636,18 @@ admission and resume observations are not installation proof.
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
 long transfer. The uploader discards only well-formed notifications of the
-known MeshCore 1.17.1 kinds it never uses, so a busy mesh cannot fill its
-256-frame response queue. It keeps received OTA packets (census replies and
-lease acknowledgments), command replies, errors and signatures. A malformed
-known notification is a fatal error, and unknown or future notification kinds
-still count against the bound and fail explicitly if they accumulate.
+known MeshCore 1.17.1 kinds it never uses. Its RF-log demultiplexer also validates
+the payload shape of echoed OTA traffic, including signed blocks and retry
+envelopes, then counts and removes non-consumed echoes from the USB response
+queue. It does not suppress those packets on air or claim their signatures
+were authenticated. Census replies and lease/profile acknowledgments remain
+pending, as do command replies, errors and requested signatures.
+
+Unknown or malformed OTA shapes are not discarded by this demultiplexer;
+normal freshness and protocol checks still apply. Malformed recognized ordinary
+notifications and invalid USB frame lengths fail explicitly. The bounds remain
+176 bytes per frame and 256 pending responses. Diagnostic events contain
+bounded metadata and exact final counters, not plaintext payloads.
 
 Direct stock captures the sender's exact original radio/repeat settings and TX power,
 persists `original-radio.json` before changing radio, accounts for physical TX
