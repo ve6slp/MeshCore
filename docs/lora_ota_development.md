@@ -56,6 +56,16 @@ checks refusal of old companions and receivers before any upload, the default
 reliable framing parser, and a stock session with more than 256 interleaved
 ordinary notifications.
 
+`make test-ota-stock-companion` also exercises exactly-two-target stock
+background collection: one shared initial block flood, union-bitmap selective
+repair, independent nonce-bound COMMITs, target/session mismatches and explicit
+partial-failure artifacts. SIGINT/SIGTERM during admission, READY census,
+COMMIT signing or Installed polling must prevent subsequent OTA operations
+while retaining prior outcomes and completing profile/UART cleanup. Stock
+background uses public channel-255 RAW floods, not the native host's encrypted
+multicast-channel mechanism. Software coverage does not qualify the pending
+two-target hardware experiment or an installer role migration.
+
 `test-ota-disabled` (environment `native_lora_ota_disabled`) compiles the real
 `Mesh`, `Dispatcher`, `Packet` and `StaticPoolPacketManager` with
 `MESHCORE_LORA_OTA=0` and checks that ordinary routing, priorities, airtime

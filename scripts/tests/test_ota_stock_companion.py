@@ -29,6 +29,7 @@ OWNER_PRIVATE = Ed25519PrivateKey.from_private_bytes(bytes([1]) * 32)
 TARGET_PRIVATE = Ed25519PrivateKey.from_private_bytes(bytes([2]) * 32)
 OWNER = OWNER_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 TARGET = TARGET_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+TARGET2 = Ed25519PrivateKey.from_private_bytes(bytes([3]) * 32).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 RELAY = bytes.fromhex("739194" + "42" * 29)
 NORMAL = (918000, 62500, 7, 5, 1)
 STOCK_ID = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
@@ -59,12 +60,12 @@ CHALLENGE = 0x5EED0001
 
 
 def census(c, first=0, received=None, generation=10, lifecycle=None, floor=4, nonce=NONCE,
-           challenge=CHALLENGE):
+           challenge=CHALLENGE, target=TARGET):
     if received is None:
         received = set(range(c.total))
     bits = sum(1 << (i - first) for i in received if first <= i < first + 128)
     ready = len(received) == c.total
-    return (b"\x0b" + TARGET + c.digest + struct.pack(">H", first) + bits.to_bytes(16, "little")
+    return (b"\x0b" + target + c.digest + struct.pack(">H", first) + bits.to_bytes(16, "little")
             + struct.pack(">HHBIBBII", len(received), c.total, 3 if ready else 1, generation,
                           (5 if ready else 3) if lifecycle is None else lifecycle, 1, floor, c.counter)
             + bytes([ota.WIRE_VERSION]) + nonce + struct.pack(">I", challenge))
@@ -241,7 +242,7 @@ class FakeSerial:
             elif subtype == 2:
                 self.reply(b"\x18\x02" + struct.pack("<IIIIIII", 0, self.sent, 0, self.direct, 0, 0, 0))
         elif cmd == 65:
-            assert payload[2] == 0x32
+            assert payload[2] in (0x31, 0x32)
             encoded = payload[3]
             width, count = (encoded >> 6) + 1, encoded & 63
             assert width <= 3 and width * count <= 64
@@ -254,7 +255,7 @@ class FakeSerial:
                 self.queue -= 1
                 if not self.tx_fails:
                     self.sent += 1
-                    self.direct += 1
+                    self.direct += payload[2] == 0x32
                     self.remote(rf)
             self.schedule(0.15, finish)
         else:
@@ -2476,12 +2477,22 @@ class ArtifactTests(Scratch):
 
     def test_signal_cleanup_runs_restore(self):
         _, stream, stock, _ = setup()
-        with self.assertRaisesRegex(ota.Error, "signal"):
+        with self.assertRaisesRegex(ota.Cancelled, "signal"):
             with ota.termination_cleanup():
                 with ota.radio_guard(stock, BINDING, self.directory):
                     stock.radio((919000, 250000, 5, 5, 0))
                     signal.raise_signal(signal.SIGTERM)
         self.assertEqual(stream.profile, NORMAL)
+
+    def test_directed_signal_cleanup_preserves_normal_profile_without_retuning(self):
+        _, stream, stock, sender = routed_setup()
+        with self.assertRaisesRegex(ota.Cancelled, "signal"):
+            with ota.termination_cleanup():
+                with ota.radio_guard(stock, sender.binding, self.directory, mode="directed"):
+                    signal.raise_signal(signal.SIGINT)
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertTrue(ota.private_read(self.directory / "radio-unchanged.json")["normal_profile_unchanged"])
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
 
     def test_root_reupload_binding_requires_exact_next_generation_and_upload_only(self):
         value = {"schema": 1, "authorized": True, "serial": BINDING.serial,
@@ -2506,6 +2517,523 @@ class ArtifactTests(Scratch):
             ota.private_write(invalid, dict(value, reupload_generation=generation, min_generation=minimum))
             with self.assertRaises(ota.Error):
                 ota.Binding.load(invalid, BINDING.serial, OWNER, TARGET)
+
+
+class FleetSerial(FakeSerial):
+    """Two independent receivers hear each single physical stock flood."""
+    def __init__(self, clock, c):
+        super().__init__(clock, c)
+        self.nodes = {
+            TARGET: {"received": set(), "floor": 4, "generation": 10, "nonce": NONCE,
+                     "admitted": False, "permission": True, "commits": 0, "lifecycle": 8},
+            TARGET2: {"received": set(), "floor": 3, "generation": 12, "nonce": bytes([0xAB]) * 16,
+                      "admitted": False, "permission": True, "commits": 0, "lifecycle": 8},
+        }
+        self.losses = {TARGET: {}, TARGET2: {}}
+        self.deliveries = []
+        self.seen = set()
+        self.report_mutator = None
+        self.reply_attempt_delta = 0
+
+    def remote(self, wire):
+        raw = self.raw_packets[-1]
+        assert raw[:2] == b"\x31\x00"
+        attempt, frame = ota.retry_payload(wire)
+        assert attempt is not None and frame is not None
+        assert attempt not in self.seen
+        self.seen.add(attempt)
+        c = self.candidate
+        if frame[0] == 8:
+            assert frame[9:41] == OWNER and frame[41:100] == c.canonical
+            ota.verify(OWNER, c.canonical, frame[100:])
+            for key, node in self.nodes.items():
+                if frame[1:9] == hashlib.sha256(key).digest()[:8] and node["permission"]:
+                    node["admitted"] = True
+        elif frame[0] == 10:
+            key = frame[1:33]
+            node = self.nodes[key]
+            assert frame[33:65] == c.digest
+            if not node["admitted"]:
+                return
+            first = struct.unpack_from(">H", frame, 65)[0]
+            installed = node["commits"] and node["lifecycle"] == 8
+            report = census(c, first, node["received"], node["generation"],
+                            lifecycle=node["lifecycle"] if node["commits"] else None,
+                            floor=c.counter if installed else node["floor"], nonce=node["nonce"], target=key)
+            if self.report_mutator is not None:
+                report = self.report_mutator(key, report)
+            reply = ota.retry_frame(report, attempt + self.reply_attempt_delta)
+            self.schedule(0.1, lambda: self.reply(b"\x88\x08\x40\x31\x00" + reply))
+        elif frame[0] == 1:
+            index = struct.unpack_from(">H", frame, 5)[0]
+            message, prefix = ota.block_message(c, index)
+            assert frame[:-64] == prefix
+            ota.verify(OWNER, message, frame[-64:])
+            heard = []
+            for key, node in self.nodes.items():
+                if not node["admitted"] or not node["permission"]:
+                    continue
+                heard.append(key)
+                loss = self.losses[key].get(index, 0)
+                if loss:
+                    self.losses[key][index] = loss - 1
+                else:
+                    node["received"].add(index)
+            self.deliveries.append((attempt, index, tuple(heard)))
+        elif frame[0] == 3:
+            key = frame[1:33]
+            node = self.nodes[key]
+            assert node["received"] == set(range(c.total))
+            assert frame[33:65] == c.digest and struct.unpack_from(">I", frame, 65)[0] == c.counter
+            ota.verify(OWNER, ota.COMMIT_DOMAIN + frame[1:89], frame[89:])
+            if (node["permission"] and frame[69:89] == struct.pack(">I", node["generation"]) + node["nonce"]):
+                node["commits"] += 1
+        else:
+            raise AssertionError(f"background must not send lease/retirement kind {frame[0]}")
+
+
+def fleet_setup(c=None, duty=0.02):
+    c = c or candidate(84 * 6)
+    clock = Clock()
+    stream = FleetSerial(clock, c)
+    stock = ota.Stock(ota.Frames(stream, clock), OWNER, clock, clock.sleep)
+    approved = [binding(c), replace(binding(c), target=TARGET2, floor=3, min_generation=12)]
+    campaign = ota.BackgroundCampaign(stock, approved, c, NORMAL, clock() + 10000, duty, clock, clock.sleep)
+    return clock, stream, stock, campaign
+
+
+class BackgroundTests(Scratch):
+    def test_single_initial_flood_and_union_repairs_serve_both_independent_bitmaps(self):
+        _, stream, _, campaign = fleet_setup()
+        stream.losses = {TARGET: {0: 1, 4: 1}, TARGET2: {2: 1, 4: 1}}
+        events = []
+        campaign.transport.event_callback = events.append
+        for target in campaign.targets:
+            target.event_callback = events.append
+        result = campaign.deploy(300)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(result["outcome"], "shared-native-installed-reported-unsigned")
+        self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]), (6, 3))
+        self.assertEqual([index for _, index, _ in stream.deliveries], [0, 1, 2, 3, 4, 5, 0, 2, 4])
+        self.assertTrue(all(heard == (TARGET, TARGET2) for _, _, heard in stream.deliveries))
+        self.assertEqual(len(stream.seen), len(stream.raw_packets))
+        self.assertEqual((stream.sent, stream.direct), (len(stream.raw_packets), 0))
+        for node in stream.nodes.values():
+            self.assertEqual(node["received"], set(range(6)))
+            self.assertEqual(node["commits"], 1)
+        self.assertEqual([(r["target_public_key"], r["generation"], r["begin_nonce"], r["confirmed_floor"])
+                          for r in result["targets"]],
+                         [(TARGET.hex(), 10, NONCE.hex(), 5), (TARGET2.hex(), 12, (bytes([0xAB]) * 16).hex(), 5)])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertFalse(result["status_authenticated"])
+        self.assertTrue(all(r["native_installed"] and not r["status_authenticated"]
+                            and not r["installation_confirmed"] for r in result["targets"]))
+        repairs = [e for e in events if e["event"] == "shared_block_sent" and not e["initial"]]
+        self.assertEqual([e["needed_by"] for e in repairs],
+                         [[TARGET.hex()], [TARGET2.hex()], [TARGET.hex(), TARGET2.hex()]])
+        census_events = [e for e in events if e["event"] == "census_parsed"]
+        self.assertEqual({e["target_public_key"] for e in census_events}, {TARGET.hex(), TARGET2.hex()})
+        self.assertTrue(all(len(e["bitmap"]) == 32 and not e["status_authenticated"] for e in census_events))
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertEqual(stream.tx_power, 2)
+        self.assertTrue(all(cmd[0] != 11 and (cmd[0] != 65 or cmd[1] == 250) for cmd in stream.commands))
+
+    def test_multiple_bitmap_windows_tail_loss_converges_and_repair_is_common(self):
+        c = candidate(84 * 130)
+        _, stream, _, campaign = fleet_setup(c, duty=0.8)
+        stream.losses = {TARGET: {129: 1}, TARGET2: {1: 1, 129: 1}}
+        result = campaign.upload()
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]), (130, 2))
+        self.assertEqual([i for _, i, _ in stream.deliveries][130:], [1, 129])
+        self.assertEqual(stream.nodes[TARGET]["received"], set(range(130)))
+        self.assertEqual(stream.nodes[TARGET2]["received"], set(range(130)))
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_one_permission_rejection_never_rebegins_or_floods_image_or_claims_global_success(self):
+        _, stream, _, campaign = fleet_setup()
+        stream.nodes[TARGET2]["permission"] = False
+        result = campaign.deploy()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(result["targets"][1]["outcome"], "failed")
+        self.assertFalse(stream.deliveries)
+        auth = [raw for raw in stream.raw_packets if raw[7] == 8]
+        self.assertEqual(len(auth), 2)
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_session_manifest_nonce_generation_floor_mismatches_fail_before_any_commit(self):
+        changes = ((33, b"\x99" * 32), (88, struct.pack(">I", 13)),
+                   (94, struct.pack(">I", 1)), (103, b"\x00" * 16), (103, b"\xCD" * 16))
+        for offset, replacement in changes:
+            _, stream, _, campaign = fleet_setup(duty=0.8)
+            def mutate(key, report):
+                if key == TARGET2 and stream.deliveries:
+                    return report[:offset] + replacement + report[offset + len(replacement):]
+                return report
+            stream.report_mutator = mutate
+            with self.subTest(offset=offset, value=replacement.hex()):
+                result = campaign.deploy()
+                self.assertFalse(result["operation_complete"])
+                self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_other_target_or_stale_attempt_report_cannot_admit_second_session(self):
+        for mutation in ("target", "attempt"):
+            _, stream, _, campaign = fleet_setup(duty=0.8)
+            if mutation == "target":
+                stream.report_mutator = lambda key, frame: (
+                    frame[:1] + TARGET + frame[33:] if key == TARGET2 else frame)
+            else:
+                stream.reply_attempt_delta = 1
+            result = campaign.upload()
+            self.assertFalse(result["operation_complete"])
+            self.assertFalse(stream.deliveries)
+            self.assertIsNone(campaign.targets[1].begin_nonce)
+
+    def test_permanent_loss_is_bounded_and_never_signs_a_commit(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        stream.losses[TARGET2][3] = 100
+        result = campaign.deploy()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]), (6, 8))
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_one_native_failure_keeps_other_installed_outcome_without_global_success(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        stream.nodes[TARGET]["lifecycle"] = 10
+        result = campaign.deploy()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual([r["outcome"] for r in result["targets"]], ["failed", "native-installed-reported-unsigned"])
+        self.assertIn("FAILED", result["targets"][0]["error"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertFalse(result["status_authenticated"])
+        self.assertEqual([n["commits"] for n in stream.nodes.values()], [1, 1])
+
+    def test_installed_requires_exact_counter_floor_and_same_begin_nonce(self):
+        for change in ("floor", "nonce", "generation"):
+            _, stream, _, campaign = fleet_setup(duty=0.8)
+            def mutate(key, frame):
+                if key != TARGET2 or not stream.nodes[key]["commits"]:
+                    return frame
+                offset, value = {"floor": (94, struct.pack(">I", 4)), "nonce": (103, bytes([0xEE]) * 16),
+                                 "generation": (88, struct.pack(">I", 13))}[change]
+                return frame[:offset] + value + frame[offset + len(value):]
+            stream.report_mutator = mutate
+            result = campaign.deploy()
+            self.assertFalse(result["operation_complete"])
+            self.assertEqual([r["outcome"] for r in result["targets"]], ["native-installed-reported-unsigned", "failed"])
+
+    def test_fresh_ready_before_each_commit_rejects_one_changed_attempt_independently(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        ready = campaign.upload()
+        stream.nodes[TARGET]["nonce"] = bytes([0xEF]) * 16
+        result = campaign.commit(ready)
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual([node["commits"] for node in stream.nodes.values()], [0, 1])
+        self.assertEqual(result["targets"][1]["outcome"], "signed-commit-aggregate-tx-observed-not-install-confirmed")
+
+    def test_separate_commit_does_not_authorize_or_send_data_and_prevalidates_both_receipts(self):
+        _, stream, stock, campaign = fleet_setup(duty=0.8)
+        ready = campaign.upload()
+        fresh = ota.BackgroundCampaign(stock, [target.binding for target in campaign.targets],
+                                       campaign.transport.candidate, NORMAL, campaign.transport.deadline, 0.8,
+                                       stream.clock, stream.clock.sleep)
+        bad = dict(ready, targets=[ready["targets"][0], dict(ready["targets"][1], target_public_key=TARGET.hex())])
+        before = len(stream.raw_packets)
+        with self.assertRaisesRegex(ota.Error, "individual"):
+            fresh.commit(bad)
+        self.assertEqual(len(stream.raw_packets), before)
+        result = fresh.commit(ready)
+        self.assertTrue(result["operation_complete"])
+        kinds = [raw[7] for raw in stream.raw_packets[before:]]
+        self.assertEqual(kinds, [10, 3, 10, 3])
+        self.assertFalse(result["installation_confirmed"])
+
+    def test_common_endpoint_image_profile_counter_gates_before_any_usb_or_rf(self):
+        _, stream, stock, campaign = fleet_setup()
+        first, second = [target.binding for target in campaign.targets]
+        for wrong in (replace(second, target=TARGET), replace(second, floor=5),
+                      replace(second, manifest_hash=bytes([9]) * 32),
+                      replace(second, image_hash=bytes([9]) * 32),
+                      replace(second, normal=(918000, 250000, 7, 5)), replace(second, sender=TARGET2)):
+            with self.assertRaises(ota.Error):
+                ota.BackgroundCampaign(stock, [first, wrong], campaign.transport.candidate, NORMAL, 10000)
+        self.assertFalse(stream.commands)
+
+    def test_default_budget_is_one_shared_two_percent_stream_without_retune(self):
+        clock, stream, stock, campaign = fleet_setup()
+        with ota.radio_guard(stock, campaign.targets[0].binding, self.directory, mode="background"):
+            result = campaign.upload()
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(campaign.transport.duty, 0.02)
+        for (before, profile, _), (after, _, _) in zip(stream.rf_packets, stream.rf_packets[1:]):
+            self.assertEqual(profile, NORMAL)
+            self.assertGreater(after - before, 0.15 * 49)
+        self.assertGreater(clock(), 1)
+        self.assertTrue(ota.private_read(self.directory / "radio-unchanged.json")["normal_profile_unchanged"])
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_no_unconfirmed_broadcast_or_attempt_wrap_is_counted_successfully(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        stream.tx_fails = True
+        result = campaign.upload()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(result["initial_block_transmissions"], 0)
+        self.assertEqual(len(stream.raw_packets), 1)
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        campaign.transport.next_attempt = 0xFFFFFFFF
+        result = campaign.upload()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(len(stream.raw_packets), 1)
+
+    def test_initial_uses_normal_attempt_and_common_repairs_use_repair_attempt(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        stream.losses[TARGET][1] = 1
+        result = campaign.upload()
+        self.assertTrue(result["operation_complete"])
+        blocks = [raw[2:] for raw in stream.raw_packets if raw[7] == 1]
+        self.assertEqual([wire[0] for wire in blocks], [17] * 6 + [18])
+        self.assertEqual(blocks[1][5:], blocks[-1][5:])
+        self.assertNotEqual(blocks[1][1:5], blocks[-1][1:5])
+
+    def test_one_commit_permission_revocation_cannot_fabricate_installed(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        original = stream.remote
+        def revoke(wire):
+            _, frame = ota.retry_payload(wire)
+            if frame[0] == 3 and frame[1:33] == TARGET2:
+                stream.nodes[TARGET2]["permission"] = False
+                stream.nodes[TARGET2]["admitted"] = False
+            original(wire)
+        stream.remote = revoke
+        result = campaign.deploy(100)
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual([node["commits"] for node in stream.nodes.values()], [1, 0])
+        self.assertEqual([r["outcome"] for r in result["targets"]], ["native-installed-reported-unsigned", "failed"])
+        self.assertFalse(result["installation_confirmed"])
+
+    def test_shared_transport_failure_after_ready_never_attempts_later_rf_writes(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        ready = campaign.upload()
+        before = len(stream.raw_packets)
+        stream.tx_fails = True
+        result = campaign.commit(ready)
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(len(stream.raw_packets), before + 1)
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_normal_profile_drift_stops_shared_flood_without_radio_mutation(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        original = stream.remote
+        def drift(wire):
+            original(wire)
+            if stream.deliveries:
+                stream.profile = (918000, 250000, 7, 5, 1)
+        stream.remote = drift
+        result = campaign.upload()
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(result["initial_block_transmissions"], 1)
+        self.assertIn("profile changed", result["error"]["reason"])
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_pending_aborted_target_is_never_retired_or_reuploaded(self):
+        _, stream, _, campaign = fleet_setup(duty=0.8)
+        stream.report_mutator = lambda key, frame: (
+            frame[:87] + b"\x05" + frame[88:92] + b"\x09" + frame[93:] if key == TARGET2 else frame)
+        result = campaign.upload()
+        self.assertFalse(result["operation_complete"])
+        self.assertIn("explicit REUPLOAD", result["targets"][1]["error"])
+        self.assertFalse(stream.deliveries)
+        self.assertFalse(any(raw[7] in (4, 12, 14, 15) for raw in stream.raw_packets))
+
+    def cli_inputs(self):
+        clock, stream, _, campaign = fleet_setup(duty=0.8)
+        paths = []
+        for target in campaign.targets:
+            b = target.binding
+            path = self.directory / (b.target.hex() + ".json")
+            ota.private_write(path, {"schema": 1, "serial": b.serial,
+                                     "sender_public_key": b.sender.hex(), "target_public_key": b.target.hex(),
+                                     "floor": b.floor, "min_generation": b.min_generation,
+                                     "normal_profile": list(b.normal)})
+            paths.append(path)
+        image = self.directory / "ordinary.bin"
+        manifest = self.directory / "canonical.bin"
+        image.write_bytes(campaign.transport.candidate.image)
+        manifest.write_bytes(campaign.transport.candidate.canonical)
+        args = ["--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(), "--binding", str(paths[0]),
+                "--second-target", TARGET2.hex(), "--second-binding", str(paths[1]),
+                "--mode", "background", "--image", str(image), "--manifest", str(manifest)]
+        return args, clock, stream
+
+    @contextmanager
+    def cli_transport(self, clock, stream, campaigns=None, on_close=None):
+        @contextmanager
+        def uart(*args, **kwargs):
+            try:
+                yield stream
+            finally:
+                if on_close is not None:
+                    on_close()
+        frames, stock, fleet = ota.Frames, ota.Stock, ota.BackgroundCampaign
+        def campaign(*args, **kwargs):
+            instance = fleet(*args, clock=clock, sleep=clock.sleep, **kwargs)
+            if campaigns is not None:
+                campaigns.append(instance)
+            return instance
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                patch.object(ota, "Stock", side_effect=lambda f, key, **kw: stock(f, key, clock, clock.sleep, **kw)), \
+                patch.object(ota, "BackgroundCampaign", side_effect=campaign), \
+                patch.object(ota.time, "monotonic", clock), redirect_stdout(io.StringIO()):
+            yield
+
+    def cancelled_cli(self, phase, signum):
+        args, clock, stream = self.cli_inputs()
+        campaigns, closed, interrupted = [], [], {}
+        directory = self.directory / "cancelled"
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+        receive, write = ota.Frames.receive, stream.write
+        def cancel():
+            interrupted.update(commands=len(stream.commands), raw_packets=len(stream.raw_packets),
+                               commits=[node["commits"] for node in stream.nodes.values()])
+            signal.raise_signal(signum)
+            self.fail("cancellation did not interrupt execution")
+        def wait(frames, *args, **kwargs):
+            target = kwargs.get("target", args[4] if len(args) > 4 else None)
+            if (not interrupted and target == TARGET and campaigns[0].stage == phase
+                    and phase != "commit-signing"):
+                cancel()
+            return receive(frames, *args, **kwargs)
+        def signing(wire):
+            result = write(wire)
+            if (not interrupted and phase == "commit-signing" and wire[3] == 34
+                    and bytes(stream.signing).startswith(ota.COMMIT_DOMAIN + TARGET)):
+                cancel()
+            return result
+        stream.write = signing
+        with patch.object(ota.Frames, "receive", wait), \
+                self.cli_transport(clock, stream, campaigns, lambda: closed.append(True)), \
+                self.assertRaisesRegex(ota.Cancelled, f"signal {signum}"):
+            ota.main(["deploy"] + args + ["--artifacts", str(directory), "--board", "xiao_nrf52840",
+                                         "--role-id", "0", "--counter", "5", "--normal-duty-percent", "80"])
+        self.assertTrue(interrupted)
+        self.assertEqual(closed, [True])
+        self.assertEqual({sig: signal.getsignal(sig) for sig in handlers}, handlers)
+        self.assertTrue(campaigns[0].transport.failed_tx)
+        self.assertEqual(len(stream.raw_packets), interrupted["raw_packets"])
+        self.assertEqual([node["commits"] for node in stream.nodes.values()], interrupted["commits"])
+        self.assertTrue(all(command[0] not in (11, 33, 34, 35, 65)
+                            for command in stream.commands[interrupted["commands"]:]))
+        self.assertTrue(ota.private_read(directory / "radio-unchanged.json")["normal_profile_unchanged"])
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertEqual(stream.tx_power, 2)
+        result = ota.private_read(directory / "result.json")
+        self.assertEqual(result["outcome"], "shared-campaign-cancelled")
+        self.assertFalse(result["operation_complete"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertFalse(result["status_authenticated"])
+        self.assertTrue(result["error"]["cancelled"])
+        self.assertEqual(result["error"]["stage"],
+                         "individual-signed-commit" if phase == "commit-signing" else phase)
+        expected_commits = [1, 1] if phase == "individual-installed-status" else [0, 0]
+        self.assertEqual(interrupted["commits"], expected_commits)
+        expected_outcome = ("signed-commit-aggregate-tx-observed-not-install-confirmed"
+                            if phase == "individual-installed-status" else
+                            "not-completed" if phase == "admission" else "ready-observed-unsigned")
+        self.assertEqual([target["outcome"] for target in result["targets"]], [expected_outcome] * 2)
+
+    def test_cancel_upload_census_never_admits_or_services_second_target(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            directory = self.directory / str(signum)
+            directory.mkdir()
+            original_directory = self.directory
+            self.directory = directory
+            try:
+                with self.subTest(signum=signum):
+                    self.cancelled_cli("admission", signum)
+            finally:
+                self.directory = original_directory
+
+    def test_cancel_first_ready_census_never_advances_to_second_target(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            directory = self.directory / str(signum)
+            directory.mkdir()
+            original_directory = self.directory
+            self.directory = directory
+            try:
+                with self.subTest(signum=signum):
+                    self.cancelled_cli("individual-signed-commit", signum)
+            finally:
+                self.directory = original_directory
+
+    def test_cancel_first_commit_signing_never_signs_or_commits_second_target(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            directory = self.directory / str(signum)
+            directory.mkdir()
+            original_directory = self.directory
+            self.directory = directory
+            try:
+                with self.subTest(signum=signum):
+                    self.cancelled_cli("commit-signing", signum)
+            finally:
+                self.directory = original_directory
+
+    def test_cancel_installed_poll_stops_both_targets_and_retains_prior_commit_outcomes(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            directory = self.directory / str(signum)
+            directory.mkdir()
+            original_directory = self.directory
+            self.directory = directory
+            try:
+                with self.subTest(signum=signum):
+                    self.cancelled_cli("individual-installed-status", signum)
+            finally:
+                self.directory = original_directory
+
+    def test_cli_upload_and_separate_commit_persist_two_attempts_and_unsigned_outcomes(self):
+        args, clock, stream = self.cli_inputs()
+        upload_dir, commit_dir = self.directory / "upload", self.directory / "commit"
+        with self.cli_transport(clock, stream):
+            ota.main(["upload"] + args + ["--artifacts", str(upload_dir)])
+            ota.main(["commit"] + args + ["--artifacts", str(commit_dir),
+                                         "--ready-receipt", str(upload_dir / "result.json")])
+        self.assertEqual([n["commits"] for n in stream.nodes.values()], [1, 1])
+        result = ota.private_read(commit_dir / "result.json")
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(result["initial_block_transmissions"], 6)
+        self.assertFalse(result["installation_confirmed"])
+        for key in (TARGET, TARGET2):
+            receipt = ota.private_read(upload_dir / ("attempt-" + key.hex() + ".json"))
+            self.assertEqual(receipt["target_public_key"], key.hex())
+            self.assertEqual(receipt["normal_duty_percent"], 2)
+
+    def test_cli_deploy_partial_failure_is_persistent_and_fails_closed(self):
+        args, clock, stream = self.cli_inputs()
+        stream.nodes[TARGET2]["lifecycle"] = 10
+        args = [item for item in args]
+        args += ["--board", "xiao_nrf52840", "--role-id", "0", "--counter", "5"]
+        directory = self.directory / "deploy"
+        with self.cli_transport(clock, stream), self.assertRaisesRegex(ota.Error, "incomplete"):
+            ota.main(["deploy"] + args + ["--artifacts", str(directory), "--normal-duty-percent", "80"])
+        result = ota.private_read(directory / "result.json")
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual([r["outcome"] for r in result["targets"]], ["native-installed-reported-unsigned", "failed"])
+        self.assertTrue(ota.private_read(directory / "radio-unchanged.json")["normal_profile_unchanged"])
+
+    def test_cli_safety_gates_reject_bad_multimode_or_fallback_before_usb(self):
+        args, _, _ = self.cli_inputs()
+        for flags in (["--reupload"], ["--reupload-generation", "9"], ["--resume-receipt", "nope"],
+                      ["--relay-key", RELAY.hex()], ["--lease-ms", "60000"], ["--frequency-khz", "919000"],
+                      ["--no-routed-retry"], ["--channel", "0"], ["--second-target", TARGET.hex()],
+                      ["--mode", "directed", "--relay-key", RELAY.hex()]):
+            with patch.object(ota, "validated_stock_uart") as uart, self.assertRaises(ota.Error):
+                ota.main(["upload"] + args + ["--artifacts", str(self.directory / "NOT_CREATED")] + flags)
+            uart.assert_not_called()
+        for operation in ("inspect", "restore"):
+            with patch.object(ota, "validated_stock_uart") as uart, self.assertRaises(ota.Error):
+                ota.main([operation] + args + ["--artifacts", str(self.directory / "NOT_CREATED")])
+            uart.assert_not_called()
 
 
 class GoldenCppTests(Scratch):
@@ -2577,6 +3105,10 @@ int main() {
   n=encodeOtaRetryAttempt(0x11223346,inner,inner_n,out,sizeof(out));dump(out,n);
   routed.header=0x31;routed.setPathHashSizeAndCount(1,1);routed.payload_len=n;
   std::memcpy(routed.payload,out,n);n=routed.writeTo(wire);dump(wire,n);
+  encodeOtaSignedBlockFrame(1,hash,0x1234,data,84,sig,inner,sizeof(inner),inner_n);
+  n=encodeOtaRetryAttempt(0x11223347,inner,inner_n,out,sizeof(out));
+  routed.header=0x31;routed.setPathHashSizeAndCount(1,0);routed.payload_len=n;
+  std::memcpy(routed.payload,out,n);n=routed.writeTo(wire);dump(wire,n);
 }'''
         path = self.directory / "golden.cpp"
         path.write_text(cpp)
@@ -2618,6 +3150,7 @@ int main() {
             ota.retry_frame(block_prefix + signature, 0x11223345, repair=True),
             ota.retry_frame(report, 0x11223346),
             b"\x31\x01" + RELAY[:1] + ota.retry_frame(report, 0x11223346),
+            ota.packet(ota.retry_frame(block_prefix + signature, 0x11223347), route=1),
         ]
         self.assertEqual(actual, [blob.hex() for blob in expected])
         # Exact wire sizes and the 176-byte stock frame ceiling.

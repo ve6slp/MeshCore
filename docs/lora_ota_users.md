@@ -216,8 +216,8 @@ make ota-deploy \
 Omit `OTA_DEPLOY_CLIENT_DTR=1` for ESP. Choose legal radio settings yourself;
 there is no private RF profile, key or device-path default. Native `directed`
 (the default `OTA_UPLOAD_MODE`) uses the normal mesh; `background` requires
-`OTA_UPLOAD_CHANNEL` set to an existing multicast channel. Those transports are
-software-tested only.
+`OTA_UPLOAD_CHANNEL` set to an existing multicast channel. Those native-host
+transports are software-tested only.
 
 Directed and background delivery always use reliable attempt-diverse framing,
 so a retried packet can pass relays that already saw a lost copy instead of
@@ -264,9 +264,10 @@ It does not grant receiver administrator permission or perform a deployment.
 
 `OTA_DEPLOY_TRANSPORT=stock` uses ordinary MeshCore **1.17.1** USB signing and raw
 packet commands. It does not require the native OTA USB command. It supports
-zero-hop off-channel `direct` delivery and normal-channel `directed` delivery
-through **one explicitly selected relay** to an OTA-enabled receiver. Stock
-background/multicast campaigns are not offered.
+zero-hop off-channel `direct` delivery, normal-channel `directed` delivery
+through **one explicitly selected relay**, and `background` collection by
+**exactly two receivers sharing one block flood**. Two-target stock background
+delivery is software-tested; its hardware experiment is still pending.
 
 Create your own owned mode-0600 JSON binding. Replace every angle-bracket field;
 `normal_profile` is the **receiver's actual normal radio configuration**, not
@@ -380,6 +381,68 @@ a real install. Failure never retries with a zero-hop path or changes firmware.
 
 The public `inspect` command remains USB-only and read-only by default; it
 does not perform RF probes or claim that the selected topology is ready.
+
+### Two-target shared-flood background collection
+
+Both receivers must already be qualified installers for the same board, role
+and APP image and must authorize the stock sender's OTA administrator identity.
+Choose a common counter above the maximum of their freshly measured confirmed
+floors. A relay-only APP does not qualify a second installer, and signing two
+different role descriptors cannot make them share one signed block stream.
+
+Provide two distinct full target keys and two owned mode-0600 bindings. Each
+binding has its own target, floor and generation guards; both must agree on the
+stock sender, physical USB endpoint, candidate and normal radio profile. If
+physical USB anchoring is required, include the same `--by-path` and matching
+binding metadata for both targets.
+
+```sh
+make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=background \
+  OTA_DEPLOY_CLIENT_PORT="$CLIENT_PORT" \
+  OTA_STOCK_SERIAL="$CLIENT_SERIAL" OTA_STOCK_SENDER_KEY="$SENDER_PUBLIC_KEY" \
+  OTA_STOCK_BINDING="$TARGET1_BINDING_JSON" OTA_ARTIFACT_DIR="$NEW_RUN_DIRECTORY" \
+  OTA_UPLOAD_TARGET="$TARGET1_PUBLIC_KEY" \
+  OTA_UPLOAD_IMAGE="$COMMON_APP_BIN" OTA_UPLOAD_BOARD=xiao_nrf52840_sense \
+  OTA_UPLOAD_ROLE_ID=1 OTA_UPLOAD_COUNTER="$NEXT_COMMON_COUNTER" \
+  OTA_UPLOAD_CHANNEL=255 OTA_UPLOAD_FREQ_KHZ=0 OTA_UPLOAD_LEASE_MS=0 \
+  OTA_UPLOAD_DUTY_MILLI_PERCENT=2000 OTA_UPLOAD_TIMEOUT=172800 \
+  OTA_STOCK_ARGS="--second-target $TARGET2_PUBLIC_KEY --second-binding $TARGET2_BINDING_JSON"
+```
+
+Omit DTR for Heltec/ESP, and retain any required USB anchor/name guards in
+`OTA_STOCK_ARGS`. Unlike native-host encrypted multicast-channel delivery,
+stock background uses **channel 255: a public, unscoped OTA RAW flood**. It
+does not require an encrypted multicast channel, select a mandatory relay,
+retune radios or obtain a direct lease.
+
+The host admits the two targets independently, sends each initial image block
+once for both receivers to hear, then repairs the union of their missing
+bitmaps with shared block transmissions. Each target's fresh READY and signed
+COMMIT remain bound to its own generation and BEGIN nonce. Admission,
+repair and installation failures remain per-target facts and cannot become
+aggregate success merely because the other receiver succeeds.
+
+The new artifact directory holds `original-radio.json`, final
+`radio-unchanged.json`, schema-3 `attempt-FULL_TARGET_KEY.json` receipts and a
+schema-1 aggregate `result.json`. For `make ota-deploy`,
+`shared-native-installed-reported-unsigned` with `operation_complete:true`
+means both matching unsigned Installed reports and counter floors were observed.
+It does **not** authenticate installation: `status_authenticated` and
+`installation_confirmed` remain false. Partial failure records
+`shared-campaign-incomplete`, individual outcomes/errors and
+`operation_complete:false`, then exits nonzero.
+
+The stock CLI also supports two-target `upload` and separate
+`commit --ready-receipt`; their aggregate outcomes are
+`shared-ready-observed-unsigned` and
+`shared-signed-commits-not-install-confirmed`, respectively. Neither means
+installation was confirmed. Background `--resume-receipt` is intentionally
+refused; the directed resume procedure below does not apply.
+
+SIGINT/SIGTERM stops further OTA signing, transmissions and target processing,
+records `shared-campaign-cancelled` with `operation_complete:false`, and unwinds
+through profile readback and UART cleanup. Already-issued COMMITs remain
+recorded; cancellation cannot withdraw them.
 
 ### Resume an interrupted directed attempt without a new BEGIN
 

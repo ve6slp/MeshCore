@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Signed direct or on-channel directed OTA through a stock 1.17.1 companion.
+"""Signed direct, directed or shared-flood OTA through a stock 1.17.1 companion.
 
 Uses normal USB identity, signing, raw packet and measured-TX commands; never
 native OTA CMD67, key export, contact mutation, reset or flash operations.
@@ -18,6 +18,14 @@ Directed mode requires the sender already on the bound normal profile, never
 retunes and accepts only attempt-matched reply floods bearing the selected
 relay's path prefix. These path observations, like status, are unsigned.
 Explicit restore reuses the original-settings artifact.
+Background mode requires exactly two deployment-bound targets with the same
+image/descriptor and normal profile. One initial block flood serves both, then
+the union of their missing bitmaps drives common selective repairs. Individual
+COMMITs bind each target's own generation/nonce. Channel 255 is an unscoped
+normal-radio flood, not a native companion's configured multicast channel.
+It never retunes, re-BEGINs, REUPLOADs, takes over or resets a target.
+Cancellation stops the whole campaign immediately, retaining prior unsigned
+outcomes in a non-success result before normal-profile/UART cleanup.
 Stable USB selection and flock prevent endpoint races/concurrent readers; normal
 115200 serial is opened with RTS false and caller-selected DTR before open.
 """
@@ -55,6 +63,10 @@ ATTEMPT_RECEIPT_SCHEMA = 3
 
 
 class Error(RuntimeError):
+    pass
+
+
+class Cancelled(Error):
     pass
 
 
@@ -205,8 +217,8 @@ def validate_profile(profile):
 
 
 def validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding=None):
-    if mode not in ("direct", "directed") or channel != 255:
-        raise Error("stock supports direct/directed on the existing radio channel (channel 255) only")
+    if mode not in ("direct", "directed", "background") or channel != 255:
+        raise Error("stock supports direct/directed/background on the existing radio channel (channel 255) only")
     if path_hash_bytes not in (1, 2, 3):
         raise Error("MeshCore path hashes must be 1, 2 or 3 bytes")
     if mode == "direct":
@@ -216,13 +228,15 @@ def validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_byte
                 or not MIN_LEASE <= lease_ms <= 60000
                 or (binding is not None and frequency == binding.normal[0])):
             raise Error("off-normal frequency and host lease 30000..60000ms required")
-    else:
+    elif mode == "directed":
         if frequency != 0 or lease_ms != 0:
             raise Error("directed mode requires zero frequency/lease; no retune or lease fallback")
         if not isinstance(relay, bytes) or len(relay) != 32 or not any(relay):
             raise Error("directed mode requires one explicit full --relay-key")
         if binding is not None and any(relay[:1] == key[:1] for key in (binding.sender, binding.target)):
             raise Error("relay hash must be distinct from sender/target for width-1 reply evidence")
+    elif frequency != 0 or lease_ms != 0 or relay is not None or path_hash_bytes != 1:
+        raise Error("background requires normal-channel flood: zero frequency/lease, no relay/path override")
 
 
 @dataclass(frozen=True)
@@ -266,12 +280,14 @@ class Candidate:
         return cls(canonical, image, hashlib.sha256(canonical).digest(), counter, (size + 83) // 84)
 
 
-def packet(payload, path=b"", hash_size=1):
+def packet(payload, path=b"", hash_size=1, *, route=2):
+    if route not in (1, 2) or (route == 1 and (path or hash_size != 1)):
+        raise Error("stock flood requires an empty width-1 path")
     if (hash_size not in (1, 2, 3) or len(path) > 64 or len(path) % hash_size
             or len(path) // hash_size > 63):
         raise Error("invalid MeshCore path hash width/count")
     encoded = ((hash_size - 1) << 6) | (len(path) // hash_size)
-    raw = bytes([0x32, encoded]) + path + payload
+    raw = bytes([0x30 | route, encoded]) + path + payload
     if not payload or len(raw) + 2 > MAX_FRAME:
         raise Error("CMD65 exceeds stock 176-byte frame")
     return raw
@@ -620,8 +636,8 @@ class Sender:
                  attempt_callback=None):
         validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding)
         validate_profile(profile)
-        if mode == "directed" and tuple(profile[:4]) != binding.normal:
-            raise Error("directed sender must already match the bound normal radio profile; no retune")
+        if mode != "direct" and tuple(profile[:4]) != binding.normal:
+            raise Error(f"{mode} sender must already match the bound normal radio profile; no retune")
         if not math.isfinite(duty) or not 0 < duty <= 1:
             raise Error("normal-channel duty must be in (0,1]")
         binding.check_candidate(candidate)
@@ -629,10 +645,10 @@ class Sender:
         self.stock, self.binding, self.candidate = stock, binding, candidate
         self.mode, self.relay, self.path_hash_bytes = mode, relay, path_hash_bytes
         self.path = relay[:path_hash_bytes] if relay is not None else b""
-        self.next_attempt = (int.from_bytes(os.urandom(4), "big") or 1) if mode == "directed" else None
+        self.next_attempt = (int.from_bytes(os.urandom(4), "big") or 1) if mode != "direct" else None
         self.last_tx_attempt = None
         self.original = tuple(profile)
-        self.normal = self.original if mode == "directed" else (*binding.normal, 0)
+        self.normal = self.original if mode != "direct" else (*binding.normal, 0)
         self.profile, self.deadline = self.normal, deadline
         self.frequency, self.lease_ms, self.duty = frequency, lease_ms, duty
         self.direct_bandwidth = 250000
@@ -674,33 +690,34 @@ class Sender:
         if self.lease_end and self.clock() + seconds >= self.lease_end:
             raise LeaseExpired("direct lease operation margin exhausted")
 
-    def send(self, payload):
+    def send(self, payload, *, repair=None):
         self.room(9)
         if not payload:
             raise Error("empty OTA payload")
         inner_kind = payload[0]
         attempt = None
-        if self.mode == "directed":
+        if self.mode != "direct":
             if self.next_attempt > 0xFFFFFFFF:
                 raise Error("OTA retry attempts exhausted; no wrap/replay fallback")
             attempt = self.next_attempt
-            payload = retry_frame(payload, attempt, repair=inner_kind == 1)
+            payload = retry_frame(payload, attempt, repair=inner_kind == 1 if repair is None else repair)
             self.next_attempt += 1
-        raw = packet(payload, self.path, self.path_hash_bytes)
-        command = bytes([65, 250 if self.mode == "directed" else 0]) + raw
+        route = 1 if self.mode == "background" else 2
+        raw = packet(payload, self.path, self.path_hash_bytes, route=route)
+        command = bytes([65, 250 if self.mode != "direct" else 0]) + raw
         normal = self.profile == self.normal
         if normal:
             self.wait_until(self.next_normal)
         deadline = min(self.deadline, self.clock() + 8, self.lease_end or self.deadline)
-        if self.mode == "directed" and self.stock.identify(deadline) != self.original:
-            raise Error("directed sender normal radio/repeat profile changed; no retune")
+        if self.mode != "direct" and self.stock.identify(deadline) != self.original:
+            raise Error(f"{self.mode} sender normal radio/repeat profile changed; no retune")
         before = self.stock.stats(deadline)
         if before[0]:
             raise Error("stock outbound queue not exclusive/idle")
         started = self.clock()
         estimate = airtime(len(raw), self.profile)
         self.last_tx_attempt = attempt
-        self.emit("rf_tx_request", mode=self.mode, route=2, path_hash_bytes=self.path_hash_bytes,
+        self.emit("rf_tx_request", mode=self.mode, route=route, path_hash_bytes=self.path_hash_bytes,
                   path=self.path.hex(), retry_attempt=attempt, kind=inner_kind,
                   packet_length=len(raw), frequency_khz=self.profile[0], normal_duty_percent=self.duty * 100)
         self.stock.pending_tx = before[1:3]
@@ -709,15 +726,15 @@ class Sender:
         except Refused:
             self.stock.pending_tx = None
             raise
-        # CMD65 OK only admits to a queue. Require physical sent + direct TX
-        # completion, not merely a drained queue; unexpected activity fails closed.
+        # CMD65 OK only admits to a queue. Require one physical TX and the
+        # matching direct/non-direct counter delta, not merely a drained queue.
         while self.clock() < deadline:
             after = self.stock.stats(deadline)
             sent = (after[1] - before[1]) & 0xFFFFFFFF
             direct = (after[2] - before[2]) & 0xFFFFFFFF
             if sent > 1 or direct > 1:
                 raise Error("concurrent/unattributable stock radio traffic")
-            if not after[0] and sent == direct == 1:
+            if not after[0] and sent == 1 and direct == (route == 2):
                 self.stock.pending_tx = None
                 actual_air = after[3]
                 spent = max(estimate, self.clock() - started,
@@ -733,7 +750,7 @@ class Sender:
         raise Error("no measured physical stock TX completion")
 
     def reply_route(self, frame):
-        if self.mode != "directed":
+        if self.mode == "direct":
             return True
         decoded = rf_packet(frame)
         if decoded is None:
@@ -741,12 +758,14 @@ class Sender:
         route, width, path, payload = decoded
         attempt, inner = retry_payload(payload)
         # Mesh::pumpOtaControl emits width-1 floods on the normal channel.
-        # Reject the target's zero-hop copy and any other relay trail.
-        matched = (route == 1 and width == 1 and path == self.relay[:1] and attempt is not None
+        # Directed mode also requires the selected relay's reply trail.
+        matched = (route == 1 and width == 1
+                   and (self.mode == "background" or path == self.relay[:1]) and attempt is not None
                    and attempt == self.last_tx_attempt and inner is not None)
         self.emit("rf_reply_route", route=route, path_hash_bytes=width, path=path.hex(),
                   retry_attempt=attempt, expected_attempt=self.last_tx_attempt,
-                  selected_relay_match=matched, evidence_authenticated=False)
+                  selected_relay_match=matched if self.mode == "directed" else None,
+                  attempt_route_match=matched, evidence_authenticated=False)
         return matched
 
     def census(self, first=0, retries=3, allow_pending=False, post_commit=False):
@@ -762,7 +781,7 @@ class Sender:
             try:
                 reply_wait = 4 if self.lease_end else 25
                 _, frame = self.stock.frames.receive(
-                    lambda p: p[:1] == b"\x0b", since,
+                    lambda p: p[:1] == b"\x0b" and (self.mode != "background" or p[1:33] == b.target), since,
                     min(self.deadline, self.clock() + reply_wait, self.lease_end or self.deadline),
                     observer, b.target, c.digest, route_predicate=self.reply_route)
             except TimeoutError:
@@ -779,7 +798,8 @@ class Sender:
             self.emit("census_parsed", first=report["first"], lifecycle=report["lifecycle"],
                       generation=report["generation"], phase=report["phase"],
                       received=report["received"], total=report["total"], bitmap_count=report["bits"].bit_count(),
-                      begin_nonce=None if self.begin_nonce is None else self.begin_nonce.hex())
+                      begin_nonce=None if self.begin_nonce is None else self.begin_nonce.hex(),
+                      bitmap=report["bits"].to_bytes(16, "little").hex(), status_authenticated=False)
             if (self.attempt_callback is not None and not self.attempt_recorded
                     and not post_commit and not self.pending_reupload and self.begin_nonce is not None):
                 self.attempt_callback(self.attempt_receipt(report))
@@ -866,7 +886,7 @@ class Sender:
         self.wait_until(max(self.target_normal_after, self.next_normal))
 
     def negotiate(self):
-        if self.mode == "directed":
+        if self.mode != "direct":
             return
         # Receiver ignores in-flight renewals. Wait out the old bounded lease,
         # then negotiate on normal frequency with a new signed token.
@@ -921,11 +941,11 @@ class Sender:
             return
         raise Error("signed normal-channel direct ACK retries exhausted")
 
-    def authorize(self):
+    def authorize(self, retries=3):
         c, b = self.candidate, self.binding
         signature = self.stock.sign(c.canonical, self.deadline)
         frame = b"\x08" + hashlib.sha256(b.target).digest()[:8] + b.sender + c.canonical + signature
-        for attempt in range(1, 4):
+        for attempt in range(1, retries + 1):
             self.emit("auth_request", attempt=attempt, counter=c.counter, total=c.total)
             self.send(frame)
             self.emit("auth_sent", attempt=attempt, tx_evidence="aggregate-counters")
@@ -933,7 +953,7 @@ class Sender:
                 return self.census(allow_pending=True)
             except NoCensus:
                 self.emit("auth_no_census", attempt=attempt)
-        self.emit("auth_exhausted", attempts=3)
+        self.emit("auth_exhausted", attempts=retries)
         raise Error("target did not admit candidate; operator must resolve cache/admin state")
 
     def activate_prepared(self):
@@ -1024,6 +1044,10 @@ class Sender:
                           request_path=self.path.hex(), path_hash_bytes=self.path_hash_bytes,
                           reply_route="flood", reply_path=self.relay[:1].hex(),
                           reply_path_hash_bytes=1, status_authenticated=False)
+        elif self.mode == "background":
+            result.update(mode="background", request_route="flood", channel=255,
+                          floor=self.binding.floor, min_generation=self.binding.min_generation,
+                          normal_profile=list(self.binding.normal), status_authenticated=False)
         return result
 
     def attempt_receipt(self, report):
@@ -1157,12 +1181,234 @@ class Sender:
         return self.wait_installed(install_timeout)
 
 
+class BackgroundTarget(Sender):
+    """Independent census/attempt state, sharing one physical transmitter."""
+    def __init__(self, transport, binding, **options):
+        super().__init__(transport.stock, binding, transport.candidate, transport.original,
+                         transport.deadline, 0, 0, transport.duty, transport.clock, transport.sleep,
+                         mode="background", **options)
+        self.transport = transport
+
+    def send(self, payload):
+        if getattr(self.transport, "failed_tx", False):
+            raise Error("shared transmitter failed; no further RF writes")
+        try:
+            since = self.transport.send(payload)
+        except (Error, TimeoutError):
+            self.transport.failed_tx = True
+            raise
+        self.last_tx_attempt = self.transport.last_tx_attempt
+        return since
+
+    def emit(self, event, **fields):
+        super().emit(event, target_public_key=self.binding.target.hex(), **fields)
+
+
+class BackgroundCampaign:
+    @staticmethod
+    def validate_bindings(bindings, candidate):
+        if (len(bindings) != 2 or len({b.target for b in bindings}) != 2
+                or any(len(b.target) != 32 or not any(b.target) or b.target == b.sender for b in bindings)):
+            raise Error("background requires exactly two distinct full target identities")
+        first = bindings[0]
+        common = ("serial", "sender", "normal", "by_path", "id_path", "usb_vid", "usb_pid", "sender_name")
+        if any(any(getattr(b, key) != getattr(first, key) for key in common) for b in bindings):
+            raise Error("background targets require the same stock endpoint/sender and normal radio profile")
+        for b in bindings:
+            b.check_candidate(candidate)
+            if not b.floor < candidate.counter:
+                raise Error("common candidate counter must exceed both measured target floors")
+
+    def __init__(self, stock, bindings, candidate, profile, deadline, duty=0.02,
+                 clock=time.monotonic, sleep=time.sleep, event_callback=None, attempt_callback=None):
+        self.validate_bindings(bindings, candidate)
+        first = bindings[0]
+        self.transport = Sender(stock, first, candidate, profile, deadline, 0, 0, duty, clock, sleep,
+                                mode="background", event_callback=event_callback)
+        self.targets = [
+            BackgroundTarget(self.transport, b, event_callback=event_callback,
+                             attempt_callback=attempt_callback)
+            for b in bindings
+        ]
+        self.initial_sent = self.repair_sent = 0
+        self.repairs = {}
+        self.outcomes = [None, None]
+        self.stage = "admission"
+        self.error = None
+
+    def result(self, outcome, complete=False):
+        return {"schema": 1, "mode": "background", "outcome": outcome, "operation_complete": complete,
+                "sender_public_key": self.transport.binding.sender.hex(),
+                "manifest_hash": self.transport.candidate.digest.hex(),
+                "image_sha256": hashlib.sha256(self.transport.candidate.image).hexdigest(),
+                "counter": self.transport.candidate.counter, "channel": 255, "target_count": 2,
+                "initial_block_transmissions": self.initial_sent,
+                "repair_block_transmissions": self.repair_sent,
+                "error": self.error,
+                "status_authenticated": False, "installation_confirmed": False,
+                "targets": [
+                    result if result is not None else target.receipt("not-completed")
+                    for target, result in zip(self.targets, self.outcomes)
+                ]}
+
+    def failed(self, index, exc):
+        result = self.targets[index].receipt("failed")
+        result.update(stage=self.stage, error=str(exc))
+        self.outcomes[index] = result
+
+    def cancel(self, exc):
+        self.transport.failed_tx = True
+        self.error = {"stage": self.stage, "reason": str(exc), "cancelled": True}
+
+    def send_block(self, index, *, initial, needed_by):
+        wire = self.transport
+        wire.room(22)
+        message, prefix = block_message(wire.candidate, index)
+        signature = wire.stock.sign(message, wire.deadline)
+        wire.send(prefix + signature, repair=not initial)
+        if initial:
+            self.initial_sent += 1
+        else:
+            self.repair_sent += 1
+        wire.emit("shared_block_sent", index=index, initial=initial, needed_by=needed_by,
+                  total=wire.candidate.total, tx_evidence="aggregate-counters",
+                  initial_block_transmissions=self.initial_sent, repair_block_transmissions=self.repair_sent)
+
+    def upload(self):
+        current = 0
+        try:
+            for current, target in enumerate(self.targets):
+                # Only one BEGIN per target. Missing permission/census never
+                # triggers another BEGIN, takeover or retirement operation.
+                report = target.authorize(retries=1)
+                while report["lifecycle"] == 2:
+                    report = target.census()
+            self.stage = "initial-shared-flood"
+            current = None
+            keys = [target.binding.target.hex() for target in self.targets]
+            for index in range(self.transport.candidate.total):
+                self.send_block(index, initial=True, needed_by=keys)
+            self.stage = "census-selective-repair"
+            windows = tuple(range(0, self.transport.candidate.total, 128))
+            while True:
+                all_ready = True
+                for first in windows:
+                    missing = {}
+                    for current, target in enumerate(self.targets):
+                        report = target.census(first)
+                        all_ready &= report["lifecycle"] == 5
+                        for index in range(first, min(first + 128, target.candidate.total)):
+                            if not report["bits"] & (1 << (index - first)):
+                                missing.setdefault(index, []).append(target.binding.target.hex())
+                    for index, needed_by in sorted(missing.items()):
+                        current = None
+                        self.repairs[index] = self.repairs.get(index, 0) + 1
+                        if self.repairs[index] > 8:
+                            raise Error("shared RF block repair retries exhausted")
+                        self.send_block(index, initial=False, needed_by=needed_by)
+                if all_ready:
+                    break
+            self.outcomes = [target.receipt("ready-observed-unsigned") for target in self.targets]
+            return self.result("shared-ready-observed-unsigned", complete=True)
+        except Cancelled as exc:
+            self.cancel(exc)
+            raise
+        except (Error, TimeoutError) as exc:
+            if current is None:
+                self.error = {"stage": self.stage, "reason": str(exc)}
+            else:
+                self.failed(current, exc)
+            return self.result("shared-campaign-incomplete")
+
+    def commit(self, receipt):
+        c = self.transport.candidate
+        if (not isinstance(receipt, dict) or receipt.get("schema") != 1
+                or receipt.get("mode") != "background" or receipt.get("target_count") != 2
+                or receipt.get("outcome") != "shared-ready-observed-unsigned"
+                or receipt.get("operation_complete") is not True
+                or receipt.get("sender_public_key") != self.transport.binding.sender.hex()
+                or receipt.get("manifest_hash") != c.digest.hex()
+                or receipt.get("image_sha256") != hashlib.sha256(c.image).hexdigest()
+                or receipt.get("counter") != c.counter or receipt.get("channel") != 255
+                or receipt.get("status_authenticated") is not False
+                or receipt.get("installation_confirmed") is not False
+                or not isinstance(receipt.get("targets"), list) or len(receipt["targets"]) != 2
+                or type(receipt.get("initial_block_transmissions")) is not int
+                or receipt["initial_block_transmissions"] != c.total
+                or type(receipt.get("repair_block_transmissions")) is not int
+                or receipt["repair_block_transmissions"] < 0):
+            raise Error("background COMMIT requires this common-image two-target READY receipt")
+        # Prevalidate BOTH READY bindings before either COMMIT is signed.
+        for target, ready in zip(self.targets, receipt["targets"]):
+            if not isinstance(ready, dict):
+                raise Error("background COMMIT requires two individual READY receipts")
+            expected = target.receipt("ready-observed-unsigned")
+            expected.update(generation=ready.get("generation"), begin_nonce=ready.get("begin_nonce"))
+            nonce = ready.get("begin_nonce")
+            if (ready != expected or type(ready.get("generation")) is not int
+                    or not target.binding.min_generation <= ready["generation"] <= 0xFFFFFFFF
+                    or not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                    or not any(bytes.fromhex(nonce))):
+                raise Error("background COMMIT individual identity/floor/attempt READY mismatch")
+        self.initial_sent = receipt["initial_block_transmissions"]
+        self.repair_sent = receipt["repair_block_transmissions"]
+        self.stage = "individual-signed-commit"
+        for current, (target, ready) in enumerate(zip(self.targets, receipt["targets"])):
+            try:
+                self.outcomes[current] = target.commit(ready)
+            except Cancelled as exc:
+                self.cancel(exc)
+                raise
+            except (Error, TimeoutError) as exc:
+                self.failed(current, exc)
+        complete = all(result["outcome"] == "signed-commit-aggregate-tx-observed-not-install-confirmed"
+                       for result in self.outcomes)
+        return self.result("shared-signed-commits-not-install-confirmed" if complete
+                           else "shared-campaign-incomplete", complete=complete)
+
+    def deploy(self, install_timeout=300):
+        if not math.isfinite(install_timeout) or install_timeout <= 0:
+            raise Error("positive finite installation timeout required")
+        ready = self.upload()
+        if not ready["operation_complete"]:
+            return ready
+        committed = self.commit(ready)
+        self.stage = "individual-installed-status"
+        # Installation deadlines start together, after both COMMIT attempts.
+        install_deadline = min(self.transport.deadline, self.transport.clock() + install_timeout)
+        waiting = {i for i, result in enumerate(committed["targets"])
+                   if result["outcome"] == "signed-commit-aggregate-tx-observed-not-install-confirmed"}
+        while waiting:
+            for current in sorted(waiting):
+                target = self.targets[current]
+                target.deadline = install_deadline
+                try:
+                    report = target.census(retries=1, post_commit=True)
+                    if report["lifecycle"] == 8:
+                        result = target.receipt("native-installed-reported-unsigned")
+                        result.update(native_installed=True, lifecycle=8,
+                                      confirmed_floor=report["confirmed_floor"], status_authenticated=False)
+                        self.outcomes[current] = result
+                        waiting.remove(current)
+                except NoCensus:
+                    continue
+                except Cancelled as exc:
+                    self.cancel(exc)
+                    raise
+                except (Error, TimeoutError) as exc:
+                    self.failed(current, exc)
+                    waiting.remove(current)
+        complete = all(result["outcome"] == "native-installed-reported-unsigned" for result in self.outcomes)
+        return self.result("shared-native-installed-reported-unsigned" if complete
+                           else "shared-campaign-incomplete", complete=complete)
+
+
 @contextmanager
 def radio_guard(stock, binding, directory, restoring=False, mode="direct"):
     stock.expected_name = binding.sender_name
     original = stock.identify()
-    if mode == "directed" and original[:4] != binding.normal:
-        raise Error("directed sender must already match the bound normal radio profile; no retune")
+    if mode != "direct" and original[:4] != binding.normal:
+        raise Error(f"{mode} sender must already match the bound normal radio profile; no retune")
     path = directory / "original-radio.json"
     if restoring:
         saved = private_read(path)
@@ -1191,7 +1437,7 @@ def radio_guard(stock, binding, directory, restoring=False, mode="direct"):
             private_write(directory / "restored.json", {"restored": True})
         else:
             if stock.identify() != original:
-                raise Error("directed sender radio/repeat changed; not restored or retuned")
+                raise Error(f"{mode} sender radio/repeat changed; not restored or retuned")
             private_write(directory / "radio-unchanged.json", {"normal_profile_unchanged": True})
 
 
@@ -1302,7 +1548,7 @@ def termination_cleanup():
         # Subsequent TERM/INT cannot interrupt radio restoration.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise Error(f"interrupted by signal {signum}; closing UART, restoring radio only if its guard is active")
+        raise Cancelled(f"interrupted by signal {signum}; closing UART, restoring radio only if its guard is active")
     for signum in (signal.SIGINT, signal.SIGTERM):
         old[signum] = signal.signal(signum, interrupted)
     try:
@@ -1324,6 +1570,8 @@ def main(argv=None):
     parser.add_argument("--sender-name", help="optional explicit public label guard; must match configured sender_name")
     parser.add_argument("--target", required=True, type=full_key)
     parser.add_argument("--binding", required=True, type=Path)
+    parser.add_argument("--second-target", type=full_key, help="background only: exactly one additional full target identity")
+    parser.add_argument("--second-binding", type=Path, help="background only: additional target's owned 0600 binding")
     parser.add_argument("--artifacts", required=True, type=Path, help="exclusive new 0700 directory (including inspect); existing only for restore")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--image", type=Path, help="pure ordinary APP .bin only")
@@ -1338,36 +1586,47 @@ def main(argv=None):
     retirement.add_argument("--reupload", action="store_true", help="upload only; binding allow_reupload:true, generation learned only from fresh RF census")
     retirement.add_argument("--reupload-generation", type=int, help="legacy upload-only strict expectation; signing still uses fresh RF-observed generation")
     parser.add_argument("--frequency-khz", type=int)
-    parser.add_argument("--mode", choices=("direct", "directed"), default="direct")
+    parser.add_argument("--mode", choices=("direct", "directed", "background"), default="direct")
     parser.add_argument("--channel", type=int, default=255, help="255 means existing normal radio; no channel override")
-    parser.add_argument("--lease-ms", type=int, help="direct default 60000; directed requires 0")
+    parser.add_argument("--lease-ms", type=int, help="direct default 60000; on-mesh requires 0")
     parser.add_argument("--relay-key", type=full_key, help="directed: full identity of the single mandatory relay")
     parser.add_argument("--path-hash-bytes", type=int, default=1, choices=(1, 2, 3),
                         help="directed request path uses this many public-key prefix bytes")
-    parser.add_argument("--routed-retry", action="store_true", help="redundant in directed mode; refused in direct mode")
-    parser.add_argument("--no-routed-retry", action="store_true", help="refused in directed mode; direct remains unframed")
+    parser.add_argument("--routed-retry", action="store_true", help="redundant in on-mesh modes; refused in direct mode")
+    parser.add_argument("--no-routed-retry", action="store_true", help="refused in on-mesh modes; direct remains unframed")
     parser.add_argument("--normal-duty-percent", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
+    if args.mode == "background":
+        if (args.operation not in ("upload", "commit", "deploy")
+                or args.second_target is None or args.second_binding is None
+                or args.reupload or args.reupload_generation is not None or args.resume_receipt is not None):
+            raise Error("background requires two explicit targets/bindings and upload/commit/deploy; no REUPLOAD/resume")
+        if args.second_target == args.target:
+            raise Error("background requires exactly two distinct targets")
+    elif args.second_target is not None or args.second_binding is not None:
+        raise Error("second target/binding requires background mode")
     if args.resume_receipt is not None and (
             args.operation not in ("upload", "deploy") or args.mode != "directed"
             or args.reupload or args.reupload_generation is not None):
         raise Error("resume requires directed upload/deploy without REUPLOAD")
-    if args.routed_retry and args.mode != "directed":
-        raise Error("routed-retry requires directed mode; no legacy fallback")
-    if args.no_routed_retry and args.mode == "directed":
-        raise Error("directed OTA requires attempt-diverse framing; no legacy fallback")
+    if args.routed_retry and args.mode == "direct":
+        raise Error("routed-retry requires directed/background mode; no legacy fallback")
+    if args.no_routed_retry and args.mode != "direct":
+        raise Error(f"{args.mode} OTA requires attempt-diverse framing; no legacy fallback")
     if args.operation in ("inspect", "restore") and (
             args.mode != "direct" or args.relay_key is not None or args.path_hash_bytes != 1):
         raise Error("inspect/restore do not select an RF route")
-    frequency = args.frequency_khz if args.frequency_khz is not None else (0 if args.mode == "directed" else None)
-    lease_ms = args.lease_ms if args.lease_ms is not None else (0 if args.mode == "directed" else 60000)
+    frequency = args.frequency_khz if args.frequency_khz is not None else (0 if args.mode != "direct" else None)
+    lease_ms = args.lease_ms if args.lease_ms is not None else (0 if args.mode != "direct" else 60000)
     if (args.reupload or args.reupload_generation is not None) and args.operation not in ("upload", "deploy"):
         raise Error("explicit REUPLOAD is supported only by upload, never COMMIT/restore")
     if args.operation in ("upload", "commit", "deploy"):
         validate_transport(args.mode, frequency, lease_ms, args.channel, args.relay_key, args.path_hash_bytes)
     binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)
     binding.permit_reupload(args.reupload_generation, args.reupload)
+    second_binding = (Binding.load(args.second_binding, args.serial, args.sender_key, args.second_target,
+                                   args.by_path, args.sender_name) if args.mode == "background" else None)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise Error("positive finite campaign timeout required")
     candidate = None
@@ -1390,6 +1649,8 @@ def main(argv=None):
         else:
             candidate = Candidate.build(canonical, args.image.read_bytes(), binding.floor)
         binding.check_candidate(candidate)
+        if second_binding is not None:
+            BackgroundCampaign.validate_bindings([binding, second_binding], candidate)
         validate_transport(args.mode, frequency, lease_ms, args.channel, args.relay_key, args.path_hash_bytes, binding)
         if (not math.isfinite(args.normal_duty_percent)
                 or not 0 < args.normal_duty_percent <= 100):
@@ -1426,9 +1687,24 @@ def main(argv=None):
                 print(json.dumps(result, sort_keys=True))
                 return
             result = None
-            guard_options = {"mode": args.mode} if args.mode == "directed" else {}
+            guard_options = {"mode": args.mode} if args.mode != "direct" else {}
             with radio_guard(stock, binding, directory, args.operation == "restore", **guard_options) as profile:
-                if candidate:
+                if candidate and args.mode == "background":
+                    campaign = BackgroundCampaign(
+                        stock, [binding, second_binding], candidate, profile, time.monotonic() + args.timeout,
+                        args.normal_duty_percent / 100, event_callback=public_event,
+                        attempt_callback=lambda observed: private_write(
+                            directory / ("attempt-" + observed["target_public_key"] + ".json"), observed))
+                    try:
+                        result = (campaign.deploy(args.install_timeout) if args.operation == "deploy" else
+                                  campaign.upload() if args.operation == "upload" else campaign.commit(receipt))
+                    except Cancelled as exc:
+                        campaign.cancel(exc)
+                        result = campaign.result("shared-campaign-cancelled")
+                        private_write(directory / "result.json", result)
+                        print(json.dumps(result, sort_keys=True))
+                        raise
+                elif candidate:
                     sender = Sender(stock, binding, candidate, profile, time.monotonic() + args.timeout,
                                     frequency, lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,
@@ -1444,6 +1720,8 @@ def main(argv=None):
             if result is not None:
                 private_write(directory / "result.json", result)
                 print(json.dumps(result, sort_keys=True))
+                if args.mode == "background" and not result["operation_complete"]:
+                    raise Error("shared campaign incomplete; individual unsigned outcomes saved in result.json")
             else:
                 print("Original stock radio and repeat setting restored and read back.")
 
