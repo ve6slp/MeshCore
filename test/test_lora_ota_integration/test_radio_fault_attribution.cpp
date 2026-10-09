@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 #include <array>
+#include <cstring>
+#include <limits>
+#include <string>
 #include <helpers/radiolib/RadioLibDriverFaultClassification.h>
 #include <helpers/radiolib/Sx1262CheckedProbe.h>
 
@@ -7,12 +10,216 @@ namespace {
 using mesh::RadioDriverFaultDiagnostic;
 using mesh::RadioDriverFaultDetails;
 using mesh::RadioDriverFaultOrigin;
+using mesh::RadioServiceDiagnostic;
 
 RadioDriverFaultDiagnostic snapshot(const RadioDriverHealthLatch& latch) {
   RadioDriverFaultDiagnostic diagnostic;
   latch.getDiagnostic(diagnostic);
   return diagnostic;
 }
+
+void expectSameDiagnostic(const RadioDriverFaultDiagnostic& expected,
+                          const RadioDriverFaultDiagnostic& actual) {
+  EXPECT_EQ(expected.healthy, actual.healthy);
+  EXPECT_EQ(expected.hasFailure, actual.hasFailure);
+  EXPECT_EQ(expected.faultCount, actual.faultCount);
+  EXPECT_EQ(expected.lastFaultCount, actual.lastFaultCount);
+  for (size_t i = 0; i < RadioDriverFaultDiagnostic::kOriginCount; ++i)
+    EXPECT_EQ(expected.originCounts[i], actual.originCounts[i]);
+  EXPECT_EQ(expected.last.origin, actual.last.origin);
+  EXPECT_EQ(expected.last.driverStatus, actual.last.driverStatus);
+  EXPECT_EQ(expected.last.probeReasons, actual.last.probeReasons);
+  EXPECT_EQ(expected.last.expectedMode, actual.last.expectedMode);
+  EXPECT_EQ(expected.last.statusByte, actual.last.statusByte);
+  EXPECT_EQ(expected.last.deviceErrors, actual.last.deviceErrors);
+  EXPECT_EQ(expected.last.irqFlags, actual.last.irqFlags);
+  EXPECT_EQ(expected.last.deviceErrorsStatus, actual.last.deviceErrorsStatus);
+  EXPECT_EQ(expected.last.irqFlagsStatus, actual.last.irqFlagsStatus);
+  EXPECT_EQ(expected.last.statusReadStatus, actual.last.statusReadStatus);
+  EXPECT_EQ(expected.last.softwareStateBefore, actual.last.softwareStateBefore);
+  EXPECT_EQ(expected.last.softwareStateAfter, actual.last.softwareStateAfter);
+}
+
+void expectSameServiceDiagnostic(const RadioServiceDiagnostic& expected,
+                                 const RadioServiceDiagnostic& actual) {
+  EXPECT_EQ(expected.freeCount, actual.freeCount);
+  EXPECT_EQ(expected.outboundTotal, actual.outboundTotal);
+  EXPECT_EQ(expected.txTimeoutCount, actual.txTimeoutCount);
+  EXPECT_EQ(expected.otaAccountingFailureCount, actual.otaAccountingFailureCount);
+  EXPECT_EQ(expected.remainingTxBudget, actual.remainingTxBudget);
+  EXPECT_EQ(expected.remainingOtaAirtimeBudget, actual.remainingOtaAirtimeBudget);
+  EXPECT_EQ(expected.normalTrafficQueued, actual.normalTrafficQueued);
+  EXPECT_EQ(expected.directActive, actual.directActive);
+  EXPECT_EQ(expected.directPending, actual.directPending);
+  EXPECT_EQ(expected.controlDue, actual.controlDue);
+  EXPECT_EQ(expected.controlLength, actual.controlLength);
+  EXPECT_EQ(expected.controlKind, actual.controlKind);
+}
+}
+
+TEST(OtaRadioFaultAttribution, ServiceFormatterDefaultsAndDueControlSnapshotArePassive) {
+  RadioServiceDiagnostic diagnostic;
+  const auto initial = diagnostic;
+  std::array<char, 161> out;
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioServiceDiagnostic(out.data(), 160, diagnostic));
+  EXPECT_STREQ("ram free=0 q=0 to=0 af=0 tx=0 ota=0 n=0 d=0 p=0 c=0 len=0 kind=00", out.data());
+  EXPECT_EQ('!', out[160]);
+  expectSameServiceDiagnostic(initial, diagnostic);
+  diagnostic = {32, 2, 4, 1, 1000, 72000, true, false, true, true, 123, 0x0B};
+  const auto before = diagnostic;
+  ASSERT_TRUE(mesh::formatRadioServiceDiagnostic(out.data(), 160, diagnostic));
+  EXPECT_STREQ("ram free=32 q=2 to=4 af=1 tx=3E8 ota=11940 n=1 d=0 p=1 c=1 len=123 kind=0B", out.data());
+  EXPECT_LT(std::strlen(out.data()) + 3, 160u);
+  EXPECT_EQ('!', out[160]);
+  expectSameServiceDiagnostic(before, diagnostic);
+}
+
+TEST(OtaRadioFaultAttribution, ServiceFormatterMaximalFieldsFitReplyAndExactCapacity) {
+  RadioServiceDiagnostic diagnostic{
+      std::numeric_limits<int>::min(), std::numeric_limits<int>::min(),
+      UINT32_MAX, UINT32_MAX, std::numeric_limits<unsigned long>::max(),
+      std::numeric_limits<unsigned long>::max(), true, true, true, true, UINT16_MAX, UINT8_MAX};
+  const auto before = diagnostic;
+  const std::string budget_max = sizeof(unsigned long) == 8 ? "FFFFFFFFFFFFFFFF" : "FFFFFFFF";
+  const std::string expected =
+      "ram free=" + std::to_string(diagnostic.freeCount) +
+      " q=" + std::to_string(diagnostic.outboundTotal) +
+      " to=FFFFFFFF af=FFFFFFFF tx=" + budget_max + " ota=" + budget_max +
+      " n=1 d=1 p=1 c=1 len=65535 kind=FF";
+  std::array<char, 161> out;
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioServiceDiagnostic(out.data(), 160, diagnostic));
+  EXPECT_STREQ(expected.c_str(), out.data());
+  const size_t length = std::strlen(out.data());
+  EXPECT_EQ(sizeof(unsigned long) == 8 ? 133u : 117u, length);
+  EXPECT_LE(length + 3, 159u);
+  EXPECT_EQ('\0', out[length]);
+  EXPECT_EQ('!', out[length + 1]);
+  EXPECT_EQ('!', out[160]);
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioServiceDiagnostic(out.data(), length + 1, diagnostic));
+  EXPECT_STREQ(expected.c_str(), out.data());
+  EXPECT_EQ('!', out[length + 1]);
+  expectSameServiceDiagnostic(before, diagnostic);
+}
+
+TEST(OtaRadioFaultAttribution, ServiceFormatterRejectsNullAndSmallBuffersWithoutMutation) {
+  RadioServiceDiagnostic diagnostic{32, 2, 4, 1, 1000, 72000, true, false, true, true, 123, 0x0B};
+  const auto before = diagnostic;
+  EXPECT_FALSE(mesh::formatRadioServiceDiagnostic(nullptr, 160, diagnostic));
+  EXPECT_FALSE(mesh::formatRadioServiceDiagnostic(nullptr, 0, diagnostic));
+  std::array<char, 161> out;
+  out.fill('!');
+  EXPECT_FALSE(mesh::formatRadioServiceDiagnostic(out.data(), 0, diagnostic));
+  EXPECT_EQ('!', out[0]);
+  for (size_t capacity : {size_t{1}, size_t{4}}) {
+    out.fill('!');
+    EXPECT_FALSE(mesh::formatRadioServiceDiagnostic(out.data(), capacity, diagnostic));
+    EXPECT_EQ('\0', out[0]);
+    for (size_t i = capacity; i < out.size(); ++i) EXPECT_EQ('!', out[i]);
+  }
+  ASSERT_TRUE(mesh::formatRadioServiceDiagnostic(out.data(), 160, diagnostic));
+  const size_t missing_nul_capacity = std::strlen(out.data());
+  out.fill('!');
+  EXPECT_FALSE(mesh::formatRadioServiceDiagnostic(out.data(), missing_nul_capacity, diagnostic));
+  EXPECT_EQ('\0', out[0]);
+  EXPECT_EQ('\0', out[missing_nul_capacity - 1]);
+  for (size_t i = missing_nul_capacity; i < out.size(); ++i) EXPECT_EQ('!', out[i]);
+  expectSameServiceDiagnostic(before, diagnostic);
+}
+
+TEST(OtaRadioFaultAttribution, PassiveFormatterDefaultsHaveNoFaultAndTerminateWithinBounds) {
+  RadioDriverFaultDiagnostic diagnostic;
+  const auto before = diagnostic;
+  std::array<char, 161> out;
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioDriverFaultDiagnostic(out.data(), 160, diagnostic,
+                                                   false, false, false, false));
+  EXPECT_STREQ("retained h=1 f=0 n=0 l=0 o=0 ds=0 pr=0 em=0 sb=0 de=0 irq=0 "
+               "es=0 is=0 ss=0 sw=0/0 r=0 t=0 d=0 p=0", out.data());
+  EXPECT_LT(std::strlen(out.data()), 160u);
+  EXPECT_EQ('!', out[160]);
+  expectSameDiagnostic(before, diagnostic);
+}
+
+TEST(OtaRadioFaultAttribution, PassiveFormatterMaximalFieldsFitReplyIncludingOptionalPrefix) {
+  RadioDriverFaultDiagnostic diagnostic;
+  diagnostic.healthy = false;
+  diagnostic.hasFailure = true;
+  diagnostic.faultCount = UINT32_MAX;
+  diagnostic.lastFaultCount = UINT32_MAX;
+  for (auto& count : diagnostic.originCounts) count = UINT32_MAX;
+  diagnostic.last = {static_cast<RadioDriverFaultOrigin>(UINT8_MAX), INT16_MIN,
+                     UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT16_MAX, UINT32_MAX,
+                     INT16_MIN, INT16_MIN, INT16_MIN, UINT8_MAX, UINT8_MAX};
+  const auto before = diagnostic;
+  const char* expected =
+      "retained h=0 f=1 n=FFFFFFFF l=FFFFFFFF o=255 ds=-32768 pr=FF em=FF sb=FF "
+      "de=FFFF irq=FFFFFFFF es=-32768 is=-32768 ss=-32768 sw=FF/FF r=1 t=1 d=1 p=1";
+  std::array<char, 161> out;
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioDriverFaultDiagnostic(out.data(), 160, diagnostic,
+                                                   true, true, true, true));
+  EXPECT_STREQ(expected, out.data());
+  EXPECT_EQ(148u, std::strlen(out.data()));
+  EXPECT_LE(std::strlen(out.data()) + 3, 159u);
+  EXPECT_EQ('\0', out[148]);
+  EXPECT_EQ('!', out[149]);
+  EXPECT_EQ('!', out[160]);
+  out.fill('!');
+  ASSERT_TRUE(mesh::formatRadioDriverFaultDiagnostic(out.data(), 149, diagnostic,
+                                                   true, true, true, true));
+  EXPECT_STREQ(expected, out.data());
+  EXPECT_EQ('!', out[149]);
+  expectSameDiagnostic(before, diagnostic);
+}
+
+TEST(OtaRadioFaultAttribution, PassiveFormatterRetainsLastFailureAfterSuccessfulRecovery) {
+  RadioDriverHealthLatch latch;
+  Sx1262CheckedProbeResult probe{-705, 0xFFFF, -706, 0xFFFFFFFF, -707, 0xFF};
+  recordSx1262CheckedProbeOutcome(latch, probe, Sx1262ExpectedChipMode::kReceiving, 1, 0x11);
+  latch.recordOutcome(true);
+  auto diagnostic = snapshot(latch);
+  const auto before = diagnostic;
+  char out[160];
+  ASSERT_TRUE(mesh::formatRadioDriverFaultDiagnostic(out, sizeof(out), diagnostic,
+                                                   true, false, true, false));
+  EXPECT_STREQ("retained h=1 f=1 n=1 l=1 o=5 ds=-705 pr=7 em=1 sb=FF de=FFFF "
+               "irq=FFFFFFFF es=-705 is=-706 ss=-707 sw=1/11 r=1 t=0 d=1 p=0", out);
+  expectSameDiagnostic(before, diagnostic);
+  expectSameDiagnostic(before, snapshot(latch));
+}
+
+TEST(OtaRadioFaultAttribution, PassiveFormatterRejectsNullAndSmallBuffersWithoutOverrun) {
+  RadioDriverFaultDiagnostic diagnostic;
+  const auto before = diagnostic;
+  EXPECT_FALSE(mesh::formatRadioDriverFaultDiagnostic(nullptr, 160, diagnostic,
+                                                    false, false, false, false));
+  EXPECT_FALSE(mesh::formatRadioDriverFaultDiagnostic(nullptr, 0, diagnostic,
+                                                    false, false, false, false));
+  std::array<char, 161> out;
+  out.fill('!');
+  EXPECT_FALSE(mesh::formatRadioDriverFaultDiagnostic(out.data(), 0, diagnostic,
+                                                    false, false, false, false));
+  EXPECT_EQ('!', out[0]);
+  for (size_t capacity : {size_t{1}, size_t{4}}) {
+    out.fill('!');
+    EXPECT_FALSE(mesh::formatRadioDriverFaultDiagnostic(out.data(), capacity, diagnostic,
+                                                      false, false, false, false));
+    EXPECT_EQ('\0', out[0]);
+    for (size_t i = capacity; i < out.size(); ++i) EXPECT_EQ('!', out[i]);
+  }
+  ASSERT_TRUE(mesh::formatRadioDriverFaultDiagnostic(out.data(), 160, diagnostic,
+                                                   false, false, false, false));
+  const size_t missing_nul_capacity = std::strlen(out.data());
+  out.fill('!');
+  EXPECT_FALSE(mesh::formatRadioDriverFaultDiagnostic(out.data(), missing_nul_capacity, diagnostic,
+                                                    false, false, false, false));
+  EXPECT_EQ('\0', out[0]);
+  EXPECT_EQ('\0', out[missing_nul_capacity - 1]);
+  for (size_t i = missing_nul_capacity; i < out.size(); ++i) EXPECT_EQ('!', out[i]);
+  expectSameDiagnostic(before, diagnostic);
 }
 
 TEST(OtaRadioFaultAttribution, DefaultsAndUnattributedLegacyCallsPreserveHealthAndCount) {

@@ -10,6 +10,7 @@
 #include <helpers/ota/OtaBoardBackendCommon.h>
 #include <helpers/ota/OtaWriteGate.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
+#include <helpers/radiolib/RadioDriverHealthLatch.h>
 __attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
   out = mesh::ota::OtaBootLifecycleEvidence();
   return false;
@@ -1521,6 +1522,53 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     while (*sub == ' ') sub++;
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
+    } else if (strcmp(sub, "radio") == 0) {
+      if (sender_timestamp != 0 || !local_usb) {
+        strcpy(reply, "Err - local USB only");
+      } else {
+        mesh::RadioDriverFaultDiagnostic diagnostic;
+        if (!_radio) {
+          strcpy(reply, "Err - radio unavailable");
+        } else if (!_radio->getDriverFaultDiagnostic(diagnostic)) {
+          strcpy(reply, "Err - radio diagnostic unsupported");
+        } else {
+          const auto& integration = getOtaIntegration();
+          if (!mesh::formatRadioDriverFaultDiagnostic(reply, 160, diagnostic,
+              _radio->isInRecvMode(), isSendInProgress(),
+              integration.directActive(), integration.directPending())) {
+            strcpy(reply, "Err - radio diagnostic too long");
+          }
+        }
+      }
+    } else if (strcmp(sub, "service") == 0) {
+      if (sender_timestamp != 0 || !local_usb) {
+        strcpy(reply, "Err - local USB only");
+      } else if (!_mgr) {
+        strcpy(reply, "Err - packet manager unavailable");
+      } else {
+        const uint32_t now_ms = _ms->getMillis();
+        const auto& integration = getDispatcherOtaIntegration();
+        mesh::RadioServiceDiagnostic diagnostic;
+        diagnostic.freeCount = _mgr->getFreeCount();
+        diagnostic.outboundTotal = _mgr->getOutboundTotal();
+        diagnostic.txTimeoutCount = getTxTimeoutCount();
+        diagnostic.otaAccountingFailureCount = getOtaAccountingFailureCount();
+        diagnostic.remainingTxBudget = getRemainingTxBudget();
+        diagnostic.remainingOtaAirtimeBudget = getRemainingOtaAirtimeBudget(now_ms);
+        diagnostic.normalTrafficQueued = hasQueuedNormalTraffic();
+        diagnostic.directActive = integration.directActive();
+        diagnostic.directPending = integration.directPending();
+        uint8_t frame[mesh::ota::kOtaDirectFrameBytes];
+        size_t frame_len = 0;
+        diagnostic.controlDue = integration.peekOutboundControlFrame(frame, sizeof(frame), frame_len, now_ms);
+        if (diagnostic.controlDue) {
+          diagnostic.controlLength = static_cast<uint16_t>(frame_len);
+          diagnostic.controlKind = frame_len > 0 ? frame[0] : 0;
+        }
+        if (!mesh::formatRadioServiceDiagnostic(reply, 160, diagnostic)) {
+          strcpy(reply, "Err - service diagnostic too long");
+        }
+      }
     } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
       mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
           strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
@@ -1535,7 +1583,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else if (memcmp(sub, "duty ", 5) == 0) {
       if (setFirmwareOtaDutyCycle((float)atof(sub + 5))) strcpy(reply, "OK"); else strcpy(reply, "Err - bad duty");
     } else {
-      strcpy(reply, "Err - usage: ota status|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
+      strcpy(reply, "Err - usage: ota status|radio|service|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
     }
 #endif
   } else{

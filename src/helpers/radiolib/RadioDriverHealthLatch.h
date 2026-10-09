@@ -1,6 +1,8 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 namespace mesh {
 
@@ -37,6 +39,68 @@ struct RadioDriverFaultDiagnostic {
   uint32_t originCounts[kOriginCount] = {};
   RadioDriverFaultDetails last;
 };
+
+inline bool formatRadioDriverFaultDiagnostic(char* out, size_t capacity,
+                                            const RadioDriverFaultDiagnostic& diagnostic,
+                                            bool receiving, bool sending,
+                                            bool direct_active, bool direct_pending) {
+  if (!out || capacity == 0) return false;
+  const auto& last = diagnostic.last;
+  const int written = snprintf(out, capacity,
+      "retained h=%u f=%u n=%lX l=%lX o=%u ds=%d pr=%X em=%X sb=%X de=%X irq=%lX "
+      "es=%d is=%d ss=%d sw=%X/%X r=%u t=%u d=%u p=%u",
+      static_cast<unsigned>(diagnostic.healthy), static_cast<unsigned>(diagnostic.hasFailure),
+      static_cast<unsigned long>(diagnostic.faultCount),
+      static_cast<unsigned long>(diagnostic.lastFaultCount),
+      static_cast<unsigned>(last.origin), static_cast<int>(last.driverStatus),
+      static_cast<unsigned>(last.probeReasons), static_cast<unsigned>(last.expectedMode),
+      static_cast<unsigned>(last.statusByte), static_cast<unsigned>(last.deviceErrors),
+      static_cast<unsigned long>(last.irqFlags), static_cast<int>(last.deviceErrorsStatus),
+      static_cast<int>(last.irqFlagsStatus), static_cast<int>(last.statusReadStatus),
+      static_cast<unsigned>(last.softwareStateBefore), static_cast<unsigned>(last.softwareStateAfter),
+      static_cast<unsigned>(receiving), static_cast<unsigned>(sending),
+      static_cast<unsigned>(direct_active), static_cast<unsigned>(direct_pending));
+  if (written < 0 || static_cast<size_t>(written) >= capacity) {
+    out[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
+struct RadioServiceDiagnostic {
+  int freeCount = 0;
+  int outboundTotal = 0;
+  uint32_t txTimeoutCount = 0;
+  uint32_t otaAccountingFailureCount = 0;
+  unsigned long remainingTxBudget = 0;
+  unsigned long remainingOtaAirtimeBudget = 0;
+  bool normalTrafficQueued = false;
+  bool directActive = false;
+  bool directPending = false;
+  bool controlDue = false;
+  uint16_t controlLength = 0;
+  uint8_t controlKind = 0;
+};
+
+inline bool formatRadioServiceDiagnostic(char* out, size_t capacity,
+                                        const RadioServiceDiagnostic& diagnostic) {
+  if (!out || capacity == 0) return false;
+  const int written = snprintf(out, capacity,
+      "ram free=%d q=%d to=%lX af=%lX tx=%lX ota=%lX n=%u d=%u p=%u c=%u len=%u kind=%02X",
+      diagnostic.freeCount, diagnostic.outboundTotal,
+      static_cast<unsigned long>(diagnostic.txTimeoutCount),
+      static_cast<unsigned long>(diagnostic.otaAccountingFailureCount),
+      diagnostic.remainingTxBudget, diagnostic.remainingOtaAirtimeBudget,
+      static_cast<unsigned>(diagnostic.normalTrafficQueued),
+      static_cast<unsigned>(diagnostic.directActive), static_cast<unsigned>(diagnostic.directPending),
+      static_cast<unsigned>(diagnostic.controlDue), static_cast<unsigned>(diagnostic.controlLength),
+      static_cast<unsigned>(diagnostic.controlKind));
+  if (written < 0 || static_cast<size_t>(written) >= capacity) {
+    out[0] = '\0';
+    return false;
+  }
+  return true;
+}
 
 // Counts retain the existing unsigned modulo-2^32 semantics. hasFailure
 // distinguishes a wrapped lastFaultCount of zero from no recorded failure.

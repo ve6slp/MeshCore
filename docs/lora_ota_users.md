@@ -147,6 +147,53 @@ make ota-device-inspect OTA_DEVICE_PORT="$CLIENT_PORT" OTA_DEVICE_DTR=1
 Ports are exclusively locked and opened at 115200, with RTS false and DTR selected
 **before** opening. These tools never use a 1200-baud reset.
 
+### Passive repeater radio-fault readback
+
+On an OTA-enabled repeater's physical USB CLI, run `ota radio`. Both local USB
+provenance and a zero sender timestamp are required; remote and Ethernet requests
+return `Err - local USB only`. An unavailable radio or unsupported diagnostic also
+returns an explicit `Err`.
+
+The `retained` reply is passive history, **not a fresh chip-state measurement**.
+It only copies the driver's retained diagnostic and reads software state flags:
+no active probe, SPI/status read, reset, queue change, retune, fault clearing,
+settings change or write-gate change. A successful recovery can give `h=1 f=1`:
+the last failure remains recorded until the driver object is recreated.
+
+Compact labels: `h` healthy, `f` hasFailure, `n` faultCount, `l` lastFaultCount;
+`o` last origin (0 unknown, 1 startReceive, 2 readData, 3 receiveRearm,
+4 startTransmit, 5 activeProbe); `ds` driverStatus, `pr` probeReasons,
+`em` expectedMode, `sb` statusByte, `de` deviceErrors, `irq` irqFlags,
+`es` deviceErrorsStatus, `is` irqFlagsStatus, `ss` statusReadStatus,
+`sw` softwareStateBefore/After. Counts and `pr/em/sb/de/irq/sw` are hexadecimal
+without `0x`; origin and signed statuses are decimal. Boolean `r/t/d/p` mean
+software receive mode, send in progress, direct active and direct pending.
+Replies fit the existing 160-byte buffer including NUL and the optional CLI prefix.
+
+### Passive repeater service readback
+
+The same physical USB CLI offers `ota service`, with the same zero-timestamp
+and local-USB provenance gate. The `ram` reply observes dispatcher/pool/budget
+state and peeks at a **due-now** outbound control reply without consuming or
+releasing it. It never probes the radio, reads RSSI, updates budgets, ticks the
+integration, changes queues/settings or alters boot, trust, ownership or write gates.
+A missing packet manager returns an explicit `Err`.
+
+Labels: `free` free packet count, `q` total outbound queue count,
+`to` TX timeout count, `af` OTA airtime-accounting failure count,
+`tx` remaining dispatcher TX budget in milliseconds, `ota` remaining OTA
+airtime budget in milliseconds; `n` ready normal traffic, `d/p` direct
+active/pending, `c` control reply due now, `len/kind` its byte length and first
+byte. `to/af/tx/ota/kind` are hexadecimal without `0x`; other values are decimal.
+`c=0 len=0 kind=00` means no control reply is due now, not necessarily that none
+is scheduled for later. The OTA budget is the stored on-mesh share, not the
+remaining direct-lease duration. Airtime estimation and `canTransmit` are
+deliberately omitted to keep this snapshot strictly RAM-only.
+
+For example: `ram free=32 q=2 to=4 af=1 tx=3E8 ota=11940 n=1 d=0 p=1 c=1 len=123 kind=0B`.
+The maximum formatted reply is 117 characters on ROLE1 (133 with 64-bit
+`unsigned long` budgets), plus optional 3-character CLI prefix and NUL.
+
 ## Deploy through an OTA-enabled companion
 
 Use a raw application `.bin`, not ZIP/UF2, bootloader, partition-table or merged
