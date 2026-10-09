@@ -103,6 +103,46 @@ bootloader/application and normal service afterward.
 `tools/commission_pair.py` can validate a compound against the selected pair and
 ordinary restore ZIP; its bounded readback callback does not discover hardware.
 
+The compound preload is for the **old vendor bootloader**, before replacing
+the primary. Once the paired primary is installed, serial APP recovery must use
+the exact **ordinary APP-only ZIP**, not the compound: the new primary protects
+the fixed installer region and rejects an application extending into it.
+Do not repeat the old bootstrap sequence to recover an already paired board.
+
+### No USB after an interrupted bootstrap
+
+First check the target's own USB-C data cable and connector. Target power and a
+working USB debug probe do not establish a USB data connection to the target.
+
+SWD diagnosis on a non-enumerating XIAO Sense found two separate problems: a
+bootloader update had displaced the ordinary APP, and the old primary trapped
+before starting USB. Its early `usb_init` call queried
+`sd_softdevice_is_enabled` (`SVC 0x12`) before SoftDevice interrupt forwarding
+was initialized, entering the primary's default SVC handler. This was not a
+HardFault or an MBR command (`SVC 0x18`). The current vendor patch uses a
+phase-aware wrapper so cold-entry USB setup does not issue that premature
+SoftDevice call.
+
+When USB recovery cannot start, identify the actual board/BSP and role through
+SWD before writing anything. Diagnose the executing primary and APP vectors;
+do not symbolize an old physical image using a newer ELF. Preserving recovery
+restores only the matching primary/config region and fixed installer region,
+then uses the recovered vendor serial port to restore the ordinary APP-only
+ZIP. Keep the SoftDevice, UICR, parameter/settings pages, filesystems, QSPI
+transactions, public identity and confirmed counter history intact. Never use
+mass erase, unlock/recover or a merged HEX as a substitute for this diagnosis.
+Check normal USB service, public identity and OTA status after recovery; a
+subsequent real signed LoRa installation is still required to establish OTA
+operation.
+
+On a previously confirmed device, a different APP restored over USB does not
+replace the confirmed OTA image hash or counter. An image mismatch can therefore
+keep userdata writes and software-requested UF2 recovery disabled even though
+the application enumerates. Enter vendor recovery with the physical double
+reset and restore the **exact previously confirmed APP**, or perform an
+authorized compatible OTA update with a higher counter. Do not erase or lower
+the confirmed floor to make an unrelated USB image appear qualified.
+
 **Do not copy bootloader-update UF2 files to the board.** Vendor UF2 self-update
 can remap writes into protected ExtraFS even when the UF2's own addresses look
 safe. `tools/install_uf2.py` is now an offline artifact validator only; it does
