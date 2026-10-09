@@ -8,6 +8,7 @@ VENDOR ?= $(ROOT)/.tmp/Adafruit_nRF52_Bootloader_OTAFIX
 VENDOR_URL ?= https://github.com/oltaco/Adafruit_nRF52_Bootloader_OTAFIX.git
 VENDOR_PIN := a62825be4733f500271c89b5ec489fd609748e97
 APP_PACKAGE ?=
+APP_CONTEXT ?=
 PACKAGE_OUTPUT ?= $(OUTPUT)-packages
 NRFUTIL ?= $(HOME)/.platformio/packages/tool-adafruit-nrfutil/adafruit-nrfutil.py
 VERIFY_ONLY ?= 0
@@ -17,7 +18,7 @@ export TMP := $(TMPDIR)
 export TEMP := $(TMPDIR)
 export PYTHONDONTWRITEBYTECODE := 1
 
-.PHONY: fetch pair test package-pair
+.PHONY: fetch pair test test-primary package-pair
 fetch:
 	@test ! -e "$(VENDOR)" || { echo 'Vendor path exists; refusing to overwrite.' >&2; exit 1; }
 	@mkdir -p "$(TMPDIR)"
@@ -28,13 +29,15 @@ pair:
 	@mkdir -p "$(TMPDIR)"
 	$(PYTHON) "$(PRODUCT)/tools/build_pair.py" \
 	  --board "$(BOARD)" --role "$(ROLE)" --output "$(OUTPUT)" --vendor "$(VENDOR)"
-test:
+test-primary:
 	@mkdir -p "$(TMPDIR)"
 	$(PYTHON) "$(PRODUCT)/tools/build_pair.py" --test \
 	  --board "$(BOARD)" --role "$(ROLE)" --output "$(OUTPUT)" --vendor "$(VENDOR)"
-	XIAO_TEST_PAIR_DIR="$(OUTPUT)" XIAO_TEST_APP_PACKAGE="$(APP_PACKAGE)" \
+test: test-primary
+	XIAO_TEST_PAIR_DIR="$(OUTPUT)" XIAO_TEST_APP_PACKAGE="$(APP_PACKAGE)" XIAO_TEST_APP_CONTEXT="$(APP_CONTEXT)" \
 	  XIAO_TEST_NRFUTIL="$(NRFUTIL)" $(PYTHON) -m unittest discover -s "$(PRODUCT)/tests" -p test_package_pair.py
 package-pair:
 	$(PYTHON) "$(PRODUCT)/tools/package_pair.py" --pair "$(OUTPUT)" \
 	  --board "$(BOARD)" --role "$(ROLE)" --app-package "$(APP_PACKAGE)" \
+	  --app-context "$(APP_CONTEXT)" \
 	  --output "$(PACKAGE_OUTPUT)" --nrfutil "$(NRFUTIL)" $(if $(filter 1,$(VERIFY_ONLY)),--verify-only)

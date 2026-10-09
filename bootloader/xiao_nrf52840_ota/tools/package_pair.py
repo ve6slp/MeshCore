@@ -63,6 +63,29 @@ def package_payload(path, kind, expected=None):
         return raw, init
 
 
+def verify_app_context(context_path, app_package, *, board, role):
+    require(context_path is not None, "requires actual APP compiler build context")
+    context = read_json(context_path)
+    app, _ = package_payload(app_package, "application")
+    require(context["schema"] == "xiao-ota-app-build-v1" and type(context["role"]) is int and
+            context["board_profile"] == board and context["role"] == role,
+            "APP build board/ROLE differs from selected pair")
+    require(board in ("xiao_nrf52840", "xiao_nrf52840_sense") and
+            context["pio_board"] == "seeed-xiao-afruitnrf52-nrf52840" and
+            context["mcu"] == "nrf52840" and
+            all(type(v) is int for v in context["compiler"].values()) and
+            context["compiler"] == {"XIAO_NRF52": 1, "MESHCORE_LORA_OTA": 1,
+                                     "XIAO_OTA_COMPILED_ROLE_ID": role},
+            "APP compiler context is not the matching XIAO installer")
+    require(context["image_sha256"] == digest(app) and context["image_bytes"] == len(app) and
+            context["zip_sha256"] == build.sha(app_package),
+            "APP image/ZIP differs from its actual build context")
+    require(context["elf"] == "firmware.elf" and
+            build.sha(context_path.parent / context["elf"]) == context["elf_sha256"],
+            "APP frozen ELF differs from its build context")
+    return context
+
+
 def verify_pair(pair, *, board=None, role=None):
     manifest = read_json(pair / "pair-manifest.json")
     selected = manifest["board_profile"]
@@ -79,6 +102,8 @@ def verify_pair(pair, *, board=None, role=None):
             "requires genuine pinned BSP / logical board/ROLE pair")
     require(manifest["architecture"] == "fixed-otafix-primary-secondary" and
             manifest["optional_fault_layer"] == "excluded", "wrong selected architecture/layer")
+    require(manifest.get("usb_bench") == build.USB_BENCH,
+            "pair does not implement the native USB serial fresh-bench profile")
     known = {str(p.relative_to(build.PRODUCT)) for p in build.PRODUCT.rglob("*")
              if p.is_file() and "__pycache__" not in p.parts} | {"canonical-layout"}
     require(set(manifest["source_fingerprints"]) == known, "incomplete/stale source inventory")
@@ -148,6 +173,7 @@ def verify_pair(pair, *, board=None, role=None):
               ("currentSourceRelease", "vendor_pin", "vendor_release", "logical_board",
                "actual_vendor_bsp", "role", "source_fingerprints", "stage2")}
     public.update(pair_manifest_sha256=build.sha(pair / "pair-manifest.json"),
+                  usb_bench=manifest["usb_bench"],
                   capabilities=fields[5], primary_code_bytes=code,
                   primary_initialized_data_bytes=data, primary_arm_load_bytes=code + data,
                   cf2_board_id=cf2, marker_address=0xFDC00,
@@ -206,9 +232,11 @@ def emit(args, kind, filename, raw, init):
 
 def run(args):
     primary, stage, public = verify_pair(args.pair, board=args.board, role=args.role)
+    context = verify_app_context(args.app_context, args.app_package, board=args.board, role=args.role)
     app, original_init = package_payload(args.app_package, "application")
     compound = compound_payload(app, stage)
-    binding = dict(pair=public, app_prefix_sha256=digest(app), app_prefix_bytes=len(app),
+    binding = dict(pair=public, app_build=context, app_build_context_sha256=build.sha(args.app_context),
+                   app_prefix_sha256=digest(app), app_prefix_bytes=len(app),
                    input_app_zip_sha256=build.sha(args.app_package), app_start=0x27000,
                    stage_start=0xC4000, stage_bytes=len(stage), primary_start=0xF4000,
                    compound_bytes=len(compound), compound_sha256=digest(compound),
@@ -256,6 +284,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pair", type=Path, required=True)
     parser.add_argument("--app-package", type=Path, required=True)
+    parser.add_argument("--app-context", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--nrfutil", required=True)
     parser.add_argument("--verify-only", action="store_true")
@@ -264,6 +293,7 @@ def main():
     args = parser.parse_args()
     args.pair, args.app_package, args.output = (
         p.resolve() for p in (args.pair, args.app_package, args.output))
+    args.app_context = args.app_context.resolve()
     run(args)
 
 

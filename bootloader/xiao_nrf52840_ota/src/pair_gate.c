@@ -44,3 +44,14 @@ pair_result_t pair_call(const pair_expected_t *expected) {
   pair_result_t result = entry(&request);
   return result == PAIR_APP_INTACT ? result : PAIR_RECOVERY;
 }
+
+bool pair_bench_reset(const pair_expected_t *expected) {
+  if (!pair_validate_internal(expected)) return false;
+  const struct {
+    pair_request_t header;
+    uint32_t operation;
+  } request = {{PAIR_ABI_VERSION, sizeof(request), expected->board, expected->role},
+               PAIR_BENCH_REQUEST};
+  const pair_entry_t entry = (pair_entry_t)(uintptr_t)expected->entry;
+  return entry(&request.header) == PAIR_BENCH_READY;
+}

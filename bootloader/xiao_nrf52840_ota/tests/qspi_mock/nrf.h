@@ -19,9 +19,9 @@ typedef struct { volatile uint32_t CTRL, CYCCNT; } mock_dwt_t;
 typedef struct { volatile uint32_t DEMCR; } mock_coredebug_t;
 typedef struct { volatile uint32_t READY, CONFIG, ERASEPAGE; } mock_nvmc_t;
 typedef struct {
-  volatile uint32_t CONFIG, CRV, RREN, TASKS_START, RR[1];
+  volatile uint32_t CONFIG, CRV, RREN, TASKS_START, RUNSTATUS, RR[8];
 } mock_wdt_t;
-typedef struct { volatile uint32_t GPREGRET, RESETREAS; } mock_power_t;
+typedef struct { volatile uint32_t GPREGRET, RESETREAS, USBREGSTATUS; } mock_power_t;
 typedef struct { volatile uint32_t DEVICEID[2]; } mock_ficr_t;
 
 extern NRF_QSPI_Type mock_qspi;

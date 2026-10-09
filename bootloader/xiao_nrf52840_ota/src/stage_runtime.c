@@ -21,7 +21,7 @@ const pair_header_t stage_header = {
  * reset handler: S140, VTOR, CONTROL, interrupt mask and MSP remain primary-owned. */
 pair_result_t stage_run(const pair_request_t *request) {
   if (!request || request->abi != PAIR_ABI_VERSION ||
-      request->bytes != sizeof(*request) ||
+      (request->bytes != sizeof(*request) && request->bytes != sizeof(*request) + 4) ||
       request->board != XIAO_OTA_BOARD_TARGET ||
       request->role != XIAO_OTA_COMPILED_ROLE_ID) return PAIR_RECOVERY;
   const uint8_t *source = &__data_load__;
@@ -30,6 +30,11 @@ pair_result_t stage_run(const pair_request_t *request) {
   for (uint8_t *dest = &__bss_start__; dest < &__bss_end__; ++dest) *dest = 0;
   if (initialized_cookie != UINT32_C(0x3241544F) || zero_cookie != 0)
     return PAIR_RECOVERY;
+  if (request->bytes == sizeof(*request) + 4) {
+    const uint32_t *operation = (const uint32_t *)(request + 1);
+    return *operation == PAIR_BENCH_REQUEST && xiao_ota_boot_bench_reset() ?
+        PAIR_BENCH_READY : PAIR_RECOVERY;
+  }
   xiao_ota_boot_process();
   return xiao_ota_stage2_recovery_requested() ? PAIR_RECOVERY : PAIR_APP_INTACT;
 }

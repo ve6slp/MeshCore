@@ -16,6 +16,7 @@ PRODUCT = Path(__file__).resolve().parents[1]
 ROOT = PRODUCT.parents[1]
 PIN = "a62825be4733f500271c89b5ec489fd609748e97"
 RELEASE = "0.9.2-OTAFIX2.3-BP1.4"
+USB_BENCH = "serial-usb-cdc-fresh-v2"
 BSP = {"xiao_nrf52840": "xiao_nrf52840_ble",
        "xiao_nrf52840_sense": "xiao_nrf52840_ble_sense",
        "sensecap_solar_p1": "sensecap_solar_p1"}
@@ -78,6 +79,99 @@ def loads(elf):
             result.append(dict(zip(("offset", "vaddr", "paddr", "filesz", "memsz"),
                                    (int(v, 16) for v in fields[1:6]))))
     return result
+
+
+def enable_usb_bench(tree):
+    """Native USB serial START admits fresh bench; BLE/field stays bounded."""
+    serial = tree / "lib/sdk11/components/libraries/bootloader_dfu/dfu_transport_serial.c"
+    text = serial.read_text()
+    text = '#include "xiao_ota_vendor.h"\n' + text
+    text = once(text, "                        retval = dfu_start_pkt_handle(packet);",
+        "#ifdef NRF_USBD\n"
+        "                        if (!xiao_ota_vendor_usb_bench_enter()) {\n"
+        "                            APP_ERROR_CHECK(NRF_ERROR_INVALID_STATE);\n"
+        "                            break;\n"
+        "                        }\n"
+        "#endif\n"
+        "                        retval = dfu_start_pkt_handle(packet);")
+    serial.write_text(text)
+    single = tree / "lib/sdk11/components/libraries/bootloader_dfu/dfu_single_bank.c"
+    text = single.read_text()
+    text = once(text, '#include "dfu_init.h"', '#include "dfu_init.h"\n#include "crc16.h"')
+    text = once(text, "    update_status.app_crc     = m_image_crc;",
+                "    update_status.app_crc     = crc16_compute((uint8_t *)DFU_BANK_0_REGION_START, m_image_size, NULL);")
+    text = once(text, "    if ((p_packet->params.start_packet->dfu_update_mode & DFU_UPDATE_APP) &&\n"
+        "        !xiao_ota_vendor_sdk_upload_begin()) return NRF_ERROR_INVALID_STATE;\n", "")
+    text = once(text, "    if (m_start_packet.dfu_update_mode != DFU_UPDATE_APP ||\n"
+        "        m_start_packet.sd_image_size || m_start_packet.bl_image_size)\n"
+        "        return NRF_ERROR_NOT_SUPPORTED;",
+        "    bool const bench = xiao_ota_vendor_usb_bench_mode() && !sd_enabled && !is_ota();\n"
+        "    if (m_start_packet.sd_image_size ||\n"
+        "        !((m_start_packet.dfu_update_mode == DFU_UPDATE_APP && !m_start_packet.bl_image_size) ||\n"
+        "          (bench && m_start_packet.dfu_update_mode == DFU_UPDATE_BL &&\n"
+        "           !m_start_packet.app_image_size && m_start_packet.bl_image_size == 0xA000u)))\n"
+        "        return NRF_ERROR_NOT_SUPPORTED;")
+    text = once(text, "    if (!xiao_ota_vendor_start(m_start_packet.app_image_size))",
+        "    xiao_ota_vendor_bench_allow_stage_repair(bench &&\n"
+        "        (m_start_packet.dfu_update_mode == DFU_UPDATE_BL || m_image_size > 0x9D000u));\n"
+        "    if (!xiao_ota_vendor_start(m_image_size))")
+    text = once(text, "    return dfu_bl_image_validate() == NRF_SUCCESS ?\n"
+        "           NRF_SUCCESS : NRF_ERROR_NOT_SUPPORTED;",
+        "    uint16_t marker;\n"
+        "    memcpy(&marker, (const uint8_t *)&settings + 6, 2);\n"
+        "    if (xiao_ota_vendor_usb_bench_mode() && marker == XIAO_OTA_BENCH_PENDING &&\n"
+        "        settings.bank_1 == BANK_VALID_BOOT &&\n"
+        "        !settings.sd_image_size && !settings.app_image_size && settings.bl_image_size == 0xA000u) {\n"
+        "        sd_mbr_command_t command = {.command = SD_MBR_COMMAND_COPY_BL};\n"
+        "        command.params.copy_bl.bl_src = (uint32_t *)DFU_BANK_0_REGION_START;\n"
+        "        command.params.copy_bl.bl_len = settings.bl_image_size / 4;\n"
+        "        return sd_mbr_command(&command);\n"
+        "    }\n"
+        "    return dfu_bl_image_validate() == NRF_SUCCESS ? NRF_SUCCESS : NRF_ERROR_NOT_SUPPORTED;")
+    single.write_text(text)
+    boot = tree / "lib/sdk11/components/libraries/bootloader_dfu/bootloader.c"
+    text = boot.read_text()
+    getter = """  p_settings->bank_0         = p_bootloader_settings->bank_0;
+  p_settings->bank_0_crc     = p_bootloader_settings->bank_0_crc;
+  p_settings->bank_0_size    = p_bootloader_settings->bank_0_size;
+  p_settings->bank_1         = p_bootloader_settings->bank_1;
+  p_settings->sd_image_size  = p_bootloader_settings->sd_image_size;
+  p_settings->bl_image_size  = p_bootloader_settings->bl_image_size;
+  p_settings->app_image_size = p_bootloader_settings->app_image_size;
+  p_settings->sd_image_start = p_bootloader_settings->sd_image_start;"""
+    text = once(text, getter,
+                "  memcpy(p_settings, p_bootloader_settings, sizeof(*p_settings));")
+    text = once(text, "    settings.bank_1         = BANK_VALID_BOOT;",
+        "    settings.bank_1         = BANK_VALID_BOOT;\n"
+        "    if (!xiao_ota_vendor_usb_bench_mode()) { APP_ERROR_CHECK(NRF_ERROR_NOT_SUPPORTED); return; }\n"
+        "    settings.bank_0 = BANK_INVALID_APP;\n"
+        "    settings.bank_0_crc = update_status.app_crc;\n"
+        "    settings.bank_0_size = update_status.bl_size;\n"
+        "    uint16_t bench_marker = XIAO_OTA_BENCH_PENDING;\n"
+        "    memcpy((uint8_t *)&settings + 6, &bench_marker, 2);")
+    boot.write_text(text)
+    # CDC serial DFU is the bench transport. Drop MSC/UF2 to keep the fixed
+    # primary budget; BOOT-family UF2 remapping remains unsupported.
+    config = tree / "src/usb/tusb_config.h"
+    config.write_text(once(config.read_text(), "#define CFG_TUD_MSC                 1",
+                          "#define CFG_TUD_MSC                 0"))
+    usb = tree / "src/usb/usb.c"
+    usb.write_text(once(once(usb.read_text(), "  usb_desc_init(cdc_only);",
+                            "  (void)cdc_only;\n  usb_desc_init(true);"), "  uf2_init();", ""))
+    desc = tree / "src/usb/usb_desc.c"
+    text, count = re.subn(r"uint8_t desc_configuration_cdc_msc\[\] =\s*\{.*?\n\};",
+                         "", desc.read_text(), count=1, flags=re.S)
+    assert count == 1
+    desc.write_text(once(text, "return _cdc_only ? desc_configuration_cdc_only : desc_configuration_cdc_msc;",
+                        "return desc_configuration_cdc_only;"))
+    makefile = tree / "Makefile"
+    text = makefile.read_text()
+    for name in ("src/usb/msc_uf2.c", "src/usb/uf2/ghostfat.c",
+                 "$(TUSB_PATH)/class/msc/msc_device.c"):
+        text = re.sub(r"^\s*" + re.escape(name) + r"\s*\\?\s*\n", "", text, flags=re.M)
+    # ghostfat was the final entry in a backslash-continued source list.
+    text = text.replace("src/usb/usb.c \\\n\n", "src/usb/usb.c\n\n")
+    makefile.write_text(text)
 
 
 def build_stage(out, vendor, board, role):
@@ -164,7 +258,26 @@ def prepare_primary(out, tree, board, role, stage):
         '#include "boards.h"\n#include "pair_abi.h"\n#include "pair_expected.h"\n'
         '#include "xiao_ota_primary.h"\n#include "xiao_ota_vendor.h"\n'
         '#include "xiao_ota_vendor_sdk.h"\n#include "bootloader_settings.h"\n'
-        "static uint32_t entry_gpregret;\n"
+        '#include "tusb.h"\n'
+        "static uint32_t entry_gpregret, entry_resetreas;\n"
+        "static bool usb_bench;\n"
+        "static bool bench_stage_repair;\n"
+        "bool is_ota(void);\n"
+        "bool xiao_ota_vendor_usb_bench_mode(void) { return usb_bench; }\n"
+        "bool xiao_ota_vendor_usb_bench_enter(void) {\n"
+        "  if (is_ota() || !tud_mounted() ||\n"
+        "      !(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) ||\n"
+        "      NRF_ACL->ACL[0].SIZE || NRF_ACL->ACL[1].SIZE ||\n"
+        "      !xiao_ota_vendor_sdk_usb_bench_enter()) return false;\n"
+        "  usb_bench = true;\n"
+        "  return true;\n"
+        "}\n"
+        "void xiao_ota_vendor_bench_allow_stage_repair(bool allowed) { bench_stage_repair = usb_bench && allowed; }\n"
+        "bool xiao_ota_primary_bench_prepare(void) {\n"
+        "  if (!usb_bench) return false;\n"
+        "  if (!pair_validate_internal(&paired_stage)) return bench_stage_repair;\n"
+        "  return pair_bench_reset(&paired_stage);\n"
+        "}\n"
         "static bool pair_intact;\n"
         "void xiao_ota_primary_invalidate_app_grant(void) { pair_intact = false; }")
     text = text.replace("static void check_dfu_mode(void)",
@@ -175,11 +288,14 @@ def prepare_primary(out, tree, board, role, stage):
     text = once(text, "int main(void) {",
         "int main(void) {\n"
         "  entry_gpregret = NRF_POWER->GPREGRET;\n"
+        "  entry_resetreas = NRF_POWER->RESETREAS;\n"
+        "  if ((entry_resetreas & POWER_RESETREAS_RESETPIN_Msk) &&\n"
+        "      (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk))\n"
+        "    entry_gpregret = DFU_MAGIC_SERIAL_ONLY_RESET;\n"
         "  APP_ERROR_CHECK(xiao_ota_vendor_sdk_boot_entry(\n"
         "      entry_gpregret == DFU_MAGIC_OTA_APPJUM));\n")
     text = once(text, "  uint32_t const gpregret = NRF_POWER->GPREGRET;",
-        "  uint32_t const gpregret = pair_forced_recovery ?\n"
-        "      DFU_MAGIC_UF2_RESET : entry_gpregret;")
+        "  uint32_t const gpregret = pair_forced_recovery ? DFU_MAGIC_UF2_RESET : entry_gpregret;")
     text = once(text,
         "  // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC\n"
         "  _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);",
@@ -188,6 +304,7 @@ def prepare_primary(out, tree, board, role, stage):
         "      _sd_inited = true;",
         "      if (!_sd_inited) mbr_init_sd();")
     text = once(text, "  bootloader_init();",
+        "  NRF_POWER->RESETREAS = entry_resetreas;\n"
         "  bootloader_init();\n  uint32_t pair_init = xiao_ota_primary_init();")
     text = once(text, "    bootloader_dfu_sd_update_continue();\n"
         "    bootloader_dfu_sd_update_finalize();",
@@ -200,10 +317,10 @@ def prepare_primary(out, tree, board, role, stage):
         "    }")
     text = once(text, "  // Check all inputs and enter DFU if needed",
         "  uint32_t const prior_marker = *dbl_reset_mem;\n"
-        "  bool const pin_reset = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) != 0;\n"
+        "  bool const pin_reset = (entry_resetreas & POWER_RESETREAS_RESETPIN_Msk) != 0;\n"
         "  bool const escape = pair_explicit_escape(entry_gpregret, pin_reset,\n"
         "                                          prior_marker, button_pressed(BUTTON_DFU));\n"
-        "  bool const protected = pair_lock_protection();\n"
+        "  bool const protected = escape || pair_lock_protection();\n"
         "  pair_intact = false;\n"
         "  if (!escape && protected && pair_init == NRF_SUCCESS && !bootloader_dfu_sd_in_progress()) {\n"
         "    if (pin_reset) *dbl_reset_mem = DFU_DBL_RESET_MAGIC;\n"
@@ -211,9 +328,26 @@ def prepare_primary(out, tree, board, role, stage):
         "    *dbl_reset_mem = prior_marker;\n"
         "  }\n"
         "  bool const forced = (!escape && !pair_intact) || pair_init != NRF_SUCCESS;\n"
-        "  if (forced) NRF_POWER->GPREGRET = DFU_MAGIC_UF2_RESET;\n\n"
+        "  if (forced) {\n"
+        "    NRF_POWER->GPREGRET = DFU_MAGIC_UF2_RESET;\n"
+        "    if (!escape) NVIC_SystemReset();\n"
+        "  }\n\n"
         "  // Check all inputs and enter DFU if needed")
-    text = once(text, "  check_dfu_mode();", "  check_dfu_mode(forced);")
+    text = once(text, "  check_dfu_mode();",
+        "  check_dfu_mode(forced);\n"
+        "  if (usb_bench && bootloader_dfu_sd_in_progress()) {\n"
+        "    APP_ERROR_CHECK(xiao_ota_vendor_pending_check());\n"
+        "    APP_ERROR_CHECK(bootloader_dfu_sd_update_continue());\n"
+        "    APP_ERROR_CHECK(bootloader_dfu_sd_update_finalize());\n"
+        "  }")
+    text = once(text,
+        "  bool const reason_reset_pin = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) ? true : false;",
+        "  bool const reason_reset_pin = (entry_resetreas & POWER_RESETREAS_RESETPIN_Msk) != 0;")
+    text = once(text, "      led_state(STATE_BLE_DISCONNECTED);\n"
+        "      if (!_sd_inited) mbr_init_sd();",
+        "      APP_ERROR_CHECK(pair_lock_protection() ? NRF_SUCCESS : NRF_ERROR_INTERNAL);\n"
+        "      led_state(STATE_BLE_DISCONNECTED);\n"
+        "      if (!_sd_inited) mbr_init_sd();")
     text = once(text, "  if (bootloader_app_is_valid() && !bootloader_dfu_sd_in_progress()) {",
         "  bootloader_settings_t const *sdk;\n  bootloader_util_settings_get(&sdk);\n"
         "  if (pair_app_gate(pair_intact, sdk->bank_0 == BANK_VALID_APP,\n"
@@ -227,8 +361,8 @@ def prepare_primary(out, tree, board, role, stage):
         "    uint32_t dfu_error;\n\n"
         "    // Initiate an update of the firmware.")
     text = once(text, "  if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {",
-        "  if (!pair_forced_recovery &&\n"
-        "      (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu)) {")
+        "  if (!pair_forced_recovery && APP_ASKS_FOR_SINGLE_TAP_RESET() &&\n"
+        "      !uf2_dfu && !serial_only_dfu) {")
     text = once(text, "      bootloader_dfu_start(_ota_dfu, 3000, true);",
                 "      dfu_error = bootloader_dfu_start(_ota_dfu, 3000, true);")
     text = once(text, "      bootloader_dfu_start(_ota_dfu, 0, false);",
@@ -279,10 +413,11 @@ def test_pair(out, vendor, board, role):
     end = generated.index("static uint32_t ble_stack_init", start)
     (folder / "generated_primary.inc").write_text(
         generated[start:end].replace("int main(void)", "int vendor_main(void)", 1))
-    grant = re.search(r"static bool pair_intact;\nvoid xiao_ota_primary_invalidate_app_grant\(void\) \{[^}]*\}", generated)
-    assert grant
+    start = generated.index("static bool usb_bench;")
+    end = generated.index('\n#include "pstorage_platform.h"', start)
     (folder / "primary_grant.inc").write_text(
-        "static uint32_t entry_gpregret;\n" + grant[0] + "\n")
+        "static uint32_t entry_gpregret, entry_resetreas;\n" +
+        generated[start:end] + "\n")
     shutil.copy2(out / "primary-source/src/xiao_ota/pair_expected.h", folder / "pair_expected.h")
     flags = ["-std=c11", "-D_GNU_SOURCE", "-O2", "-Wall", "-Wextra", "-Werror",
              "-Wno-unused-function", "-Wno-sign-compare",
@@ -320,6 +455,47 @@ def test_pair(out, vendor, board, role):
             assert result.returncode == 0, result.stdout
             print(result.stdout, end="")
     print("Old production reset-GP57 adapter compiles and assertion-fails: PASS")
+    single = (out / "primary-source/lib/sdk11/components/libraries/bootloader_dfu/dfu_single_bank.c").read_text()
+    postvalidate = (out / "primary-source/src/dfu_init.c").read_text()
+    start = postvalidate.index("uint32_t dfu_init_postvalidate(")
+    extracted = [postvalidate[start:postvalidate.index("\n}", start) + 2]]
+    boot = (out / "primary-source/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c").read_text()
+    start = boot.index("void bootloader_settings_get(")
+    extracted.append(boot[start:boot.index("\n}", start) + 2])
+    original = (vendor / "lib/sdk11/components/libraries/bootloader_dfu/bootloader.c").read_text()
+    start = original.index("void bootloader_settings_get(")
+    extracted.append(original[start:original.index("\n}", start) + 2].replace(
+        "void bootloader_settings_get(", "void legacy_fields_only_get(", 1))
+    for name in ("dfu_bl_image_validate", "dfu_start_pkt_handle", "dfu_bl_image_swap",
+                 "dfu_activate_bl", "dfu_image_validate"):
+        start = single.index(("static " if name == "dfu_activate_bl" else "") + "uint32_t " + name + "(")
+        end = single.index("\n}", start) + 2
+        extracted.append(single[start:end])
+    start = boot.index("  else if (update_status.status_code == DFU_UPDATE_BOOT_COMPLETE)")
+    end = boot.index("  else if (update_status.status_code == DFU_UPDATE_SD_SWAPPED)", start)
+    (folder / "generated_usb_receipt.inc").write_text(
+        "static void bootloader_dfu_update_process(dfu_update_status_t update_status) {\n"
+        "  const bootloader_settings_t *p_bootloader_settings = &settings;\n"
+        "  bootloader_settings_t settings = {0};\n" +
+        boot[start:end].replace("else if", "if", 1) + "}\n")
+    sdk = (PRODUCT / "src/xiao_ota_vendor_sdk.c").read_text()
+    start = sdk.index("bool xiao_ota_vendor_sdk_usb_bench_enter(")
+    extracted.append(sdk[start:sdk.index("\n}", start) + 2])
+    start = sdk.index("uint32_t xiao_ota_vendor_pending_check(")
+    extracted.append(sdk[start:sdk.index("\n}", start) + 2])
+    (folder / "generated_usb_policy.inc").write_text("\n".join(extracted))
+    start = generated.index("bool xiao_ota_vendor_usb_bench_enter(")
+    (folder / "generated_usb_enter.inc").write_text(
+        generated[start:generated.index("\n}", start) + 2])
+    serial = (out / "primary-source/lib/sdk11/components/libraries/bootloader_dfu/dfu_transport_serial.c").read_text()
+    start = serial.index("static void process_dfu_packet(")
+    (folder / "generated_usb_dispatch.inc").write_text(
+        serial[start:serial.index("\n}", start) + 2])
+    executable = folder / "usb-bench-policy"
+    run(["cc", *flags, PRODUCT / "tests/test_usb_bench_policy.c",
+         PRODUCT / "tests/crc16_host.c", "-o", executable], ROOT,
+        out / "logs/usb-bench-policy.compile.log")
+    print(run([executable], ROOT), end="")
 
 
 def main():
@@ -361,6 +537,7 @@ def main():
     assert sha(patch) == "97c539f9216bf2569937b150dfaff743a5799aa8668c3222fe16fe5b36718bb0"
     run(["git", "apply", "--check", patch], tree)
     run(["git", "apply", patch], tree)
+    enable_usb_bench(tree)
     prepare_primary(out, tree, args.board, args.role, stage)
     bsp = BSP[args.board]
     name = f"{bsp}_bootloader-{RELEASE}"
@@ -421,6 +598,7 @@ def main():
         "arm_gcc_version": run(["arm-none-eabi-gcc", "--version"], ROOT).splitlines()[0],
         "source_date_epoch": int(os.environ["SOURCE_DATE_EPOCH"]),
         "optional_fault_layer": "excluded",
+        "usb_bench": USB_BENCH,
         "files": {str(p.relative_to(out)): sha(p) for p in
             (elf, hexfile, out / "primary-boot-only.bin", out / "stage2/stage2.bin")},
         "hardware": "NOT exercised; ready for combined source/artifact review"

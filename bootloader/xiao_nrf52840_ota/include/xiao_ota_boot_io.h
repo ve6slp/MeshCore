@@ -23,6 +23,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct xiao_ota_io;
+bool xiao_ota_usb_bench_prepare(const struct xiao_ota_io *io, uint32_t extent);
+bool xiao_ota_usb_bench_publish(const struct xiao_ota_io *io, uint32_t extent);
+bool xiao_ota_usb_bench_intact(const struct xiao_ota_io *io);
+bool xiao_ota_usb_bench_reset(const struct xiao_ota_io *io, bool authorized);
+
 /*
  * Bank-0 (currently-running application) settings this processor reads
  * and writes. Deliberately just these three fields -- everything else in
@@ -46,7 +52,7 @@ typedef struct {
 #define XIAO_OTA_BANK_VALID_APP 0x01u
 #define XIAO_OTA_BANK_INVALID_APP 0x00FFu
 
-typedef struct {
+typedef struct xiao_ota_io {
   void *ctx;
 
   /* True if this device's FICR unique ID, packed the same way as

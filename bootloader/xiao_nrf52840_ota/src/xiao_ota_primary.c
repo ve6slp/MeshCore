@@ -24,12 +24,14 @@ static void feed_existing_watchdog(void) {
 uint32_t xiao_ota_primary_init(void) {
   const xiao_ota_vendor_sdk_config_t config = {
       .internal = xiao_ota_boot_internal_io(),
-      .app_end = XIAO_OTA_INSTALL_ALLOWED_END,
+      .app_end = xiao_ota_vendor_usb_bench_mode() ? 0xD4000u : XIAO_OTA_INSTALL_ALLOWED_END,
       .poll_soc = proc_soc,
       .ticks = ticks,
       .timeout_ticks = 5u * 32768u,
       .feed_existing_dfu_watchdog = feed_existing_watchdog,
       .invalidate_app_grant = xiao_ota_primary_invalidate_app_grant,
+      .usb_bench = xiao_ota_vendor_usb_bench_mode(),
+      .bench_prepare = xiao_ota_primary_bench_prepare,
   };
   return xiao_ota_vendor_sdk_init(&config);
 }
@@ -49,8 +51,9 @@ bool xiao_ota_vendor_app_ready(void) {
 
 static bool direct_app_operation(uint32_t address, size_t bytes) {
   uint8_t enabled = 1;
-  return address >= XIAO_OTA_APP_START && address < XIAO_OTA_INSTALL_ALLOWED_END &&
-         bytes <= XIAO_OTA_INSTALL_ALLOWED_END - address &&
+  const uint32_t end = xiao_ota_vendor_usb_bench_mode() ? 0xD4000u : XIAO_OTA_INSTALL_ALLOWED_END;
+  return address >= XIAO_OTA_APP_START && address < end &&
+         bytes <= end - address &&
          xiao_ota_vendor_sd_is_enabled(&enabled) == NRF_SUCCESS && !enabled;
 }
 

@@ -11,9 +11,12 @@ typedef struct {
   uint32_t timeout_ticks;
   void (*feed_existing_dfu_watchdog)(void);
   void (*invalidate_app_grant)(void);
+  bool usb_bench;
+  bool (*bench_prepare)(void);
 } xiao_ota_vendor_sdk_config_t;
 
 uint32_t xiao_ota_vendor_sdk_init(const xiao_ota_vendor_sdk_config_t *config);
+bool xiao_ota_vendor_sdk_usb_bench_enter(void);
 uint32_t xiao_ota_vendor_sdk_boot_entry(bool routed);
 uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t error);
 uint32_t xiao_ota_vendor_sd_is_enabled(uint8_t *enabled);

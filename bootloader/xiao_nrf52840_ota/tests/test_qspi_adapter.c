@@ -187,6 +187,10 @@ void mock_barrier(void) {
 void NVIC_SystemReset(void) { assert(!"hardware recovery is outside this test"); }
 bool xiao_ota_explicit_dfu_requested(uint32_t value) { (void)value; return false; }
 void xiao_ota_boot_process_io(const xiao_ota_io_t *hardware_io) { io = hardware_io; }
+bool xiao_ota_usb_bench_reset(const xiao_ota_io_t *hardware_io, bool authorized) {
+  assert(authorized);
+  return hardware_io->qspi_init(hardware_io->ctx);
+}
 
 static void reset_model(void) {
   memset(&mock_qspi, 0, sizeof(mock_qspi));
@@ -374,6 +378,21 @@ static void quick_completion_and_wrap(void) {
   assert(sr2 == 2 && !busy_until);
 }
 
+static void bench_watchdog_scope(void) {
+  reset_model();
+  memset(&mock_wdt, 0, sizeof(mock_wdt));
+  mock_wdt.RUNSTATUS = 1;
+  mock_wdt.RREN = 0x81;
+  hold_ready = true;
+  assert(!xiao_ota_boot_bench_reset());
+  assert(!mock_wdt.TASKS_START && mock_wdt.RR[0] == 0x6E524635u &&
+         mock_wdt.RR[7] == 0x6E524635u && !mock_wdt.RR[1]);
+  mock_wdt.RR[0] = mock_wdt.RR[7] = 0;
+  assert(!io->qspi_init(NULL));
+  assert(!mock_wdt.RR[0] && !mock_wdt.RR[7]);
+  memset(&mock_wdt, 0, sizeof(mock_wdt));
+}
+
 int main(int argc, char **argv) {
   /* Non-PIE static buffers fit the nRF's 32-bit DMA registers. This
    * models caller reuse without pretending host stack addresses are RAM. */
@@ -382,6 +401,7 @@ int main(int argc, char **argv) {
   xiao_ota_boot_process();
   assert(io);
   const struct { const char *name; void (*run)(void); } cases[] = {
+    {"bench-watchdog", bench_watchdog_scope},
     {"delayed-erase", delayed_erase_then_write},
     {"program-busy", program_busy_and_buffer_reuse},
     {"pending-buffer", pending_buffer_timeout},

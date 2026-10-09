@@ -20,6 +20,21 @@ stuck-device recovery, not a normal setup requirement. Field OTA must still
 preserve identity, configuration and confirmed floors and retain its signed
 transaction, trial and rollback safeguards.
 
+The paired XIAO's `serial-usb-cdc-fresh-v2` profile uses ordinary vendor CDC
+recovery and actual configured local USB START provenance, not a retained
+double-reset grant. `commission-xiao-ota-usb` retains explicit fresh consent,
+device selection and a board/role/hash-bound APP build context. Recovery entry
+alone must not erase userdata, and merely having USB connected must not elevate
+BLE or field requests. Normal boot and BLE retain the protected-region locks.
+Pending primary-BOOT replacement must preserve its receipt through the SDK's
+persisted settings getter and recheck its staged extent and CRC before MBR
+copying in the admitted USB session. Interrupted uploads must fail closed and
+require explicit re-upload. The host must propagate vendor DFU failures rather
+than reporting a successful Make invocation.
+See the [paired bootloader recipe](../bootloader/xiao_nrf52840_ota/README.md)
+for phases, erase ranges and legacy-device recovery limits; software validation
+does not qualify actual USB transfers or cold boots.
+
 ## Reproducible Make workflows
 
 `build`, `upload` and `clean` require an explicit `ENV`; an unselected command

@@ -63,6 +63,33 @@ Any destructive provisioning must explicitly select the intended physical
 device; it is not an automatic recovery fallback. SWD is for stuck-device
 recovery, not the normal bench workflow.
 
+For the paired XIAO nRF52840 installer, use
+`make build-xiao-ota-usb-app` and the guarded
+`make commission-xiao-ota-usb` phases in the
+[USB bench recipe](../bootloader/xiao_nrf52840_ota/README.md).
+Select the matching board, installer role and exact physical USB endpoint.
+The physical USB bench path resets identity, configuration, filesystems
+and the OTA floor; entering that mode alone does not erase them. The uploader
+checks the selected pair against the actual APP build context before transferring.
+Choose the APP's intended radio defaults before building; fresh provisioning
+does not restore the old profile.
+
+The new paired primary uses the `serial-usb-cdc-fresh-v2` profile. With USB
+attached, one physical reset selects vendor CDC recovery; if the BOOT endpoint
+is already present, use it directly. Fresh admission comes from the actual
+configured USB transport, not a retained RAM marker or a reset/power sequence.
+Local physical USB is trusted; the host's explicit fresh-provisioning consent
+does not add an authentication bit to the vendor protocol. Normal boot, BLE and
+field OTA keep their protections. This simplified profile is software-verified
+but **not yet hardware-qualified**.
+
+An older experimental paired bootloader may lock its own BOOT region even in
+USB recovery mode. Host options and a factory reset cannot remove that installed
+restriction. Such a device needs one-time stuck-device recovery before it can
+use the new USB bench path; ordinary vendor bootloaders use the USB recipe
+directly. Earlier physical-double-reset bench builds also have different entry
+rules; selecting the new host profile does not change an installed older BOOT.
+
 Regular **field OTA** updates are different: retain identity, configuration,
 filesystem data and confirmed rollback floors, and keep signed admission,
 trial confirmation and rollback safety. A fresh bench setup must not weaken
@@ -158,6 +185,12 @@ OTA permission; regrant it explicitly.
 These startup safeguards protect field updates and uncertain boots; they do
 not require preservation-heavy migration for an explicitly selected fresh
 bench USB conversion.
+
+A fresh qualified installer has floor 0 and no previously signed OTA image.
+Its transaction status can therefore report an unknown image or boot state
+while local preflight reports `writes=allowed marker=qualified` and the normal
+radio is usable. Do not treat that as an authenticated Installed report or
+require another provisioning cycle merely to manufacture prior OTA history.
 
 ## Inspect USB without changing settings
 

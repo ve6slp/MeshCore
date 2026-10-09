@@ -11,6 +11,14 @@
 #include "xiao_ota_layout.h"
 #include "xiao_ota_record.h"
 
+static bool bench_reset_active;
+
+static void bench_feed_existing_watchdog(void) {
+  if (!bench_reset_active || !NRF_WDT->RUNSTATUS) return;
+  for (unsigned i = 0; i < 8; ++i)
+    if (NRF_WDT->RREN & (1u << i)) NRF_WDT->RR[i] = 0x6E524635u;
+}
+
 #if NRFX_DELAY_DWT_BASED
 #error "QSPI wake requires the pinned finite non-DWT nrfx delay"
 #endif
@@ -145,6 +153,7 @@ static void qspi_quiesce(void) {
 static bool qspi_wait_ready(qspi_deadline_t *deadline,
                             qspi_deadline_t *operation_deadline) {
   for (;;) {
+    bench_feed_existing_watchdog();
     if (qspi_deadline_expired(deadline) ||
         (operation_deadline && qspi_deadline_expired(operation_deadline))) {
       qspi_quiesce();
@@ -167,6 +176,7 @@ static bool nvmc_wait_for(uint32_t timeout_ms) {
   const uint32_t start = DWT->CYCCNT;
   const uint32_t deadline_cycles = hw_deadline_cycles(timeout_ms);
   while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {
+    bench_feed_existing_watchdog();
     if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
   }
   return true;
@@ -485,7 +495,7 @@ const xiao_ota_io_t *xiao_ota_boot_internal_io(void) {
   return &internal;
 }
 
-void xiao_ota_boot_process(void) {
+static const xiao_ota_io_t *complete_io(void) {
   static const xiao_ota_io_t hardware_io = {
       .ctx = NULL,
       .device_address = hw_device_address,
@@ -500,12 +510,24 @@ void xiao_ota_boot_process(void) {
       .start_trial_watchdog = hw_start_trial_watchdog,
       .force_recovery = hw_force_recovery,
   };
+  return &hardware_io;
+}
+
+bool xiao_ota_boot_bench_reset(void) {
+  bench_reset_active = true;
+  bool ready = xiao_ota_usb_bench_reset(complete_io(), true);
+  bench_reset_active = false;
+  return ready;
+}
+
+void xiao_ota_boot_process(void) {
+  const xiao_ota_io_t *hardware_io = complete_io();
 #ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
   stage_recovery_requested = false;
 #endif
-  xiao_ota_boot_process_io(&hardware_io);
+  xiao_ota_boot_process_io(hardware_io);
 #ifdef XIAO_OTA_FIXED_STAGE2_RETURNING
-  if (!stage_recovery_requested && !xiao_ota_app_is_intact(&hardware_io))
+  if (!stage_recovery_requested && !xiao_ota_app_is_intact(hardware_io))
     hw_force_recovery(NULL);
 #endif
 }

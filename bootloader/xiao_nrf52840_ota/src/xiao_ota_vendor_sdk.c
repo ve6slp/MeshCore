@@ -6,14 +6,17 @@
 #include "nrf_sdm.h"
 #include "nrf_error.h"
 #include <string.h>
+#include "crc16.h"
 
 static xiao_ota_vendor_sdk_config_t config;
+static bool bench_prepared;
 static pstorage_handle_t settings_handle;
 static uint32_t words[6] __attribute__((aligned(4)));
 static bool initialized, poisoned, completed;
 static bool entry_captured;
 static uint32_t result;
 extern bool _sd_inited;
+extern bool is_ota(void);
 
 uint32_t xiao_ota_vendor_sdk_boot_entry(bool routed) {
   if (entry_captured || poisoned) {
@@ -158,7 +161,8 @@ uint32_t xiao_ota_vendor_sdk_init(const xiao_ota_vendor_sdk_config_t *input) {
       !input->poll_soc || !input->ticks || !input->invalidate_app_grant || !input->timeout_ticks ||
       input->timeout_ticks > UINT32_C(0x007fffff) ||
       input->app_end <= XIAO_OTA_APP_START ||
-      input->app_end > XIAO_OTA_APP_START + XIAO_OTA_INSTALL_MAX_SIZE ||
+      input->app_end > (input->usb_bench && input->bench_prepare ? 0xD4000u :
+                       XIAO_OTA_APP_START + XIAO_OTA_INSTALL_MAX_SIZE) ||
       (input->app_end & 4095u)) return NRF_ERROR_INVALID_PARAM;
   config = *input;
   settings_handle.block_id = XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS;
@@ -175,21 +179,44 @@ bool xiao_ota_vendor_sdk_upload_begin(void) {
   return true;
 }
 
+bool xiao_ota_vendor_sdk_usb_bench_enter(void) {
+  bool enabled;
+  if (!initialized || poisoned || is_ota() || !config.bench_prepare ||
+      !sd_enabled(&enabled) || enabled) return false;
+  config.usb_bench = true;
+  config.app_end = 0xD4000u;
+  return true;
+}
+
 bool xiao_ota_vendor_sdk_prepare(uint32_t extent) {
+  if (!initialized || poisoned || extent < 8 || (extent & 3u) ||
+      extent > config.app_end - XIAO_OTA_APP_START) return false;
+  if (config.usb_bench) {
+    bool enabled;
+    if (is_ota() || !sd_enabled(&enabled) || enabled) return false;
+    if (!bench_prepared) {
+      if (!config.bench_prepare || !config.bench_prepare()) return false;
+      bench_prepared = true;
+    }
+  }
   return xiao_ota_vendor_sdk_upload_begin() && !poisoned &&
          extent <= config.app_end - XIAO_OTA_APP_START &&
          xiao_ota_vendor_sdk_drain() == NRF_SUCCESS &&
-         xiao_ota_vendor_prepare(&sdk_io, extent);
+         (config.usb_bench ? xiao_ota_usb_bench_prepare(&sdk_io, extent) :
+                            xiao_ota_vendor_prepare(&sdk_io, extent));
 }
 
 bool xiao_ota_vendor_sdk_publish(uint32_t extent) {
-  return initialized && !poisoned && extent <= config.app_end - XIAO_OTA_APP_START &&
+  return initialized && !poisoned && (!config.usb_bench || !is_ota()) &&
+         extent <= config.app_end - XIAO_OTA_APP_START &&
          xiao_ota_vendor_sdk_drain() == NRF_SUCCESS &&
-         xiao_ota_vendor_publish(&sdk_io, extent);
+         (config.usb_bench ? xiao_ota_usb_bench_publish(&sdk_io, extent) :
+                            xiao_ota_vendor_publish(&sdk_io, extent));
 }
 
 bool xiao_ota_vendor_sdk_intact(void) {
-  return initialized && !poisoned && xiao_ota_app_is_intact(&sdk_io);
+  return initialized && !poisoned && (!config.usb_bench || !is_ota()) && (config.usb_bench ?
+      xiao_ota_usb_bench_intact(&sdk_io) : xiao_ota_app_is_intact(&sdk_io));
 }
 
 bool xiao_ota_vendor_sdk_save(const bootloader_settings_t *settings) {
@@ -251,7 +278,23 @@ uint32_t xiao_ota_vendor_pending_check(void) {
       return NRF_ERROR_DATA_SIZE;
     /* A different pending primary cannot replace the approved frozen image. */
     uint32_t error = dfu_bl_image_validate();
-    if (error != NRF_SUCCESS) return NRF_ERROR_NOT_SUPPORTED;
+    uint16_t bench_marker;
+    memcpy(&bench_marker, (const uint8_t *)&state + 6, sizeof(bench_marker));
+    bool bench_pending = xiao_ota_vendor_usb_bench_mode() &&
+        bench_marker == XIAO_OTA_BENCH_PENDING &&
+        state.bank_1 == BANK_VALID_BOOT && !state.sd_image_size && !state.app_image_size &&
+        state.bl_image_size == 0xA000u && state.bank_0 == BANK_INVALID_APP &&
+        state.bank_0_size == state.bl_image_size;
+    if (error != NRF_SUCCESS && !bench_pending) return NRF_ERROR_NOT_SUPPORTED;
+    if (bench_pending) {
+      uint16_t crc = 0xFFFF;
+      for (uint32_t offset = 0; offset < state.bl_image_size; offset += sizeof(tail)) {
+        if (!read_internal(NULL, source + offset, tail, sizeof(tail)))
+          return NRF_ERROR_INTERNAL;
+        crc = crc16_compute(tail, sizeof(tail), &crc);
+      }
+      if (crc != state.bank_0_crc) return NRF_ERROR_NOT_SUPPORTED;
+    }
   }
   return NRF_SUCCESS;
 }

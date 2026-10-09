@@ -35,8 +35,10 @@ typedef struct {
 typedef uint32_t pair_result_t;
 enum {
   PAIR_RECOVERY = 0,
-  PAIR_APP_INTACT = 1
+  PAIR_APP_INTACT = 1,
+  PAIR_BENCH_READY = 2
 };
+#define PAIR_BENCH_REQUEST UINT32_C(0x42454E43)
 
 typedef pair_result_t (*pair_entry_t)(const pair_request_t *);
 
@@ -55,5 +57,6 @@ bool pair_app_gate(bool service_intact, bool bank_valid, bool vendor_valid,
                    bool pending);
 bool pair_validate_internal(const pair_expected_t *);
 pair_result_t pair_call(const pair_expected_t *);
+bool pair_bench_reset(const pair_expected_t *);
 bool pair_lock_protection(void);
 #endif

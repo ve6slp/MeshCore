@@ -51,8 +51,17 @@ XIAO_OTA_PAIR_BOARD ?=
 XIAO_OTA_PAIR_ROLE_ID ?=
 XIAO_OTA_PAIR_DIR ?= $(TMPDIR)/ota-boot-builds/$(XIAO_OTA_PAIR_BOARD)-role$(XIAO_OTA_PAIR_ROLE_ID)-pair
 XIAO_OTA_PAIR_APP_PACKAGE ?=
+XIAO_OTA_PAIR_APP_CONTEXT ?=
+XIAO_OTA_APP_FREEZE_DIR ?=
+XIAO_OTA_APP_ENV = $(if $(strip $(ENV)),$(ENV),$(if $(filter 1,$(XIAO_OTA_PAIR_ROLE_ID)),Xiao_nrf52_repeater_ota_usb,Xiao_nrf52_companion_radio_ota_usb))
 XIAO_OTA_PAIR_PACKAGE_DIR ?= $(XIAO_OTA_PAIR_DIR)-packages
 XIAO_OTA_PAIR_VERIFY_ONLY ?= 0
+XIAO_OTA_USB_PORT ?=
+XIAO_OTA_USB_PHASE ?=
+XIAO_OTA_USB_BOOT_POLICY ?=
+XIAO_OTA_USB_FRESH ?= 0
+XIAO_OTA_NRFUTIL ?= $(HOME)/.platformio/packages/tool-adafruit-nrfutil/adafruit-nrfutil.py
+XIAO_OTA_USB_PACKAGE = $(if $(filter compound,$(XIAO_OTA_USB_PHASE)),$(XIAO_OTA_PAIR_PACKAGE_DIR)/compound.zip,$(if $(filter bootloader,$(XIAO_OTA_USB_PHASE)),$(XIAO_OTA_PAIR_PACKAGE_DIR)/bootloader.zip,$(XIAO_OTA_PAIR_APP_PACKAGE)))
 XIAO_OTA_VENDOR ?= $(TMPDIR)/Adafruit_nRF52_Bootloader_OTAFIX
 XIAO_OTA_PRIVATE_KEY ?=
 XIAO_OTA_IMAGE ?=
@@ -150,9 +159,27 @@ build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bo
 	@test -n "$(XIAO_OTA_PAIR_BOARD)" && test -n "$(XIAO_OTA_PAIR_ROLE_ID)" || { echo 'Select XIAO_OTA_PAIR_BOARD and XIAO_OTA_PAIR_ROLE_ID.' >&2; exit 1; }
 	$(MAKE) --no-print-directory -f bootloader/xiao_nrf52840_ota/Makefile $(if $(filter build-%,$@),pair,$(if $(filter test-%,$@),test,package-pair)) \
 	  BOARD="$(XIAO_OTA_PAIR_BOARD)" ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" OUTPUT="$(XIAO_OTA_PAIR_DIR)" VENDOR="$(XIAO_OTA_VENDOR)" \
-	  APP_PACKAGE="$(XIAO_OTA_PAIR_APP_PACKAGE)" PACKAGE_OUTPUT="$(XIAO_OTA_PAIR_PACKAGE_DIR)" VERIFY_ONLY="$(XIAO_OTA_PAIR_VERIFY_ONLY)"
+	  APP_PACKAGE="$(XIAO_OTA_PAIR_APP_PACKAGE)" APP_CONTEXT="$(XIAO_OTA_PAIR_APP_CONTEXT)" PACKAGE_OUTPUT="$(XIAO_OTA_PAIR_PACKAGE_DIR)" VERIFY_ONLY="$(XIAO_OTA_PAIR_VERIFY_ONLY)"
 verify-xiao-ota-bootloader-pair-packages: XIAO_OTA_PAIR_VERIFY_ONLY = 1
 verify-xiao-ota-bootloader-pair-packages: package-xiao-ota-bootloader-pair
+.PHONY: commission-xiao-ota-usb test-xiao-ota-usb-bench build-xiao-ota-usb-app
+build-xiao-ota-usb-app: tmpdir
+	@test -n "$(XIAO_OTA_PAIR_BOARD)" && test -n "$(XIAO_OTA_PAIR_ROLE_ID)" && test -n "$(XIAO_OTA_APP_FREEZE_DIR)" || { echo 'Select board, ROLE and a new APP freeze directory.' >&2; exit 1; }
+	$(PYTHON) bootloader/xiao_nrf52840_ota/tools/record_app_context.py \
+	  --config-output "$(XIAO_OTA_APP_FREEZE_DIR).ini" --environment "$(XIAO_OTA_APP_ENV)"
+	XIAO_OTA_APP_BOARD="$(XIAO_OTA_PAIR_BOARD)" XIAO_OTA_APP_ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" \
+	  XIAO_OTA_APP_FREEZE="$(XIAO_OTA_APP_FREEZE_DIR)" \
+	  $(PLATFORMIO) run -d "$(CURDIR)" -c "$(XIAO_OTA_APP_FREEZE_DIR).ini" \
+	    -e "$(XIAO_OTA_APP_ENV)" -t xiao-app-context
+# Exactly one explicitly selected phase, never endpoint discovery or an automatic three-write loop.
+commission-xiao-ota-usb:
+	@test "$(XIAO_OTA_USB_FRESH)" = 1 && test -n "$(XIAO_OTA_USB_PORT)" || { echo 'Select a physical USB bench port and explicitly authorize fresh commissioning.' >&2; exit 1; }
+	$(PYTHON) bootloader/xiao_nrf52840_ota/tools/commission_pair.py \
+	  --pair-manifest "$(XIAO_OTA_PAIR_DIR)/pair-manifest.json" \
+	  --restore-package "$(XIAO_OTA_PAIR_APP_PACKAGE)" --package "$(XIAO_OTA_USB_PACKAGE)" \
+	  --board "$(XIAO_OTA_PAIR_BOARD)" --role "$(XIAO_OTA_PAIR_ROLE_ID)" --app-context "$(XIAO_OTA_PAIR_APP_CONTEXT)" \
+	  --usb-phase "$(XIAO_OTA_USB_PHASE)" --boot-policy "$(XIAO_OTA_USB_BOOT_POLICY)" \
+	  --usb-port "$(XIAO_OTA_USB_PORT)" --fresh --nrfutil "$(XIAO_OTA_NRFUTIL)"
 sign-xiao-ota-image: tmpdir
 	@test -n "$(XIAO_OTA_ACTIVE_IMAGE)" && test -n "$(OTA_ARTIFACT_DIR)" || { echo 'Select the exact active APP and an output directory.' >&2; exit 1; }
 	$(PYTHON) bootloader/xiao_nrf52840_ota/tools/sign_image.py --private-key "$(XIAO_OTA_PRIVATE_KEY)" \
@@ -215,6 +242,21 @@ test-xiao-ota-boot-process: tmpdir
 	  -o "$(TMPDIR)/xiao-ota-host/test_boot_process"
 	"$(TMPDIR)/xiao-ota-host/test_boot_process"
 
+test-xiao-ota-usb-bench: tmpdir
+	@mkdir -p "$(TMPDIR)/xiao-usb-bench"
+	$(CC) $(XIAO_OTA_BOOT_PROCESS_CFLAGS) $(XIAO_OTA_BOOT_PROCESS_SOURCES) \
+	  bootloader/xiao_nrf52840_ota/tests/test_usb_bench_reset.c \
+	  -o "$(TMPDIR)/xiao-usb-bench/reset"
+	"$(TMPDIR)/xiao-usb-bench/reset"
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fno-pie -no-pie \
+	  -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast \
+	  -Ibootloader/xiao_nrf52840_ota/tests/qspi_mock \
+	  -I"$(XIAO_OTA_VENDOR)/lib/nrfx/mdk" \
+	  -Ibootloader/xiao_nrf52840_ota/include -Ibootloader/xiao_nrf52840_ota/src \
+	  bootloader/xiao_nrf52840_ota/src/xiao_ota_boot.c \
+	  bootloader/xiao_nrf52840_ota/tests/test_qspi_adapter.c \
+	  -o "$(TMPDIR)/xiao-usb-bench/watchdog"
+	"$(TMPDIR)/xiao-usb-bench/watchdog"
 test-nrf-unadmitted-boot-process: tmpdir
 	@mkdir -p "$(TMPDIR)/rf-n1-boot-host"
 	$(CC) $(XIAO_OTA_BOOT_PROCESS_CFLAGS) \

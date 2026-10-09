@@ -1587,7 +1587,8 @@ static bool settings_page_tail_erased(const xiao_ota_io_t *io, bool *out_blank) 
 
 /*
  * Shared low-level whole-page writer for the two frozen-base settings
- * operations below: confirms the page tail is blank (see
+ * operations below: confirms the page tail is blank unless explicitly
+ * replacing clean-slate bench metadata (see
  * settings_page_tail_erased() above), then erase+program+read-back-
  * verify the WHOLE page from `raw` -- never a read-modify-write over
  * whatever is CURRENTLY on the page, unlike xiao_ota_settings_set()
@@ -1596,12 +1597,12 @@ static bool settings_page_tail_erased(const xiao_ota_io_t *io, bool *out_blank) 
  * exists -- e.g. by native test fixtures -- where there is no frozen
  * admission-time snapshot to use instead).
  */
-static bool settings_write_raw(const xiao_ota_io_t *io,
-                               const xiao_ota_settings_raw_t *raw) {
+static bool settings_write_raw_mode(const xiao_ota_io_t *io,
+                                    const xiao_ota_settings_raw_t *raw, bool fresh) {
   xiao_ota_settings_raw_t verify;
   bool tail_blank;
   if (!settings_page_tail_erased(io, &tail_blank)) return false;
-  if (!tail_blank) return false;
+  if (!tail_blank && !fresh) return false;
   if (!io->internal_erase_page(io->ctx, XIAO_OTA_BOOTLOADER_SETTINGS_ADDRESS)) {
     return false;
   }
@@ -1620,6 +1621,11 @@ static bool settings_write_raw(const xiao_ota_io_t *io,
     return false;
   if (!settings_read_raw(io, &verify)) return false;
   return memcmp(&verify, raw, sizeof(*raw)) == 0;
+}
+
+static bool settings_write_raw(const xiao_ota_io_t *io,
+                               const xiao_ota_settings_raw_t *raw) {
+  return settings_write_raw_mode(io, raw, false);
 }
 
 static bool settings_invalidate_bank0(
@@ -1717,7 +1723,7 @@ static bool app_vectors_valid(const xiao_ota_io_t *io, uint32_t extent) {
          (vectors[1] & ~1u) < XIAO_OTA_APP_START + extent;
 }
 
-bool xiao_ota_app_is_intact(const xiao_ota_io_t *io) {
+static bool app_is_intact_limit(const xiao_ota_io_t *io, uint32_t limit) {
   xiao_ota_settings_raw_t before, after;
   uint16_t crc;
   bool blank;
@@ -1725,7 +1731,7 @@ bool xiao_ota_app_is_intact(const xiao_ota_io_t *io) {
       before.bank_0 != XIAO_OTA_BANK_VALID_APP ||
       (before.bank_1 != 0xFEu && before.bank_1 != 0xFFu) ||
       before.bank_0_size < 8u ||
-      before.bank_0_size > XIAO_OTA_INSTALL_MAX_SIZE ||
+      before.bank_0_size > limit ||
       !settings_page_tail_erased(io, &blank) || !blank ||
       !app_vectors_valid(io, before.bank_0_size) ||
       !crc16_over_internal(io, XIAO_OTA_APP_START, before.bank_0_size, &crc) ||
@@ -1736,10 +1742,14 @@ bool xiao_ota_app_is_intact(const xiao_ota_io_t *io) {
   return true;
 }
 
-bool xiao_ota_vendor_prepare(const xiao_ota_io_t *io, uint32_t extent) {
+bool xiao_ota_app_is_intact(const xiao_ota_io_t *io) {
+  return app_is_intact_limit(io, XIAO_OTA_INSTALL_MAX_SIZE);
+}
+
+static bool vendor_prepare_limit(const xiao_ota_io_t *io, uint32_t extent, uint32_t limit) {
   xiao_ota_settings_raw_t before, invalid = {0}, verify;
   bool blank;
-  if (extent < 8u || extent > XIAO_OTA_INSTALL_MAX_SIZE || (extent & 3u) ||
+  if (extent < 8u || extent > limit || (extent & 3u) ||
       !settings_read_raw(io, &before) ||
       before.bank_0 == 0xA5u || before.bank_0 == 0xAAu ||
       before.bank_1 == 0xA5u || before.bank_1 == 0xAAu ||
@@ -1755,11 +1765,11 @@ bool xiao_ota_vendor_prepare(const xiao_ota_io_t *io, uint32_t extent) {
          settings_page_tail_erased(io, &blank) && blank;
 }
 
-bool xiao_ota_vendor_publish(const xiao_ota_io_t *io, uint32_t extent) {
+static bool vendor_publish_limit(const xiao_ota_io_t *io, uint32_t extent, uint32_t limit) {
   xiao_ota_settings_raw_t before, invalid = {0}, verify;
   uint16_t crc;
   bool blank;
-  if (extent < 8u || extent > XIAO_OTA_INSTALL_MAX_SIZE || (extent & 3u) ||
+  if (extent < 8u || extent > limit || (extent & 3u) ||
       !settings_read_raw(io, &before)) return false;
   invalid.bank_0 = XIAO_OTA_BANK_INVALID_APP;
   invalid.bank_0_crc = before.bank_0_crc;
@@ -1774,7 +1784,48 @@ bool xiao_ota_vendor_publish(const xiao_ota_io_t *io, uint32_t extent) {
       !settings_page_tail_erased(io, &blank) || !blank) return false;
   before.bank_0 = XIAO_OTA_BANK_VALID_APP;
   before.bank_0_crc = crc;
-  return settings_write_raw(io, &before) && xiao_ota_app_is_intact(io);
+  return settings_write_raw(io, &before) && app_is_intact_limit(io, limit);
+}
+
+bool xiao_ota_vendor_prepare(const xiao_ota_io_t *io, uint32_t extent) {
+  return vendor_prepare_limit(io, extent, XIAO_OTA_INSTALL_MAX_SIZE);
+}
+bool xiao_ota_vendor_publish(const xiao_ota_io_t *io, uint32_t extent) {
+  return vendor_publish_limit(io, extent, XIAO_OTA_INSTALL_MAX_SIZE);
+}
+bool xiao_ota_usb_bench_prepare(const xiao_ota_io_t *io, uint32_t extent) {
+  if (extent < 8u || extent > 0xD4000u - XIAO_OTA_APP_START || (extent & 3u))
+    return false;
+  xiao_ota_settings_raw_t invalid = {0};
+  invalid.bank_0 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_1 = XIAO_OTA_BANK_INVALID_APP;
+  invalid.bank_0_size = extent;
+  return settings_write_raw_mode(io, &invalid, true);
+}
+bool xiao_ota_usb_bench_publish(const xiao_ota_io_t *io, uint32_t extent) {
+  return vendor_publish_limit(io, extent, 0xD4000u - XIAO_OTA_APP_START);
+}
+bool xiao_ota_usb_bench_intact(const xiao_ota_io_t *io) {
+  return app_is_intact_limit(io, 0xD4000u - XIAO_OTA_APP_START);
+}
+
+bool xiao_ota_usb_bench_reset(const xiao_ota_io_t *io, bool authorized) {
+  if (!authorized || !io->qspi_init(io->ctx)) return false;
+  for (uint32_t address = 0; address < 0x200000u; address += 4096) {
+    if (!io->qspi_erase_sector(io->ctx, address)) return false;
+    for (uint32_t offset = 0; offset < 4096; offset += sizeof(io_buffer)) {
+      if (!io->qspi_read(io->ctx, address + offset, io_buffer, sizeof(io_buffer))) return false;
+      for (size_t i = 0; i < sizeof(io_buffer); ++i) if (io_buffer[i] != 0xff) return false;
+    }
+  }
+  for (uint32_t address = 0xD4000u; address < 0xF4000u; address += 4096) {
+    if (!io->internal_erase_page(io->ctx, address)) return false;
+    for (uint32_t offset = 0; offset < 4096; offset += sizeof(io_buffer)) {
+      if (!io->internal_read(io->ctx, address + offset, io_buffer, sizeof(io_buffer))) return false;
+      for (size_t i = 0; i < sizeof(io_buffer); ++i) if (io_buffer[i] != 0xff) return false;
+    }
+  }
+  return true;
 }
 
 bool xiao_ota_vendor_settings_write(const xiao_ota_io_t *io, const uint8_t bytes[28]) {
