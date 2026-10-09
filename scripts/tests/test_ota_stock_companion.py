@@ -29,6 +29,7 @@ OWNER_PRIVATE = Ed25519PrivateKey.from_private_bytes(bytes([1]) * 32)
 TARGET_PRIVATE = Ed25519PrivateKey.from_private_bytes(bytes([2]) * 32)
 OWNER = OWNER_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 TARGET = TARGET_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+RELAY = bytes.fromhex("739194" + "42" * 29)
 NORMAL = (918000, 62500, 7, 5, 1)
 STOCK_ID = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
 STOCK_PATH = "/dev/serial/by-path/pci-0000:00:00.0-usb-0:1.1:1.0-port0"
@@ -119,6 +120,7 @@ class FakeSerial:
         self.timeout = 0.1
         self.commands = []
         self.rf_packets = []
+        self.raw_packets = []
         self.queue = self.sent = self.direct = self.air = 0
         self.admitted = False
         self.signing = bytearray()
@@ -239,9 +241,13 @@ class FakeSerial:
             elif subtype == 2:
                 self.reply(b"\x18\x02" + struct.pack("<IIIIIII", 0, self.sent, 0, self.direct, 0, 0, 0))
         elif cmd == 65:
-            assert payload[1:4] == b"\x00\x32\x00"
+            assert payload[2] == 0x32
+            encoded = payload[3]
+            width, count = (encoded >> 6) + 1, encoded & 63
+            assert width <= 3 and width * count <= 64
             self.queue += 1
-            rf = payload[4:]
+            self.raw_packets.append(payload[2:])
+            rf = payload[4 + width * count:]
             self.rf_packets.append((self.clock(), self.profile, rf))
             self.reply(b"\x00")
             def finish():
@@ -366,6 +372,69 @@ class FakeSerial:
             pass
         else:
             raise AssertionError(f"unexpected RF kind {rf[0]}")
+
+
+class RelaySerial(FakeSerial):
+    """A consumptive direct hop, deduplicating relay and v3 target replies."""
+    def __init__(self, clock, c, received=()):
+        super().__init__(clock, c, received)
+        self.relay_enabled = True
+        self.seen_requests, self.seen_replies = set(), set()
+        self.forwarded_requests = []
+        self.reply_attempt = None
+        self.reply_mode = "relay"
+        self.install_lifecycle = 8
+        self.reply_mutator = None
+
+    def remote(self, wire):
+        raw = self.raw_packets[-1]
+        width, count = (raw[1] >> 6) + 1, raw[1] & 63
+        # Targets hearing the sender cannot consume a nonempty direct path.
+        if (not self.relay_enabled or count != 1 or raw[2:2 + width] != RELAY[:width]
+                or hashlib.sha256(bytes([12]) + wire).digest() in self.seen_requests):
+            return
+        self.seen_requests.add(hashlib.sha256(bytes([12]) + wire).digest())
+        forwarded = bytes([0x32, (width - 1) << 6]) + wire
+        self.forwarded_requests.append(forwarded)
+        # The existing firmware unwraps, verifies and echoes BE32 attempts.
+        assert wire[0] in (17, 18) and len(wire) <= 171
+        self.reply_attempt = struct.unpack_from(">I", wire, 1)[0]
+        assert self.reply_attempt
+        inner = wire[5:]
+        assert wire[0] != 18 or inner[0] == 1
+        super().remote(inner)
+
+    def push(self, payload):
+        if self.commit_count and payload[0] == 11:
+            payload = census(self.candidate, generation=self.generation, lifecycle=self.install_lifecycle,
+                             floor=self.candidate.counter, nonce=self.nonce)
+        wire = b"\x11" + struct.pack(">I", self.reply_attempt) + payload
+        if self.reply_mutator is not None:
+            wire = self.reply_mutator(wire)
+        # Stock RF logs occur before mesh dedup: a directly heard flood and
+        # the later forwarded copy are both available to the host.
+        for path in ((b"", RELAY[:1]) if self.reply_mode == "relay" else
+                     (b"",) if self.reply_mode == "bypass" else (b"\x99",)):
+            if path:
+                digest = hashlib.sha256(bytes([12]) + wire).digest()
+                if digest in self.seen_replies:
+                    continue
+                self.seen_replies.add(digest)
+            raw = bytes([0x31, len(path)]) + path + wire
+            self.rx_packets.append((self.clock(), self.profile, raw, payload))
+            self.reply(b"\x88\x08\x40" + raw)
+
+
+def routed_setup(c=None, received=(), width=1, duty=0.02, reupload=False):
+    c = c or candidate()
+    clock = Clock()
+    stream = RelaySerial(clock, c, received)
+    stock = ota.Stock(ota.Frames(stream, clock), OWNER, clock, clock.sleep)
+    approved = replace(binding(c), allow_reupload=reupload)
+    sender = ota.Sender(stock, approved, c, NORMAL, clock() + 10000, 0, 0, duty,
+                        clock, clock.sleep, reupload=reupload, mode="directed", relay=RELAY,
+                        path_hash_bytes=width)
+    return clock, stream, stock, sender
 
 
 def setup(c=None, received=(), lease=60000, duty=0.02, reupload_generation=None):
@@ -636,6 +705,318 @@ class PathBindingTests(Scratch):
                 ota.main(argv)
             self.assertFalse(any(command[0] in (11, 33, 34, 35, 65) for command in stream.commands))
             self.assertFalse(list(directory.iterdir()))
+
+
+class DirectedTests(Scratch):
+    def test_retry_and_path_limits_reject_malformed_nested_and_exhausted_attempts(self):
+        report = census(candidate())
+        for wire in (b"\x11", b"\x11" + bytes(4) + report,
+                     b"\x11\x00\x00\x00\x01" + report[:-1],
+                     b"\x12\x00\x00\x00\x01" + report,
+                     b"\x11\x00\x00\x00\x01" + ota.retry_frame(report, 2)):
+            with self.subTest(wire=wire[:6].hex()):
+                self.assertIsNone(ota.raw_rx(b"\x88\x08\x40\x31\x01" + RELAY[:1] + wire))
+        for inner in (bytes([1]) + bytes(70), bytes([1]) + bytes(155),
+                      bytes([12]) + bytes(170), ota.retry_frame(report, 2)):
+            with self.assertRaises(ota.Error):
+                ota.retry_frame(inner, 1)
+        with self.assertRaises(ota.Error):
+            ota.packet(bytes(169), bytes(4))
+        for width, path in ((4, b""), (2, bytes(3)), (1, bytes(64)), (3, bytes(66))):
+            with self.assertRaises(ota.Error):
+                ota.packet(b"\x07", path, width)
+        _, stream, _, sender = routed_setup()
+        sender.next_attempt = 0xFFFFFFFF
+        poll = b"\x0a" + TARGET + sender.candidate.digest + b"\x00\x00"
+        sender.send(poll)
+        with self.assertRaisesRegex(ota.Error, "exhausted"):
+            sender.send(poll)
+        self.assertEqual(len(stream.raw_packets), 1)
+        self.assertEqual(stream.raw_packets[0][3:8], b"\x11\xff\xff\xff\xff")
+
+    def test_cli_separate_role1_upload_and_commit_share_manifest_and_route_receipt(self):
+        import ota_uploader as native
+        original = candidate()
+        canonical = native.deploy_manifest(original.image, "xiao_nrf52840_sense", 1, 5, None)
+        c = ota.Candidate.build(canonical, original.image, 4, board="xiao_nrf52840_sense", role_id=1, counter=5)
+        clock, stream, _, _ = routed_setup(c)
+        path = self.directory / "binding.json"
+        ota.private_write(path, {"schema": 1, "serial": BINDING.serial,
+                                 "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "floor": 4, "min_generation": 10, "normal_profile": list(NORMAL[:4])})
+        image, manifest = self.directory / "ordinary.bin", self.directory / "manifest.bin"
+        image.write_bytes(c.image)
+        manifest.write_bytes(c.canonical)
+        common = ["--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                  "--sender-key", OWNER.hex(), "--target", TARGET.hex(), "--binding", str(path),
+                  "--image", str(image), "--manifest", str(manifest), "--board", "xiao_nrf52840_sense",
+                  "--role-id", "1", "--counter", "5", "--mode", "directed", "--relay-key", RELAY.hex()]
+        @contextmanager
+        def uart(*args, **kwargs):
+            yield stream
+        frames, stock, sender = ota.Frames, ota.Stock, ota.Sender
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                patch.object(ota, "Stock", side_effect=lambda f, key, **kw: stock(f, key, clock, clock.sleep, **kw)), \
+                patch.object(ota, "Sender", side_effect=lambda *a, **kw: sender(*a, clock=clock, sleep=clock.sleep, **kw)), \
+                patch.object(ota.time, "monotonic", clock), redirect_stdout(io.StringIO()):
+            ota.main(["upload"] + common + ["--artifacts", str(self.directory / "upload")])
+            self.assertEqual(stream.commit_count, 0)
+            receipt = self.directory / "upload" / "result.json"
+            ota.main(["commit"] + common + ["--artifacts", str(self.directory / "commit"), "--ready-receipt", str(receipt)])
+        self.assertEqual(stream.commit_count, 1)
+        self.assertEqual(ota.private_read(receipt)["manifest_hash"], c.digest.hex())
+        self.assertFalse(ota.private_read(self.directory / "commit" / "result.json")["installation_confirmed"])
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_cli_directed_deploy_generates_repeater_manifest_and_uses_bound_transport(self):
+        import ota_uploader as native
+        original = candidate()
+        canonical = native.deploy_manifest(original.image, "xiao_nrf52840_sense", 1, 5, None)
+        c = ota.Candidate.build(canonical, original.image, 4, board="xiao_nrf52840_sense", role_id=1, counter=5)
+        clock, stream, _, _ = routed_setup(c)
+        path = self.directory / "binding.json"
+        ota.private_write(path, {"schema": 1, "serial": BINDING.serial,
+                                 "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "floor": 4, "min_generation": 10, "normal_profile": list(NORMAL[:4])})
+        image = self.directory / "ordinary.bin"
+        image.write_bytes(c.image)
+        directory = self.directory / "run"
+        argv = ["deploy", "--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(), "--binding", str(path),
+                "--artifacts", str(directory), "--image", str(image),
+                "--board", "xiao_nrf52840_sense", "--role-id", "1", "--counter", "5",
+                "--mode", "directed", "--relay-key", RELAY.hex(), "--path-hash-bytes", "3",
+                "--routed-retry"]
+        @contextmanager
+        def uart(*args, **kwargs):
+            yield stream
+        frames, stock, sender = ota.Frames, ota.Stock, ota.Sender
+        output = io.StringIO()
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                patch.object(ota, "Stock", side_effect=lambda f, key, **kw: stock(f, key, clock, clock.sleep, **kw)), \
+                patch.object(ota, "Sender", side_effect=lambda *a, **kw: sender(*a, clock=clock, sleep=clock.sleep, **kw)), \
+                patch.object(ota.time, "monotonic", clock), redirect_stdout(output):
+            ota.main(argv)
+        result = ota.private_read(directory / "result.json")
+        self.assertEqual(result["manifest_hash"], c.digest.hex())
+        self.assertEqual(result["outcome"], "native-installed-reported-unsigned")
+        self.assertFalse(result["installation_confirmed"])
+        self.assertEqual(stream.commit_count, 1)
+        self.assertTrue(ota.private_read(directory / "radio-unchanged.json")["normal_profile_unchanged"])
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_one_hop_deploy_all_hash_widths_preserves_normal_and_unsigned_install(self):
+        for width in (1, 2, 3):
+            _, stream, _, sender = routed_setup(width=width)
+            events = []
+            sender.event_callback = events.append
+            result = sender.deploy(300)
+            self.assertEqual(result["outcome"], "native-installed-reported-unsigned")
+            self.assertEqual(result["relay_public_key"], RELAY.hex())
+            self.assertEqual(result["request_path"], RELAY[:width].hex())
+            self.assertEqual(result["reply_path"], RELAY[:1].hex())
+            self.assertEqual(result["confirmed_floor"], sender.candidate.counter)
+            self.assertFalse(result["status_authenticated"])
+            self.assertFalse(result["installation_confirmed"])
+            self.assertEqual(stream.commit_count, 1)
+            self.assertEqual(stream.profile, NORMAL)
+            self.assertFalse(any(command[0] == 11 for command in stream.commands))
+            self.assertFalse(stream.tokens)
+            attempts = []
+            for raw in stream.raw_packets:
+                self.assertEqual(raw[:2], bytes([0x32, ((width - 1) << 6) | 1]))
+                self.assertEqual(raw[2:2 + width], RELAY[:width])
+                wire = raw[2 + width:]
+                attempts.append(struct.unpack_from(">I", wire, 1)[0])
+                self.assertNotIn(wire[5], (12, 15))
+                if wire[5] == 8:
+                    self.assertEqual(len(raw) + 2, 173 + width)
+                self.assertLessEqual(len(raw) + 2, ota.MAX_FRAME)
+            self.assertEqual(len(attempts), len(set(attempts)))
+            self.assertTrue(all(b == a + 1 for a, b in zip(attempts, attempts[1:])))
+            self.assertTrue(all(command[1] == 250 for command in stream.commands if command[0] == 65))
+            self.assertTrue(all(raw[1] & 63 == 0 for raw in stream.forwarded_requests))
+            evidence = [event for event in events if event["event"] == "rf_reply_route"]
+            self.assertTrue(any(event["selected_relay_match"] for event in evidence))
+            self.assertTrue(any(not event["selected_relay_match"] and event["path"] == "" for event in evidence))
+
+    def test_attempt_diverse_poll_and_block_repair_pass_relay_dedup(self):
+        _, stream, _, sender = routed_setup()
+        stream.drop_census = stream.drop_blocks = 1
+        sender.upload()
+        payloads = [raw[3:] for raw in stream.raw_packets]
+        polls = [wire for wire in payloads if wire[5] == 10]
+        blocks = [wire for wire in payloads if wire[5] == 1]
+        repaired = [wire for wire in blocks if wire[10:12] == b"\x00\x00"]
+        self.assertGreaterEqual(len(polls), 2)
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(repaired[0][5:], repaired[1][5:])
+        self.assertNotEqual(repaired[0][:5], repaired[1][:5])
+        self.assertTrue(all(wire[0] == 18 for wire in blocks))
+        self.assertEqual(len(stream.seen_requests), len(payloads))
+        self.assertEqual(stream.received, {0, 1})
+        self.assertEqual(stream.commit_count, 0)
+
+    def test_missing_selected_relay_cannot_deliver_even_when_target_hears_sender(self):
+        _, stream, _, sender = routed_setup()
+        stream.relay_enabled = False
+        with self.assertRaisesRegex(ota.Error, "did not admit"):
+            sender.upload()
+        self.assertFalse(stream.admitted)
+        self.assertFalse(stream.forwarded_requests)
+        self.assertTrue(all(raw[1] & 63 == 1 and raw[2:3] == RELAY[:1] for raw in stream.raw_packets))
+        self.assertFalse(any(raw[8] in (1, 3) for raw in stream.raw_packets))
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_only_selected_relay_return_trail_is_accepted(self):
+        for mode in ("bypass", "wrong"):
+            _, stream, _, sender = routed_setup()
+            stream.reply_mode = mode
+            with self.subTest(mode=mode), self.assertRaisesRegex(ota.Error, "did not admit"):
+                sender.upload()
+            self.assertTrue(stream.admitted)
+            self.assertEqual(stream.received, set())
+            self.assertIsNone(sender.generation)
+            self.assertFalse(stream.commit_count)
+
+    def test_return_attempt_must_match_latest_poll_not_unwrapped_or_prior_attempt(self):
+        for mutation in (lambda wire: wire[5:],
+                         lambda wire: wire[:1] + struct.pack(">I", struct.unpack_from(">I", wire, 1)[0] - 1) + wire[5:]):
+            _, stream, _, sender = routed_setup()
+            sender.next_attempt = 100
+            stream.reply_mutator = mutation
+            with self.assertRaisesRegex(ota.Error, "did not admit"):
+                sender.upload()
+            self.assertIsNone(sender.begin_nonce)
+            self.assertFalse(stream.received)
+
+    def test_transport_options_are_fail_closed_before_binding_or_uart(self):
+        base = ["deploy", "--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(),
+                "--binding", "NOT_READ", "--artifacts", "NOT_CREATED"]
+        options = (
+            ["--mode", "directed"],
+            ["--mode", "directed", "--relay-key", RELAY.hex(), "--frequency-khz", "919000"],
+            ["--mode", "directed", "--relay-key", RELAY.hex(), "--lease-ms", "60000"],
+            ["--mode", "directed", "--relay-key", RELAY.hex(), "--channel", "0"],
+            ["--mode", "directed", "--relay-key", RELAY.hex(), "--no-routed-retry"],
+            ["--relay-key", RELAY.hex(), "--frequency-khz", "919000"],
+        )
+        for flags in options:
+            with self.subTest(flags=flags), patch.object(ota.Binding, "load") as load, \
+                    patch.object(ota, "validated_stock_uart") as uart, self.assertRaises(ota.Error):
+                ota.main(base + flags)
+            load.assert_not_called()
+            uart.assert_not_called()
+        for key in (OWNER, TARGET, OWNER[:1] + RELAY[1:], TARGET[:1] + RELAY[1:]):
+            with self.assertRaisesRegex(ota.Error, "distinct"):
+                ota.validate_transport("directed", 0, 0, 255, key, 3, BINDING)
+
+    def test_normal_profile_mismatch_never_retunes_signs_or_sends(self):
+        for field in range(4):
+            clock, stream, stock, sender = routed_setup()
+            wrong = list(NORMAL)
+            wrong[field] += 1
+            stream.profile = tuple(wrong)
+            with self.subTest(field=field), self.assertRaisesRegex(ota.Error, "normal radio"):
+                with ota.radio_guard(stock, BINDING, self.directory, mode="directed"):
+                    self.fail("mismatched sender yielded")
+            with self.assertRaisesRegex(ota.Error, "normal radio"):
+                ota.Sender(stock, BINDING, sender.candidate, tuple(wrong), clock() + 100, 0, 0,
+                           mode="directed", relay=RELAY)
+            self.assertFalse(any(command[0] in (11, 33, 34, 35, 65) for command in stream.commands))
+            self.assertFalse(list(self.directory.iterdir()))
+
+    def test_profile_drift_after_selection_fails_without_radio_override(self):
+        _, stream, _, sender = routed_setup()
+        stream.profile = (*NORMAL[:2], 8, NORMAL[3], NORMAL[4])
+        with self.assertRaisesRegex(ota.Error, "profile changed"):
+            sender.census(retries=1)
+        self.assertFalse(any(command[0] in (11, 65) for command in stream.commands))
+
+    def test_on_channel_duty_counts_retry_and_path_overhead_on_every_send(self):
+        clock, stream, _, sender = routed_setup(width=3, duty=0.01)
+        poll = b"\x0a" + TARGET + sender.candidate.digest + b"\x00\x00"
+        sender.send(poll)
+        finished = clock()
+        estimate = ota.airtime(2 + 3 + 5 + len(poll), NORMAL)
+        sender.send(poll)
+        self.assertGreaterEqual(stream.rf_packets[1][0], finished + estimate * 99)
+        self.assertGreater(estimate, ota.airtime(2 + len(poll), NORMAL))
+        self.assertEqual(stream.profile, NORMAL)
+        for duty in (0, -1, float("nan"), float("inf"), 1.1):
+            with self.assertRaisesRegex(ota.Error, "duty"):
+                routed_setup(duty=duty)
+
+    def test_directed_guard_never_writes_radio_even_on_failure_or_signal(self):
+        for failure in (False, True):
+            directory = self.directory / str(failure)
+            directory.mkdir(mode=0o700)
+            _, stream, stock, _ = routed_setup()
+            try:
+                with ota.radio_guard(stock, BINDING, directory, mode="directed"):
+                    if failure:
+                        raise ota.Error("interrupted")
+            except ota.Error:
+                self.assertTrue(failure)
+            self.assertEqual(stream.profile, NORMAL)
+            self.assertFalse(any(command[0] == 11 for command in stream.commands))
+            self.assertTrue(ota.private_read(directory / "radio-unchanged.json")["normal_profile_unchanged"])
+            self.assertFalse((directory / "restored.json").exists())
+
+    def test_directed_tx_queue_ok_is_not_measured_completion(self):
+        _, stream, _, sender = routed_setup()
+        stream.tx_fails = True
+        with self.assertRaisesRegex(ota.Error, "physical stock TX"):
+            sender.census(retries=1)
+        self.assertFalse(stream.forwarded_requests)
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_nonce_binding_and_separate_commit_keep_exact_selected_route(self):
+        clock, stream, stock, sender = routed_setup()
+        receipt = sender.upload()
+        fresh = ota.Sender(stock, BINDING, sender.candidate, NORMAL, clock() + 10000, 0, 0,
+                           clock=clock, sleep=clock.sleep, mode="directed", relay=RELAY)
+        stream.nonce = bytes([3]) * 16
+        with self.assertRaisesRegex(ota.Error, "BEGIN"):
+            fresh.commit(receipt)
+        self.assertEqual(stream.commit_count, 0)
+        stream.nonce = NONCE
+        different = ota.Sender(stock, BINDING, sender.candidate, NORMAL, clock() + 10000, 0, 0,
+                               clock=clock, sleep=clock.sleep, mode="directed", relay=RELAY,
+                               path_hash_bytes=2)
+        with self.assertRaisesRegex(ota.Error, "matching"):
+            different.commit(receipt)
+
+    def test_reupload_signs_observed_generation_and_new_nonce_through_relay(self):
+        _, stream, _, sender = routed_setup(reupload=True)
+        stream.local_cache = stream.aborted = True
+        stream.generation = 9
+        receipt = sender.upload()
+        self.assertEqual(stream.reupload_count, 1)
+        self.assertEqual(receipt["generation"], 10)
+        self.assertNotEqual(receipt["begin_nonce"], NONCE.hex())
+        controls = [wire for _, _, wire in stream.rf_packets if wire[5] == 14]
+        self.assertEqual(struct.unpack_from(">I", controls[0], 102)[0], 9)
+        self.assertFalse(stream.commit_count)
+
+    def test_post_commit_wrong_nonce_and_failed_report_are_failures_not_fallback(self):
+        for fault in ("nonce", "failed", "missing"):
+            _, stream, _, sender = routed_setup()
+            sender.upload()
+            sender._send_commit()
+            if fault == "nonce":
+                stream.nonce = bytes([3]) * 16
+            elif fault == "failed":
+                stream.install_lifecycle = 10
+            else:
+                stream.reply_mode = "bypass"
+            with self.subTest(fault=fault), self.assertRaises((ota.Error, TimeoutError)):
+                sender.wait_installed(100)
+            self.assertEqual(stream.commit_count, 1)
+            self.assertFalse(any(command[0] == 11 for command in stream.commands))
 
 
 class ProtocolTests(unittest.TestCase):
@@ -1948,6 +2329,18 @@ int main() {
   std::memcpy(u.manifestHash,hash,32); u.durableReceivedBlocks=2; u.totalBlocks=2; u.counter=5;
   u.statusAgeMs=0; u.retryAfterMs=0; u.generation=0x0A0B0C0D; std::memcpy(u.beginNonce,nonce,16);
   u.wireVersion=usb::kOtaWireVersion; n=usb::encodeUsbOtaReply(u,out); dump(out,n);
+  unsigned char inner[184];
+  size_t inner_n=encodeOtaTargetAuthorization(target,owner,canonical,sig,inner,sizeof(inner));
+  n=encodeOtaRetryAttempt(0x11223344,inner,inner_n,out,sizeof(out));dump(out,n);
+  mesh::Packet routed;routed.header=0x32;routed.setPathHashSizeAndCount(3,1);
+  routed.path[0]=0x73;routed.path[1]=0x91;routed.path[2]=0x94;
+  routed.payload_len=n;std::memcpy(routed.payload,out,n);n=routed.writeTo(wire);dump(wire,n);
+  encodeOtaSignedBlockFrame(1,hash,0x1234,data,84,sig,inner,sizeof(inner),inner_n);
+  n=encodeOtaRetryAttempt(0x11223345,inner,inner_n,out,sizeof(out),true);dump(out,n);
+  inner_n=encodeOtaCensusReport(r,inner,sizeof(inner));
+  n=encodeOtaRetryAttempt(0x11223346,inner,inner_n,out,sizeof(out));dump(out,n);
+  routed.header=0x31;routed.setPathHashSizeAndCount(1,1);routed.payload_len=n;
+  std::memcpy(routed.payload,out,n);n=routed.writeTo(wire);dump(wire,n);
 }'''
         path = self.directory / "golden.cpp"
         path.write_text(cpp)
@@ -1983,6 +2376,12 @@ int main() {
             ota.REUPLOAD_DOMAIN + b"\x0e" + owner + target + digest + struct.pack(">I", 9),
             b"\x0e" + owner + target + digest + struct.pack(">I", 9) + signature,
             ota.DIRECT_PROFILE_DOMAIN + profile, reply,
+            ota.retry_frame(b"\x08" + hashlib.sha256(target).digest()[:8] + owner + canonical + signature, 0x11223344),
+            ota.packet(ota.retry_frame(b"\x08" + hashlib.sha256(target).digest()[:8] + owner + canonical + signature,
+                                       0x11223344), RELAY[:3], 3),
+            ota.retry_frame(block_prefix + signature, 0x11223345, repair=True),
+            ota.retry_frame(report, 0x11223346),
+            b"\x31\x01" + RELAY[:1] + ota.retry_frame(report, 0x11223346),
         ]
         self.assertEqual(actual, [blob.hex() for blob in expected])
         # Exact wire sizes and the 176-byte stock frame ceiling.

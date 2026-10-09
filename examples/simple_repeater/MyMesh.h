@@ -39,6 +39,10 @@
 #include "RateLimiter.h"
 #include "RepeaterPrefs.h"
 
+#if MESHCORE_REPEATER_RELAY_PROFILE && MESHCORE_LORA_OTA
+#error "The isolated relay profile must not enable the OTA installer"
+#endif
+
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaFirmwareService.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
@@ -282,6 +286,9 @@ public:
   }
 
   void savePrefs() override {
+#if MESHCORE_REPEATER_RELAY_PROFILE
+    if (_ota_destructive_writes_disallowed_) return;
+#endif
     _cli.savePrefs(_fs, _prefs_filename);
   }
 

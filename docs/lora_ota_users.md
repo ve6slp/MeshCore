@@ -3,8 +3,10 @@
 This optional feature is **off in ordinary builds**. It is being soaked in a
 public fork; no upstream pull request or production-readiness claim is implied.
 Direct nRF52840 updates have succeeded on hardware, including normal-radio
-restoration. ESP32-S3 and SenseCAP Solar hardware updates, routed delivery and
-fleet/background deployments have **not yet been tested on hardware**.
+restoration. One-hop stock-sender routed requests/replies have also been verified
+on hardware; the full routed image installation remains pending (see below).
+ESP32-S3 and SenseCAP Solar hardware updates, complete routed installations and
+fleet/background deployments have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
 OTA-administrator permission on the receiver. It is independent of the ordinary
@@ -260,8 +262,10 @@ It does not grant receiver administrator permission or perform a deployment.
 ## Deploy through an unchanged stock companion
 
 `OTA_DEPLOY_TRANSPORT=stock` uses ordinary MeshCore **1.17.1** USB signing and raw
-packet commands. It does not require the native OTA USB command and supports
-only zero-hop direct delivery to an OTA-enabled receiver.
+packet commands. It does not require the native OTA USB command. It supports
+zero-hop off-channel `direct` delivery and normal-channel `directed` delivery
+through **one explicitly selected relay** to an OTA-enabled receiver. Stock
+background/multicast campaigns are not offered.
 
 Create your own owned mode-0600 JSON binding. Replace every angle-bracket field;
 `normal_profile` is the **receiver's actual normal radio configuration**, not
@@ -290,6 +294,9 @@ the receiver's generation and `begin_nonce`. `commit --ready-receipt` refuses a
 schema-1 receipt, and also refuses one whose nonce no longer matches the
 receiver's fresh READY (for example after ABORT and reupload). Run `upload` again
 to get a current receipt. `deploy` handles this internally.
+For separate `upload`/`commit` to a repeater, pass the same explicit `--board`,
+`--role-id 1` and `--counter` alongside its canonical manifest; omission retains
+the legacy ROLE0-only manifest checks.
 
 ```sh
 make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=direct \
@@ -302,6 +309,97 @@ make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=direct \
   OTA_UPLOAD_TARGET="$TARGET_PUBLIC_KEY" OTA_UPLOAD_FREQ_KHZ="$OFF_NORMAL_FREQ_KHZ"
 ```
 
+For a stock Heltec → nRF relay → nRF repeater target on the existing normal
+radio profile, select the relay's **full public key**, the repeater role and
+the request path hash width explicitly:
+
+```sh
+make ota-deploy OTA_DEPLOY_TRANSPORT=stock OTA_UPLOAD_MODE=directed \
+  OTA_DEPLOY_CLIENT_PORT="$CLIENT_PORT" \
+  OTA_STOCK_SERIAL="$CLIENT_SERIAL" OTA_STOCK_SENDER_KEY="$SENDER_PUBLIC_KEY" \
+  OTA_STOCK_BINDING="$BINDING_JSON" OTA_ARTIFACT_DIR="$NEW_RUN_DIRECTORY" \
+  OTA_STOCK_RELAY_KEY="$RELAY_PUBLIC_KEY" OTA_STOCK_PATH_HASH_BYTES=1 \
+  OTA_UPLOAD_CHANNEL=255 OTA_UPLOAD_FREQ_KHZ=0 \
+  OTA_UPLOAD_DUTY_MILLI_PERCENT=2000 OTA_UPLOAD_TIMEOUT=172800 \
+  OTA_UPLOAD_IMAGE="$APP_BIN" OTA_UPLOAD_BOARD=xiao_nrf52840_sense \
+  OTA_UPLOAD_ROLE_ID=1 OTA_UPLOAD_COUNTER="$NEXT_COUNTER" \
+  OTA_UPLOAD_TARGET="$TARGET_PUBLIC_KEY"
+```
+
+Omit DTR for the Heltec/ESP sender. Keep any required physical USB anchor/name
+guards in `OTA_STOCK_ARGS`; directed mode does not override the binding.
+All three devices must already share `normal_profile`, and the selected relay
+must have OTA-aware forwarding enabled. A dedicated repeater or relay-only
+repeater can forward these packets without an installer. A companion can also
+serve as the relay if its existing firmware forwards OTA traffic and repeat mode
+is enabled; no role change is implied. The host verifies the sender's frequency,
+bandwidth, SF and CR against
+the binding before any signing or RF operation, preserves its repeat setting
+and TX power, and never writes radio configuration in directed mode. A mismatch
+or later profile drift is an error, not an invitation to retune.
+
+Stock CLI equivalents are `--mode directed --relay-key "$RELAY_PUBLIC_KEY"
+--path-hash-bytes 1 --channel 255 --frequency-khz 0 --lease-ms 0
+--normal-duty-percent 2 --timeout 172800`.
+The CLI still defaults to off-channel `direct`; omitted frequency/lease in
+explicit directed mode mean zero. Widths **1, 2 and 3** use the existing
+MeshCore encoded path byte `((width - 1) << 6) | count` and public-key prefixes,
+not SHA-256 hashes. Every request has exactly one hop. The largest wrapped
+authorization fits the stock 176-byte command only with at most three path
+bytes; this adapter therefore does not offer multi-relay paths.
+
+Directed requests use existing OTA `0x11`/`0x12` BE32 attempt wrappers around the
+unchanged signed frames (repair blocks use `0x12`). Attempts are fresh on every
+transmission, including repeated polls and repairs; sequence exhaustion fails
+without wrapping or unframed fallback. `--routed-retry` is redundant in directed
+mode; `--no-routed-retry` / `OTA_DEPLOY_ROUTED_RETRY=0` are refused there.
+No signed direct lease is requested and no off-channel burst is used.
+`OTA_UPLOAD_DUTY_MILLI_PERCENT` / `--normal-duty-percent` apply to every packet,
+including retry and path overhead. CMD65 requests use normal OTA low priority;
+queue acceptance is still insufficient without measured physical TX completion.
+Large applications at a small normal-channel duty share can exceed the default
+four-hour campaign timeout. Select an adequate `OTA_UPLOAD_TIMEOUT` explicitly;
+on-channel deployment never substitutes the faster off-channel burst profile.
+
+**Return-route contract:** current receiver firmware sends normal-channel
+census/status replies as **floods**, with width-1 relay hashes appended; it does
+not provide a directed reverse-path API. The stock host requires the reply to
+echo the latest request attempt and contain exactly the selected relay's
+one-byte prefix. A zero-hop copy heard directly from the target, a direct reply,
+an unwrapped/old attempt, or another relay trail cannot advance the campaign.
+`rf_tx_request`, `rf_rx` and `rf_reply_route` JSON events expose request paths,
+reply trails and attempt matching without logging packet bodies. Directed READY
+receipts also bind the selected relay/path; separate COMMIT cannot switch paths.
+These are **unsigned path observations**, not cryptographic hop attestation;
+the selected relay's one-byte prefix must be distinct from sender/target, and
+operators must rule out other relay prefix collisions. An older relay must
+actually forward these OTA wrappers and v3 census floods; a protocol/version
+label alone does not establish that. Qualify both directions on hardware before
+a real install. Failure never retries with a zero-hop path or changes firmware.
+
+The public `inspect` command remains USB-only and read-only by default; it
+does not perform RF probes or claim that the selected topology is ready.
+
+### Hardware milestone: routed RF verified, full installation pending
+
+As of **2026-10-09**, a stock Heltec sender → dedicated nRF repeater relay →
+nRF repeater installer target has passed a bounded, non-activating RF check on
+907.525 MHz / BW250 kHz / SF7 / CR5, TX2 and 2% OTA duty. The relay's isolated
+profile and enabled forwarding persisted across reboot. With relay forwarding
+disabled, the poll timed out after 25 seconds with no accepted route; enabled,
+**5/5** baseline census replies echoed the current request attempt and carried
+exactly the selected relay trail. Directly overheard target replies were rejected.
+The v3 reports described the existing generation-1, floor-1 image; the probe did
+not authorize or replace a candidate, retune radios or use a direct fallback.
+These remain unsigned RF/path observations.
+
+The subsequent 506,524-byte counter-2 campaign is using the same normal profile,
+2% duty and a 172,800-second budget. At the recorded 90.243-second checkpoint,
+the target reported generation 2 Receiving with **4/6,031 blocks** received.
+**Full-image completion, counter-2 Installed and post-install persistence have
+not yet been verified.** This milestone proves the selected RF hop in both
+directions, not successful routed firmware installation.
+
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
 long transfer. The uploader discards only well-formed notifications of the
@@ -311,11 +409,14 @@ lease acknowledgments), command replies, errors and signatures. A malformed
 known notification is a fatal error, and unknown or future notification kinds
 still count against the bound and fail explicitly if they accumulate.
 
-Stock captures the sender's exact original radio/repeat settings and TX power,
+Direct stock captures the sender's exact original radio/repeat settings and TX power,
 persists `original-radio.json` before changing radio, accounts for physical TX
 completion, verifies signed direct-lease acknowledgments, and restores and reads
 back the original settings on success or failure. The receiver's bounded lease
 also returns it to normal radio. The unchanged stock host never changes TX power.
+Directed stock persists the original settings too and writes
+`radio-unchanged.json` only after an unchanged final readback, rather than
+claiming to have restored settings it never modified.
 
 **Status limitation:** RF lifecycle reports are currently unsigned. Stock
 success means fresh matching native Installed was reported with the candidate's

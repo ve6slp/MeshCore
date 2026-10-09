@@ -1015,6 +1015,10 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _prefs_filename = resolveRepeaterPrefsFilename(*_fs);
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  // Avoid CommonCLI's implicit legacy /com_prefs migration in a role change.
+  if (_identity_available_ && !_ota_destructive_writes_disallowed_ && _fs->exists(_prefs_filename))
+#endif
   _cli.loadPrefs(_fs, _prefs_filename);
   // acl.load() keys every entry against self_id's own identity -- skip it
   // entirely (ACL stays empty) rather than load/bind against an unset
@@ -1178,7 +1182,9 @@ void MyMesh::revertTempRadioLeaseIfDue() {
 }
 
 bool MyMesh::formatFileSystem() {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  return false;
+#elif defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   return InternalFS.format();
 #elif defined(RP2040_PLATFORM)
   return LittleFS.format();
@@ -1317,7 +1323,11 @@ void MyMesh::startRegionsLoad() {
 }
 
 bool MyMesh::saveRegions() {
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  return false;
+#else
   return region_map.save(_fs);
+#endif
 }
 
 void MyMesh::onDefaultRegionChanged(const RegionEntry* r) {
@@ -1342,6 +1352,9 @@ void MyMesh::formatPacketStatsReply(char *reply) {
 }
 
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  (void)new_id;
+#else
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   IdentityStore store(*_fs, "");
 #elif defined(ESP32)
@@ -1352,6 +1365,7 @@ void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
 #error "need to define saveIdentity()"
 #endif
   store.save("_main", new_id);
+#endif
 }
 
 void MyMesh::clearStats() {
@@ -1445,6 +1459,15 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     reply += 3;
     command += 3;
   }
+
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  if (strncmp(command, "set prv.key", 11) == 0 || strncmp(command, "get prv.key", 11) == 0 ||
+      strncmp(command, "erase", 5) == 0 || strncmp(command, "setperm ", 8) == 0 ||
+      strncmp(command, "start ota", 9) == 0) {
+    strcpy(reply, "Err - relay profile preserves identity and userdata");
+    return;
+  }
+#endif
 
 #if XIAO_OTA_USB_RECOVERY
   if (strncmp(command, "reboot uf2", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
@@ -1650,7 +1673,7 @@ void MyMesh::loop() {
     if (ota_write_gate::guardedPersist(_ota_destructive_writes_disallowed_, [&](){ acl.save(_fs); return true; })) {
       dirty_contacts_expiry = 0;
     }
-#else
+#elif !MESHCORE_REPEATER_RELAY_PROFILE
     acl.save(_fs);
     dirty_contacts_expiry = 0;
 #endif

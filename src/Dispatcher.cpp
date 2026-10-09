@@ -63,12 +63,26 @@ uint32_t Dispatcher::getCADFailMaxDuration() const {
   return 4000;   // 4 seconds
 }
 
+#if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
+void Dispatcher::recordRelayAirtime(uint32_t duration_ms) {
+  if (mesh::ota::isOtaPacket(outbound) &&
+      !relay_airtime.recordUsage(_ms->getMillis(),
+          meshcore::ota::protocol::OtaAirtimeCategory::Relay, duration_ms)) {
+    // Never continue forwarding after losing airtime accounting.
+    relay_accounting_fault = true;
+  }
+}
+#endif
+
 bool Dispatcher::completeOutboundSend() {
   if (outbound == nullptr || !_radio->isSendComplete()) return false;
   const unsigned long t = _ms->getMillis() - outbound_start;
   total_air_time += t;
   updateTxBudget();
   tx_budget_ms = t > tx_budget_ms ? 0 : tx_budget_ms - t;
+#if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
+  recordRelayAirtime(t);
+#endif
 #if MESHCORE_LORA_OTA
   if (outbound_is_ota) {
     if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
@@ -132,6 +146,15 @@ void Dispatcher::loop() {
   if (outbound) {  // waiting for outbound send to be completed
     if (!completeOutboundSend()) {
       if (millisHasNowPassed(outbound_expiry)) {
+#if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
+        if (mesh::ota::isOtaPacket(outbound)) {
+          const uint32_t duration = _ms->getMillis() - outbound_start;
+          recordRelayAirtime(duration);
+          total_air_time += duration;
+          updateTxBudget();
+          tx_budget_ms = duration > tx_budget_ms ? 0 : tx_budget_ms - duration;
+        }
+#endif
 #if MESHCORE_LORA_OTA
         ++tx_timeout_count;
 #endif
@@ -200,7 +223,7 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
 
   memcpy(pkt->path, &raw[i], path_byte_len); i += path_byte_len;
 
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   if (mesh::ota::isOtaPacket(pkt) && i >= len) return false;
 #endif
   pkt->payload_len = len - i;  // payload is remainder
@@ -236,7 +259,7 @@ __attribute__((noinline)) Packet* Dispatcher::readReceivedPacket(float& score, u
         MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): WARNING: received data, no unused packets available!", getLogDateTime());
       } else {
         if (tryParsePacket(pkt, raw, len)) {
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
           // Ingress cannot classify OTA until after ordinary allocation.
           if (mesh::ota::isOtaPacket(pkt) &&
               (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve)) {
@@ -315,7 +338,7 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
     _mgr->free(pkt);
   } else if (action == ACTION_MANUAL_HOLD) {
     // sub-class is wanting to manually hold Packet instance, and call releasePacket() at appropriate time
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   } else if (mesh::ota::isOtaPacket(pkt) &&
              (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve)) {
     // ACTION_RETRANSMIT* for an OTA packet (relay/forward), but the pool is
@@ -368,7 +391,7 @@ void Dispatcher::checkSend() {
   }
   cad_busy_start = 0;  // reset busy state
 
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   outbound = _mgr->supportsOtaQueue()
       ? _mgr->getNextOutboundWithPriority(_ms->getMillis(), &outbound_priority)
       : _mgr->getNextOutbound(_ms->getMillis());
@@ -395,7 +418,7 @@ void Dispatcher::checkSend() {
       memcpy(&raw[len], outbound->payload, outbound->payload_len); len += outbound->payload_len;
 
       uint32_t prospective_airtime = _radio->getEstAirtimeFor(len);
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
       updateTxBudget();
       // Ordinary traffic retains dev's half-MTU-airtime admission threshold.
       // Only OTA must also fit its entire prospective airtime in the budget.
@@ -409,7 +432,24 @@ void Dispatcher::checkSend() {
         // Only this OTA packet is delayed; ordinary traffic remains runnable.
         return;
       }
-
+#endif
+#if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
+      if (mesh::ota::isOtaPacket(outbound)) {
+        meshcore::ota::runtime::OtaAirtimeDecisionInput decision;
+        decision.normalTrafficActive = hasQueuedNormalTraffic();
+        // Include the send-timeout envelope; payloads remain completely opaque.
+        const uint32_t maximum_duration = prospective_airtime * 3 / 2;
+        if (relay_accounting_fault || !_mgr->supportsOtaQueue() ||
+            !relay_airtime.canAdmit(_ms->getMillis(),
+                meshcore::ota::protocol::OtaAirtimeCategory::Relay, maximum_duration, decision)) {
+          Packet* held = outbound;
+          outbound = nullptr;
+          sendPacket(held, mesh::ota::kOtaForwardPriority, 60000);
+          return;
+        }
+      }
+#endif
+#if MESHCORE_LORA_OTA
       outbound_is_ota = mesh::ota::isOtaPacket(outbound);
       if (outbound_is_ota) {
         if (!_mgr->supportsOtaQueue()) {
@@ -515,7 +555,7 @@ bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_mil
     _mgr->free(packet);
     return false;
   }
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   if (mesh::ota::isOtaPacket(packet)) {
     if (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
       _mgr->free(packet);
@@ -533,7 +573,7 @@ bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_mil
   return true;  // Legacy submission consumes but cannot report enqueue failure.
 }
 
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
 bool Dispatcher::hasQueuedNormalTraffic() {
   // getOutboundCount(now) only tells us *some* entry (of any kind) is
   // ready now; it does NOT mean the specific entries this loop finds
@@ -555,7 +595,9 @@ bool Dispatcher::hasQueuedNormalTraffic() {
   }
   return false;
 }
+#endif
 
+#if MESHCORE_LORA_OTA
 bool Dispatcher::hasQueuedOtaTraffic() {
   if (!_mgr->supportsOtaQueue()) return false;
   if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return false;

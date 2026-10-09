@@ -66,6 +66,98 @@ to check the queue reserve, priorities and ownership. Both are part of
 `make test-ota`. `build-ota-nrf52-targets` and `build-ota-esp32-targets` compile the explicit
 opt-in environments; callers can override the corresponding environment lists.
 
+### Installer-independent repeater relay
+
+`make build ENV=Xiao_nrf52_repeater_ota_relay_usb` builds an APP-only USB
+repeater with `MESHCORE_LORA_OTA=0`, `MESHCORE_LORA_OTA_RELAY=1` and
+`MESHCORE_REPEATER_RELAY_PROFILE=1`. The relay gate defaults off. It classifies
+payload type `0x0C` for routing/queueing only, never instantiates the installer,
+staging/image storage, RF authorization, qualification or boot-command backend.
+The linker ends APP at `0xC4000`; do not replace the paired bootloader, fixed
+installer, stage, floor or filesystem when changing to this profile. This
+profile does not become install-capable by changing its advertised role.
+
+Directed requests consume the selected next-hop prefix (width 1/2/3).
+Flood replies append that same-width relay prefix once; their original payload,
+including `0x11`/`0x12` and BE32 retry attempt, is opaque and unchanged. Normal
+transport, flood policy, hop limits, native packet-hash deduplication and path
+capacity limits still apply. There is no direct-bypass fallback or duplicate
+delivery exception at the relay. Traffic uses priority 250 and preserves four
+packet buffers for ordinary traffic. The dispatcher requires the full estimated
+airtime in its normal mesh budget and additionally admits at most 72,000 ms per
+rolling hour (2%), conservatively checking the 1.5x send-timeout envelope before
+TX. All opaque OTA packets share the Relay category, including control/replies.
+Completed and timed-out sends are charged; accounting failure blocks further
+OTA TX for this boot. Ready ordinary traffic takes precedence; budget-deferred
+OTA frames retry the queue after 60 seconds without globally stalling normal
+traffic. This is an airtime limit, not permission to use a restricted frequency.
+
+The isolated profile mounts InternalFS without format-on-failure and requires
+its existing `/_main.id`; absent/unreadable identities result in no mesh
+dispatch, no new key and no writes. Only `/relay_prefs.json` is used for repeater
+preferences, with no `/prefs.json`, `/com_prefs` or legacy companion preference
+migration. Identity rekey/export, filesystem erase, ACL persistence and region
+persistence are disabled in this profile. Ordinary-to-OTA repeater preference
+fallback remains unchanged when this isolation opt-in is off. No ExtraFS/QSPI
+mount or OTA stage/floor access is enabled.
+
+Generic defaults inherit ordinary board settings; no lab channel, power or
+identity is embedded. An operator can supply controlled `LORA_FREQ`, `LORA_BW`,
+`LORA_SF`, `LORA_CR`, `LORA_TX_POWER`, `ADVERT_NAME` build overrides before the
+first boot, or use the standard repeater USB CLI (`set radio`, `set tx`,
+`set name`, `set repeat`, followed by `get radio`/`get tx`/`get repeat`). Existing
+isolated preferences override build defaults. Changing mesh `airtime.factor`
+does not raise the relay's independent 2% OTA ceiling. To change inherited
+preprocessor definitions, use an explicit local environment with matching
+`build_unflags` and new `build_flags`; avoid relying on duplicate `-D` ordering.
+
+For a private extending environment, retain the relay environment's
+`build_unflags` (`-std=gnu++11 -std=gnu++14 -D EXTRAFS=1`) and remove the
+inherited `-D LORA_FREQ=869.618`, `-D LORA_BW=62.5`, `-D LORA_SF=8`,
+`-D LORA_TX_POWER=22` and `-D ADVERT_NAME='"Xiao_nrf52 Repeater"'` before
+supplying replacements alongside the inherited `build_flags`. `LORA_CR` has
+no inherited command-line definition to remove. Build with
+`make build ENV=<private-relay-env>`; the APP-only DFU ZIP is
+`.pio/build/<private-relay-env>/firmware.zip`. Flash APP only, preserving the
+paired bootloader and userdata; verify identity, radio, name and repeat setting
+again after reboot. The advertised repeater role is not a paired installer-role
+qualification.
+
+#### Parent-observed hardware milestone — 2026-10-09
+
+A private APP-only build using 907.525 MHz, BW250, SF7, CR5 and TX2 produced a
+362,868-byte APP (SHA-256 prefix `19ef6692`, exclusive flash end `0x7F974`).
+The isolated name `OTA-LAB-RELAY`, 2% duty setting and repeat-on state persisted
+across reboot; the existing companion public identity was retained and the
+node advertised as a genuine repeater. These are private lab settings, not
+generic environment defaults.
+
+The reproducible negative/positive route probe used a stock sender with one
+explicit selected-relay hop and accepted only the current poll attempt's
+exact single-relay return trail. Repeat-off yielded no accepted route during
+25 seconds; repeat-on yielded 5/5 v3 census replies from the target's unchanged
+generation-1/floor-1 baseline (6,017 blocks). A bare target reply was received
+but correctly rejected. No retune, fallback or candidate mutation was used.
+
+**Full counter-2 campaign remains pending.** The subsequent stock-sender →
+dedicated-repeater → target campaign was running on the normal channel at 2%
+with a 172,800-second timeout. Its observed generation-2 state was Receiving,
+6,031 total blocks, with live census reporting four received blocks at 90.243
+seconds. This proves relay necessity and early RF admission/progress, not
+completed transfer, installation, reboot confirmation or counter-2 floor
+advancement.
+
+Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
+off), startup safety and gate-off compatibility use existing Make targets:
+
+```sh
+PLATFORMIO_BUILD_FLAGS='-D MESHCORE_LORA_OTA_RELAY=1 -D MESHCORE_REPEATER_RELAY_PROFILE=1' make test-ota-disabled
+make test-ota-storage OTA_GTEST_FILTER='RelayStartup.*:BExampleStartupTest.*'
+make test-ota-disabled
+make test-ota-queue-compatibility
+make test-ota-native OTA_TEST_FILTER=test_config_serializer OTA_GTEST_FILTER='RepeaterPrefsMigration.*'
+```
+
 ### PacketManager compatibility
 
 Existing `PacketManager` implementations compile and behave unchanged, with or

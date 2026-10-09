@@ -91,7 +91,7 @@ void setup() {
   const bool radio_ok = radio_init();
 #endif
   if (!radio_ok) {
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_REPEATER_RELAY_PROFILE
     MESH_DEBUG_PRINTLN("Radio init failed! Continuing in degraded (maintenance-only) mode.");
     the_mesh.notifyRadioUnavailableForDispatch();
 #else
@@ -114,6 +114,9 @@ void setup() {
     // _ota_destructive_writes_disallowed_'s doc comment in MyMesh.h).
     the_mesh.notifyDestructiveWritesDisallowed();
   }
+#elif MESHCORE_REPEATER_RELAY_PROFILE
+  // Role-changing relay firmware may neither format nor provision an identity.
+  const bool ota_allow_destructive_boot_writes = false;
 #else
   const bool ota_allow_destructive_boot_writes = true;
 #endif
@@ -156,11 +159,15 @@ void setup() {
   // radio_ok result, never a literal `true`.
   the_mesh.setOtaTrialBootHealthSignals(radio_ok, filesystem_ok);
 #endif
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_REPEATER_RELAY_PROFILE
   const identity_io::LoadStatus identity_status =
       store.loadWithStatus("_main", the_mesh.self_id, filesystem_ok);
   const bool identity_loaded = identity_status == identity_io::LoadStatus::Loaded;
+#if MESHCORE_REPEATER_RELAY_PROFILE
+  if (!radio_ok || !filesystem_ok || !identity_loaded) {
+#else
   if (!radio_ok || !identity_io::canWriteUserdata(ota_allow_destructive_boot_writes, filesystem_ok, identity_status)) {
+#endif
     the_mesh.notifyDestructiveWritesDisallowed();
   }
 #else
@@ -185,7 +192,7 @@ void setup() {
     // generation, zero writes, self_id left unset, degraded-dispatch-
     // only) instead of inventing a second decision path or promoting
     // millis-seeded entropy into an identity.
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_REPEATER_RELAY_PROFILE
     const bool identity_generation_safe = identity_io::canProvisionIdentity(
         ota_allow_destructive_boot_writes, radio_ok, filesystem_ok, identity_status);
 #else
@@ -217,7 +224,7 @@ void setup() {
       // bounded serial/CLI/maintenance/trial-health path (and the
       // bootloader's own trial-rollback path on the next boot) reachable.
       MESH_DEBUG_PRINTLN("OTA trial/unknown boot: identity unavailable, running degraded (no mesh dispatch)");
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_REPEATER_RELAY_PROFILE
       the_mesh.notifyIdentityUnavailableForDispatch();
 #endif
     }

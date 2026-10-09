@@ -9,6 +9,8 @@
 
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaFirmwareIntegration.h>
+#elif MESHCORE_LORA_OTA_RELAY
+#include <ota/runtime/OtaAirtimeLimiter.h>
 #endif
 
 namespace mesh {
@@ -197,8 +199,15 @@ typedef uint32_t  DispatcherAction;
 class Dispatcher {
   Packet* outbound;  // current outbound packet
   unsigned long outbound_expiry, outbound_start, total_air_time, rx_air_time;
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   uint8_t outbound_priority;
+#endif
+#if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
+  meshcore::ota::runtime::OtaAirtimeLimiter relay_airtime;
+  bool relay_accounting_fault = false;
+  void recordRelayAirtime(uint32_t duration_ms);
+#endif
+#if MESHCORE_LORA_OTA
   bool outbound_is_ota;
   meshcore::ota::protocol::OtaAirtimeCategory outbound_ota_category;
   mesh::ota::OtaFirmwareIntegration dispatcher_ota;
@@ -230,8 +239,10 @@ protected:
     : _radio(&radio), _ms(&ms), _mgr(&mgr)
   {
     outbound = NULL;
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
     outbound_priority = 0;
+#endif
+#if MESHCORE_LORA_OTA
     outbound_is_ota = false;
     outbound_ota_category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
     active_ota = &dispatcher_ota;
@@ -282,8 +293,10 @@ public:
   // cannot report queue-full drops: true means submitted to their consuming
   // queueOutbound(), not confirmed enqueue.
   bool sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis=0);
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   bool hasQueuedNormalTraffic();
+#endif
+#if MESHCORE_LORA_OTA
   bool hasQueuedOtaTraffic();
   void attachOtaIntegration(mesh::ota::OtaFirmwareIntegration* integration) {
     active_ota = integration != nullptr ? integration : &dispatcher_ota;

@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <Packet.h>
 
+#ifndef MESHCORE_LORA_OTA_RELAY
+#define MESHCORE_LORA_OTA_RELAY 0
+#endif
+
 namespace mesh {
 namespace ota {
 
@@ -14,9 +18,9 @@ static constexpr bool kOtaMeshEnabled = true;
 static constexpr bool kOtaMeshEnabled = false;
 #endif
 
-// OFF builds: payload type 0x0C is ordinary/unknown traffic, never OTA.
+// Relay-only builds classify opaque OTA traffic without enabling an installer.
 inline bool isOtaPayloadType(uint8_t payload_type) {
-  return kOtaMeshEnabled && payload_type == PAYLOAD_TYPE_LORA_OTA;
+  return (kOtaMeshEnabled || MESHCORE_LORA_OTA_RELAY) && payload_type == PAYLOAD_TYPE_LORA_OTA;
 }
 
 inline bool isOtaPacket(const Packet* packet) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Signed direct OTA through an unchanged MeshCore 1.17.1 companion.
+"""Signed direct or on-channel directed OTA through a stock 1.17.1 companion.
 
 Uses normal USB identity, signing, raw packet and measured-TX commands; never
 native OTA CMD67, key export, contact mutation, reset or flash operations.
@@ -13,8 +13,11 @@ and confirmed floor. RF lifecycle reports are unsigned; output explicitly says
 status_authenticated:false and installation_confirmed:false. Queue admission
 and signed COMMIT alone never mean installation succeeded.
 
-Exact original sender radio/repeat settings are persisted before any change,
-restored and read back on success/failure. Explicit restore reuses this artifact.
+Direct mode persists, restores and reads back original radio/repeat settings.
+Directed mode requires the sender already on the bound normal profile, never
+retunes and accepts only attempt-matched reply floods bearing the selected
+relay's path prefix. These path observations, like status, are unsigned.
+Explicit restore reuses the original-settings artifact.
 Stable USB selection and flock prevent endpoint races/concurrent readers; normal
 115200 serial is opened with RTS false and caller-selected DTR before open.
 """
@@ -200,6 +203,27 @@ def validate_profile(profile):
         raise Error("invalid stock radio profile")
 
 
+def validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding=None):
+    if mode not in ("direct", "directed") or channel != 255:
+        raise Error("stock supports direct/directed on the existing radio channel (channel 255) only")
+    if path_hash_bytes not in (1, 2, 3):
+        raise Error("MeshCore path hashes must be 1, 2 or 3 bytes")
+    if mode == "direct":
+        if relay is not None or path_hash_bytes != 1:
+            raise Error("explicit relay/path requires directed mode")
+        if (type(frequency) is not int or not 150000 <= frequency <= 2500000
+                or not MIN_LEASE <= lease_ms <= 60000
+                or (binding is not None and frequency == binding.normal[0])):
+            raise Error("off-normal frequency and host lease 30000..60000ms required")
+    else:
+        if frequency != 0 or lease_ms != 0:
+            raise Error("directed mode requires zero frequency/lease; no retune or lease fallback")
+        if not isinstance(relay, bytes) or len(relay) != 32 or not any(relay):
+            raise Error("directed mode requires one explicit full --relay-key")
+        if binding is not None and any(relay[:1] == key[:1] for key in (binding.sender, binding.target)):
+            raise Error("relay hash must be distinct from sender/target for width-1 reply evidence")
+
+
 @dataclass(frozen=True)
 class Candidate:
     canonical: bytes
@@ -241,15 +265,18 @@ class Candidate:
         return cls(canonical, image, hashlib.sha256(canonical).digest(), counter, (size + 83) // 84)
 
 
-def packet(payload):
-    # Packet::writeTo: version 0, type 0x0c, direct route 2, zero path.
-    raw = b"\x32\x00" + payload
+def packet(payload, path=b"", hash_size=1):
+    if (hash_size not in (1, 2, 3) or len(path) > 64 or len(path) % hash_size
+            or len(path) // hash_size > 63):
+        raise Error("invalid MeshCore path hash width/count")
+    encoded = ((hash_size - 1) << 6) | (len(path) // hash_size)
+    raw = bytes([0x32, encoded]) + path + payload
     if not payload or len(raw) + 2 > MAX_FRAME:
         raise Error("CMD65 exceeds stock 176-byte frame")
     return raw
 
 
-def raw_rx(frame):
+def rf_packet(frame):
     if len(frame) > MAX_FRAME:
         raise Error("oversize stock USB frame")
     if len(frame) < 6 or frame[:1] != b"\x88":
@@ -260,11 +287,43 @@ def raw_rx(frame):
     hash_size, count = (path >> 6) + 1, path & 63
     path_bytes = hash_size * count
     offset = 5 + path_bytes
-    # Normal-channel receiver control is flood; leased control is direct.
-    # Match Packet::isValidPathLen and skip hashes, never transport codes.
     if hash_size == 4 or path_bytes > 64 or offset >= len(frame):
         return None
-    return frame[offset:]
+    return header & 3, hash_size, frame[5:offset], frame[offset:]
+
+
+def retry_frame(payload, attempt, repair=False):
+    if (type(attempt) is not int or not 0 < attempt <= 0xFFFFFFFF
+            or not valid_retry_inner(payload) or len(payload) + 5 > 171
+            or (repair and payload[0] != 1)):
+        raise Error("invalid existing OTA retry attempt/inner frame")
+    return bytes([0x12 if repair else 0x11]) + struct.pack(">I", attempt) + payload
+
+
+def valid_retry_inner(payload):
+    if not payload:
+        return False
+    sizes = {2: 156, 3: 153, 4: 165, 6: 42, 7: 5, 8: 164, 10: 67,
+             11: CENSUS_REPORT_BYTES, 14: 165}
+    return (72 <= len(payload) <= 155 if payload[0] == 1
+            else len(payload) == sizes.get(payload[0]))
+
+
+def retry_payload(payload):
+    if payload[:1] not in (b"\x11", b"\x12"):
+        return None, payload
+    if not 5 < len(payload) <= 171:
+        return None, None
+    attempt = struct.unpack_from(">I", payload, 1)[0]
+    inner = payload[5:]
+    if not attempt or not valid_retry_inner(inner) or (payload[0] == 0x12 and inner[0] != 1):
+        return None, None
+    return attempt, inner
+
+
+def raw_rx(frame):
+    decoded = rf_packet(frame)
+    return retry_payload(decoded[3])[1] if decoded is not None else None
 
 
 def rf_metadata(frame, payload, target, manifest):
@@ -272,7 +331,12 @@ def rf_metadata(frame, payload, target, manifest):
     kind = payload[0] if payload else None
     target_offset = {11: 1, 13: 33, 16: 33}.get(kind)
     hash_offset = {11: 33, 13: 65, 16: 65}.get(kind)
+    decoded = rf_packet(frame)
+    attempt = retry_payload(decoded[3])[0] if decoded is not None else None
     return {"usb_length": len(frame), "packet_length": max(0, len(frame) - 3),
+            "path_hash_bytes": decoded[1] if decoded is not None else None,
+            "path": decoded[2].hex() if decoded is not None else None,
+            "retry_attempt": attempt,
             "route": header & 3 if header is not None else None,
             "version": header >> 6 if header is not None else None,
             "payload_type": (header >> 2) & 15 if header is not None else None,
@@ -409,7 +473,8 @@ class Frames:
                     observer({"event": "rf_discard", **rf_metadata(frame, raw_rx(frame), target, manifest)})
         self.pending = [(t, f) for t, f in self.pending if f[0] != 0x88]
 
-    def receive(self, predicate, since, deadline, observer=None, target=None, manifest=None):
+    def receive(self, predicate, since, deadline, observer=None, target=None, manifest=None,
+                route_predicate=None):
         while self.clock() < deadline:
             for i, (timestamp, frame) in enumerate(self.pending):
                 if frame[0] == 0x88:
@@ -418,7 +483,9 @@ class Frames:
                     if observer is not None:
                         observer({"event": "rf_rx", "fresh": timestamp >= since,
                                   **rf_metadata(frame, payload, target, manifest)})
-                    if timestamp >= since and payload is not None and predicate(payload):
+                    if (timestamp >= since and payload is not None
+                            and (route_predicate is None or route_predicate(frame))
+                            and predicate(payload)):
                         return timestamp, payload
                     break
             else:
@@ -548,15 +615,22 @@ def airtime(raw_length, profile):
 class Sender:
     def __init__(self, stock, binding, candidate, profile, deadline, frequency, lease_ms=60000,
                  duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False,
-                 event_callback=None):
-        if not MIN_LEASE <= lease_ms <= 60000 or not 150000 <= frequency <= 2500000 or frequency == binding.normal[0]:
-            raise Error("off-normal frequency and host lease 30000..60000ms required")
+                 event_callback=None, *, mode="direct", relay=None, path_hash_bytes=1, channel=255):
+        validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding)
+        validate_profile(profile)
+        if mode == "directed" and tuple(profile[:4]) != binding.normal:
+            raise Error("directed sender must already match the bound normal radio profile; no retune")
         if not math.isfinite(duty) or not 0 < duty <= 1:
             raise Error("normal-channel duty must be in (0,1]")
         binding.check_candidate(candidate)
         binding.permit_reupload(reupload_generation, reupload)
         self.stock, self.binding, self.candidate = stock, binding, candidate
-        self.original, self.normal = tuple(profile), (*binding.normal, 0)
+        self.mode, self.relay, self.path_hash_bytes = mode, relay, path_hash_bytes
+        self.path = relay[:path_hash_bytes] if relay is not None else b""
+        self.next_attempt = (int.from_bytes(os.urandom(4), "big") or 1) if mode == "directed" else None
+        self.last_tx_attempt = None
+        self.original = tuple(profile)
+        self.normal = self.original if mode == "directed" else (*binding.normal, 0)
         self.profile, self.deadline = self.normal, deadline
         self.frequency, self.lease_ms, self.duty = frequency, lease_ms, duty
         self.direct_bandwidth = 250000
@@ -599,16 +673,33 @@ class Sender:
 
     def send(self, payload):
         self.room(9)
-        command = b"\x41\x00" + packet(payload)
+        if not payload:
+            raise Error("empty OTA payload")
+        inner_kind = payload[0]
+        attempt = None
+        if self.mode == "directed":
+            if self.next_attempt > 0xFFFFFFFF:
+                raise Error("OTA retry attempts exhausted; no wrap/replay fallback")
+            attempt = self.next_attempt
+            payload = retry_frame(payload, attempt, repair=inner_kind == 1)
+            self.next_attempt += 1
+        raw = packet(payload, self.path, self.path_hash_bytes)
+        command = bytes([65, 250 if self.mode == "directed" else 0]) + raw
         normal = self.profile == self.normal
         if normal:
             self.wait_until(self.next_normal)
         deadline = min(self.deadline, self.clock() + 8, self.lease_end or self.deadline)
+        if self.mode == "directed" and self.stock.identify(deadline) != self.original:
+            raise Error("directed sender normal radio/repeat profile changed; no retune")
         before = self.stock.stats(deadline)
         if before[0]:
             raise Error("stock outbound queue not exclusive/idle")
         started = self.clock()
-        estimate = airtime(len(payload) + 2, self.profile)
+        estimate = airtime(len(raw), self.profile)
+        self.last_tx_attempt = attempt
+        self.emit("rf_tx_request", mode=self.mode, route=2, path_hash_bytes=self.path_hash_bytes,
+                  path=self.path.hex(), retry_attempt=attempt, kind=inner_kind,
+                  packet_length=len(raw), frequency_khz=self.profile[0])
         self.stock.pending_tx = before[1:3]
         try:
             self.stock.ok(command, deadline)
@@ -638,6 +729,23 @@ class Sender:
             self.sleep(max(0.05, min(0.25, estimate / 2)))
         raise Error("no measured physical stock TX completion")
 
+    def reply_route(self, frame):
+        if self.mode != "directed":
+            return True
+        decoded = rf_packet(frame)
+        if decoded is None:
+            return False
+        route, width, path, payload = decoded
+        attempt, inner = retry_payload(payload)
+        # Mesh::pumpOtaControl emits width-1 floods on the normal channel.
+        # Reject the target's zero-hop copy and any other relay trail.
+        matched = (route == 1 and width == 1 and path == self.relay[:1] and attempt is not None
+                   and attempt == self.last_tx_attempt and inner is not None)
+        self.emit("rf_reply_route", route=route, path_hash_bytes=width, path=path.hex(),
+                  retry_attempt=attempt, expected_attempt=self.last_tx_attempt,
+                  selected_relay_match=matched, evidence_authenticated=False)
+        return matched
+
     def census(self, first=0, retries=3, allow_pending=False, post_commit=False):
         self.room(15)
         c, b = self.candidate, self.binding
@@ -653,7 +761,7 @@ class Sender:
                 _, frame = self.stock.frames.receive(
                     lambda p: p[:1] == b"\x0b", since,
                     min(self.deadline, self.clock() + reply_wait, self.lease_end or self.deadline),
-                    observer, b.target, c.digest)
+                    observer, b.target, c.digest, route_predicate=self.reply_route)
             except TimeoutError:
                 self.emit("census_timeout", attempt=attempt, first=first)
                 self.room(15)
@@ -750,6 +858,8 @@ class Sender:
         self.wait_until(max(self.target_normal_after, self.next_normal))
 
     def negotiate(self):
+        if self.mode == "directed":
+            return
         # Receiver ignores in-flight renewals. Wait out the old bounded lease,
         # then negotiate on normal frequency with a new signed token.
         self.leave_direct()
@@ -868,7 +978,7 @@ class Sender:
                     if self.attempts[index] > 8:
                         raise Error("RF block repair retries exhausted")
                     message, prefix = block_message(self.candidate, index)
-                    signature = self.stock.sign(message, min(self.deadline, self.lease_end))
+                    signature = self.stock.sign(message, min(self.deadline, self.lease_end or self.deadline))
                     self.send(prefix + signature)
                     self.emit("block_sent", index=index, attempt=self.attempts[index], total=self.candidate.total,
                               tx_evidence="aggregate-counters")
@@ -880,7 +990,7 @@ class Sender:
                     self.leave_direct()
                     for window in ((0,) if ready_once else windows):
                         if self.census(window)["lifecycle"] != 5:
-                            raise Error("READY lost after direct lease expiry")
+                            raise Error("READY lost on final normal-channel census")
                     self.emit("ready_observed_unsigned", generation=self.generation, total=self.candidate.total)
                     return self.receipt("ready-observed-unsigned")
             except LeaseExpired:
@@ -889,12 +999,18 @@ class Sender:
             # Polling is bounded by stock TX completion and receiver reply wait.
 
     def receipt(self, outcome):
-        return {"schema": RECEIPT_SCHEMA, "outcome": outcome, "serial": self.binding.serial,
+        result = {"schema": RECEIPT_SCHEMA, "outcome": outcome, "serial": self.binding.serial,
                 "sender_public_key": self.binding.sender.hex(), "target_public_key": self.binding.target.hex(),
                 "manifest_hash": self.candidate.digest.hex(), "counter": self.candidate.counter,
                 "generation": self.generation,
                 "begin_nonce": None if self.begin_nonce is None else self.begin_nonce.hex(),
                 "installation_confirmed": False}
+        if self.mode == "directed":
+            result.update(mode="directed", relay_public_key=self.relay.hex(),
+                          request_path=self.path.hex(), path_hash_bytes=self.path_hash_bytes,
+                          reply_route="flood", reply_path=self.relay[:1].hex(),
+                          reply_path_hash_bytes=1, status_authenticated=False)
+        return result
 
     def commit(self, receipt):
         expected = self.receipt("ready-observed-unsigned")
@@ -959,9 +1075,11 @@ class Sender:
 
 
 @contextmanager
-def radio_guard(stock, binding, directory, restoring=False):
+def radio_guard(stock, binding, directory, restoring=False, mode="direct"):
     stock.expected_name = binding.sender_name
     original = stock.identify()
+    if mode == "directed" and original[:4] != binding.normal:
+        raise Error("directed sender must already match the bound normal radio profile; no retune")
     path = directory / "original-radio.json"
     if restoring:
         saved = private_read(path)
@@ -981,12 +1099,17 @@ def radio_guard(stock, binding, directory, restoring=False):
                          "by_path": binding.by_path, "id_path": binding.id_path,
                          "usb_vid": binding.usb_vid, "usb_pid": binding.usb_pid, "tx_power_dbm": stock.tx_power})
     try:
-        stock.radio((*binding.normal, 0))
+        if mode == "direct":
+            stock.radio((*binding.normal, 0))
         yield original
     finally:
-        # Do not swallow failures: recovery must be explicit and artifact retained.
-        restore_radio(stock, original)
-        private_write(directory / "restored.json", {"restored": True})
+        if mode == "direct":
+            restore_radio(stock, original)
+            private_write(directory / "restored.json", {"restored": True})
+        else:
+            if stock.identify() != original:
+                raise Error("directed sender radio/repeat changed; not restored or retuned")
+            private_write(directory / "radio-unchanged.json", {"normal_profile_unchanged": True})
 
 
 def restore_radio(stock, profile):
@@ -1130,43 +1253,58 @@ def main(argv=None):
     retirement.add_argument("--reupload", action="store_true", help="upload only; binding allow_reupload:true, generation learned only from fresh RF census")
     retirement.add_argument("--reupload-generation", type=int, help="legacy upload-only strict expectation; signing still uses fresh RF-observed generation")
     parser.add_argument("--frequency-khz", type=int)
-    parser.add_argument("--lease-ms", type=int, default=60000)
-    parser.add_argument("--routed-retry", action="store_true", help="unsupported by this zero-hop-only stock adapter; explicitly refused")
+    parser.add_argument("--mode", choices=("direct", "directed"), default="direct")
+    parser.add_argument("--channel", type=int, default=255, help="255 means existing normal radio; no channel override")
+    parser.add_argument("--lease-ms", type=int, help="direct default 60000; directed requires 0")
+    parser.add_argument("--relay-key", type=full_key, help="directed: full identity of the single mandatory relay")
+    parser.add_argument("--path-hash-bytes", type=int, default=1, choices=(1, 2, 3),
+                        help="directed request path uses this many public-key prefix bytes")
+    parser.add_argument("--routed-retry", action="store_true", help="redundant in directed mode; refused in direct mode")
+    parser.add_argument("--no-routed-retry", action="store_true", help="refused in directed mode; direct remains unframed")
     parser.add_argument("--normal-duty-percent", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
-    if args.routed_retry:
-        raise Error("routed-retry unsupported by the stock zero-hop-only adapter; no legacy fallback")
-    binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)
+    if args.routed_retry and args.mode != "directed":
+        raise Error("routed-retry requires directed mode; no legacy fallback")
+    if args.no_routed_retry and args.mode == "directed":
+        raise Error("directed OTA requires attempt-diverse framing; no legacy fallback")
+    if args.operation in ("inspect", "restore") and (
+            args.mode != "direct" or args.relay_key is not None or args.path_hash_bytes != 1):
+        raise Error("inspect/restore do not select an RF route")
+    frequency = args.frequency_khz if args.frequency_khz is not None else (0 if args.mode == "directed" else None)
+    lease_ms = args.lease_ms if args.lease_ms is not None else (0 if args.mode == "directed" else 60000)
     if (args.reupload or args.reupload_generation is not None) and args.operation not in ("upload", "deploy"):
         raise Error("explicit REUPLOAD is supported only by upload, never COMMIT/restore")
+    if args.operation in ("upload", "commit", "deploy"):
+        validate_transport(args.mode, frequency, lease_ms, args.channel, args.relay_key, args.path_hash_bytes)
+    binding = Binding.load(args.binding, args.serial, args.sender_key, args.target, args.by_path, args.sender_name)
     binding.permit_reupload(args.reupload_generation, args.reupload)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise Error("positive finite campaign timeout required")
     candidate = None
     receipt = None
     if args.operation in ("upload", "commit", "deploy"):
-        if (not args.image or args.frequency_khz is None
+        if (not args.image
                 or (args.operation != "deploy" and not args.manifest)):
-            raise Error("upload/commit/deploy require ordinary APP image and direct frequency; upload/commit also require manifest")
+            raise Error("upload/commit/deploy require ordinary APP image; upload/commit also require manifest")
         if (args.image.suffix != ".bin" or not args.image.is_file()
                 or (args.manifest is not None and not args.manifest.is_file())):
             raise Error("regular .bin APP and canonical59 manifest required; packages refused")
         canonical = args.manifest.read_bytes() if args.manifest else None
-        if args.operation == "deploy":
+        if args.operation == "deploy" or any(value is not None for value in (args.board, args.role_id, args.counter)):
             if args.board is None or args.role_id is None or args.counter is None:
-                raise Error("deploy requires explicit --board, --role-id and --counter")
-            if not math.isfinite(args.install_timeout) or args.install_timeout <= 0:
+                raise Error("board selection requires explicit --board, --role-id and --counter")
+            if args.operation == "deploy" and (not math.isfinite(args.install_timeout) or args.install_timeout <= 0):
                 raise Error("positive finite installation timeout required")
             candidate = Candidate.build(canonical, args.image.read_bytes(), binding.floor,
                                         board=args.board, role_id=args.role_id, counter=args.counter)
         else:
             candidate = Candidate.build(canonical, args.image.read_bytes(), binding.floor)
         binding.check_candidate(candidate)
-        if (not MIN_LEASE <= args.lease_ms <= 60000 or not 150000 <= args.frequency_khz <= 2500000
-                or args.frequency_khz == binding.normal[0] or not math.isfinite(args.normal_duty_percent)
+        validate_transport(args.mode, frequency, lease_ms, args.channel, args.relay_key, args.path_hash_bytes, binding)
+        if (not math.isfinite(args.normal_duty_percent)
                 or not 0 < args.normal_duty_percent <= 100):
-            raise Error("invalid direct lease/frequency/normal budget")
+            raise Error("invalid normal-channel duty budget")
         if args.operation == "commit":
             if not args.ready_receipt:
                 raise Error("separate COMMIT requires explicit READY receipt")
@@ -1192,12 +1330,14 @@ def main(argv=None):
                 print(json.dumps(result, sort_keys=True))
                 return
             result = None
-            with radio_guard(stock, binding, directory, args.operation == "restore") as profile:
+            guard_options = {"mode": args.mode} if args.mode == "directed" else {}
+            with radio_guard(stock, binding, directory, args.operation == "restore", **guard_options) as profile:
                 if candidate:
                     sender = Sender(stock, binding, candidate, profile, time.monotonic() + args.timeout,
-                                    args.frequency_khz, args.lease_ms, args.normal_duty_percent / 100,
+                                    frequency, lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,
-                                    event_callback=public_event)
+                                    event_callback=public_event, mode=args.mode, relay=args.relay_key,
+                                    path_hash_bytes=args.path_hash_bytes, channel=args.channel)
                     if args.operation == "deploy":
                         result = sender.deploy(args.install_timeout)
                     else:

@@ -149,7 +149,7 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 
         uint32_t d = getDirectRetransmitDelay(pkt);
         uint8_t pri = 0;
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
         if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) pri = mesh::ota::kOtaForwardPriority;
 #endif
         return ACTION_RETRANSMIT_DELAYED(pri, d);  // Routed traffic is HIGHEST priority, except OTA background traffic
@@ -160,18 +160,24 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 
   if (pkt->isRouteFlood() && filterRecvFloodPacket(pkt)) return ACTION_RELEASE;
 
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) {
     if (!_tables->wasSeen(pkt)) {
       _tables->markSeen(pkt);
+#if MESHCORE_LORA_OTA
       onOtaDataRecv(pkt);
+#endif
       return routeRecvPacket(pkt);
     }
+#if MESHCORE_LORA_OTA
     // Retry only first-hop delivery; relayed copies and echoes stay suppressed.
     if (pkt->getPathHashCount() == 0 &&
         (pkt->payload_len == 0 || !ota::isOtaRetryAttempt(pkt->payload[0]))) onOtaDataRecv(pkt);
+#endif
     return ACTION_RELEASE;
   }
+#endif
+#if MESHCORE_LORA_OTA
   return onRecvOrdinaryPacket(pkt);
 }
 
@@ -418,7 +424,7 @@ DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
     uint32_t d = getRetransmitDelay(packet);
     // as this propagates outwards, give it lower and lower priority
     uint8_t pri = packet->getPathHashCount();
-#if MESHCORE_LORA_OTA
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
     if (packet->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) pri = mesh::ota::kOtaForwardPriority;
 #endif
     return ACTION_RETRANSMIT_DELAYED(pri, d);   // give priority to closer sources, than ones further away

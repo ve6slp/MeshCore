@@ -203,7 +203,7 @@ TEST_F(Fixture, OrdinaryTransmissionUsesDevHalfMtuBudgetWithoutRequeueing) {
   EXPECT_EQ(2, manager.submissions);
 }
 
-#if !MESHCORE_LORA_OTA
+#if !MESHCORE_LORA_OTA && !MESHCORE_LORA_OTA_RELAY
 TEST_F(Fixture, DisabledUnknownType0CFloodDropsWithoutSeenStateOrForwarding) {
   mesh.begin();
   auto* p = packet(PAYLOAD_TYPE_LORA_OTA);
@@ -231,7 +231,7 @@ TEST_F(Fixture, DisabledUnknownType0CDirectForwardingRetainsDevPriorityZero) {
   EXPECT_EQ(1, manager.last_priority);
   EXPECT_EQ(nullptr, mesh.createOtaData(reinterpret_cast<const uint8_t*>("x"), 1));
 }
-#else
+#elif MESHCORE_LORA_OTA
 TEST_F(Fixture, EnabledOtaFailsClosedWithLegacyManagerButOrdinaryStillWorks) {
   EXPECT_EQ(nullptr, mesh.createOtaData(reinterpret_cast<const uint8_t*>("x"), 1));
   auto* p = packet(PAYLOAD_TYPE_LORA_OTA);

@@ -40,6 +40,8 @@ OTA_ARTIFACT_DIR ?=
 OTA_STOCK_BINDING ?=
 OTA_STOCK_SERIAL ?=
 OTA_STOCK_SENDER_KEY ?=
+OTA_STOCK_RELAY_KEY ?=
+OTA_STOCK_PATH_HASH_BYTES ?= 1
 OTA_STOCK_ARGS ?=
 OTA_DEVICE_PORT ?= $(OTA_DEPLOY_CLIENT_PORT)
 OTA_DEVICE_DTR ?= $(OTA_DEPLOY_CLIENT_DTR)
@@ -127,15 +129,17 @@ ifeq ($(OTA_DEPLOY_TRANSPORT),native)
 	  --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --duty-milli-percent "$(OTA_UPLOAD_DUTY_MILLI_PERCENT)" \
 	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
 else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
-	@test -n "$(OTA_ARTIFACT_DIR)" && test -n "$(OTA_STOCK_BINDING)" && test -n "$(OTA_STOCK_SERIAL)" && test -n "$(OTA_STOCK_SENDER_KEY)" && test "$(OTA_UPLOAD_MODE)" = direct || { echo 'Stock requires a new artifact directory, binding, serial, sender key and direct mode.' >&2; exit 1; }
+	@test -n "$(OTA_ARTIFACT_DIR)" && test -n "$(OTA_STOCK_BINDING)" && test -n "$(OTA_STOCK_SERIAL)" && test -n "$(OTA_STOCK_SENDER_KEY)" || { echo 'Stock requires a new artifact directory, binding, serial and sender key.' >&2; exit 1; }
 	$(PYTHON) scripts/ota_stock_companion.py deploy --by-id "$(OTA_DEPLOY_CLIENT_PORT)" --serial "$(OTA_STOCK_SERIAL)" \
 	  $(if $(filter 1,$(OTA_DEPLOY_CLIENT_DTR)),--client-dtr) \
 	  --sender-key "$(OTA_STOCK_SENDER_KEY)" --binding "$(OTA_STOCK_BINDING)" --artifacts "$(OTA_ARTIFACT_DIR)" $(OTA_STOCK_ARGS) \
 	  --image "$(OTA_UPLOAD_IMAGE)" $(if $(strip $(OTA_UPLOAD_MANIFEST)),--manifest "$(OTA_UPLOAD_MANIFEST)") \
 	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
-	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(OTA_UPLOAD_LEASE_MS)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
+	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" \
+	  $(if $(strip $(OTA_STOCK_RELAY_KEY)),--relay-key "$(OTA_STOCK_RELAY_KEY)") --path-hash-bytes "$(OTA_STOCK_PATH_HASH_BYTES)" \
+	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
 	  --normal-duty-percent "$$( $(PYTHON) -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)' )" \
-	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload)
+	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
 else
 	@echo 'OTA_DEPLOY_TRANSPORT must be native or stock.' >&2; exit 1
 endif
