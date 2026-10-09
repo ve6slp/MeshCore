@@ -12,6 +12,14 @@ are unchanged. See [the product guide](lora_ota_users.md) for environments,
 installation, deployment and recovery, and [design](lora_ota_design.md) for
 transaction boundaries. Soak work stays in the public fork; no upstream PR.
 
+Bench USB conversion is fresh provisioning, not an in-field OTA transaction.
+Prefer the simplest supported vendor flash workflow and allow a clean slate
+with subsequent key/configuration setup. Do not require preservation-heavy
+cross-role or cross-layout migration merely to adopt the firmware. SWD remains
+stuck-device recovery, not a normal setup requirement. Field OTA must still
+preserve identity, configuration and confirmed floors and retain its signed
+transaction, trial and rollback safeguards.
+
 ## Reproducible Make workflows
 
 `build`, `upload` and `clean` require an explicit `ENV`; an unselected command

@@ -51,6 +51,25 @@ Opt-in companion/repeater environments are `Xiao_nrf52_companion_radio_ota_usb`,
 `make upload ENV=...` uses the normal PlatformIO upload flow. It is not the
 paired nRF bootstrap procedure.
 
+### Bench USB provisioning versus field OTA
+
+Treat a full conversion to this firmware on the bench as fresh provisioning.
+Use the simplest supported vendor USB flashing flow for the selected
+bootloader/installer/APP combination. A clean slate is acceptable: users can
+reconfigure keys, contacts, channels and other settings afterward. Preserving
+the previous identity, layout or OTA transaction state is not a prerequisite
+for this conversion. Export settings first only if you want to reuse them.
+Any destructive provisioning must explicitly select the intended physical
+device; it is not an automatic recovery fallback. SWD is for stuck-device
+recovery, not the normal bench workflow.
+
+Regular **field OTA** updates are different: retain identity, configuration,
+filesystem data and confirmed rollback floors, and keep signed admission,
+trial confirmation and rollback safety. A fresh bench setup must not weaken
+those checks or turn a failed field update into a factory reset. After bench
+flashing, configure the normal radio and explicitly grant OTA administrator
+permission before admitting an update.
+
 Intentional opt-in profile differences:
 
 * All three OTA repeater profiles enable the USB interface.
@@ -61,12 +80,13 @@ Intentional opt-in profile differences:
   USB companion profiles already have no BLE transport.
 * `Xiao_nrf52_companion_radio_ota_usb` replaces the external-QSPI secondary
   filesystem with internal ExtraFS, reserving QSPI for OTA. Existing QSPI contacts,
-  channels and advertisement blobs are **not automatically imported**. Export and
-  save them before the first profile conversion; reimport/reprovision afterward.
+  channels and advertisement blobs are **not automatically imported**. If you
+  want to retain them, export before the first conversion and reimport afterward;
+  otherwise configure the fresh device.
   This migration caveat is separate from userdata preservation during OTA between
   compatible layouts.
 
-Before updating, install the appropriate platform backend on the receiver:
+During bench provisioning, install the appropriate platform backend:
 
 * **nRF52840:** bootstrap the matching primary/installer pair; see the
   [paired bootloader recipe](../bootloader/xiao_nrf52840_ota/README.md). Ordinary
@@ -134,6 +154,10 @@ never formats storage, generates an identity or rewrites provisioning data. It
 also never does so after a short read or other storage I/O error. Reprovision
 after the device reports Normal operation. A runtime factory reset never grants
 OTA permission; regrant it explicitly.
+
+These startup safeguards protect field updates and uncertain boots; they do
+not require preservation-heavy migration for an explicitly selected fresh
+bench USB conversion.
 
 ## Inspect USB without changing settings
 
