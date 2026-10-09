@@ -65,6 +65,7 @@ public:
   int local_raw = 0;
   int local_acks = 0;
   unsigned long window = 3600000;
+  float airtime_factor = 1;
   int rx_delay = 0;
   RelayMesh(RelayRadio& radio, RelayClock& clock, RelayRandom& random, RelayRtc& rtc,
             StaticPoolPacketManager& manager, SimpleMeshTables& tables)
@@ -79,6 +80,7 @@ protected:
   bool filterRecvFloodPacket(mesh::Packet*) override { return filtered; }
   uint32_t getRetransmitDelay(const mesh::Packet*) override { return 0; }
   unsigned long getDutyCycleWindowMs() const override { return window; }
+  float getAirtimeBudgetFactor() const override { return airtime_factor; }
   int calcRxDelay(float, uint32_t) const override { return rx_delay; }
   void onOtaDataRecv(mesh::Packet*) override { ++local_ota; }
   void onRawDataRecv(mesh::Packet*) override { ++local_raw; }
@@ -306,8 +308,27 @@ TEST_F(OpaqueRelay, FullMeshAirtimeDefersOnlyOtaAndOrdinaryRoutingRemainsUnchang
   EXPECT_EQ(1, mesh.local_acks);
 }
 
-TEST_F(OpaqueRelay, IndependentTwoPercentRollingBudgetShelvesOtaButNotNormalTraffic) {
-  radio.airtime = 48000;  // Timeout envelope exactly fits the 72s/hour OTA ceiling.
+constexpr uint32_t kRelayBudgetMs = 3600000 / 100 * MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT;
+
+TEST_F(OpaqueRelay, AboveConfiguredCapIsDeferredBeforeAnyTransmit) {
+  mesh.airtime_factor = 0;  // Isolate the OTA cap from the normal mesh budget.
+  radio.airtime = kRelayBudgetMs * 2 / 3 + 2;
+  mesh.begin();
+  auto* ota = mesh.obtainNewPacket();
+  *ota = packet(ROUTE_TYPE_DIRECT);
+  ASSERT_TRUE(mesh.sendPacket(ota, 250));
+  clock.now = 2;
+  mesh.loop();
+  EXPECT_TRUE(radio.sent.empty());
+  uint32_t schedule = 0;
+  ASSERT_TRUE(manager.getOutboundScheduleByIdx(0, schedule));
+  EXPECT_EQ(clock.now + 60000, schedule);
+}
+
+TEST_F(OpaqueRelay, ConfiguredRollingBudgetShelvesOtaButNotNormalTraffic) {
+  mesh.airtime_factor = 0;
+  const uint32_t airtime = kRelayBudgetMs * 2 / 3;
+  radio.airtime = airtime;  // Timeout envelope exactly fits the configured ceiling.
   mesh.begin();
   auto* ota = mesh.obtainNewPacket();
   *ota = packet(ROUTE_TYPE_DIRECT);
@@ -316,17 +337,18 @@ TEST_F(OpaqueRelay, IndependentTwoPercentRollingBudgetShelvesOtaButNotNormalTraf
   mesh.loop();
   ASSERT_EQ(1u, radio.sent.size());
   radio.completed = true;
-  clock.now = 48002;
+  clock.now = airtime + 2;
   mesh.loop();
   ota = mesh.obtainNewPacket();
   *ota = packet(ROUTE_TYPE_DIRECT, 1, 0, 0x11, 2);
   ASSERT_TRUE(mesh.sendPacket(ota, 250));
-  clock.now = 48003;
+  clock.now = airtime * 2 + 3;  // Refill the mesh budget without expiring the OTA charge.
   mesh.loop();
   EXPECT_EQ(1u, radio.sent.size());
   uint32_t schedule = 0;
   ASSERT_TRUE(manager.getOutboundScheduleByIdx(0, schedule));
   EXPECT_EQ(clock.now + 60000, schedule);
+  radio.airtime = 200;
   auto* normal = mesh.obtainNewPacket();
   normal->header = (PAYLOAD_TYPE_RAW_CUSTOM << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT;
   normal->payload_len = 1;
@@ -335,24 +357,27 @@ TEST_F(OpaqueRelay, IndependentTwoPercentRollingBudgetShelvesOtaButNotNormalTraf
   mesh.loop();
   EXPECT_EQ(2u, radio.sent.size());
   radio.completed = true;
-  clock.now += 48000;
+  clock.now += 200;
   mesh.loop();
-  clock.now = 48002 + 3600001;
+  radio.airtime = airtime;
+  clock.now = airtime + 2 + 3600001;
   mesh.loop();
   EXPECT_EQ(3u, radio.sent.size());  // Fresh hour, same shelved opaque request.
 }
 
-TEST_F(OpaqueRelay, TimedOutOtaStillConsumesAirtimeAndCannotEvadeTwoPercentBudget) {
-  radio.airtime = 48000;
+TEST_F(OpaqueRelay, TimedOutOtaStillConsumesAirtimeAndCannotEvadeConfiguredBudget) {
+  mesh.airtime_factor = 0;
+  radio.airtime = kRelayBudgetMs * 2 / 3;
   mesh.begin();
   auto* ota = mesh.obtainNewPacket();
   *ota = packet(ROUTE_TYPE_DIRECT);
   ASSERT_TRUE(mesh.sendPacket(ota, 250));
   clock.now = 2;
   mesh.loop();
-  clock.now = 72003;
+  clock.now = kRelayBudgetMs + 3;
   mesh.loop();  // No completion: timeout must still be charged.
-  EXPECT_GE(mesh.getTotalAirTime(), 72000u);
+  EXPECT_GE(mesh.getTotalAirTime(), kRelayBudgetMs);
+  radio.airtime = 200;
   ota = mesh.obtainNewPacket();
   *ota = packet(ROUTE_TYPE_DIRECT, 1, 0, 0x11, 2);
   ASSERT_TRUE(mesh.sendPacket(ota, 250));

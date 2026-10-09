@@ -84,7 +84,7 @@ transport, flood policy, hop limits, native packet-hash deduplication and path
 capacity limits still apply. There is no direct-bypass fallback or duplicate
 delivery exception at the relay. Traffic uses priority 250 and preserves four
 packet buffers for ordinary traffic. The dispatcher requires the full estimated
-airtime in its normal mesh budget and additionally admits at most 72,000 ms per
+airtime in its normal mesh budget and additionally defaults to at most 72,000 ms per
 rolling hour (2%), conservatively checking the 1.5x send-timeout envelope before
 TX. All opaque OTA packets share the Relay category, including control/replies.
 Completed and timed-out sends are charged; accounting failure blocks further
@@ -107,7 +107,7 @@ identity is embedded. An operator can supply controlled `LORA_FREQ`, `LORA_BW`,
 first boot, or use the standard repeater USB CLI (`set radio`, `set tx`,
 `set name`, `set repeat`, followed by `get radio`/`get tx`/`get repeat`). Existing
 isolated preferences override build defaults. Changing mesh `airtime.factor`
-does not raise the relay's independent 2% OTA ceiling. To change inherited
+does not raise the relay's independent OTA ceiling. To change inherited
 preprocessor definitions, use an explicit local environment with matching
 `build_unflags` and new `build_flags`; avoid relying on duplicate `-D` ordering.
 
@@ -122,6 +122,29 @@ no inherited command-line definition to remove. Build with
 paired bootloader and userdata; verify identity, radio, name and repeat setting
 again after reboot. The advertised repeater role is not a paired installer-role
 qualification.
+
+The relay-only OTA cap can be explicitly changed at compile time with
+`-D MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=<integer-percent>`; valid values are
+1–100 inclusive, and an omitted flag retains the production default of 2%.
+Out-of-range definitions fail compilation. The existing rolling-hour limiter,
+timeout accounting, queue reserve and ordinary-traffic precedence remain in
+force; this flag does not enable an installer or change RF power/frequency.
+For the explicitly authorized accelerated functional RF lab, add
+`-D MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=80` only to the private extending
+environment's `build_flags` (2,880,000 ms/hour), retaining TX2 and its existing
+channel overrides. The normal mesh airtime budget is a separate, additional
+limit: configure its duty to 80% through the standard repeater CLI and verify
+readback. Do not infer regulatory permission from a higher software cap, and
+do not change generic environment defaults or treat acceleration as a raw
+throughput benchmark. The earlier hardware milestone below was at 2%, not
+proof of the subsequent accelerated campaign.
+
+For an installer receiver's native OTA CLI, `ota duty 80` changes only the
+in-memory OTA airtime budget; it does not reset the candidate, generation,
+BEGIN nonce or bitmap, and it is not persisted across reboot. An unwired
+CommonCLI `get ota.dutycycle` callback is not readback of this native setting.
+Keep critical APP-only DFU packages outside `.pio/build`: PlatformIO may
+invalidate the project-wide build cache when configuration changes.
 
 #### Parent-observed hardware milestone — 2026-10-09
 
@@ -147,16 +170,38 @@ seconds. This proves relay necessity and early RF admission/progress, not
 completed transfer, installation, reboot confirmation or counter-2 floor
 advancement.
 
+The subsequent accelerated lab run preserved the same counter-2 image and
+generation. After a graceful host pause, one routed census captured 129/6,031
+received blocks and the existing nonce as unsigned observations. Strict resume
+then used an 80% sender budget, an APP-only relay build with the private 80%
+flag (362,868 bytes, SHA-256 prefix `08096e47`, end `0x7F974`), relay mesh duty
+80%, and the receiver's native `ota duty 80`. RF profile and TX2 were unchanged.
+
+A six-second relay-forwarding outage left the four-block batch 2056-2059
+missing: window 2048 still reported eight present blocks. The sender retried
+those individual indices, and a later current-attempt census reported twelve
+present blocks at 563.726 seconds on the resumed clock. Generation and nonce
+were unchanged; no BEGIN, REUPLOAD or direct fallback was used. This establishes
+bounded RF outage recovery and selective block repair, not full-image
+installation or post-reboot floor advancement, which remain pending.
+
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
 
 ```sh
 PLATFORMIO_BUILD_FLAGS='-D MESHCORE_LORA_OTA_RELAY=1 -D MESHCORE_REPEATER_RELAY_PROFILE=1' make test-ota-disabled
+PLATFORMIO_BUILD_FLAGS='-D MESHCORE_LORA_OTA_RELAY=1 -D MESHCORE_REPEATER_RELAY_PROFILE=1 -D MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=80' make test-ota-disabled
 make test-ota-storage OTA_GTEST_FILTER='RelayStartup.*:BExampleStartupTest.*'
 make test-ota-disabled
 make test-ota-queue-compatibility
 make test-ota-native OTA_TEST_FILTER=test_config_serializer OTA_GTEST_FILTER='RepeaterPrefsMigration.*'
 ```
+
+Both relay runs exercise the configured cap's admission, rolling expiry and
+timeout charging alongside unchanged routing/isolation behavior. With the same
+relay flags, `MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=0`, `-1` or `101` must fail
+the native build at the explicit compile-time guard; these are expected build
+failures, not runtime tests.
 
 ### PacketManager compatibility
 

@@ -380,6 +380,70 @@ a real install. Failure never retries with a zero-hop path or changes firmware.
 The public `inspect` command remains USB-only and read-only by default; it
 does not perform RF probes or claim that the selected topology is ready.
 
+### Resume an interrupted directed attempt without a new BEGIN
+
+Directed `upload`/`deploy` now persist an owned mode-0600
+`attempt-receipt.json` after the first fresh validated census. This schema-3
+receipt is **unsigned attempt/progress evidence**, not READY or installation
+confirmation. It freezes full sender/target identities, image SHA-256 and size,
+manifest hash, counter, generation, BEGIN nonce, floor/generation guards,
+normal and sender radio profiles, TX power, physical USB binding, selected
+relay/path, original duty and first-window progress.
+
+Stop the old host gracefully and wait for its endpoint lock to be released;
+do **not** ABORT the receiver. Resume using the same image, manifest, binding,
+board/role/counter and route, an explicit original receipt, and a **new**
+artifact directory. Add these arguments to the directed Make example:
+
+```sh
+OTA_STOCK_RESUME_RECEIPT="$ORIGINAL_ATTEMPT_RECEIPT" \
+OTA_ARTIFACT_DIR="$NEW_RESUME_DIRECTORY" \
+OTA_UPLOAD_DUTY_MILLI_PERCENT=80000
+```
+
+The stock CLI equivalents are `--resume-receipt "$ORIGINAL_ATTEMPT_RECEIPT"
+--artifacts "$NEW_RESUME_DIRECTORY" --normal-duty-percent 80`.
+**80% is an explicit caller-authorized test setting, not the product default
+or a throughput guarantee.** The default stays 2%; relay/receiver airtime
+settings are not changed by the host, and spectrum rules still apply.
+
+Resume sends census polls first, never Authorization/BEGIN or REUPLOAD.
+Fresh route/attempt-matched reports must retain the receipt's exact generation,
+nonzero BEGIN nonce, manifest, counter and floor, and cannot regress its recorded
+received count or first-window bitmap. Only then may it send missing image
+blocks, observe fresh READY, and (for `deploy`) send one nonce-bound COMMIT and
+wait for matching unsigned Installed. Timeout, missing route, ABORTED/FAILED,
+or any identity/profile/attempt mismatch is a failure with no admission,
+counter change, nonce substitution, direct fallback or retune.
+
+The new directory preserves `resume-source.json` with the original receipt,
+its source path and canonical-JSON SHA-256, plus a newly observed
+`attempt-receipt.json`. Old artifacts are never overwritten; the new receipt
+records the newly selected sender duty. Normal radio/repeat settings remain
+unchanged and are read back on exit.
+
+Older running hosts did not emit schema-3 receipts. If only their original
+`original-radio.json` survives, a caller-owned bounded helper can capture the
+current attempt **after stopping the old host**, without Authorization/BEGIN
+or REUPLOAD. Construct a fresh directed `Sender` with the exact immutable image,
+manifest, binding and current `stock.identify()` profile, then call
+`capture_resume(private_read(original_radio_path), expected_generation,
+min_received=known_received_lower_bound)`. This performs one route/attempt-matched
+census and requires current Receiving, the explicit generation, matching
+manifest/counter/floor and non-regressed known progress. The original radio
+artifact must exactly match sender identity, physical binding, profile and TX
+power. Save the returned schema-3 receipt privately in a new capture directory.
+
+The captured nonzero BEGIN nonce is explicitly a **fresh unsigned observation
+of the existing attempt**, not verification against an unavailable historical
+nonce; no nonce is generated, substituted or sent to the receiver. The subsequent
+resume pins that captured nonce and refuses changes. Capture never accepts
+ABORTED/READY/Installed as Receiving, silently re-admits, or retries with a
+direct path. Preserve the original radio evidence and capture provenance
+alongside the new receipt; do not invent missing historical session metadata.
+Capture records the helper's selected duty, not an unavailable historical
+sender duty.
+
 ### Hardware milestone: routed RF verified, full installation pending
 
 As of **2026-10-09**, a stock Heltec sender → dedicated nRF repeater relay →
@@ -393,12 +457,22 @@ The v3 reports described the existing generation-1, floor-1 image; the probe did
 not authorize or replace a candidate, retune radios or use a direct fallback.
 These remain unsigned RF/path observations.
 
-The subsequent 506,524-byte counter-2 campaign is using the same normal profile,
+The subsequent 506,524-byte counter-2 campaign began on the same normal profile,
 2% duty and a 172,800-second budget. At the recorded 90.243-second checkpoint,
 the target reported generation 2 Receiving with **4/6,031 blocks** received.
 **Full-image completion, counter-2 Installed and post-install persistence have
 not yet been verified.** This milestone proves the selected RF hop in both
 directions, not successful routed firmware installation.
+
+The explicitly authorized accelerated run gracefully paused that host and
+captured the existing generation-2 Receiving state at 129/6,031 blocks. It
+resumed the same image and nonce with an 80% sender budget, a private 80% relay
+cap and mesh duty, and the receiver's transient native `ota duty 80` setting.
+TX2 and the normal radio profile stayed unchanged. A six-second relay outage
+left a four-block batch missing; selective retries of blocks 2056-2059 restored
+that window's census bitmap count from eight to twelve. No ABORT, new BEGIN,
+REUPLOAD or direct fallback was used. These remain unsigned progress/path
+observations; full-image installation and reboot persistence are still pending.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a

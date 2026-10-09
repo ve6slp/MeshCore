@@ -51,6 +51,7 @@ DIRECT_PROFILE_DOMAIN = b"MeshCore/OTA/direct-profile/v3"
 COMMIT_DOMAIN = b"MeshCore/OTA/commit/v2"
 REUPLOAD_DOMAIN = b"MeshCore/OTA/reupload/v1"
 RECEIPT_SCHEMA = 2
+ATTEMPT_RECEIPT_SCHEMA = 3
 
 
 class Error(RuntimeError):
@@ -615,7 +616,8 @@ def airtime(raw_length, profile):
 class Sender:
     def __init__(self, stock, binding, candidate, profile, deadline, frequency, lease_ms=60000,
                  duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False,
-                 event_callback=None, *, mode="direct", relay=None, path_hash_bytes=1, channel=255):
+                 event_callback=None, *, mode="direct", relay=None, path_hash_bytes=1, channel=255,
+                 attempt_callback=None):
         validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding)
         validate_profile(profile)
         if mode == "directed" and tuple(profile[:4]) != binding.normal:
@@ -651,6 +653,7 @@ class Sender:
         self.activation_generation = None
         self.pending_reupload = False
         self.event_callback, self.event_start = event_callback, clock()
+        self.attempt_callback, self.attempt_recorded = attempt_callback, False
 
     def emit(self, event, **fields):
         if self.event_callback is not None:
@@ -699,7 +702,7 @@ class Sender:
         self.last_tx_attempt = attempt
         self.emit("rf_tx_request", mode=self.mode, route=2, path_hash_bytes=self.path_hash_bytes,
                   path=self.path.hex(), retry_attempt=attempt, kind=inner_kind,
-                  packet_length=len(raw), frequency_khz=self.profile[0])
+                  packet_length=len(raw), frequency_khz=self.profile[0], normal_duty_percent=self.duty * 100)
         self.stock.pending_tx = before[1:3]
         try:
             self.stock.ok(command, deadline)
@@ -775,7 +778,12 @@ class Sender:
                 raise
             self.emit("census_parsed", first=report["first"], lifecycle=report["lifecycle"],
                       generation=report["generation"], phase=report["phase"],
-                      received=report["received"], total=report["total"], bitmap_count=report["bits"].bit_count())
+                      received=report["received"], total=report["total"], bitmap_count=report["bits"].bit_count(),
+                      begin_nonce=None if self.begin_nonce is None else self.begin_nonce.hex())
+            if (self.attempt_callback is not None and not self.attempt_recorded
+                    and not post_commit and not self.pending_reupload and self.begin_nonce is not None):
+                self.attempt_callback(self.attempt_receipt(report))
+                self.attempt_recorded = True
             return report
         self.emit("census_exhausted", first=first, attempts=retries)
         raise NoCensus("fresh RF census deadline/retries exhausted")
@@ -955,8 +963,14 @@ class Sender:
                 raise Error("REUPLOAD requires generation+1 Receiving, never old-cache promotion")
         raise Error("REUPLOAD activation/Receiving deadline exhausted")
 
-    def upload(self, *, ready_once=False):
-        report = self.authorize()
+    def upload(self, *, ready_once=False, resume_receipt=None):
+        if resume_receipt is None:
+            report = self.authorize()
+        else:
+            self.bind_resume(resume_receipt)
+            report = self.census()
+            self.emit("resume_matched_unsigned", generation=self.generation, received=report["received"],
+                      total=report["total"], begin_nonce=self.begin_nonce.hex(), status_authenticated=False)
         if report["lifecycle"] == 9:
             self.activate_prepared()
         self.negotiate()
@@ -1012,6 +1026,75 @@ class Sender:
                           reply_path_hash_bytes=1, status_authenticated=False)
         return result
 
+    def attempt_receipt(self, report):
+        result = self.receipt("attempt-observed-unsigned")
+        result.update(schema=ATTEMPT_RECEIPT_SCHEMA,
+                      image_sha256=hashlib.sha256(self.candidate.image).hexdigest(),
+                      image_size=len(self.candidate.image), total_blocks=self.candidate.total,
+                      floor=self.binding.floor, min_generation=self.binding.min_generation,
+                      normal_duty_percent=self.duty * 100,
+                      normal_profile=list(self.binding.normal), sender_profile=list(self.original),
+                      tx_power_dbm=self.stock.tx_power, by_path=self.binding.by_path,
+                      id_path=self.binding.id_path, usb_vid=self.binding.usb_vid, usb_pid=self.binding.usb_pid,
+                      sender_name=self.binding.sender_name,
+                      first=report["first"], received_blocks=report["received"],
+                      bitmap=report["bits"].to_bytes(16, "little").hex(),
+                      status_authenticated=False)
+        return result
+
+    def bind_resume(self, receipt):
+        if self.mode != "directed" or self.reupload_enabled:
+            raise Error("resume requires directed mode without REUPLOAD; no admission fallback")
+        if not isinstance(receipt, dict):
+            raise Error("resume requires an original attempt receipt")
+        generation, nonce = receipt.get("generation"), receipt.get("begin_nonce")
+        received, bitmap = receipt.get("received_blocks"), receipt.get("bitmap")
+        old_duty = receipt.get("normal_duty_percent")
+        if (type(generation) is not int or not self.binding.min_generation <= generation <= 0xFFFFFFFF
+                or not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                or not any(bytes.fromhex(nonce))
+                or type(received) is not int or not 0 <= received <= self.candidate.total
+                or type(old_duty) not in (int, float) or not math.isfinite(old_duty) or not 0 < old_duty <= 100
+                or not isinstance(bitmap, str) or not re.fullmatch(r"[0-9a-f]{32}", bitmap)):
+            raise Error("resume requires original generation, BEGIN nonce and bounded progress")
+        bits = int.from_bytes(bytes.fromhex(bitmap), "little")
+        if bits >> min(128, self.candidate.total) or bits.bit_count() > received:
+            raise Error("resume receipt bitmap/progress mismatch")
+        report = {"first": 0, "received": received, "bits": bits}
+        expected = self.attempt_receipt(report)
+        expected.update(generation=generation, begin_nonce=nonce, normal_duty_percent=old_duty)
+        if receipt != expected:
+            raise Error("resume receipt identity/image/manifest/profile/floor/route binding mismatch")
+        self.generation, self.begin_nonce, self.received = generation, bytes.fromhex(nonce), received
+        self.previous[0] = report
+        self.emit("resume_expected", generation=generation, begin_nonce=nonce, received=received,
+                  previous_duty_percent=old_duty, normal_duty_percent=self.duty * 100, status_authenticated=False)
+
+    def capture_resume(self, original_radio, expected_generation, *, min_received=0):
+        """Read-only RF capture for older hosts that never persisted an attempt receipt."""
+        if (self.mode != "directed" or self.reupload_enabled or self.begin_nonce is not None
+                or self.generation is not None):
+            raise Error("resume capture requires a fresh directed sender without admission or nonce replacement")
+        expected_radio = {"schema": 1, "serial": self.binding.serial,
+                          "sender_public_key": self.binding.sender.hex(), "profile": list(self.original),
+                          "by_path": self.binding.by_path, "id_path": self.binding.id_path,
+                          "usb_vid": self.binding.usb_vid, "usb_pid": self.binding.usb_pid,
+                          "tx_power_dbm": self.stock.tx_power}
+        if original_radio != expected_radio:
+            raise Error("resume capture original sender identity/physical binding/profile/TX power mismatch")
+        if (type(expected_generation) is not int
+                or not self.binding.min_generation <= expected_generation <= 0xFFFFFFFF
+                or type(min_received) is not int or not 0 <= min_received <= self.candidate.total):
+            raise Error("resume capture requires an explicit bounded generation/progress expectation")
+        self.generation, self.received = expected_generation, min_received
+        report = self.census(retries=1)
+        if report["lifecycle"] != 3 or report["phase"] != 1:
+            raise Error("resume capture requires current Receiving; no admission or terminal fallback")
+        self.emit("resume_capture_receiving_unsigned", generation=self.generation,
+                  begin_nonce=self.begin_nonce.hex(), received=report["received"], total=report["total"],
+                  status_authenticated=False, historical_nonce_verified=False)
+        return self.attempt_receipt(report)
+
     def commit(self, receipt):
         expected = self.receipt("ready-observed-unsigned")
         expected["generation"] = receipt.get("generation")
@@ -1066,10 +1149,10 @@ class Sender:
             raise TimeoutError("installation timeout: no matching native INSTALLED report") from exc
         raise TimeoutError("installation timeout: no matching native INSTALLED report")
 
-    def deploy(self, install_timeout=300):
+    def deploy(self, install_timeout=300, *, resume_receipt=None):
         if not math.isfinite(install_timeout) or install_timeout <= 0:
             raise Error("positive finite installation timeout required")
-        self.upload(ready_once=True)
+        self.upload(ready_once=True, resume_receipt=resume_receipt)
         self._send_commit()
         return self.wait_installed(install_timeout)
 
@@ -1249,6 +1332,8 @@ def main(argv=None):
     parser.add_argument("--counter", type=int)
     parser.add_argument("--install-timeout", type=float, default=300)
     parser.add_argument("--ready-receipt", type=Path)
+    parser.add_argument("--resume-receipt", type=Path,
+                        help="directed upload/deploy only: original schema-3 attempt receipt; never sends BEGIN/REUPLOAD")
     retirement = parser.add_mutually_exclusive_group()
     retirement.add_argument("--reupload", action="store_true", help="upload only; binding allow_reupload:true, generation learned only from fresh RF census")
     retirement.add_argument("--reupload-generation", type=int, help="legacy upload-only strict expectation; signing still uses fresh RF-observed generation")
@@ -1264,6 +1349,10 @@ def main(argv=None):
     parser.add_argument("--normal-duty-percent", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
+    if args.resume_receipt is not None and (
+            args.operation not in ("upload", "deploy") or args.mode != "directed"
+            or args.reupload or args.reupload_generation is not None):
+        raise Error("resume requires directed upload/deploy without REUPLOAD")
     if args.routed_retry and args.mode != "directed":
         raise Error("routed-retry requires directed mode; no legacy fallback")
     if args.no_routed_retry and args.mode == "directed":
@@ -1309,7 +1398,14 @@ def main(argv=None):
             if not args.ready_receipt:
                 raise Error("separate COMMIT requires explicit READY receipt")
             receipt = private_read(args.ready_receipt)
+        elif args.resume_receipt is not None:
+            receipt = private_read(args.resume_receipt)
         args.artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
+        if args.resume_receipt is not None:
+            encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            private_write(args.artifacts / "resume-source.json",
+                          {"source_receipt": str(args.resume_receipt.resolve()),
+                           "canonical_json_sha256": hashlib.sha256(encoded).hexdigest(), "receipt": receipt})
     elif args.operation == "inspect":
         args.artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
     directory = args.artifacts
@@ -1337,11 +1433,14 @@ def main(argv=None):
                                     frequency, lease_ms, args.normal_duty_percent / 100,
                                     reupload_generation=args.reupload_generation, reupload=args.reupload,
                                     event_callback=public_event, mode=args.mode, relay=args.relay_key,
-                                    path_hash_bytes=args.path_hash_bytes, channel=args.channel)
+                                    path_hash_bytes=args.path_hash_bytes, channel=args.channel,
+                                    attempt_callback=(lambda observed: private_write(directory / "attempt-receipt.json", observed))
+                                    if args.mode == "directed" else None)
+                    resume_options = {"resume_receipt": receipt} if args.resume_receipt is not None else {}
                     if args.operation == "deploy":
-                        result = sender.deploy(args.install_timeout)
+                        result = sender.deploy(args.install_timeout, **resume_options)
                     else:
-                        result = sender.upload() if args.operation == "upload" else sender.commit(receipt)
+                        result = sender.upload(**resume_options) if args.operation == "upload" else sender.commit(receipt)
             if result is not None:
                 private_write(directory / "result.json", result)
                 print(json.dumps(result, sort_keys=True))

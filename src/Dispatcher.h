@@ -11,6 +11,12 @@
 #include <helpers/ota/OtaFirmwareIntegration.h>
 #elif MESHCORE_LORA_OTA_RELAY
 #include <ota/runtime/OtaAirtimeLimiter.h>
+#ifndef MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT
+#define MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT 2
+#endif
+#if MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT <= 0 || MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT > 100
+#error "MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT must be an integer from 1 to 100"
+#endif
 #endif
 
 namespace mesh {
@@ -203,7 +209,10 @@ class Dispatcher {
   uint8_t outbound_priority;
 #endif
 #if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
-  meshcore::ota::runtime::OtaAirtimeLimiter relay_airtime;
+  meshcore::ota::runtime::OtaAirtimeLimiter relay_airtime{
+      meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultWindowMs,
+      meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultWindowMs / 100 *
+          (MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT)};
   bool relay_accounting_fault = false;
   void recordRelayAirtime(uint32_t duration_ms);
 #endif

@@ -42,6 +42,7 @@ OTA_STOCK_SERIAL ?=
 OTA_STOCK_SENDER_KEY ?=
 OTA_STOCK_RELAY_KEY ?=
 OTA_STOCK_PATH_HASH_BYTES ?= 1
+OTA_STOCK_RESUME_RECEIPT ?=
 OTA_STOCK_ARGS ?=
 OTA_DEVICE_PORT ?= $(OTA_DEPLOY_CLIENT_PORT)
 OTA_DEVICE_DTR ?= $(OTA_DEPLOY_CLIENT_DTR)
@@ -137,6 +138,7 @@ else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
 	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
 	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" \
 	  $(if $(strip $(OTA_STOCK_RELAY_KEY)),--relay-key "$(OTA_STOCK_RELAY_KEY)") --path-hash-bytes "$(OTA_STOCK_PATH_HASH_BYTES)" \
+	  $(if $(strip $(OTA_STOCK_RESUME_RECEIPT)),--resume-receipt "$(OTA_STOCK_RESUME_RECEIPT)") \
 	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
 	  --normal-duty-percent "$$( $(PYTHON) -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)' )" \
 	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)

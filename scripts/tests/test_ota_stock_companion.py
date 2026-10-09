@@ -707,6 +707,242 @@ class PathBindingTests(Scratch):
             self.assertFalse(list(directory.iterdir()))
 
 
+class ResumeTests(Scratch):
+    def original_attempt(self):
+        original = candidate(336)
+        canonical = original.canonical[:45] + struct.pack(">I", 2) + original.canonical[49:]
+        c = ota.Candidate.build(canonical, original.image, 1)
+        clock, stream, stock, _ = routed_setup(c, received={0, 2})
+        approved = replace(binding(c), floor=1, min_generation=2)
+        stream.floor, stream.generation = 1, 2
+        sender = ota.Sender(stock, approved, c, NORMAL, clock() + 10000, 0, 0, clock=clock,
+                            sleep=clock.sleep, mode="directed", relay=RELAY)
+        observed = sender.authorize()
+        return clock, stream, stock, sender, sender.attempt_receipt(observed)
+
+    def resumed(self, clock, stock, original, **options):
+        return ota.Sender(stock, original.binding, original.candidate, NORMAL, clock() + 10000,
+                          0, 0, clock=clock, sleep=clock.sleep, mode="directed", relay=RELAY, **options)
+
+    def original_radio(self, original, stock):
+        b = original.binding
+        return {"schema": 1, "serial": b.serial, "sender_public_key": b.sender.hex(),
+                "profile": list(original.original), "by_path": b.by_path, "id_path": b.id_path,
+                "usb_vid": b.usb_vid, "usb_pid": b.usb_pid, "tx_power_dbm": stock.tx_power}
+
+    def test_legacy_host_capture_observes_existing_receiving_nonce_without_admission(self):
+        clock, stream, stock, original, _ = self.original_attempt()
+        before, nonce, generation = len(stream.rf_packets), stream.nonce, stream.generation
+        events = []
+        capture = self.resumed(clock, stock, original, event_callback=events.append)
+        receipt = capture.capture_resume(self.original_radio(original, stock), 2, min_received=2)
+        self.assertEqual(len(stream.rf_packets) - before, 1)
+        self.assertEqual(stream.rf_packets[-1][2][5], 10)
+        self.assertEqual((stream.generation, stream.nonce), (generation, nonce))
+        self.assertEqual(receipt["begin_nonce"], nonce.hex())
+        self.assertEqual(receipt["received_blocks"], 2)
+        evidence = next(event for event in events if event["event"] == "resume_capture_receiving_unsigned")
+        self.assertFalse(evidence["status_authenticated"])
+        self.assertFalse(evidence["historical_nonce_verified"])
+        resumed = self.resumed(clock, stock, original, duty=0.8)
+        resumed.deploy(300, resume_receipt=receipt)
+        self.assertTrue(all(payload[5] not in (8, 14) for _, _, payload in stream.rf_packets[before:]))
+        self.assertEqual(stream.commit_count, 1)
+        self.assertEqual(stream.nonce, nonce)
+
+    def test_capture_requires_original_profile_and_explicit_generation_before_poll(self):
+        clock, stream, stock, original, _ = self.original_attempt()
+        radio = self.original_radio(original, stock)
+        for field, value in (("profile", [*NORMAL[:4], 0]), ("sender_public_key", TARGET.hex()),
+                             ("serial", "other"), ("by_path", STOCK_PATH), ("tx_power_dbm", 3)):
+            before = len(stream.commands)
+            capture = self.resumed(clock, stock, original)
+            with self.subTest(field=field), self.assertRaises(ota.Error):
+                capture.capture_resume({**radio, field: value}, 2, min_received=2)
+            self.assertEqual(len(stream.commands), before)
+        for generation, received in ((1, 2), (True, 2), (2, 5), (2, -1)):
+            before = len(stream.commands)
+            capture = self.resumed(clock, stock, original)
+            with self.assertRaises(ota.Error):
+                capture.capture_resume(radio, generation, min_received=received)
+            self.assertEqual(len(stream.commands), before)
+
+    def test_capture_rejects_changed_generation_progress_terminal_or_unrouted_status(self):
+        for fault in ("generation", "regression", "ready", "aborted", "bypass"):
+            clock, stream, stock, original, _ = self.original_attempt()
+            if fault == "generation":
+                stream.generation = 3
+            elif fault == "regression":
+                stream.received = {0}
+            elif fault == "ready":
+                stream.received = {0, 1, 2, 3}
+            elif fault == "aborted":
+                stream.prepared = stream.aborted = True
+            else:
+                stream.reply_mode = "bypass"
+            before = len(stream.rf_packets)
+            capture = self.resumed(clock, stock, original)
+            with self.subTest(fault=fault), self.assertRaises(ota.Error):
+                capture.capture_resume(self.original_radio(original, stock), 2, min_received=2)
+            self.assertEqual(len(stream.rf_packets) - before, 1)
+            self.assertEqual(stream.rf_packets[-1][2][5], 10)
+            self.assertFalse(stream.commit_count)
+
+    def test_eighty_percent_resume_preserves_progress_attempt_and_single_commit(self):
+        clock, stream, stock, original, receipt = self.original_attempt()
+        before, nonce, generation = len(stream.rf_packets), stream.nonce, stream.generation
+        stream.drop_blocks = 1
+        events = []
+        resumed = self.resumed(clock, stock, original, duty=0.8, event_callback=events.append)
+        with ota.radio_guard(stock, original.binding, self.directory, mode="directed"):
+            result = resumed.deploy(300, resume_receipt=receipt)
+        wire = [payload for _, _, payload in stream.rf_packets[before:]]
+        self.assertTrue(all(payload[5] not in (8, 14, 12, 15) for payload in wire))
+        blocks = [struct.unpack_from(">H", payload, 10)[0] for payload in wire if payload[5] == 1]
+        self.assertEqual(blocks, [1, 3, 1])
+        repairs = [payload for payload in wire if payload[5] == 1 and payload[10:12] == b"\x00\x01"]
+        self.assertEqual(repairs[0][5:], repairs[1][5:])
+        self.assertNotEqual(repairs[0][:5], repairs[1][:5])
+        self.assertEqual((stream.generation, stream.nonce), (generation, nonce))
+        self.assertEqual(result["generation"], 2)
+        self.assertEqual(result["begin_nonce"], receipt["begin_nonce"])
+        self.assertEqual(result["counter"], 2)
+        self.assertEqual(stream.commit_count, 1)
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+        self.assertTrue(ota.private_read(self.directory / "radio-unchanged.json")["normal_profile_unchanged"])
+        matched = [event for event in events if event["event"] == "resume_matched_unsigned"]
+        self.assertEqual(matched[0]["received"], 2)
+        tx = [event for event in events if event["event"] == "rf_tx_request"]
+        self.assertTrue(all(event["normal_duty_percent"] == 80 for event in tx))
+        self.assertEqual(receipt["normal_duty_percent"], 2)
+
+    def test_resume_source_static_mismatches_refuse_before_rf_or_signing(self):
+        mutations = {
+            "sender_public_key": TARGET.hex(), "target_public_key": OWNER.hex(),
+            "manifest_hash": "ff" * 32, "image_sha256": "ff" * 32, "image_size": 340,
+            "total_blocks": 5, "counter": 3, "floor": 0, "min_generation": 1,
+            "normal_profile": [919000, *NORMAL[1:4]], "sender_profile": [*NORMAL[:4], 0],
+            "tx_power_dbm": 3, "relay_public_key": TARGET.hex(), "request_path": "99",
+            "path_hash_bytes": 2, "reply_path": "99", "by_path": STOCK_PATH,
+            "id_path": STOCK_ID_PATH, "usb_vid": 0x239A, "usb_pid": 0x8029,
+            "sender_name": "different", "schema": 2, "outcome": "ready-observed-unsigned",
+            "begin_nonce": "00" * 16, "generation": 1, "received_blocks": 5,
+            "bitmap": "ff" * 16, "normal_duty_percent": float("nan"),
+            "status_authenticated": True, "installation_confirmed": True,
+        }
+        clock, stream, stock, original, receipt = self.original_attempt()
+        for field, value in mutations.items():
+            before = len(stream.commands)
+            resumed = self.resumed(clock, stock, original, duty=0.8)
+            with self.subTest(field=field), self.assertRaises(ota.Error):
+                resumed.upload(resume_receipt={**receipt, field: value})
+            self.assertFalse(any(command[0] in (33, 34, 35, 65, 11) for command in stream.commands[before:]))
+
+    def test_fresh_nonce_generation_and_progress_mismatch_never_authorize_or_send_data(self):
+        for fault in ("nonce", "generation", "floor", "received", "bitmap"):
+            clock, stream, stock, original, receipt = self.original_attempt()
+            if fault == "nonce":
+                stream.nonce = bytes([7]) * 16
+            elif fault == "generation":
+                stream.generation += 1
+            elif fault == "floor":
+                stream.floor = 0
+            elif fault == "received":
+                stream.received = {0}
+            else:
+                stream.received = {0, 1}
+            before = len(stream.rf_packets)
+            resumed = self.resumed(clock, stock, original, duty=0.8)
+            with self.subTest(fault=fault), self.assertRaises(ota.Error):
+                resumed.deploy(300, resume_receipt=receipt)
+            self.assertTrue(all(payload[5] == 10 for _, _, payload in stream.rf_packets[before:]))
+            self.assertEqual(stream.commit_count, 0)
+
+    def test_resume_missing_routed_census_never_falls_back_to_admission_or_direct(self):
+        clock, stream, stock, original, receipt = self.original_attempt()
+        stream.reply_mode = "bypass"
+        before = len(stream.rf_packets)
+        resumed = self.resumed(clock, stock, original, duty=0.8)
+        with self.assertRaises(ota.NoCensus):
+            resumed.upload(resume_receipt=receipt)
+        payloads = [payload for _, _, payload in stream.rf_packets[before:]]
+        self.assertEqual(len(payloads), 3)
+        self.assertTrue(all(payload[5] == 10 for payload in payloads))
+        self.assertEqual(len({payload[:5] for payload in payloads}), 3)
+        self.assertFalse(stream.commit_count)
+
+    def test_receipt_is_published_only_after_fresh_verified_resume_and_is_frozen(self):
+        clock, stream, stock, original, receipt = self.original_attempt()
+        observed = []
+        resumed = self.resumed(clock, stock, original, duty=0.8, attempt_callback=observed.append)
+        resumed.upload(resume_receipt=receipt)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["begin_nonce"], receipt["begin_nonce"])
+        self.assertEqual(observed[0]["generation"], 2)
+        self.assertEqual(observed[0]["received_blocks"], 2)
+        self.assertEqual(observed[0]["normal_duty_percent"], 80)
+        self.assertEqual(receipt["received_blocks"], 2)
+        self.assertFalse(stream.commit_count)
+
+    def test_resume_is_not_reupload_and_cannot_be_selected_for_inspect_or_commit(self):
+        base = ["--serial", BINDING.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(),
+                "--binding", "NOT_READ", "--artifacts", "NOT_CREATED", "--resume-receipt", "NOT_READ"]
+        options = (["inspect"], ["commit", "--mode", "directed"], ["deploy"],
+                   ["deploy", "--mode", "directed", "--reupload"],
+                   ["deploy", "--mode", "directed", "--reupload-generation", "2"])
+        for flags in options:
+            with self.subTest(flags=flags), patch.object(ota.Binding, "load") as load, \
+                    patch.object(ota, "validated_stock_uart") as uart, self.assertRaises(ota.Error):
+                ota.main(flags + base)
+            load.assert_not_called()
+            uart.assert_not_called()
+
+    def test_cli_resume_persists_source_and_new_receipt_without_overwriting_old_artifacts(self):
+        clock, stream, stock, original, receipt = self.original_attempt()
+        path = self.directory / "binding.json"
+        b = original.binding
+        ota.private_write(path, {"schema": 1, "serial": b.serial,
+                                 "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "floor": 1, "min_generation": 2, "normal_profile": list(NORMAL[:4])})
+        image, source = self.directory / "ordinary.bin", self.directory / "original-attempt.json"
+        image.write_bytes(original.candidate.image)
+        ota.private_write(source, receipt)
+        source_bytes = source.read_bytes()
+        directory = self.directory / "resume"
+        argv = ["deploy", "--serial", b.serial, "--by-id", "/dev/serial/by-id/NOT_OPENED",
+                "--sender-key", OWNER.hex(), "--target", TARGET.hex(), "--binding", str(path),
+                "--artifacts", str(directory), "--image", str(image), "--board", "xiao_nrf52840",
+                "--role-id", "0", "--counter", "2", "--mode", "directed", "--relay-key", RELAY.hex(),
+                "--resume-receipt", str(source), "--normal-duty-percent", "80"]
+        @contextmanager
+        def uart(*args, **kwargs):
+            yield stream
+        frames, stock_cls, sender_cls = ota.Frames, ota.Stock, ota.Sender
+        before = len(stream.rf_packets)
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                patch.object(ota, "Stock", side_effect=lambda f, key, **kw: stock_cls(f, key, clock, clock.sleep, **kw)), \
+                patch.object(ota, "Sender", side_effect=lambda *a, **kw: sender_cls(*a, clock=clock, sleep=clock.sleep, **kw)), \
+                patch.object(ota.time, "monotonic", clock), redirect_stdout(io.StringIO()):
+            ota.main(argv)
+        reference = ota.private_read(directory / "resume-source.json")
+        self.assertEqual(reference["source_receipt"], str(source.resolve()))
+        self.assertEqual(reference["receipt"], receipt)
+        canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(reference["canonical_json_sha256"], hashlib.sha256(canonical).hexdigest())
+        self.assertEqual(source.read_bytes(), source_bytes)
+        new = ota.private_read(directory / "attempt-receipt.json")
+        self.assertEqual((new["generation"], new["begin_nonce"], new["normal_duty_percent"]),
+                         (2, receipt["begin_nonce"], 80))
+        self.assertEqual(ota.private_read(directory / "result.json")["outcome"], "native-installed-reported-unsigned")
+        self.assertTrue(all(payload[5] not in (8, 14) for _, _, payload in stream.rf_packets[before:]))
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+
 class DirectedTests(Scratch):
     def test_retry_and_path_limits_reject_malformed_nested_and_exhausted_attempts(self):
         report = census(candidate())
