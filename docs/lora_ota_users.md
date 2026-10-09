@@ -3,10 +3,11 @@
 This optional feature is **off in ordinary builds**. It is being soaked in a
 public fork; no upstream pull request or production-readiness claim is implied.
 Direct nRF52840 updates have succeeded on hardware, including normal-radio
-restoration. One-hop stock-sender routed requests/replies have also been verified
-on hardware; the full routed image installation remains pending (see below).
-ESP32-S3 and SenseCAP Solar hardware updates, complete routed installations and
-fleet/background deployments have **not yet been verified on hardware**.
+restoration. A full one-hop stock-sender routed nRF52840 installation has also
+succeeded, including selective loss repair, durable counter advancement and
+post-reboot RF observations (see below).
+ESP32-S3 and SenseCAP Solar hardware updates and fleet/background deployments
+have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
 OTA-administrator permission on the receiver. It is independent of the ordinary
@@ -444,7 +445,7 @@ alongside the new receipt; do not invent missing historical session metadata.
 Capture records the helper's selected duty, not an unavailable historical
 sender duty.
 
-### Hardware milestone: routed RF verified, full installation pending
+### Hardware milestone: routed installation and reboot persistence verified
 
 As of **2026-10-09**, a stock Heltec sender → dedicated nRF repeater relay →
 nRF repeater installer target has passed a bounded, non-activating RF check on
@@ -458,11 +459,8 @@ not authorize or replace a candidate, retune radios or use a direct fallback.
 These remain unsigned RF/path observations.
 
 The subsequent 506,524-byte counter-2 campaign began on the same normal profile,
-2% duty and a 172,800-second budget. At the recorded 90.243-second checkpoint,
-the target reported generation 2 Receiving with **4/6,031 blocks** received.
-**Full-image completion, counter-2 Installed and post-install persistence have
-not yet been verified.** This milestone proves the selected RF hop in both
-directions, not successful routed firmware installation.
+2% duty and a 172,800-second budget. Its early generation-2 Receiving observations
+established progress, not installation.
 
 The explicitly authorized accelerated run gracefully paused that host and
 captured the existing generation-2 Receiving state at 129/6,031 blocks. It
@@ -471,8 +469,23 @@ cap and mesh duty, and the receiver's transient native `ota duty 80` setting.
 TX2 and the normal radio profile stayed unchanged. A six-second relay outage
 left a four-block batch missing; selective retries of blocks 2056-2059 restored
 that window's census bitmap count from eight to twelve. No ABORT, new BEGIN,
-REUPLOAD or direct fallback was used. These remain unsigned progress/path
-observations; full-image installation and reboot persistence are still pending.
+REUPLOAD or direct fallback was used.
+
+The resumed campaign completed **6,031/6,031 blocks** and reported counter-2
+Installed through the selected relay at 5,538.121 seconds on the resumed clock.
+The RF report remains unsigned. Separately, the receiver's local USB CLI showed
+confirmed/installed, counter and floor 2, verified image SHA-256
+`d96a0d8b940dddb9ab85ccffd77cf145b6f994b9bca7275fc847b1ef88f95397`,
+506,524-byte extent, floor sequence 3 and qualified writes. An explicit
+same-firmware reboot preserved those values, identity, normal radio and TX2.
+After reboot, **25/25** accepted census samples reported the same Installed
+generation and floor through the mandatory relay, rejecting bare direct copies;
+one sample needed a census retry. These observations do not authenticate RF status.
+
+The stock sender's final radio/repeat/TX2 readbacks were unchanged, and only its
+temporary receiver authorization was revoked; the original administrator entry
+was preserved. Two-target shared-flood background collection and installation
+remain unverified; this completed campaign used one installer and one relay.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a

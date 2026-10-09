@@ -162,13 +162,10 @@ exact single-relay return trail. Repeat-off yielded no accepted route during
 generation-1/floor-1 baseline (6,017 blocks). A bare target reply was received
 but correctly rejected. No retune, fallback or candidate mutation was used.
 
-**Full counter-2 campaign remains pending.** The subsequent stock-sender →
-dedicated-repeater → target campaign was running on the normal channel at 2%
-with a 172,800-second timeout. Its observed generation-2 state was Receiving,
-6,031 total blocks, with live census reporting four received blocks at 90.243
-seconds. This proves relay necessity and early RF admission/progress, not
-completed transfer, installation, reboot confirmation or counter-2 floor
-advancement.
+The subsequent stock-sender → dedicated-repeater → target counter-2 campaign
+began on the normal channel at 2% with a 172,800-second timeout. Its early
+generation-2 Receiving observations established admission/progress, not
+installation.
 
 The subsequent accelerated lab run preserved the same counter-2 image and
 generation. After a graceful host pause, one routed census captured 129/6,031
@@ -181,9 +178,26 @@ A six-second relay-forwarding outage left the four-block batch 2056-2059
 missing: window 2048 still reported eight present blocks. The sender retried
 those individual indices, and a later current-attempt census reported twelve
 present blocks at 563.726 seconds on the resumed clock. Generation and nonce
-were unchanged; no BEGIN, REUPLOAD or direct fallback was used. This establishes
-bounded RF outage recovery and selective block repair, not full-image
-installation or post-reboot floor advancement, which remain pending.
+were unchanged; no BEGIN, REUPLOAD or direct fallback was used.
+
+The resumed campaign subsequently converged to 6,031/6,031 blocks and reported
+Installed at 5,538.121 seconds, generation 2 and confirmed floor 2, through the
+selected relay. Its schema-2 result remains
+`native-installed-reported-unsigned`: `status_authenticated=false` and
+`installation_confirmed=false`. The separate local USB observation showed
+confirmed/installed, counter/floor 2, verified SHA-256
+`d96a0d8b940dddb9ab85ccffd77cf145b6f994b9bca7275fc847b1ef88f95397`,
+extent `0x7BA9C` (506,524 bytes), floor sequence 3 and qualified state 1/phase 6.
+Those values, identity, normal radio and TX2 survived an explicit same-firmware
+reboot. The post-reboot stock probe accepted 25/25 Installed census samples
+through the mandatory relay; one sample needed a census retry, and bare direct
+copies remained rejected. Stock radio/repeat/TX2 readbacks stayed unchanged.
+Only the temporary stock authorization was revoked, preserving the original
+administrator entry.
+
+This proves a full routed single-target installation, bounded real-loss repair
+and durable floor advancement, not authenticated RF status or a two-target
+shared-flood installation. The latter remains the next hardware experiment.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
