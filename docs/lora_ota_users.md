@@ -474,7 +474,12 @@ retune radios or obtain a direct lease.
 
 The host admits the two targets independently, sends each initial image block
 once for both receivers to hear, then repairs the union of their missing
-bitmaps with shared block transmissions. Each target's fresh READY and signed
+bitmaps with shared block transmissions. Each repair visit sends at most four
+common blocks in a 128-bit bitmap window, obtains fresh censuses from both
+targets, then rotates windows. Updated bitmaps remove confirmed blocks from
+later repairs; a missing or drifting report stops further data. The existing
+eight-transmission limit applies to each individual repaired block, not to
+window visits or whole-image passes. Each target's fresh READY and signed
 COMMIT remain bound to its own generation and BEGIN nonce. Admission,
 repair and installation failures remain per-target facts and cannot become
 aggregate success merely because the other receiver succeeds.
@@ -644,6 +649,15 @@ control replies. The second target's existing mesh duty was 50% and its queue
 was empty. Shared-flood completion, both durable installations and post-reboot
 qualification remain outstanding. Sent-block counts are not received-block or
 installation proof.
+
+After the forwarding queue drained, one read-only census of each original
+attempt succeeded on its first request: the first target reported
+**1,016/6,031** received blocks, the second **5,546/6,031**. Both retained the
+same generations, BEGIN nonces and previous floors. For the explicitly
+authorized co-located bench recovery, forwarding was then temporarily disabled
+on both receivers, leaving radio, TX power and mesh duty unchanged. Their
+original forwarding-on setting must be restored after installation. This is
+not a recommendation to disable relays needed by a field delivery path.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a

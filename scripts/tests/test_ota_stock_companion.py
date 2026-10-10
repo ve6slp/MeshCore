@@ -2763,8 +2763,8 @@ class BackgroundTests(Scratch):
         self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]),
                          (0, 6031 - 187 + 2 + 3))
         repaired = stream.deliveries[delivered:]
-        self.assertEqual([i for _, i, _ in repaired],
-                         [3, 9] + list(range(187, 6031)) + [187, 6029, 6030])
+        self.assertEqual(sorted(i for _, i, _ in repaired),
+                         sorted([3, 9] + list(range(187, 6031)) + [187, 6029, 6030]))
         self.assertTrue(all(heard == (TARGET, TARGET2) for _, _, heard in repaired))
         self.assertTrue(all(raw[7] in (1, 3, 10) for raw in stream.raw_packets[before:]))
         self.assertTrue(all(raw[2] == (18 if raw[7] == 1 else 17) for raw in stream.raw_packets[before:]))
@@ -2791,6 +2791,172 @@ class BackgroundTests(Scratch):
         self.assertFalse(result["installation_confirmed"])
         self.assertEqual((stream.profile, stream.tx_power), ((907525, 250000, 7, 5, 0), 2))
         self.assertFalse(any(command[0] == 11 for command in stream.commands))
+
+    def test_shared_repairs_refresh_both_targets_after_at_most_four_blocks_fresh_and_resume(self):
+        for resume in (False, True):
+            if resume:
+                _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 12), prefix=2)
+                options = {"resume_receipts": receipts}
+            else:
+                _, stream, _, campaign = fleet_setup(candidate(84 * 12), duty=0.8)
+                stream.losses = {TARGET: {i: 1 for i in range(2, 12)},
+                                 TARGET2: {i: 1 for i in range(2, 12)}}
+                options = {}
+            initial = stream.remote
+            repairs = []
+            def observe(wire):
+                attempt, frame = ota.retry_payload(wire)
+                if frame[0] == 1 and wire[0] == 18:
+                    repairs.append(struct.unpack_from(">H", frame, 5)[0])
+                initial(wire)
+            stream.remote = observe
+            if resume:
+                stream.losses[TARGET][2] = 1
+            before = len(stream.raw_packets)
+            with self.subTest(resume=resume):
+                result = campaign.upload(**options)
+                self.assertTrue(result["operation_complete"])
+                if resume:
+                    self.assertEqual(repairs, [2, 3, 4, 5, 2, 6, 7, 8, 9, 10, 11])
+                else:
+                    self.assertEqual(repairs, list(range(2, 12)))
+                burst = 0
+                pair = set()
+                started = False
+                for raw in stream.raw_packets[before:]:
+                    _, frame = ota.retry_payload(raw[2:])
+                    if frame[0] == 1 and raw[2] == 18:
+                        if started and burst == 0:
+                            self.assertEqual(pair, {TARGET, TARGET2})
+                        started = True
+                        burst += 1
+                        self.assertLessEqual(burst, 4)
+                        pair.clear()
+                    elif started and frame[0] == 10:
+                        if burst:
+                            burst = 0
+                            pair.clear()
+                        pair.add(frame[1:33])
+                self.assertEqual(pair, {TARGET, TARGET2})
+                self.assertEqual(stream.profile, NORMAL)
+                self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_checkpoint_progress_reports_and_next_union_exclude_newly_confirmed_bits(self):
+        _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 12), prefix=2)
+        events = []
+        for target in campaign.targets:
+            target.event_callback = events.append
+        # A delayed/ordinary delivery can confirm a block not in this burst;
+        # the next pair of censuses must remove it from the union.
+        original = stream.remote
+        delivered = len(stream.deliveries)
+        def late_delivery(wire):
+            original(wire)
+            if len(stream.deliveries) == delivered + 4:
+                for node in stream.nodes.values():
+                    node["received"].add(6)
+        stream.remote = late_delivery
+        result = campaign.upload(resume_receipts=receipts)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual([i for _, i, _ in stream.deliveries[delivered:]], [2, 3, 4, 5, 7, 8, 9, 10, 11])
+        checkpoints = [e for e in events if e["event"] == "shared_repair_checkpoint"]
+        self.assertEqual([e["target_public_key"] for e in checkpoints[:2]], [TARGET.hex(), TARGET2.hex()])
+        self.assertEqual([e["received"] for e in checkpoints[:2]], [7, 7])
+        self.assertTrue(all(e["status_authenticated"] is False and len(e["bitmap"]) == 32 for e in checkpoints))
+        self.assertEqual(checkpoints[-1]["lifecycle"], 5)
+
+    def test_lossy_prefix_rotates_to_tail_before_retry_exhaustion_without_resending_confirmed_bits(self):
+        _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+        for node in stream.nodes.values():
+            node["received"] = set(range(130)) - {0, 1, 2, 3, 4, 128, 129}
+        stream.losses[TARGET][0] = 100
+        result = campaign.upload(resume_receipts=receipts)
+        self.assertFalse(result["operation_complete"])
+        indexes = [i for _, i, _ in stream.deliveries]
+        self.assertEqual(indexes[:6], [0, 1, 2, 3, 128, 129])
+        self.assertEqual(indexes[6:8], [0, 4])
+        self.assertEqual(indexes.count(0), 8)
+        self.assertTrue(all(indexes.count(i) == 1 for i in (1, 2, 3, 4, 128, 129)))
+        self.assertEqual(stream.nodes[TARGET]["received"], set(range(130)) - {0})
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_checkpoint_nonce_generation_manifest_floor_or_bitmap_drift_stops_after_first_burst(self):
+        changes = ((103, b"\xEE" * 16), (88, struct.pack(">I", 13)),
+                   (33, b"\xEF" * 32), (94, struct.pack(">I", 2)), (67, bytes(16)))
+        for index in (0, 1):
+            for offset, replacement in changes:
+                _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 12), prefix=2)
+                key = (TARGET, TARGET2)[index]
+                delivered = len(stream.deliveries)
+                def mutate(target, report):
+                    if target == key and len(stream.deliveries) >= delivered + 4:
+                        return report[:offset] + replacement + report[offset + len(replacement):]
+                    return report
+                stream.report_mutator = mutate
+                with self.subTest(target=index, offset=offset):
+                    result = campaign.deploy(resume_receipts=receipts)
+                    self.assertFalse(result["operation_complete"])
+                    self.assertEqual(result["repair_block_transmissions"], 4)
+                    self.assertEqual(result["targets"][index]["outcome"], "failed")
+                    self.assertEqual(len(stream.deliveries) - delivered, 4)
+                    self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_missing_fresh_checkpoint_stops_data_and_commits_without_refresh_fallback(self):
+        for index in (0, 1):
+            _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 12), prefix=2)
+            key = (TARGET, TARGET2)[index]
+            delivered = len(stream.deliveries)
+            remote = stream.remote
+            def silence(wire):
+                _, frame = ota.retry_payload(wire)
+                if frame[0] == 10 and frame[1:33] == key and len(stream.deliveries) >= delivered + 4:
+                    return
+                remote(wire)
+            stream.remote = silence
+            with self.subTest(target=index):
+                result = campaign.deploy(resume_receipts=receipts)
+                self.assertFalse(result["operation_complete"])
+                self.assertEqual(result["repair_block_transmissions"], 4)
+                self.assertEqual(result["targets"][index]["outcome"], "failed")
+                self.assertIn("census", result["targets"][index]["error"])
+                self.assertEqual(len(stream.deliveries) - delivered, 4)
+                self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_checkpoint_cancellation_never_services_next_target_or_sends_more_data(self):
+        for index in (0, 1):
+            _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 12), prefix=2)
+            target = campaign.targets[index]
+            census_call = target.census
+            delivered = len(stream.deliveries)
+            interrupted = []
+            def cancel(*args, **kwargs):
+                if len(stream.deliveries) >= delivered + 4:
+                    interrupted.append(len(stream.commands))
+                    raise ota.Cancelled("checkpoint cancellation")
+                return census_call(*args, **kwargs)
+            target.census = cancel
+            with self.subTest(target=index), self.assertRaises(ota.Cancelled):
+                campaign.deploy(resume_receipts=receipts)
+            self.assertEqual(len(stream.commands), interrupted[0])
+            self.assertEqual(len(stream.deliveries) - delivered, 4)
+            self.assertTrue(campaign.transport.failed_tx)
+            self.assertTrue(campaign.error["cancelled"])
+            self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_high_loss_checkpoint_rotation_remains_campaign_deadline_bounded(self):
+        clock, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+        stream.losses = {key: {i: 100 for i in range(130)} for key in (TARGET, TARGET2)}
+        campaign.transport.deadline = clock() + 40
+        for target in campaign.targets:
+            target.deadline = campaign.transport.deadline
+        result = campaign.deploy(resume_receipts=receipts)
+        self.assertFalse(result["operation_complete"])
+        self.assertLessEqual(clock(), campaign.transport.deadline)
+        self.assertTrue(stream.deliveries)
+        self.assertTrue(all(count <= 8 for count in campaign.repairs.values()))
+        errors = [result["error"]] + [row.get("error") for row in result["targets"]]
+        self.assertIn("deadline", str(errors))
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
 
     def test_resume_static_checks_both_receipts_before_any_rf_or_signing(self):
         mutations = {
@@ -3389,6 +3555,35 @@ class BackgroundTests(Scratch):
         self.assertEqual([target["outcome"] for target in result["targets"]], ["native-installed-reported-unsigned"] * 2)
         self.assertTrue(result["radio_cleanup"]["readback_available"])
         self.assertEqual([n["commits"] for n in stream.nodes.values()], [1, 1])
+
+    def test_cli_cancel_repair_checkpoint_persists_non_success_and_closes_without_more_rf(self):
+        args, clock, stream = self.cli_resume_inputs()
+        directory = self.directory / "checkpoint-cancel"
+        delivered = len(stream.deliveries)
+        receive = ota.Frames.receive
+        closed, interrupted = [], []
+        def cancel(frames, *args, **kwargs):
+            key = kwargs.get("target", args[4] if len(args) > 4 else None)
+            if not interrupted and key == TARGET and len(stream.deliveries) == delivered + 4:
+                interrupted.append((len(stream.raw_packets), len(stream.commands)))
+                signal.raise_signal(signal.SIGTERM)
+            return receive(frames, *args, **kwargs)
+        with patch.object(ota.Frames, "receive", cancel), \
+                self.cli_transport(clock, stream, on_close=lambda: closed.append(True)), \
+                self.assertRaises(ota.Cancelled):
+            ota.main(["deploy"] + args + ["--artifacts", str(directory), "--board", "xiao_nrf52840",
+                                         "--role-id", "0", "--counter", "5"])
+        result = ota.private_read(directory / "result.json")
+        self.assertEqual(closed, [True])
+        self.assertEqual(result["outcome"], "shared-campaign-cancelled")
+        self.assertFalse(result["operation_complete"])
+        self.assertEqual(result["repair_block_transmissions"], 4)
+        self.assertEqual(len(stream.raw_packets), interrupted[0][0])
+        self.assertTrue(all(command[0] not in (33, 34, 35, 65)
+                            for command in stream.commands[interrupted[0][1]:]))
+        self.assertTrue(result["radio_cleanup"]["normal_profile_unchanged"])
+        self.assertTrue(result["error"]["cancelled"])
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
 
     def test_cli_resume_invalid_pair_metadata_refuses_before_uart_or_artifact_creation(self):
         args, _, _ = self.cli_resume_inputs()

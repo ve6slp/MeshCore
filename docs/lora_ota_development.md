@@ -258,6 +258,22 @@ separate OTA budget. The second target had an empty queue and its existing
 counts do not establish convergence. Both installations and durable post-reboot
 qualification remain outstanding. Original run artifacts remain unchanged.
 
+A subsequent bounded read-only census, after quiet queue drain, reported
+1,016/6,031 blocks on generation-1 target 41 and 5,546/6,031 on generation-3
+target 3B. Both first requests succeeded and preserved their exact BEGIN nonces
+and floors 0/2. The explicitly approved co-located recovery temporarily
+disabled forwarding on both receiving installers, without altering the mesh
+budgets, RF profile, TX2 or candidate state. Both original forwarding-on
+settings remain restoration obligations after installation; no field relay
+path is being qualified by this bench adjustment.
+
+Shared repair now refreshes both targets after at most four common blocks per
+128-bit window, emits `shared_repair_checkpoint` and rotates windows. Subsequent
+unions come from fresh independent bitmaps. A missing or drifting report stops
+data immediately; the existing limit counts repairs per block index, not
+window visits. Full-size 6,031-block coverage exercises fresh and retained
+campaign convergence, including initially empty bitmap windows.
+
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
 

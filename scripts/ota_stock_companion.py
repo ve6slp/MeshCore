@@ -27,6 +27,9 @@ It never retunes, re-BEGINs, REUPLOADs, takes over or resets a target.
 Explicit paired schema-3 attempt receipts can resume the same two Receiving
 or READY candidates. Both receipts and fresh attempt-bound censuses are checked
 before signing data; resume sends only their common missing-block union.
+Selective repairs use the existing four-block burst limit, refreshing both
+targets after each burst and rotating bitmap windows rather than draining an
+entire missing-image pass without receiver feedback.
 Cancellation stops the whole campaign immediately, retaining prior unsigned
 outcomes in a non-success result before normal-profile/UART cleanup.
 Valid unsolicited stock pushes and OTA data/request echoes are counted with
@@ -1420,24 +1423,39 @@ class BackgroundCampaign:
                     self.send_block(index, initial=True, needed_by=keys)
             self.stage = "census-selective-repair"
             windows = tuple(range(0, self.transport.candidate.total, 128))
+            # Validate every window of both attempts before any repair, even
+            # when the mismatch is beyond the original first-window receipt.
+            for first in windows:
+                for current, target in enumerate(self.targets):
+                    target.census(first)
             while True:
                 all_ready = True
-                missing = {}
                 for first in windows:
+                    missing = {}
                     for current, target in enumerate(self.targets):
                         report = target.census(first)
-                        all_ready &= report["lifecycle"] == 5
                         for index in range(first, min(first + 128, target.candidate.total)):
                             if not report["bits"] & (1 << (index - first)):
                                 missing.setdefault(index, []).append(target.binding.target.hex())
-                # Verify the complete pair of bitmap surveys before signing any
-                # repair, including windows beyond the first receipt snapshot.
-                for index, needed_by in sorted(missing.items()):
-                    current = None
-                    self.repairs[index] = self.repairs.get(index, 0) + 1
-                    if self.repairs[index] > 8:
-                        raise Error("shared RF block repair retries exhausted")
-                    self.send_block(index, initial=False, needed_by=needed_by)
+                    for index, needed_by in sorted(missing.items())[:self.transport.burst_blocks]:
+                        current = None
+                        self.repairs[index] = self.repairs.get(index, 0) + 1
+                        if self.repairs[index] > 8:
+                            raise Error("shared RF block repair retries exhausted")
+                        self.send_block(index, initial=False, needed_by=needed_by)
+                    # Both fresh checkpoints must succeed before any more
+                    # blocks. Rotate windows so a lossy prefix cannot starve
+                    # the tail; the campaign deadline and retry bounds remain.
+                    for current, target in enumerate(self.targets):
+                        report = target.census(first)
+                        all_ready &= report["lifecycle"] == 5
+                        target.emit("shared_repair_checkpoint", first=first,
+                                    received=report["received"], total=report["total"],
+                                    lifecycle=report["lifecycle"], generation=target.generation,
+                                    begin_nonce=target.begin_nonce.hex(),
+                                    bitmap=report["bits"].to_bytes(16, "little").hex(),
+                                    repair_block_transmissions=self.repair_sent,
+                                    status_authenticated=False)
                 if all_ready:
                     break
             self.outcomes = [target.receipt("ready-observed-unsigned") for target in self.targets]
