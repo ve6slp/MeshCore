@@ -5,9 +5,11 @@ public fork; no upstream pull request or production-readiness claim is implied.
 Direct nRF52840 updates have succeeded on hardware, including normal-radio
 restoration. A full one-hop stock-sender routed nRF52840 installation has also
 succeeded, including selective loss repair, durable counter advancement and
-post-reboot RF observations (see below).
-ESP32-S3 and SenseCAP Solar hardware updates and fleet/background deployments
-have **not yet been verified on hardware**.
+post-reboot RF observations (see below). Stock shared-flood background delivery
+has now installed the same image on **two Sense receivers**, including paired
+resume, durable floors and post-reboot RF observations.
+ESP32-S3 and SenseCAP Solar hardware updates, larger fleets and native-host
+encrypted multicast delivery have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
 OTA-administrator permission on the receiver. It is independent of the ordinary
@@ -650,8 +652,8 @@ outbound packets and a pending census reply. Its ordinary mesh duty remained
 only once the outbound queue is empty, so queued forwarding traffic can delay
 control replies. The second target's existing mesh duty was 50% and its queue
 was empty. Shared-flood completion, both durable installations and post-reboot
-qualification remain outstanding. Sent-block counts are not received-block or
-installation proof.
+qualification were still outstanding at this stage. Sent-block counts are not
+received-block or installation proof.
 
 After the forwarding queue drained, one read-only census of each original
 attempt succeeded on its first request: the first target reported
@@ -670,6 +672,39 @@ their original attempt contexts and previous floors; local USB confirmed
 healthy radios, empty queues and the retained forwarding pause. No READY or
 COMMIT was observed. Continuing these attempts with a longer host deadline
 does not require a new BEGIN, reset or image change.
+
+The final continuation completed with **577 common union repairs** and no
+initial full-image pass. Both receivers reached **6,031/6,031 blocks** under
+the original descriptor, generations and BEGIN nonces. Independent signed
+COMMITs were sent at 2,612.622 and 2,633.743 seconds; matching unsigned Installed
+reports followed at 2,692.286 and 2,718.018 seconds on that resumed clock.
+The schema-1 aggregate is `shared-native-installed-reported-unsigned`, with
+`operation_complete:true`; its RF authentication and installation-confirmation
+flags remain false.
+
+Separate local USB readbacks on **both** receivers confirmed installed counter
+and floor 3, qualified state 1/phase 6, the 506,524-byte extent and SHA-256
+`f282c09849a962b81913528a514a3bc2d136e6d8424c25959cd1987f47cf187a`.
+Target 41's floor sequence was 2; target 3B's was 4. These values, identities,
+names, normal radio, TX2 and mesh duties of 2%/50% survived guarded
+same-firmware reboots. The initial lifecycle display can briefly remain
+unknown while the incremental live-image hash completes; verification was
+allowed to finish before either retention reboot.
+
+After reboot, each receiver answered **5/5** fresh Installed censuses on the
+normal channel. Original forwarding was then restored on both, and each
+answered another **5/5** fresh Installed censuses with forwarding on. These
+read-only RF checks used a 2% sender budget and remain unsigned; they are
+separate from the local USB installation proof. Only the temporary stock
+authorization was revoked on both receivers, returning 41's ACL to empty and
+preserving 3B's original administrator. Final USB readbacks retained the
+verified image, floors, identities and original preferences; stock sender
+identity, radio/repeat and TX2 remained unchanged.
+
+This completes the exactly-two-installer shared-flood bench experiment,
+including real unequal loss, independent bitmap repair and strict continuation.
+It does not qualify larger fleets, native encrypted multicast, field relay
+paths, unsupported boards or production readiness.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a

@@ -86,8 +86,9 @@ partial-failure artifacts. SIGINT/SIGTERM during admission, READY census,
 COMMIT signing or Installed polling must prevent subsequent OTA operations
 while retaining prior outcomes and completing profile/UART cleanup. Stock
 background uses public channel-255 RAW floods, not the native host's encrypted
-multicast-channel mechanism. Software coverage does not qualify the pending
-two-target hardware experiment or an installer role migration.
+multicast-channel mechanism. Software coverage alone does not qualify hardware
+or installer role migration; the completed two-target bench observations are
+recorded separately below.
 
 `test-ota-disabled` (environment `native_lora_ota_disabled`) compiles the real
 `Mesh`, `Dispatcher`, `Packet` and `StaticPoolPacketManager` with
@@ -256,7 +257,8 @@ ample budget. `Mesh::pumpOtaControl` waits for an empty outbound queue, while
 separate OTA budget. The second target had an empty queue and its existing
 50% mesh duty. Current received totals require fresh censuses; transmission
 counts do not establish convergence. Both installations and durable post-reboot
-qualification remain outstanding. Original run artifacts remain unchanged.
+qualification were still outstanding at this stage. Original run artifacts
+remain unchanged.
 
 A subsequent bounded read-only census, after quiet queue drain, reported
 1,016/6,031 blocks on generation-1 target 41 and 5,546/6,031 on generation-3
@@ -294,6 +296,34 @@ and omits a second polling pair when fresh selection finds no missing bits.
 Productive chunks still require both fresh post-censuses. A fresh full paired
 READY survey is required before completion; cached convergence cannot
 authorize COMMIT.
+
+The subsequent same-attempt continuation completed with 577 common repairs,
+zero initial-pass transmissions and both receivers reporting 6,031/6,031.
+Independent signed COMMITs were sent at 2,612.622 seconds for generation-1
+target 41 and 2,633.743 for generation-3 target 3B. Matching unsigned Installed
+reports arrived at 2,692.286 and 2,718.018 seconds, respectively; one post-COMMIT
+poll for 3B needed a retry. The schema-1 aggregate records
+`shared-native-installed-reported-unsigned`, `operation_complete=true`,
+unchanged stock profile readback and zero USB backlog. RF status remains
+unauthenticated, with `installation_confirmed=false`.
+
+Independent USB readbacks confirmed counter/floor 3, verified SHA-256
+`f282c09849a962b81913528a514a3bc2d136e6d8424c25959cd1987f47cf187a`,
+extent `0x7BA9C`, qualified state 1/phase 6 and floor sequences 2/4. The live
+lifecycle observer hashes incrementally, so an initial unknown/commit-pending
+display was allowed to resolve before the retention reboot. Both receivers
+retained the confirmed image, floors, identities, names, normal profile, TX2,
+mesh duties 2%/50% and ACLs after guarded same-firmware reboots.
+
+The post-reboot read-only stock probe accepted 5/5 Installed censuses per
+receiver using a 2% budget. After restoring original forwarding-on settings,
+a second probe accepted another 5/5 per receiver. Both used the original
+generation/nonce contexts and normal RF profile, with no candidate mutation or
+retune. Only temporary stock authorization was then removed: 41's original
+empty ACL and 3B's original administrator entry were preserved. Final USB and
+stock identity/profile/repeat/TX2 readbacks matched the required restored state.
+This establishes the exactly-two-installer stock shared-flood bench outcome,
+not larger fleets, native-host encrypted multicast or field-relay qualification.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
