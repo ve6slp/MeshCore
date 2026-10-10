@@ -274,6 +274,27 @@ data immediately; the existing limit counts repairs per block index, not
 window visits. Full-size 6,031-block coverage exercises fresh and retained
 campaign convergence, including initially empty bitmap windows.
 
+The first checkpointed hardware resume reached its 14,400-second deadline
+after 4,444 common repairs, not a radio or census failure. Final fresh reports
+showed 5,454/6,031 received blocks on target 41 and 5,977/6,031 on target 3B,
+still Receiving with the original generations, nonces and historical floors.
+USB showed healthy radios and empty queues; the approved forwarding pause
+and normal mesh budgets remained unchanged. No READY or COMMIT was issued.
+The incomplete aggregate preserves unchanged stock readback and zero USB
+backlog. A longer continuation retains the same original attempts.
+
+The completed run also exposed unnecessary host polling: all 135 zero-block
+window visits were already complete in both validated cached bitmaps, but each
+still performed paired censuses before and after selection. Those visits
+consumed 1,662.71 seconds. Productive repair checkpoints remained fresh and
+attempt-bound; the redundant traffic did not indicate a receiver fault.
+
+Repair scheduling now skips validated cached windows complete on both targets
+and omits a second polling pair when fresh selection finds no missing bits.
+Productive chunks still require both fresh post-censuses. A fresh full paired
+READY survey is required before completion; cached convergence cannot
+authorize COMMIT.
+
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
 

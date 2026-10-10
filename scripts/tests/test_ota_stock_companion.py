@@ -1,6 +1,7 @@
 """Focused host protocol tests. No serial open, lab lookup, device or key files."""
 import hashlib
 import io
+from collections import Counter
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import json
@@ -2956,6 +2957,201 @@ class BackgroundTests(Scratch):
         self.assertTrue(all(count <= 8 for count in campaign.repairs.values()))
         errors = [result["error"]] + [row.get("error") for row in result["targets"]]
         self.assertIn("deadline", str(errors))
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_6031_near_complete_pair_skips_complete_windows_until_fresh_final_ready_survey(self):
+        _, stream, _, campaign, receipts = self.partial_background(
+            candidate(506524), prefix=0, commissioning=True)
+        stream.nodes[TARGET]["received"] = set(range(5454))
+        stream.nodes[TARGET2]["received"] = set(range(5977))
+        events = []
+        for sender in [campaign.transport, *campaign.targets]:
+            sender.event_callback = events.append
+        before = len(stream.raw_packets)
+        result = campaign.upload(resume_receipts=receipts)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(result["outcome"], "shared-ready-observed-unsigned")
+        self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]), (0, 577))
+        self.assertEqual([len(node["received"]) for node in stream.nodes.values()], [6031, 6031])
+        self.assertEqual(sorted(index for _, index, _ in stream.deliveries), list(range(5454, 6031)))
+        self.assertTrue(all(heard == (TARGET, TARGET2) for _, _, heard in stream.deliveries))
+        frames = [ota.retry_payload(raw[2:])[1] for raw in stream.raw_packets[before:]]
+        polls = [frame for frame in frames if frame[0] == 10]
+        self.assertEqual((len(frames), len(polls)), (1351, 774))
+        windows = range(0, 6031, 128)
+        survey = [(key, first) for first in windows for key in (TARGET, TARGET2)]
+        poll_identity = lambda frame: (frame[1:33], struct.unpack_from(">H", frame, 65)[0])
+        self.assertEqual([poll_identity(frame) for frame in frames[:98]],
+                         [(TARGET, 0), (TARGET2, 0)] + survey)
+        self.assertEqual([poll_identity(frame) for frame in frames[-96:]], survey)
+        remaining = {first: set(range(max(first, 5454), min(first + 128, 6031)))
+                     for first in windows if first >= 5376}
+        repair_phase = frames[98:-96]
+        cursor, visits = 0, []
+        while cursor < len(repair_phase):
+            selection = repair_phase[cursor:cursor + 2]
+            self.assertTrue(all(frame[0] == 10 for frame in selection))
+            first = poll_identity(selection[0])[1]
+            self.assertEqual([poll_identity(frame) for frame in selection], [(TARGET, first), (TARGET2, first)])
+            # Once a paired checkpoint confirmed a complete window, it must
+            # not consume another selection poll while other repairs remain.
+            self.assertIn(first, remaining)
+            visits.append(first)
+            cursor += 2
+            indexes = []
+            while cursor < len(repair_phase) and repair_phase[cursor][0] == 1:
+                indexes.append(struct.unpack_from(">H", repair_phase[cursor], 5)[0])
+                cursor += 1
+            self.assertEqual(indexes, sorted(remaining[first])[:4])
+            checkpoint = repair_phase[cursor:cursor + 2]
+            self.assertTrue(all(frame[0] == 10 for frame in checkpoint))
+            self.assertEqual([poll_identity(frame) for frame in checkpoint], [(TARGET, first), (TARGET2, first)])
+            cursor += 2
+            remaining[first].difference_update(indexes)
+            if not remaining[first]:
+                del remaining[first]
+        self.assertFalse(remaining)
+        self.assertEqual(visits[:6], [5376, 5504, 5632, 5760, 5888, 6016])
+        self.assertEqual(Counter(visits), {5376: 13, 5504: 32, 5632: 32, 5760: 32, 5888: 32, 6016: 4})
+        checkpoints = [event for event in events if event["event"] == "shared_repair_checkpoint"]
+        self.assertEqual(len(checkpoints), 290)
+        self.assertEqual([event["received"] for event in checkpoints[:2]], [5458, 5977])
+        self.assertEqual([int.from_bytes(bytes.fromhex(event["bitmap"]), "little").bit_count()
+                          for event in checkpoints[:2]], [82, 128])
+        self.assertEqual([event["received"] for event in checkpoints[-2:]], [6031, 6031])
+        self.assertEqual([event["repair_block_transmissions"] for event in checkpoints[-2:]], [577, 577])
+        self.assertTrue(all(event["status_authenticated"] is False for event in checkpoints))
+        self.assertEqual([target.generation for target in campaign.targets], [1, 3])
+        self.assertEqual([target.begin_nonce.hex() for target in campaign.targets],
+                         [receipt["begin_nonce"] for receipt in receipts])
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+        self.assertEqual((stream.profile, stream.tx_power), ((907525, 250000, 7, 5, 0), 2))
+
+    def test_newly_complete_selection_emits_exact_progress_without_second_poll_pair(self):
+        _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+        for node in stream.nodes.values():
+            node["received"] = set(range(130)) - {0, 128}
+        original = stream.remote
+        def delayed_tail(wire):
+            original(wire)
+            _, frame = ota.retry_payload(wire)
+            if frame[0] == 1:
+                for node in stream.nodes.values():
+                    node["received"].add(128)
+        stream.remote = delayed_tail
+        events = []
+        for target in campaign.targets:
+            target.event_callback = events.append
+        before = len(stream.raw_packets)
+        result = campaign.upload(resume_receipts=receipts)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(result["repair_block_transmissions"], 1)
+        frames = [ota.retry_payload(raw[2:])[1] for raw in stream.raw_packets[before:]]
+        self.assertEqual(len(frames), 17)
+        block = next(index for index, frame in enumerate(frames) if frame[0] == 1)
+        self.assertEqual([struct.unpack_from(">H", frame, 65)[0] for frame in frames[block + 1:]],
+                         [0, 0, 128, 128, 0, 0, 128, 128])
+        checkpoints = [event for event in events if event["event"] == "shared_repair_checkpoint"]
+        self.assertEqual([event["first"] for event in checkpoints], [0, 0, 128, 128])
+        self.assertTrue(all(event["received"] == 130 and event["lifecycle"] == 5
+                            and event["repair_block_transmissions"] == 1
+                            and event["status_authenticated"] is False for event in checkpoints))
+        self.assertEqual([event["bitmap"] for event in checkpoints[2:]], ["03" + "00" * 15] * 2)
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_cached_ready_cannot_replace_fresh_final_receiving_then_ready_reports(self):
+        _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+        for node in stream.nodes.values():
+            node["received"] = set(range(130))
+        cycles = Counter()
+        def still_receiving(key, frame):
+            if frame[65:67] == bytes(2):
+                cycles[key] += 1
+            if key == TARGET2 and cycles[key] == 3:
+                return frame[:87] + b"\x01" + frame[88:92] + b"\x03" + frame[93:]
+            return frame
+        stream.report_mutator = still_receiving
+        before = len(stream.raw_packets)
+        result = campaign.upload(resume_receipts=receipts)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(cycles, {TARGET: 4, TARGET2: 4})
+        self.assertEqual(len(stream.raw_packets) - before, 14)
+        self.assertTrue(all(raw[7] == 10 for raw in stream.raw_packets[before:]))
+        self.assertFalse(stream.deliveries)
+        self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_fresh_final_ready_survey_rejects_cached_complete_target_context_or_bitmap_drift(self):
+        changes = ((103, b"\xEE" * 16), (88, struct.pack(">I", 13)),
+                   (33, b"\xEF" * 32), (94, struct.pack(">I", 2)), (67, bytes(16)))
+        for index in (0, 1):
+            for offset, replacement in changes:
+                _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+                for node in stream.nodes.values():
+                    node["received"] = set(range(130))
+                key = (TARGET, TARGET2)[index]
+                polls = Counter()
+                def drift(target, frame):
+                    first = struct.unpack_from(">H", frame, 65)[0]
+                    polls[target, first] += 1
+                    if target == key and first == 128 and polls[target, first] >= 2:
+                        return frame[:offset] + replacement + frame[offset + len(replacement):]
+                    return frame
+                stream.report_mutator = drift
+                before = len(stream.raw_packets)
+                with self.subTest(target=index, offset=offset):
+                    result = campaign.deploy(resume_receipts=receipts)
+                    self.assertFalse(result["operation_complete"])
+                    self.assertEqual(result["repair_block_transmissions"], 0)
+                    self.assertEqual(result["targets"][index]["outcome"], "failed")
+                    self.assertGreaterEqual(polls[key, 128], 2)
+                    self.assertTrue(all(raw[7] == 10 for raw in stream.raw_packets[before:]))
+                    self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_final_ready_cancellation_preserves_stop_before_next_target_or_commit(self):
+        for index in (0, 1):
+            _, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+            for node in stream.nodes.values():
+                node["received"] = set(range(130))
+            target = campaign.targets[index]
+            census_call = target.census
+            calls, interrupted = Counter(), []
+            def cancel(first=0, **kwargs):
+                calls[first] += 1
+                if first == 128 and calls[first] == 2:
+                    interrupted.append(len(stream.commands))
+                    raise ota.Cancelled("final READY cancellation")
+                return census_call(first, **kwargs)
+            target.census = cancel
+            with self.subTest(target=index), self.assertRaises(ota.Cancelled):
+                campaign.deploy(resume_receipts=receipts)
+            self.assertEqual(len(stream.commands), interrupted[0])
+            self.assertTrue(campaign.transport.failed_tx)
+            self.assertTrue(campaign.error["cancelled"])
+            self.assertEqual(campaign.repair_sent, 0)
+            self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
+
+    def test_all_cached_full_but_not_ready_wait_remains_deadline_bounded(self):
+        clock, stream, _, campaign, receipts = self.partial_background(candidate(84 * 130), prefix=0)
+        for node in stream.nodes.values():
+            node["received"] = set(range(130))
+        polls = Counter()
+        def never_ready(key, frame):
+            polls[key] += 1
+            return frame[:87] + b"\x01" + frame[88:92] + b"\x03" + frame[93:]
+        stream.report_mutator = never_ready
+        campaign.transport.deadline = clock() + 25
+        for target in campaign.targets:
+            target.deadline = campaign.transport.deadline
+        before = len(stream.raw_packets)
+        result = campaign.deploy(resume_receipts=receipts)
+        self.assertFalse(result["operation_complete"])
+        self.assertLessEqual(clock(), campaign.transport.deadline)
+        self.assertGreater(polls[TARGET2], 3)
+        self.assertEqual(result["repair_block_transmissions"], 0)
+        self.assertIn("deadline", str([result["error"]] + [row.get("error") for row in result["targets"]]))
+        self.assertTrue(all(raw[7] == 10 for raw in stream.raw_packets[before:]))
         self.assertFalse(any(node["commits"] for node in stream.nodes.values()))
 
     def test_resume_static_checks_both_receipts_before_any_rf_or_signing(self):

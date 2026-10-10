@@ -29,7 +29,8 @@ or READY candidates. Both receipts and fresh attempt-bound censuses are checked
 before signing data; resume sends only their common missing-block union.
 Selective repairs use the existing four-block burst limit, refreshing both
 targets after each burst and rotating bitmap windows rather than draining an
-entire missing-image pass without receiver feedback.
+entire missing-image pass without receiver feedback. Validated windows complete
+on both targets are skipped during repair, with fresh READY validation at the end.
 Cancellation stops the whole campaign immediately, retaining prior unsigned
 outcomes in a non-success result before normal-profile/UART cleanup.
 Valid unsolicited stock pushes and OTA data/request echoes are counted with
@@ -1429,11 +1430,15 @@ class BackgroundCampaign:
                 for current, target in enumerate(self.targets):
                     target.census(first)
             while True:
-                all_ready = True
                 for first in windows:
+                    mask = (1 << min(128, self.transport.candidate.total - first)) - 1
+                    if all(target.previous[first]["bits"] == mask for target in self.targets):
+                        continue
                     missing = {}
+                    reports = []
                     for current, target in enumerate(self.targets):
                         report = target.census(first)
+                        reports.append(report)
                         for index in range(first, min(first + 128, target.candidate.total)):
                             if not report["bits"] & (1 << (index - first)):
                                 missing.setdefault(index, []).append(target.binding.target.hex())
@@ -1446,9 +1451,11 @@ class BackgroundCampaign:
                     # Both fresh checkpoints must succeed before any more
                     # blocks. Rotate windows so a lossy prefix cannot starve
                     # the tail; the campaign deadline and retry bounds remain.
-                    for current, target in enumerate(self.targets):
-                        report = target.census(first)
-                        all_ready &= report["lifecycle"] == 5
+                    if missing:
+                        reports = []
+                        for current, target in enumerate(self.targets):
+                            reports.append(target.census(first))
+                    for target, report in zip(self.targets, reports):
                         target.emit("shared_repair_checkpoint", first=first,
                                     received=report["received"], total=report["total"],
                                     lifecycle=report["lifecycle"], generation=target.generation,
@@ -1456,6 +1463,17 @@ class BackgroundCampaign:
                                     bitmap=report["bits"].to_bytes(16, "little").hex(),
                                     repair_block_transmissions=self.repair_sent,
                                     status_authenticated=False)
+                if any(target.previous[first]["bits"] != (1 << min(
+                        128, self.transport.candidate.total - first)) - 1
+                       for first in windows for target in self.targets):
+                    continue
+                # Complete cached bitmaps only suppress repair work; they
+                # cannot authorize READY or signed COMMIT.
+                all_ready = True
+                for first in windows:
+                    for current, target in enumerate(self.targets):
+                        report = target.census(first)
+                        all_ready &= report["lifecycle"] == 5
                 if all_ready:
                     break
             self.outcomes = [target.receipt("ready-observed-unsigned") for target in self.targets]

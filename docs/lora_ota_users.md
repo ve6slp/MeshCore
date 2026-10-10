@@ -479,8 +479,11 @@ common blocks in a 128-bit bitmap window, obtains fresh censuses from both
 targets, then rotates windows. Updated bitmaps remove confirmed blocks from
 later repairs; a missing or drifting report stops further data. The existing
 eight-transmission limit applies to each individual repaired block, not to
-window visits or whole-image passes. Each target's fresh READY and signed
-COMMIT remain bound to its own generation and BEGIN nonce. Admission,
+window visits or whole-image passes. Windows already complete in both validated
+cached bitmaps are skipped; a fresh selection finding no missing bits needs no
+second polling pair. Completion still requires a fresh full paired READY
+survey, not cached bitmap or lifecycle authorization. Each target's fresh READY
+and signed COMMIT remain bound to its own generation and BEGIN nonce. Admission,
 repair and installation failures remain per-target facts and cannot become
 aggregate success merely because the other receiver succeeds.
 
@@ -658,6 +661,15 @@ authorized co-located bench recovery, forwarding was then temporarily disabled
 on both receivers, leaving radio, TX power and mesh duty unchanged. Their
 original forwarding-on setting must be restored after installation. This is
 not a recommendation to disable relays needed by a field delivery path.
+
+With forwarding paused, the checkpointed resume sent 4,444 common repairs and
+kept both receivers responsive, but reached its four-hour host deadline before
+completion. Its final fresh censuses reported **5,454/6,031** blocks on the
+first target and **5,977/6,031** on the second. Both remained Receiving with
+their original attempt contexts and previous floors; local USB confirmed
+healthy radios, empty queues and the retained forwarding pause. No READY or
+COMMIT was observed. Continuing these attempts with a longer host deadline
+does not require a new BEGIN, reset or image change.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
