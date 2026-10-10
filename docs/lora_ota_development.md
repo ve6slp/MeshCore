@@ -240,8 +240,23 @@ matched both original schema-3 attempts using fresh censuses: generation 1 on
 the newly commissioned target and generation 3 on the existing target, with
 159/6,031 received blocks each. Their BEGIN nonces and previous floors were
 retained. Resume repairs the union of missing bits instead of restarting the
-full stream. Both installations and durable post-reboot qualification remain
-outstanding; the first-run log and partial artifacts are preserved unchanged.
+full stream.
+
+The resume subsequently transmitted all 5,872 common repairs, with zero
+initial-pass transmissions. Its first post-pass target census exhausted three
+25-second reply attempts at 3,788.308 seconds, before READY or COMMIT. The
+aggregate records `shared-campaign-incomplete`; USB pending count was zero,
+5,805 echoed blocks were demultiplexed, and unchanged stock profile readback
+succeeded. Both targets separately remained Receiving counter 3 over USB with
+their previous floors and identities and healthy retained radio diagnostics.
+The first target's outbound queue contained fourteen packets with a pending
+census control reply. Its normal mesh budget was 2%; the OTA limiter still had
+ample budget. `Mesh::pumpOtaControl` waits for an empty outbound queue, while
+`Dispatcher::checkSend` applies the normal mesh airtime budget before the
+separate OTA budget. The second target had an empty queue and its existing
+50% mesh duty. Current received totals require fresh censuses; transmission
+counts do not establish convergence. Both installations and durable post-reboot
+qualification remain outstanding. Original run artifacts remain unchanged.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:

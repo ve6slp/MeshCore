@@ -629,9 +629,21 @@ block transmissions; neither receiver was committed. After the host fix, strict
 paired resume used both original schema-3 receipts. Fresh censuses matched the
 original independent generations and BEGIN nonces and reported 159/6,031
 received blocks on each target. The resume sends only union-bitmap repairs,
-without a new BEGIN or receiver reset. Shared-flood completion, both durable
-installations and post-reboot qualification remain outstanding; these
-admission and resume observations are not installation proof.
+without a new BEGIN or receiver reset.
+
+That resume sent **5,872 common repairs**, including the last block, before
+three fresh census requests to the first target timed out at 3,788.308 seconds.
+The USB response backlog remained empty and stock profile readback was
+unchanged. No READY or COMMIT was observed. Separate USB readbacks showed both
+targets still Receiving counter 3 with their previous floors and identities
+intact; both radio diagnostics were healthy. The first target had fourteen
+outbound packets and a pending census reply. Its ordinary mesh duty remained
+2%, independently of its transient 80% OTA cap. Firmware queues a census reply
+only once the outbound queue is empty, so queued forwarding traffic can delay
+control replies. The second target's existing mesh duty was 50% and its queue
+was empty. Shared-flood completion, both durable installations and post-reboot
+qualification remain outstanding. Sent-block counts are not received-block or
+installation proof.
 
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
