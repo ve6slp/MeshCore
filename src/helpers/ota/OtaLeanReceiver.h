@@ -31,6 +31,8 @@ public:
     ::ota::storage::OtaCandidateStore::Phase phase = ::ota::storage::OtaCandidateStore::Phase::Idle;
     uint16_t receivedBlocks = 0;
     uint16_t totalBlocks = 0;
+    uint32_t imageBytes = 0;
+    uint16_t blockBytes = kOtaBlockMaxDataBytes;
     uint32_t generation = 0;
     uint32_t counter = 0;
     uint64_t transactionNonce = 0;
@@ -179,6 +181,30 @@ public:
     return out;
   }
 
+  // Inspect the journal/bitmap without restoring the receiver, resuming its sink, or clearing a fault latch.
+  Status inspectStatus() const {
+    if (!store_ || storage_unavailable_) return status();
+    ::ota::storage::OtaCandidateStore::Snapshot snapshot;
+    const auto result = store_->load(snapshot);
+    auto out = snapshotStatus(snapshot);
+    out.storageUnavailable = result == ::ota::storage::OtaCandidateStore::LoadResult::IoError;
+    if (snapshot.valid) {
+      meshcore::ota::protocol::OtaDescriptor descriptor;
+      if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(snapshot.canonical, sizeof(snapshot.canonical),
+            descriptor) != meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
+          !descriptor.exactSizeBytes || descriptor.formatId != 1 || descriptor.algorithmId != 1 ||
+          !descriptor.keyId || !descriptor.appAddress ||
+          descriptor.exactSizeBytes > ::ota::storage::OtaCandidateStore::kMaxBlocks * kOtaBlockMaxDataBytes ||
+          descriptor.exactSizeBytes != snapshot.exactSizeBytes ||
+          snapshot.totalBlocks != (descriptor.exactSizeBytes + kOtaBlockMaxDataBytes - 1u) / kOtaBlockMaxDataBytes ||
+          snapshot.receivedBlocks > snapshot.totalBlocks) {
+        out = Status();
+        out.storageUnavailable = true;
+      }
+    }
+    return out;
+  }
+
   static Status snapshotStatus(const ::ota::storage::OtaCandidateStore::Snapshot& candidate) {
     Status out;
     out.valid = candidate.valid;
@@ -186,6 +212,7 @@ public:
     out.phase = candidate.phase;
     out.receivedBlocks = candidate.receivedBlocks;
     out.totalBlocks = candidate.totalBlocks;
+    out.imageBytes = candidate.exactSizeBytes;
     out.generation = candidate.sessionId;
     std::memcpy(out.ownerPublicKey, candidate.ownerPublicKey, sizeof(out.ownerPublicKey));
     std::memcpy(out.beginNonce, candidate.beginNonce, sizeof(out.beginNonce));
@@ -516,19 +543,74 @@ private:
 public:
   Result abort(const uint8_t signer_public_key[32], const uint8_t signature[64], const uint8_t image_hash[32],
                 uint32_t generation, bool local_owner_trusted = false) {
-    if (!reloadStorage()) return Result::Unavailable;
-    if (!candidate_.valid) return Result::NotFound;
+    return abortAuthorized(signer_public_key, signature, image_hash, generation, local_owner_trusted, false);
+  }
+
+  // Only the pairwise-authenticated admin CLI dispatcher may supply this identity.
+  // This is not an unsigned RF/USB operation and never grants local-owner/cache privileges.
+  Result abortAuthenticatedAdmin(const uint8_t admin_public_key[32], uint32_t generation,
+                                  uint32_t counter, const uint8_t image_hash[32]) {
+    if (!isCurrentAdmin(admin_public_key)) return Result::Denied;
+    if (!store_ || !staging_sink_ || !have_target_public_key_) return Result::Unavailable;
+    if (!generation || !image_hash) return Result::BadRequest;
+    return abortAuthorized(admin_public_key, nullptr, image_hash, generation, false, true, counter);
+  }
+
+private:
+  static bool matchesAbortGuard(const Status& st, uint32_t generation, uint32_t counter,
+                                const uint8_t image_hash[32]) {
+    return st.valid && image_hash && st.counter == counter &&
+        !std::memcmp(st.imageHash, image_hash, 32) &&
+        (st.generation == generation ||
+         (st.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted &&
+          generation != UINT32_MAX && st.generation == generation + 1u));
+  }
+
+  Result abortAuthorized(const uint8_t signer_public_key[32], const uint8_t signature[64],
+                          const uint8_t image_hash[32], uint32_t generation,
+                          bool local_owner_trusted, bool authenticated_admin, uint32_t expected_counter = 0) {
     static std::atomic_flag busy = ATOMIC_FLAG_INIT;
     OtaBoardProofScratchLease lease(busy);
     if (!lease) return Result::Busy;
     auto& scratch = abortScratch();
+    if (authenticated_admin) {
+      const auto durable = inspectStatus();
+      if (durable.storageUnavailable) return Result::Unavailable;
+      if (!matchesAbortGuard(durable, generation, expected_counter, image_hash)) return Result::Mismatch;
+      if (durable.localCache) return Result::Denied;
+      // Adopt only this guarded, durably acknowledged revocation after a marker verification error.
+      const auto cached = status();
+      if (durable.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted &&
+          cached.valid && durable.generation == cached.generation + 1u &&
+          !std::memcmp(durable.manifestHash, cached.manifestHash, 32) &&
+          !std::memcmp(durable.ownerPublicKey, cached.ownerPublicKey, 32)) {
+        candidate_.phase = ::ota::storage::OtaCandidateStore::Phase::Aborted;
+        candidate_.sessionId = durable.generation;
+        candidate_.receivedBlocks = durable.receivedBlocks;
+        seal_pending_ = false;
+      }
+      if (!matchesAbortGuard(status(), generation, expected_counter, image_hash)) return Result::Mismatch;
+    } else if (!reloadStorage()) {
+      return Result::Unavailable;
+    }
+    if (!candidate_.valid) return Result::NotFound;
     const bool aborted = candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted;
     // Durable ABORT advances sessionId; its original signature may still finish cleanup after reset.
     if (generation != candidate_.sessionId && !(aborted && generation == candidate_.sessionId - 1u))
       return Result::Mismatch;
     const bool committed = commit_started_ || candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Committed;
+    if (authenticated_admin) {
+      using Phase = ::ota::storage::OtaCandidateStore::Phase;
+      if (candidate_.localCache || !isCurrentAdmin(signer_public_key)) return Result::Denied;
+      if ((!aborted && committed) ||
+          (!aborted && candidate_.sessionId == UINT32_MAX) ||
+          (candidate_.phase != Phase::Receiving && candidate_.phase != Phase::Verifying &&
+           candidate_.phase != Phase::Ready && !aborted) ||
+          (terminal_check_ && terminal_check_(terminal_ctx_, candidate_))) return Result::TooLate;
+    }
     if (committed && !unadmitted_abort_) return Result::TooLate;
-    if (signer_public_key == nullptr || signature == nullptr || image_hash == nullptr || !have_target_public_key_) {
+    if (signer_public_key == nullptr || (!authenticated_admin && signature == nullptr) ||
+        image_hash == nullptr || !have_target_public_key_) {
       return Result::BadRequest;
     }
     auto& descriptor = scratch.descriptor;
@@ -541,11 +623,18 @@ public:
         !(local_owner_trusted && candidate_.localCache &&
           !std::memcmp(signer_public_key, candidate_.ownerPublicKey, 32) &&
           !std::memcmp(signer_public_key, target_public_key_, 32))) return Result::Denied;
-    auto& message = scratch.message;
-    std::memset(message, 0, sizeof(message));
-    const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, generation, message);
-    if (!verifyOwnerSignature(signer_public_key, message, message_len, signature)) return Result::Denied;
+    if (!authenticated_admin) {
+      auto& message = scratch.message;
+      std::memset(message, 0, sizeof(message));
+      const size_t message_len = usb::buildAbortSignedMessage(target_public_key_, image_hash, generation, message);
+      if (!verifyOwnerSignature(signer_public_key, message, message_len, signature)) return Result::Denied;
+    }
     if (aborted) {
+      if (authenticated_admin) {
+        const auto durable = inspectStatus();
+        if (durable.storageUnavailable) return Result::Unavailable;
+        if (!matchesAbortGuard(durable, generation, expected_counter, image_hash)) return Result::Mismatch;
+      }
       const auto recovered = !candidate_.localCache && unadmitted_abort_ ?
           unadmitted_abort_(unadmitted_ctx_, candidate_, true) : Result::Ok;
       if (recovered == Result::Ok) { commit_started_ = false; commit_sink_done_ = false; }
@@ -557,6 +646,18 @@ public:
       if (committed) proof.phase = ::ota::storage::OtaCandidateStore::Phase::Committed;
       const auto checked = unadmitted_abort_(unadmitted_ctx_, proof, false);
       if (checked != Result::Ok) return checked;
+    }
+    if (authenticated_admin) {
+      const auto durable = inspectStatus();
+      if (durable.storageUnavailable) return Result::Unavailable;
+      if (!matchesAbortGuard(durable, generation, expected_counter, image_hash) ||
+          !matchesAbortGuard(status(), generation, expected_counter, image_hash)) return Result::Mismatch;
+      if (!isCurrentAdmin(signer_public_key)) return Result::Denied;
+      using Phase = ::ota::storage::OtaCandidateStore::Phase;
+      const auto revocable = [](Phase phase) {
+        return phase == Phase::Receiving || phase == Phase::Verifying || phase == Phase::Ready;
+      };
+      if (commit_started_ || !revocable(durable.phase) || !revocable(candidate_.phase)) return Result::TooLate;
     }
     auto& next = scratch.snapshot;
     next = candidate_;

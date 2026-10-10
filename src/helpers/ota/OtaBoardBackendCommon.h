@@ -1828,8 +1828,9 @@ private:
 };
 
 inline void formatOtaBootLifecycleStatus(char* out, size_t size, const OtaBootLifecycleEvidence& boot,
-                                         usb::UsbOtaPhase phase, uint32_t counter) {
-  char floor[12] = "unknown", image[65] = "unknown";
+                                         usb::UsbOtaPhase phase, uint32_t counter, bool counter_known = true) {
+  char floor[12] = "unknown", image[65] = "unknown", candidate_counter[12] = "unknown";
+  if (counter_known) snprintf(candidate_counter, sizeof(candidate_counter), "%lu", (unsigned long)counter);
   if (boot.floorKnown) snprintf(floor, sizeof(floor), "%lu", (unsigned long)boot.confirmedFloor);
   if (boot.imageVerified) {
     static constexpr char hex[] = "0123456789abcdef";
@@ -1842,8 +1843,10 @@ inline void formatOtaBootLifecycleStatus(char* out, size_t size, const OtaBootLi
   const char* boot_name = boot.phase == usb::UsbOtaPhase::Installed ? "confirmed" :
                           boot.phase == usb::UsbOtaPhase::Trial ? "trial" :
                           boot.phase == usb::UsbOtaPhase::Failed ? "failed" : "unknown";
-  snprintf(out, size, "boot=%s phase=%s floor=%s counter=%lu verified=%u image=%s", boot_name,
-           otaLifecyclePhaseName(phase), floor, (unsigned long)counter, boot.imageVerified ? 1 : 0, image);
+  const int written = snprintf(out, size, "boot=%s phase=%s floor=%s counter=%s verified=%u image=%s", boot_name,
+           otaLifecyclePhaseName(phase), floor, candidate_counter, boot.imageVerified ? 1 : 0, image);
+  if (written < 0 || static_cast<size_t>(written) >= size)
+    snprintf(out, size, "Err - status reply too long");
 }
 
 // Thin board-facing wrapper around ::ota::storage::XiaoOtaTrialHealthMonitor

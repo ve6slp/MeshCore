@@ -443,13 +443,14 @@ def unused_push(frame):
 
 class Frames:
     """Bounded stock USB framing; no logging of opaque USB/DeviceQuery fields."""
-    def __init__(self, stream, clock=time.monotonic, *, event_callback=None):
+    def __init__(self, stream, clock=time.monotonic, *, event_callback=None, keep_login_pushes=False):
         self.stream, self.clock = stream, clock
         self.buffer = bytearray()
         self.pending = []
         self.ignored = {}
         self.unsolicited = {}
         self.event_callback = event_callback
+        self.keep_login_pushes = keep_login_pushes
 
     def observe_unused(self, frame):
         self.ignored[frame[0]] = self.ignored.get(frame[0], 0) + 1
@@ -495,7 +496,7 @@ class Frames:
                 return
             frame = bytes(self.buffer[3:3 + length])
             del self.buffer[:3 + length]
-            if unused_push(frame):
+            if unused_push(frame) and not (self.keep_login_pushes and frame[0] in (0x85, 0x86)):
                 self.observe_unused(frame)
                 continue
             if len(self.pending) >= PENDING_LIMIT:
@@ -504,6 +505,19 @@ class Frames:
                                          "incoming_length": len(frame), **self.backlog()})
                 raise Error("USB response backlog overflow")
             self.pending.append((self.clock(), frame))
+
+    def wait(self, expected, since, deadline):
+        """Receive a fresh USB reply without transmitting or clearing peers."""
+        while self.clock() < deadline:
+            for index, (timestamp, frame) in enumerate(self.pending):
+                if frame[0] in expected:
+                    self.pending.pop(index)
+                    if timestamp >= since:
+                        return frame
+                    break
+            else:
+                self.poll(min(0.1, deadline - self.clock()))
+        raise NoUsbResponse("USB asynchronous response deadline")
 
     def poll(self, timeout):
         self.stream.timeout = max(0, timeout)
@@ -1390,6 +1404,68 @@ class BackgroundCampaign:
                   total=wire.candidate.total, tx_evidence="aggregate-counters",
                   initial_block_transmissions=self.initial_sent, repair_block_transmissions=self.repair_sent)
 
+    def upload_partial(self, blocks, *, restart_receipts=None):
+        """Explicit new BEGIN pair and bounded prefix; never repair or COMMIT.
+
+        This deliberate stop is not cancellation and does not abort receivers.
+        Attempt callbacks persist both contexts before the first data block.
+        """
+        if type(blocks) is not int or not 1 <= blocks <= 32 or blocks >= self.transport.candidate.total:
+            raise Error("partial pair requires 1..32 blocks, fewer than the whole image")
+        if any(target.generation is not None for target in self.targets) or self.initial_sent:
+            raise Error("partial pair requires a fresh explicitly selected campaign")
+        if restart_receipts is not None:
+            validate_partial_restart([target.binding for target in self.targets], self.transport.candidate,
+                                     restart_receipts)
+            for target, old in zip(self.targets, restart_receipts):
+                target.binding.permit_reupload(None, True)
+                target.reupload_generation = old["generation"] + 1
+                target.reupload_enabled = True
+        current = 0
+        try:
+            if restart_receipts is not None:
+                self.stage = "restart-aborted-preflight"
+                for current, target in enumerate(self.targets):
+                    report = target.authorize(retries=1)
+                    if report["lifecycle"] != 9 or not target.pending_reupload:
+                        raise Error("explicit restart requires BOTH prior durable ABORTED generations; no resume fallback")
+                self.stage = "restart-signed-reupload"
+                for current, (target, old) in enumerate(zip(self.targets, restart_receipts)):
+                    target.activate_prepared()
+                    if (target.generation != old["generation"] + 2
+                            or target.begin_nonce.hex() == old["begin_nonce"]):
+                        raise Error("explicit restart did not create its exact new generation/fresh nonce")
+            else:
+                for current, target in enumerate(self.targets):
+                    report = target.authorize(retries=1)
+                    while report["lifecycle"] == 2:
+                        report = target.census()
+                    if report["received"] != 0 or report["lifecycle"] != 3:
+                        raise Error("partial new attempt requires empty Receiving candidates; use strict resume separately")
+            self.stage = "partial-shared-flood"
+            current = None
+            keys = [target.binding.target.hex() for target in self.targets]
+            for index in range(blocks):
+                self.send_block(index, initial=True, needed_by=keys)
+                if (index + 1) % self.transport.burst_blocks == 0 or index + 1 == blocks:
+                    for current, target in enumerate(self.targets):
+                        target.census()
+                    current = None
+            self.outcomes = [target.receipt("partial-observed-unsigned") for target in self.targets]
+            result = self.result("shared-partial-observed-unsigned", complete=True)
+            result.update(transfer_complete=False, commit_sent=False, receiver_abort_sent=False,
+                          requested_initial_blocks=blocks)
+            return result
+        except Cancelled as exc:
+            self.cancel(exc)
+            raise
+        except (Error, TimeoutError) as exc:
+            if current is None:
+                self.error = {"stage": self.stage, "reason": str(exc)}
+            else:
+                self.failed(current, exc)
+            return self.result("shared-campaign-incomplete")
+
     def upload(self, *, resume_receipts=None):
         current = 0
         try:
@@ -1572,6 +1648,87 @@ class BackgroundCampaign:
         complete = all(result["outcome"] == "native-installed-reported-unsigned" for result in self.outcomes)
         return self.result("shared-native-installed-reported-unsigned" if complete
                            else "shared-campaign-incomplete", complete=complete)
+
+
+def validate_partial_restart(bindings, candidate, receipts):
+    """Validate explicit NEW-attempt history, never reinterpret it as resume."""
+    if not isinstance(receipts, list) or len(receipts) != 2:
+        raise Error("restart needs both original attempt receipts, not a single-target guess")
+    for binding, receipt in zip(bindings, receipts):
+        if (not isinstance(receipt, dict) or receipt.get("schema") != ATTEMPT_RECEIPT_SCHEMA
+                or receipt.get("target_public_key") != binding.target.hex()
+                or receipt.get("sender_public_key") != binding.sender.hex()
+                or receipt.get("serial") != binding.serial
+                or receipt.get("manifest_hash") != candidate.digest.hex()
+                or receipt.get("counter") != candidate.counter
+                or receipt.get("image_sha256") != hashlib.sha256(candidate.image).hexdigest()
+                or type(receipt.get("generation")) is not int
+                or not 0 < receipt["generation"] <= 0xFFFFFFFD
+                or binding.min_generation != receipt["generation"] + 2
+                or binding.allow_reupload is not True
+                or binding.reupload_generation not in (None, receipt["generation"] + 1)
+                or receipt.get("mode") != "background"
+                or receipt.get("floor") != binding.floor
+                or any(receipt.get(key) != getattr(binding, key) for key in
+                       ("by_path", "id_path", "usb_vid", "usb_pid", "sender_name"))):
+            raise Error("new-attempt restart receipt identity/image/counter/generation guard mismatch")
+        nonce = receipt.get("begin_nonce")
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce) or not any(bytes.fromhex(nonce)):
+            raise Error("new-attempt restart needs an original nonzero BEGIN nonce")
+
+
+def partial_background_operation(stock, bindings, candidate, artifacts, blocks=16, timeout=1800, duty=0.02,
+                                 restart_receipts=None, *, clock=time.monotonic, event_callback=None):
+    """Persist bounded partial-pair results; no COMMIT, ABORT or resume fallback."""
+    BackgroundCampaign.validate_bindings(bindings, candidate)
+    if (type(blocks) is not int or not 1 <= blocks <= 32 or blocks >= candidate.total
+            or not math.isfinite(timeout) or not 0 < timeout <= 14400
+            or not math.isfinite(duty) or not 0 < duty <= 1):
+        raise Error("bounded partial blocks, finite timeout and duty required")
+    if restart_receipts is not None:
+        validate_partial_restart(bindings, candidate, restart_receipts)
+    campaign = result = None
+    try:
+        with radio_guard(stock, bindings[0], artifacts, mode="background") as profile:
+            def observed(receipt):
+                if restart_receipts is not None:
+                    previous = next(item for item in restart_receipts
+                                    if item["target_public_key"] == receipt["target_public_key"])
+                    if (receipt["generation"] != previous["generation"] + 2
+                            or receipt["begin_nonce"] == previous["begin_nonce"]):
+                        raise Error("restart did not create a distinct generation/nonce; no data permitted")
+                private_write(artifacts / ("attempt-" + receipt["target_public_key"] + ".json"), receipt)
+            campaign = BackgroundCampaign(stock, bindings, candidate, profile, clock() + timeout,
+                                          duty, clock=clock, sleep=stock.sleep,
+                                          event_callback=event_callback, attempt_callback=observed)
+            result = campaign.upload_partial(blocks, restart_receipts=restart_receipts)
+            if result["operation_complete"]:
+                for target in campaign.targets:
+                    private_write(artifacts / ("checkpoint-" + target.binding.target.hex() + ".json"),
+                                  target.attempt_receipt(target.previous[0]))
+    except (Error, OSError, ValueError, TimeoutError) as exc:
+        failed_stage = "radio-cleanup" if result is not None else (campaign.stage if campaign else "identity")
+        if campaign is not None:
+            if isinstance(exc, Cancelled):
+                campaign.cancel(exc)
+            result = campaign.result("shared-partial-cancelled" if isinstance(exc, Cancelled)
+                                     else "shared-partial-incomplete")
+            if result["error"] is None:
+                result["error"] = {"stage": failed_stage, "reason": str(exc)}
+        else:
+            result = {"outcome": "shared-partial-incomplete", "error": str(exc),
+                      "operation_complete": False}
+        result.update(receiver_abort_sent=False, commit_sent=False, transfer_complete=False)
+        cleanup_path = artifacts / "radio-cleanup-failed.json"
+        result["radio_cleanup"] = (private_read(cleanup_path) if cleanup_path.exists()
+                                   else {"normal_profile_unchanged": (artifacts / "radio-unchanged.json").exists()})
+        private_write(artifacts / "result.json", result)
+        raise
+    result.update(restart_selected=restart_receipts is not None, receiver_abort_sent=False,
+                  commit_sent=False, transfer_complete=False)
+    result["radio_cleanup"] = {"normal_profile_unchanged": True, "readback_available": True}
+    private_write(artifacts / "result.json", result)
+    return result
 
 
 @contextmanager

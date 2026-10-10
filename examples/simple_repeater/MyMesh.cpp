@@ -8,6 +8,7 @@
 
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaBoardBackendCommon.h>
+#include <helpers/ota/OtaInspection.h>
 #include <helpers/ota/OtaWriteGate.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
 #include <helpers/radiolib/RadioDriverHealthLatch.h>
@@ -767,7 +768,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     } else {
       MESH_DEBUG_PRINTLN("onPeerDataRecv: possible replay attack detected");
     }
-  } else if (type == PAYLOAD_TYPE_TXT_MSG && len > 5 && client->isAdmin()) { // a CLI command
+  } else if (CommonCLI::isAdminTextCommand(type, len, *client)) { // a CLI command
     uint32_t sender_timestamp;
     memcpy(&sender_timestamp, data, 4); // timestamp (by sender's RTC clock - which could be wrong)
     uint8_t flags = (data[4] >> 2);        // message attempt number, and other flags
@@ -804,7 +805,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
       if (is_retry) {
         *reply = 0;
       } else {
-        handleCommand(sender_timestamp, command, reply);
+        handleCommand(sender_timestamp, command, reply, false, client->id.pub_key);
       }
       int text_len = strlen(reply);
       if (text_len > 0) {
@@ -1154,9 +1155,26 @@ void MyMesh::rollbackFirmwareOta() {
 void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
   auto& integration = getOtaIntegration();
   const auto boot = integration.bootLifecycle();
-  const auto view = integration.readback(boot);
+  const auto view = integration.inspectReadback(boot);
+  if (view.snapshot.storageUnavailable) {
+    snprintf(reply, reply_size, "Err - candidate storage unavailable");
+    return;
+  }
   mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
-                                         view.phase, view.snapshot.counter);
+      view.emptyStore && !view.snapshot.valid ? mesh::ota::usb::UsbOtaPhase::Idle : view.phase,
+      view.snapshot.counter, view.snapshot.valid);
+}
+
+void MyMesh::formatFirmwareOtaInspection(const char* command, char* reply, size_t reply_size) {
+  auto& integration = getOtaIntegration();
+  if (strcmp(command, "settings") == 0) {
+    mesh::ota::formatOtaSettings(reply, reply_size, integration);
+    return;
+  }
+  const auto boot = integration.bootLifecycle();
+  const auto view = integration.inspectReadback(boot);
+  if (strcmp(command, "progress") == 0) mesh::ota::formatOtaProgress(reply, reply_size, view);
+  else mesh::ota::formatOtaCandidate(reply, reply_size, view);
 }
 #endif
 
@@ -1416,8 +1434,10 @@ bool MyMesh::uf2RebootAllowed() {
 }
 #endif
 
-void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply, bool local_usb) {
+void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply, bool local_usb,
+                          const uint8_t* authenticated_admin) {
   (void)local_usb;
+  (void)authenticated_admin;
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1545,6 +1565,9 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     while (*sub == ' ') sub++;
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
+    } else if (strcmp(sub, "progress") == 0 || strcmp(sub, "candidate") == 0 ||
+               strcmp(sub, "settings") == 0) {
+      formatFirmwareOtaInspection(sub, reply, 160);
     } else if (strcmp(sub, "radio") == 0) {
       if (sender_timestamp != 0 || !local_usb) {
         strcpy(reply, "Err - local USB only");
@@ -1595,9 +1618,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
       mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
           strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
-    } else if (strcmp(sub, "abort") == 0) {
-      abortFirmwareOta();
-      strcpy(reply, "OK");
+    } else if (strncmp(sub, "abort", 5) == 0) {
+      const auto result = mesh::ota::handleOtaAdminAbortCommand(getOtaIntegration(), authenticated_admin, sub);
+      using Result = mesh::ota::usb::UsbOtaResult;
+      if (result == Result::Ok) {
+        abortFirmwareOta();
+      }
+      mesh::ota::formatOtaAdminAbortResult(reply, 160, result);
     } else if (strcmp(sub, "rollback") == 0) {
       rollbackFirmwareOta();
       strcpy(reply, "OK");
@@ -1606,7 +1633,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else if (memcmp(sub, "duty ", 5) == 0) {
       if (setFirmwareOtaDutyCycle((float)atof(sub + 5))) strcpy(reply, "OK"); else strcpy(reply, "Err - bad duty");
     } else {
-      strcpy(reply, "Err - usage: ota status|radio|service|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
+      strcpy(reply, "Err - usage: ota status|progress|candidate|settings|radio|service|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
     }
 #endif
   } else{

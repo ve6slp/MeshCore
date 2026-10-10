@@ -90,6 +90,13 @@ multicast-channel mechanism. Software coverage alone does not qualify hardware
 or installer role migration; the completed two-target bench observations are
 recorded separately below.
 
+`make test-ota-management` covers the identity-bound stock remote-management
+transport and bounded partial background lifecycle helpers; it is also included
+in `test-ota-host`. Remote progress/candidate formatting distinguishes active
+candidate evidence from confirmed boot evidence, and reports unavailable
+storage explicitly within the existing 160-byte CLI reply bound. These are
+ordinary encrypted admin commands, not a new OTA trust or local-owner bypass.
+
 `test-ota-disabled` (environment `native_lora_ota_disabled`) compiles the real
 `Mesh`, `Dispatcher`, `Packet` and `StaticPoolPacketManager` with
 `MESHCORE_LORA_OTA=0` and checks that ordinary routing, priorities, airtime

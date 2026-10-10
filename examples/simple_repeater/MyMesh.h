@@ -323,7 +323,8 @@ public:
   void saveIdentity(const mesh::LocalIdentity& new_id) override;
   void clearStats() override;
 
-  void handleCommand(uint32_t sender_timestamp, char* command, char* reply, bool local_usb = false);
+  void handleCommand(uint32_t sender_timestamp, char* command, char* reply, bool local_usb = false,
+                     const uint8_t* authenticated_admin = nullptr);
   void loop();
 
 #if MESHCORE_LORA_OTA
@@ -335,6 +336,12 @@ public:
   // handleCommand() is ever invoked). No new admin/auth mechanism.
   bool setFirmwareOtaMode(const char* mode);
   bool setFirmwareOtaDutyCycle(float percent);
+  bool setOtaMode(const char* mode) override { return setFirmwareOtaMode(mode); }
+  const char* getOtaMode() override {
+    return mesh::ota::firmwareOtaModeName(getOtaIntegration().mode());
+  }
+  bool setOtaDutyCycle(float percent) override { return setFirmwareOtaDutyCycle(percent); }
+  float getOtaDutyCycle() override { return getOtaIntegration().dutyCyclePercent(); }
   void abortFirmwareOta();
   void rollbackFirmwareOta();
 #if MESHCORE_LORA_OTA
@@ -345,6 +352,7 @@ public:
                                     ::ota::storage::OtaCandidateStore::Snapshot& out);
 #endif
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
+  void formatFirmwareOtaInspection(const char* command, char* reply, size_t reply_size);
   bool isOtaAdminKey(const uint8_t key[32]) const;
   static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #endif

@@ -209,6 +209,100 @@ make ota-device-inspect OTA_DEVICE_PORT="$CLIENT_PORT" OTA_DEVICE_DTR=1
 Ports are exclusively locked and opened at 115200, with RTS false and DTR selected
 **before** opening. These tools never use a 1200-baud reset.
 
+## Inspect a receiver through remote management
+
+An OTA-enabled repeater exposes these read-only commands through its existing
+encrypted, administrator-authorized management CLI:
+
+| Command | Inspection |
+|---|---|
+| `ota status` | Boot confirmation, lifecycle, confirmed floor, candidate counter and verified running-image hash |
+| `ota progress` | Candidate source, phase, received/total/missing blocks, image bytes and block size |
+| `ota candidate` | Candidate source, phase, counter, generation and candidate image hash |
+| `ota settings` | Current OTA mode and duty limit, including zero when transmission is disabled |
+
+Candidate source is `receiver`, `boot` or `cache`. Authoritative empty storage
+reports `candidate=none phase=idle`; unreadable or corrupt state returns an
+explicit error, not idle or zero progress. Missing boot/candidate evidence is
+reported as unknown. A newer partial candidate can coexist with an older
+confirmed running image: inspect both progress/candidate and status rather
+than treating the candidate counter as an installed counter.
+
+The stock-companion host exposes the same inspection over RF:
+
+```sh
+make ota-management OTA_MANAGEMENT_ARGS="progress --by-id '$CLIENT_PORT' \
+  --serial '$SENDER_SERIAL' --sender-key '$SENDER_PUBLIC_KEY' \
+  --sender-name '$SENDER_NAME' --target '$TARGET_PUBLIC_KEY' \
+  --target-name '$TARGET_NAME' --binding '$BINDING' \
+  --artifacts '$NEW_ARTIFACT_DIR'"
+```
+
+Replace `progress` with `status`, `candidate` or `settings` for the other
+readbacks. Keep required physical USB anchors in the arguments. Every operation
+uses a new artifact directory and leaves radio, contacts and permissions
+unchanged.
+
+The receiver must already authorize the actual companion identity as a remote
+administrator, and the companion must already have the exact receiver contact
+with matching key, repeater type and public name. Blank login uses that existing
+ACL; this tool does not provision permissions or use a password that might
+modify them. The companion contact's incoming remote-CLI flag is not needed
+for outgoing management queries. `--target-name` selects the companion's stored
+contact label, which can differ from the receiver's current advertised name;
+it does not rename either endpoint.
+
+The companion performs normal pairwise encryption/decryption and checks the
+MeshCore two-byte MAC. The host checks unique contact prefixes, current admin
+login and fresh remote timestamps, but USB does not expose an independently
+verifiable RF MAC or cryptographic request nonce. Results therefore retain
+`host_mac_verified:false`, `cryptographic_request_correlation:false`,
+`status_authenticated:false` and `installation_confirmed:false`. Remote
+management evidence is distinct from the unsigned OTA census and from local
+USB installation verification.
+
+### Abort a selected candidate and deliberately restart
+
+Remote abort is a durable administrator operation, not a host pause. Inspect
+the candidate first, then send:
+
+```text
+ota abort <generation> <counter> <lowercase-64hex-image-hash>
+```
+
+The receiver compares that exact context immediately before mutation. A
+replacement attempt, malformed command or missing context is refused without
+aborting it. The stock host sends the guarded form and verifies the resulting
+state:
+
+```sh
+make ota-management OTA_MANAGEMENT_ARGS="abort --by-id '$CLIENT_PORT' \
+  --serial '$SENDER_SERIAL' --sender-key '$SENDER_PUBLIC_KEY' \
+  --sender-name '$SENDER_NAME' --target '$TARGET_PUBLIC_KEY' \
+  --target-name '$TARGET_NAME' --binding '$BINDING' \
+  --expect-generation '$GENERATION' --expect-counter '$COUNTER' \
+  --expect-image '$CANDIDATE_IMAGE_SHA256' --artifacts '$NEW_ARTIFACT_DIR'"
+```
+
+Receiving, Verifying or READY candidates become durably Aborted, advancing
+generation once while preserving the confirmed image/floor and the candidate's
+counter, image and counts. `OK - OTA aborted` means that operation completed;
+a repeated abort must select the current Aborted generation and does not
+advance it or rewrite the journal again. Committed/uncertain commit, Trial,
+Installed, local cache, unavailable storage and exhausted generation states
+are refused. Existing host cancellation and transport-stop APIs remain
+separate and do not claim a receiver abort.
+
+Restarting the same counter after abort requires explicit existing signed,
+target-bound REUPLOAD authorization before a new BEGIN. It is not strict
+resume: the new attempt has the original generation plus two, a fresh BEGIN
+nonce and zero received blocks. Plain captured BEGINs and blocks cannot
+revive an Aborted attempt; old COMMIT, ABORT, REUPLOAD and resume contexts
+cannot act on its replacement. After deliberately authorizing the restart,
+identical-image signed blocks remain valid immutable content because block
+signatures do not bind an attempt generation/nonce. Do not claim those
+content-identical blocks are distinguishable from newly sent blocks.
+
 ### Passive repeater radio-fault readback
 
 On an OTA-enabled repeater's physical USB CLI, run `ota radio`. Both local USB

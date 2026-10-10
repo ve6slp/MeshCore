@@ -405,6 +405,7 @@ public:
     OtaLeanReceiver::Status snapshot;
     usb::UsbOtaPhase phase = usb::UsbOtaPhase::Unknown;
     bool bootCandidate = false;
+    bool emptyStore = false;
   };
 
   Readback readback() const {
@@ -412,20 +413,39 @@ public:
   }
 
   Readback readback(const OtaBootLifecycleEvidence& boot, const uint8_t* manifest_hash = nullptr) const {
+    return readbackWithStatus(boot, manifest_hash, lean_.status());
+  }
+
+  Readback inspectReadback(const OtaBootLifecycleEvidence& boot) const {
+    return readbackWithStatus(boot, nullptr, lean_.inspectStatus());
+  }
+
+private:
+  Readback readbackWithStatus(const OtaBootLifecycleEvidence& boot, const uint8_t* manifest_hash,
+                              const OtaLeanReceiver::Status& st) const {
     using Phase = ::ota::storage::OtaCandidateStore::Phase;
     Readback out;
-    const auto st = lean_.status();
+    if (st.storageUnavailable) {
+      out.snapshot.storageUnavailable = true;
+      return out;
+    }
+    out.emptyStore = lean_.hasStore() && !st.valid;
     if (st.valid && (!manifest_hash || !std::memcmp(manifest_hash, st.manifestHash, 32))) {
       out.snapshot = st;
       out.phase = phaseForCandidate(st, boot);
       const bool superseded = boot.phase == usb::UsbOtaPhase::Installed && boot.imageVerified &&
                               boot.floorKnown && boot.confirmedFloor >= st.counter;
       if (st.localCache || st.counter > boot.counter ||
-          ((st.phase == Phase::Receiving || st.phase == Phase::Verifying || st.phase == Phase::Ready) &&
+          ((st.phase == Phase::Receiving || st.phase == Phase::Verifying || st.phase == Phase::Ready ||
+            st.phase == Phase::Aborted) &&
            !superseded) ||
           (boot.transactionNonce && boot.transactionNonce == st.transactionNonce &&
            boot.counter == st.counter && !std::memcmp(boot.imageHash, st.imageHash, 32) &&
            out.phase == boot.phase)) return out;
+      if (superseded && (st.phase == Phase::Receiving || st.phase == Phase::Verifying || st.phase == Phase::Ready)) {
+        out.snapshot = OtaLeanReceiver::Status();
+        out.phase = usb::UsbOtaPhase::Unknown;
+      }
     }
     ::ota::storage::OtaCandidateStore::Snapshot candidate;
     if (boot_candidate_ && boot_candidate_(boot_ctx_, boot, candidate) &&
@@ -439,6 +459,26 @@ public:
     }
     return out;
   }
+
+public:
+  usb::UsbOtaResult abortAuthenticatedAdminCommand(const uint8_t admin_public_key[32],
+      uint32_t generation, uint32_t counter, const uint8_t image_hash[32]) {
+    if (!lean_.currentAdmin(admin_public_key)) return usb::UsbOtaResult::Denied;
+    const auto boot = bootLifecycle();
+    const auto view = inspectReadback(boot);
+    if (view.snapshot.storageUnavailable) return usb::UsbOtaResult::Unavailable;
+    if (!view.snapshot.valid) return view.emptyStore ? usb::UsbOtaResult::Mismatch : usb::UsbOtaResult::Unavailable;
+    if (view.bootCandidate || boot.phase == usb::UsbOtaPhase::Trial ||
+        view.phase == usb::UsbOtaPhase::Trial || view.phase == usb::UsbOtaPhase::Installed)
+      return usb::UsbOtaResult::TooLate;
+    const auto result = lean_.abortAuthenticatedAdmin(admin_public_key, generation, counter, image_hash);
+    if (result == usb::UsbOtaResult::Ok) {
+      commit_reboot_pending_ = false;
+      stopDirect();
+    }
+    return result;
+  }
+
   void fillUsbReadback(usb::UsbOtaReply& reply) const {
     reply.wireVersion = usb::kOtaWireVersion;
     if (lean_.storageUnavailable()) {

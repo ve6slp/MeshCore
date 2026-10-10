@@ -44,6 +44,7 @@ OTA_STOCK_RELAY_KEY ?=
 OTA_STOCK_PATH_HASH_BYTES ?= 1
 OTA_STOCK_RESUME_RECEIPT ?=
 OTA_STOCK_ARGS ?=
+OTA_MANAGEMENT_ARGS ?=
 OTA_DEVICE_PORT ?= $(OTA_DEPLOY_CLIENT_PORT)
 OTA_DEVICE_DTR ?= $(OTA_DEPLOY_CLIENT_DTR)
 OTA_DEVICE_TIMEOUT ?= 5
@@ -74,7 +75,7 @@ XIAO_OTA_TEST_ROLE_ID ?= $(if $(strip $(XIAO_OTA_ROLE_ID)),$(XIAO_OTA_ROLE_ID),0
 XIAO_OTA_UPSTREAM ?= $(XIAO_OTA_VENDOR)
 OTA_NRF_REMOTE_BOOT_PROOF_PREFIX ?=
 
-.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-ota-deploy test-ota-stock-companion build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
+.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-ota-deploy test-ota-stock-companion test-ota-management build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion ota-management build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
 
 build: tmpdir
 	@test -n "$(strip $(ENV))" || { echo 'Select one firmware environment with ENV=... .' >&2; exit 1; }
@@ -96,6 +97,8 @@ test-ota-deploy: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_deploy.py'
 test-ota-stock-companion: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_stock_companion.py'
+test-ota-management: tmpdir
+	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_management.py'
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
 # Real Mesh/Dispatcher/PacketManager behaviour with MESHCORE_LORA_OTA=0 (ordinary firmware is unchanged).
@@ -126,6 +129,8 @@ ota-device-inspect:
 	$(PYTHON) scripts/ota_devices.py inspect --by-id "$(OTA_DEVICE_PORT)" --timeout "$(OTA_DEVICE_TIMEOUT)" $(if $(filter 1,$(OTA_DEVICE_DTR)),--dtr)
 ota-stock-companion:
 	$(PYTHON) scripts/ota_stock_companion.py $(OTA_STOCK_ARGS)
+ota-management:
+	$(PYTHON) scripts/ota_management.py $(OTA_MANAGEMENT_ARGS)
 
 # One selected board/role/image/counter: stage -> READY -> signed COMMIT -> matching Installed.
 ota-deploy: tmpdir

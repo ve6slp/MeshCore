@@ -337,6 +337,10 @@ class CommonCLI {
   void handleSetCmd(uint32_t sender_timestamp, char* command, char* reply);
 
 public:
+  static bool isAdminTextCommand(uint8_t type, size_t len, const ClientInfo& client) {
+    return type == PAYLOAD_TYPE_TXT_MSG && len > 5 && client.isAdmin();
+  }
+
   CommonCLI(mesh::MainBoard& board, mesh::RTCClock& rtc, SensorManager& sensors, RegionMap& region_map, ClientACL& acl, NodePrefs* prefs, CommonCLICallbacks* callbacks)
       : _board(&board), _rtc(&rtc), _sensors(&sensors), _region_map(&region_map), _acl(&acl), _prefs(prefs), _callbacks(callbacks) { }
 
