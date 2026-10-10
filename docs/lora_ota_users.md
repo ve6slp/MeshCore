@@ -239,9 +239,11 @@ make ota-management OTA_MANAGEMENT_ARGS="progress --by-id '$CLIENT_PORT' \
 ```
 
 Replace `progress` with `status`, `candidate` or `settings` for the other
-readbacks. Keep required physical USB anchors in the arguments. Every operation
-uses a new artifact directory and leaves radio, contacts and permissions
-unchanged.
+readbacks, or `inspect` to collect all four through one administrator login.
+Combined inspection records each observation separately; it is not an atomic
+snapshot across commands. Keep required physical USB anchors in the arguments.
+Every operation uses a new artifact directory and leaves radio, contacts,
+permissions and clocks unchanged.
 
 The receiver must already authorize the actual companion identity as a remote
 administrator, and the companion must already have the exact receiver contact
@@ -251,6 +253,13 @@ modify them. The companion contact's incoming remote-CLI flag is not needed
 for outgoing management queries. `--target-name` selects the companion's stored
 contact label, which can differ from the receiver's current advertised name;
 it does not rename either endpoint.
+
+On Linux the stock UART opener disables hangup-on-close and applies DTR/RTS
+together without toggling reset lines. Unsupported modem-control handling is an
+explicit error, not permission to fall back to a resetting open. Remote
+timestamps must remain within the configured freshness bound; a stale bench
+clock requires separate, explicit correction rather than an automatic reset or
+clock change by the management tool.
 
 The companion performs normal pairwise encryption/decryption and checks the
 MeshCore two-byte MAC. The host checks unique contact prefixes, current admin

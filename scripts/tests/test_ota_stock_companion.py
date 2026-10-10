@@ -4,6 +4,7 @@ import io
 from collections import Counter
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
+import errno
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import stat
 import struct
 import subprocess
 import sys
+import termios
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -611,6 +613,26 @@ class PathBindingTests(Scratch):
                                         write_timeout=2.0, exclusive=True)
         self.assertEqual(events, ["open", 2.0, "close"])
 
+    def test_default_adapter_uses_quiet_factory_with_existing_binding_and_cleanup_checks(self):
+        selected = ota.PortSelection(Path(STOCK_PATH), STOCK_TTY, os.makedev(188, 1),
+                                     Path("/synthetic/usb"), STOCK_ID_PATH)
+        stream = SimpleNamespace(port=None, dtr=True, rts=True, open=Mock(), close=Mock(),
+                                 fileno=lambda: 12345)
+        with patch.object(ota, "quiet_serial_factory", return_value=stream) as factory, \
+                patch.object(ota, "resolve_stock", return_value=selected) as resolve, \
+                patch.object(ota.os, "fstat", return_value=SimpleNamespace(
+                    st_mode=stat.S_IFCHR, st_rdev=selected.device_id)), \
+                patch.object(ota.fcntl, "flock") as flock:
+            with ota.validated_stock_uart(BINDING, STOCK_ID, sleep=lambda seconds: None) as uart:
+                self.assertIs(uart, stream)
+                self.assertEqual((stream.port, stream.dtr, stream.rts), (STOCK_PATH, False, False))
+            self.assertEqual(resolve.call_count, 3)
+            flock.assert_called_once_with(12345, ota.fcntl.LOCK_EX | ota.fcntl.LOCK_NB)
+        factory.assert_called_once_with(port=None, baudrate=115200, timeout=0.1,
+                                        write_timeout=2.0, exclusive=True)
+        stream.open.assert_called_once()
+        stream.close.assert_called_once()
+
     def test_stock_nrf_dtr_is_selected_before_open_without_reset_or_rts(self):
         selected = ota.PortSelection(Path(STOCK_PATH), STOCK_TTY, os.makedev(188, 1),
                                      Path("/synthetic/usb"), STOCK_ID_PATH)
@@ -707,6 +729,165 @@ class PathBindingTests(Scratch):
                 ota.main(argv)
             self.assertFalse(any(command[0] in (11, 33, 34, 35, 65) for command in stream.commands))
             self.assertFalse(list(directory.iterdir()))
+
+
+class QuietSerialTests(unittest.TestCase):
+    @contextmanager
+    def driver(self, *, ioctl_error=None, ignore_set=False, ignore_hupcl=False):
+        mask = termios.TIOCM_DTR | termios.TIOCM_RTS
+        state = {"lines": 0, "cflag": termios.HUPCL | termios.CS8 | termios.CLOCAL | termios.CREAD,
+                 "resets": 0, "history": [], "ioctls": [], "closed": 0, "clock": 1800000000}
+
+        def lines(value):
+            state["lines"] = value
+            state["history"].append(value & mask)
+            if value & mask == termios.TIOCM_RTS:
+                state["resets"] += 1
+                state["clock"] = 1715770351
+
+        class PosixSerial:
+            def __init__(self, **options):
+                self.fd = None
+                self._dtr_state = self._rts_state = True
+                self.options = options
+
+            @property
+            def dtr(self):
+                return self._dtr_state
+
+            @dtr.setter
+            def dtr(self, value):
+                self._dtr_state = value
+
+            @property
+            def rts(self):
+                return self._rts_state
+
+            @rts.setter
+            def rts(self, value):
+                self._rts_state = value
+
+            def _reconfigure_port(self, force_update=False):
+                pass
+
+            def open(self):
+                self.fd = 12345
+                lines(mask | termios.TIOCM_CTS)
+                try:
+                    self._reconfigure_port(True)
+                    self._update_dtr_state()
+                    self._update_rts_state()
+                except BaseException:
+                    self.close()
+                    raise
+
+            def close(self):
+                if state["cflag"] & termios.HUPCL:
+                    lines(state["lines"] & ~mask)
+                state["closed"] += 1
+                self.fd = None
+
+            def _update_dtr_state(self):
+                value = state["lines"] & ~termios.TIOCM_DTR
+                lines(value | (termios.TIOCM_DTR if self._dtr_state else 0))
+
+            def _update_rts_state(self):
+                value = state["lines"] & ~termios.TIOCM_RTS
+                lines(value | (termios.TIOCM_RTS if self._rts_state else 0))
+
+        def ioctl(fd, operation, data):
+            self.assertEqual(fd, 12345)
+            state["ioctls"].append(operation)
+            if ioctl_error:
+                raise OSError(ioctl_error, "synthetic modem control unavailable")
+            if operation == termios.TIOCMGET:
+                return struct.pack("i", state["lines"])
+            self.assertEqual(operation, termios.TIOCMSET)
+            if not ignore_set:
+                lines(struct.unpack("i", data)[0])
+            return 0
+
+        def attributes(fd):
+            self.assertEqual(fd, 12345)
+            return [0, 0, state["cflag"], 0, termios.B115200, termios.B115200, []]
+
+        def set_attributes(fd, mode, values):
+            self.assertEqual((fd, mode), (12345, termios.TCSANOW))
+            self.assertEqual(values[:2], [0, 0])
+            self.assertEqual(values[3:], [0, termios.B115200, termios.B115200, []])
+            if not ignore_hupcl:
+                state["cflag"] = values[2]
+
+        posix = SimpleNamespace(Serial=PosixSerial)
+        with patch.dict(sys.modules, {"serial": SimpleNamespace(serialposix=posix), "serial.serialposix": posix}), \
+                patch.object(ota.fcntl, "ioctl", side_effect=ioctl), \
+                patch.object(termios, "tcgetattr", side_effect=attributes), \
+                patch.object(termios, "tcsetattr", side_effect=set_attributes):
+            yield state, PosixSerial
+
+    def test_regression_separate_pyserial_updates_reset_esp_even_when_both_selected_false(self):
+        with self.driver() as (state, legacy):
+            stream = legacy(port=None)
+            stream.dtr = stream.rts = False
+            stream.open()
+            self.assertEqual(state["resets"], 1)
+            self.assertEqual(state["clock"], 1715770351)
+
+    def test_combined_linux_updates_preserve_clock_across_repeated_opens_and_disable_hangup(self):
+        with self.driver() as (state, _):
+            original = state["cflag"]
+            for _ in range(3):
+                stream = ota.quiet_serial_factory(port=None, baudrate=115200, exclusive=True)
+                stream.dtr = stream.rts = False
+                stream.open()
+                self.assertEqual(state["lines"] & (termios.TIOCM_DTR | termios.TIOCM_RTS), 0)
+                self.assertTrue(state["lines"] & termios.TIOCM_CTS)
+                self.assertEqual(state["cflag"], original & ~termios.HUPCL)
+                stream.close()
+            self.assertEqual(state["resets"], 0)
+            self.assertEqual(state["clock"], 1800000000)
+            self.assertNotIn(termios.TIOCM_RTS, state["history"])
+            self.assertEqual(set(state["ioctls"]), {termios.TIOCMGET, termios.TIOCMSET})
+
+    def test_explicit_nrf_dtr_preserved_without_rts_or_sequential_intermediate(self):
+        with self.driver() as (state, _):
+            stream = ota.quiet_serial_factory(port=None)
+            stream.dtr, stream.rts = True, False
+            stream.open()
+            stream.close()
+            self.assertEqual(state["lines"] & (termios.TIOCM_DTR | termios.TIOCM_RTS), termios.TIOCM_DTR)
+            self.assertEqual(state["resets"], 0)
+            self.assertNotIn(termios.TIOCM_RTS, state["history"])
+
+    def test_modem_ioctl_unsupported_errors_fail_closed_instead_of_pyserial_ignore(self):
+        for error in (errno.ENOTTY, errno.EINVAL, errno.EIO):
+            with self.subTest(error=error), self.driver(ioctl_error=error) as (state, _):
+                stream = ota.quiet_serial_factory(port=None)
+                stream.dtr = stream.rts = False
+                with self.assertRaisesRegex(ota.Error, "no sequential fallback"):
+                    stream.open()
+                self.assertIsNone(stream.fd)
+                self.assertEqual(state["closed"], 1)
+                self.assertEqual(state["ioctls"], [termios.TIOCMGET])
+
+    def test_modem_and_hupcl_readback_mismatch_fail_closed(self):
+        with self.driver(ignore_set=True) as (state, _):
+            stream = ota.quiet_serial_factory(port=None)
+            stream.dtr = stream.rts = False
+            with self.assertRaisesRegex(ota.Error, "modem-state readback mismatch"):
+                stream.open()
+            self.assertEqual(state["closed"], 1)
+        with self.driver(ignore_hupcl=True) as (state, _):
+            stream = ota.quiet_serial_factory(port=None)
+            with self.assertRaisesRegex(ota.Error, "HUPCL disable readback failed"):
+                stream.open()
+            self.assertEqual(state["closed"], 1)
+            self.assertEqual(state["ioctls"], [])
+
+    def test_non_linux_refused_without_reset_prone_fallback(self):
+        with patch.object(ota.sys, "platform", "unsupported"), \
+                self.assertRaisesRegex(ota.Error, "Linux combined modem control"):
+            ota.quiet_serial_factory(port=None)
 
 
 class ResumeTests(Scratch):

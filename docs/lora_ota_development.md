@@ -332,6 +332,47 @@ stock identity/profile/repeat/TX2 readbacks matched the required restored state.
 This establishes the exactly-two-installer stock shared-flood bench outcome,
 not larger fleets, native-host encrypted multicast or field-relay qualification.
 
+#### Remote lifecycle inspection bench — 2026-10-10
+
+The guarded-abort/inspection APP (512,852 bytes, SHA-256
+`9e89016adfd2f6fe791d995a1de1fbe43f48e08c7afeb99cd4e9bac7b8098c85`)
+was installed at counter 4 on both receivers through one shared initial flood:
+6,106 common block transmissions, zero repair transmissions, and matching
+unsigned Installed reports after 2,711.882 seconds. Independent local APP
+readbacks verified floor/counter 4, the exact running image, floor sequences
+3/5, and qualified state 1/phase 6. Both retained their identities, names,
+normal profile, TX2, mesh duties 2%/50%, original ACL entries and restored
+forwarding-on setting after ordinary APP reboots.
+
+The first encrypted management query failed closed on an out-of-window
+receiver timestamp, without sending abort or changing clocks. Explicit bench
+clock correction, after measuring the slow receiver clocks, enabled encrypted
+remote status on both targets. Subsequent repeated login attempts failed while
+waiting for receiver login responses, including one 300-second observation.
+Read-only stock inspection then found uptime two seconds, zero transmit
+counters and a reverted 2024 clock after reopening its UART, despite an earlier
+verified clock correction. Both selected contact routes were valid three-byte,
+zero-hop paths. A resetting sender can repeat login timestamps and trigger
+packet deduplication; routing changes are not established as a remedy.
+
+The corrected Linux stock UART opener applies DTR/RTS together and disables
+hangup-on-close. Hardware reopen inspection retained a current clock, uptime
+840 seconds and eight direct transmissions, rather than resetting. Combined
+encrypted inspection on target 41 returned status, progress, candidate and
+settings through one login. Target 3B then exposed the native RTC's one-second
+granularity: a fast reply was refused by the strict increasing-timestamp guard.
+Dispatch pacing now waits 2.01 monotonic seconds after each accepted login or
+reply, within existing deadlines. Two ticks are needed because the receiver's
+conditional timestamp adjustment can still collide after only one tick.
+Equal or older reply timestamps remain refused. A subsequent combined session
+returned all four inspection surfaces on both targets without clock mutation:
+confirmed floor/counter 4, candidate generations 2/4, 6,106 received and total
+blocks, zero missing, 512,852 bytes, block size 84, and fleet mode at 2% duty.
+
+Lifecycle abort/restart qualification remains outstanding at this stage; the
+installation and initial remote status records alone do not establish those
+operations.
+
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
 

@@ -37,7 +37,8 @@ Valid unsolicited stock pushes and OTA data/request echoes are counted with
 bounded metadata-only logging, not queued as replies. Census/lease replies
 remain pending. Cleanup readback failure is recorded, never assumed unchanged.
 Stable USB selection and flock prevent endpoint races/concurrent readers; normal
-115200 serial is opened with RTS false and caller-selected DTR before open.
+115200 serial uses one Linux modem-state update for RTS false/caller-selected DTR.
+HUPCL is disabled so close does not drop modem lines; no sequential fallback.
 """
 
 import argparse
@@ -1856,6 +1857,49 @@ def check_open_selection(stream, selection, current):
     if (selection != current or info.st_rdev != selection.device_id or not stat.S_ISCHR(info.st_mode)):
         raise Error("authorized physical USB binding changed during open; no radio/sign/RF writes")
 
+def quiet_serial_factory(*args, **options):
+    """Avoid pyserial's intermediate DTR-low/RTS-high ESP reset state."""
+    if sys.platform != "linux":
+        raise Error("quiet stock UART requires Linux combined modem control; no reset-prone fallback")
+    import serial.serialposix
+    import termios
+
+    class QuietSerial(serial.serialposix.Serial):
+        def _reconfigure_port(self, force_update=False):
+            super()._reconfigure_port(force_update)
+            attributes = termios.tcgetattr(self.fd)
+            if attributes[2] & termios.HUPCL:
+                attributes[2] &= ~termios.HUPCL
+                termios.tcsetattr(self.fd, termios.TCSANOW, attributes)
+                if termios.tcgetattr(self.fd)[2] & termios.HUPCL:
+                    raise Error("UART HUPCL disable readback failed; no reset-prone fallback")
+
+        def _update_modem_state(self):
+            mask = termios.TIOCM_DTR | termios.TIOCM_RTS
+            try:
+                current = struct.unpack("i", fcntl.ioctl(self.fd, termios.TIOCMGET, struct.pack("i", 0)))[0]
+                requested = ((termios.TIOCM_DTR if self._dtr_state else 0)
+                             | (termios.TIOCM_RTS if self._rts_state else 0))
+                desired = (current & ~mask) | requested
+                if desired != current:
+                    fcntl.ioctl(self.fd, termios.TIOCMSET, struct.pack("i", desired))
+                actual = struct.unpack("i", fcntl.ioctl(self.fd, termios.TIOCMGET, struct.pack("i", 0)))[0]
+                if actual & mask != requested:
+                    raise Error("combined UART modem-state readback mismatch; no sequential fallback")
+            except OSError as exc:
+                # pyserial ignores ENOTTY/EINVAL modem errors in open().
+                # Convert them so lack of quiet-control support fails closed.
+                raise Error("combined UART modem control unavailable; no sequential fallback") from exc
+
+        def _update_dtr_state(self):
+            self._update_modem_state()
+
+        def _update_rts_state(self):
+            self._update_modem_state()
+
+    return QuietSerial(*args, **options)
+
+
 @contextmanager
 def validated_stock_uart(binding, by_id, serial_factory=None, sleep=time.sleep, *, dtr=False):
     """Physical-bound quiet UART, not protocol verification or RF readiness."""
@@ -1864,8 +1908,7 @@ def validated_stock_uart(binding, by_id, serial_factory=None, sleep=time.sleep, 
                              usb_vid=binding.usb_vid, usb_pid=binding.usb_pid)
     selected = resolve()
     if serial_factory is None:
-        import serial
-        serial_factory = serial.Serial
+        serial_factory = quiet_serial_factory
     stream = serial_factory(port=None, baudrate=115200, timeout=0.1,
                             write_timeout=2.0, exclusive=True)
     stream.dtr = dtr

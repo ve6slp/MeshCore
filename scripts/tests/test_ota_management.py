@@ -39,6 +39,7 @@ class ManagementSerial(FakeSerial):
     def __init__(self, clock):
         super().__init__(clock, candidate())
         self.contacts = [contact(), contact(TARGET2)]
+        self.target = TARGET
         self.mail = [message("PRIVATE-UNRELATED-MESSAGE", TARGET2)]
         self.login_response = b"\x85\x01" + TARGET[:6] + struct.pack("<I", NOW) + b"\x03\x02"
         self.remote_time = NOW
@@ -55,7 +56,9 @@ class ManagementSerial(FakeSerial):
         self.refuse_cmd = None
         self.cancel_cmd = None
         self.drop_cli = False
+        self.coarse_clock = False
         self.cli = []
+        self.cli_dispatch_times = []
 
     def text(self, command):
         if command.startswith("ota abort"):
@@ -103,22 +106,25 @@ class ManagementSerial(FakeSerial):
         elif cmd == 10:
             self.reply(self.mail.pop(0) if self.mail else b"\x0a")
         elif cmd == 26:
-            assert payload == b"\x1a" + TARGET
-            self.reply(b"\x06\x01" + TARGET[:4] + struct.pack("<I", 1000))
+            assert payload == b"\x1a" + self.target
+            self.reply(b"\x06\x01" + self.target[:4] + struct.pack("<I", 1000))
             if self.login_response is not None:
                 result = self.login_response
+                if self.coarse_clock:
+                    result = result[:8] + struct.pack("<I", NOW + int(self.clock())) + result[12:]
                 if self.login_mutator:
                     result = self.login_mutator(result)
                 self.schedule(0.1, lambda: self.reply(result))
         else:
-            assert payload[:13] == b"\x02\x01\x00" + bytes(4) + TARGET[:6]
+            assert payload[:13] == b"\x02\x01\x00" + bytes(4) + self.target[:6]
             command = payload[13:].decode()
             self.cli.append(command)
+            self.cli_dispatch_times.append(self.clock())
             self.reply(b"\x06\x01" + bytes(4) + struct.pack("<I", 1000))
-            self.remote_time += 1
+            self.remote_time = NOW + int(self.clock()) if self.coarse_clock else self.remote_time + 1
             if command.startswith("ota abort ") and self.before_abort:
                 self.before_abort(self)
-            result = message(self.text(command), timestamp=self.remote_time)
+            result = message(self.text(command), key=self.target, timestamp=self.remote_time)
             if self.cli_mutator:
                 result = self.cli_mutator(result)
             if not self.drop_cli:
@@ -188,6 +194,227 @@ def restart_setup():
 
 
 class ManagementTests(unittest.TestCase):
+    def test_without_tick_spacing_fast_coarse_login_and_first_reply_have_same_timestamp(self):
+        _, stream, manager = setup()
+        stream.coarse_clock = True
+        manager.login()
+        with patch.object(manager, "_wait_for_receiver_tick"), \
+                self.assertRaisesRegex(ota.Error, "stale/replayed"):
+            manager.query("status")
+        self.assertFalse(manager.session)
+
+    def test_two_peer_coarse_receiver_inspection_uses_one_stock_transport_and_one_login_per_peer(self):
+        _, stream, first = setup()
+        stream.coarse_clock = True
+        first.login()
+        results = [first.inspect()]
+        stream.target = TARGET2
+        stream.login_response = b"\x85\x01" + TARGET2[:6] + struct.pack("<I", NOW) + b"\x03\x02"
+        second = management.RemoteManagement(first.stock, replace(binding(), target=TARGET2), NAME, timeout=3,
+                                             wall_clock=first.wall_clock, max_skew=120)
+        second.login()
+        results.append(second.inspect())
+        self.assertIs(first.stock, second.stock)
+        self.assertEqual(sum(command[0] == 26 for command in stream.commands), 2)
+        self.assertEqual([result["target_public_key"] for result in results], [TARGET.hex(), TARGET2.hex()])
+        self.assertEqual(len(stream.cli), 8)
+        for result in results:
+            stamps = [value["remote_timestamp"] for value in result["observations"]]
+            self.assertEqual(len(stamps), 4)
+            self.assertTrue(all(new > old for old, new in zip(stamps, stamps[1:])))
+        self.assertFalse(any(command[0] in (5, 6) for command in stream.commands))
+
+    def test_fast_coarse_guarded_abort_and_repeat_preserve_selected_generation_truth(self):
+        _, stream, manager = setup()
+        stream.coarse_clock = stream.durable_abort = True
+        manager.login()
+        for generation in (10, 11):
+            result = manager.abort(generation, 5, stream.image_hash)
+            self.assertTrue(result["reply"]["durable_abort_confirmed"])
+            self.assertEqual(result["candidate_after"]["reply"]["generation"], "11")
+            self.assertEqual(result["expected_aborted_generation"], 11)
+        self.assertEqual(stream.abort_mutations, 1)
+        self.assertEqual(sum(command.startswith("ota abort ") for command in stream.cli), 2)
+
+    def native_reply_clock(self, stream):
+        native = {"last_unique": NOW, "last_sender": NOW}
+        def login(frame):
+            native["last_unique"] = NOW + int(stream.clock())
+            return frame[:8] + struct.pack("<I", native["last_unique"]) + frame[12:]
+        def reply(frame):
+            native["last_unique"] = max(NOW + int(stream.clock()), native["last_unique"] + 1)
+            native["last_sender"] = max(NOW + int(stream.clock() + 0.7), native["last_sender"] + 1)
+            stamp = native["last_unique"] + (native["last_unique"] == native["last_sender"])
+            return frame[:12] + struct.pack("<I", stamp) + frame[16:]
+        stream.login_mutator, stream.cli_mutator = login, reply
+
+    def test_one_tick_can_still_duplicate_native_unique_timestamp_plus_one_workaround(self):
+        _, stream, manager = setup()
+        self.native_reply_clock(stream)
+        manager.login()
+        with patch.object(management, "RECEIVER_RTC_TICK_SECONDS", 1.01), \
+                self.assertRaisesRegex(ota.Error, "stale/replayed"):
+            manager.inspect()
+        self.assertFalse(manager.session)
+        self.assertGreater(len(manager.observations), 0)
+
+    def test_two_ticks_cover_native_unique_timestamp_plus_one_without_padding_wire_timestamps(self):
+        _, stream, manager = setup()
+        self.native_reply_clock(stream)
+        manager.login()
+        result = manager.inspect()
+        self.assertEqual(len(result["observations"]), 4)
+        stamps = [value["remote_timestamp"] for value in result["observations"]]
+        self.assertTrue(all(new > old for old, new in zip(stamps, stamps[1:])))
+        for command in stream.commands:
+            if command[0] == 2:
+                self.assertEqual(command[3:7], bytes(4))
+        self.assertFalse(any(command[0] in (5, 6) for command in stream.commands))
+
+    def test_coarse_receiver_rtc_waits_after_login_and_every_fast_reply_without_clock_writes(self):
+        _, stream, manager = setup()
+        stream.coarse_clock = True
+        manager.login()
+        previous_timestamp = manager.last_timestamp
+        for operation in ("status", "progress", "candidate", "settings"):
+            received_at = manager.last_received_at
+            result = manager.query(operation)
+            self.assertGreaterEqual(stream.cli_dispatch_times[-1],
+                                    received_at + management.RECEIVER_RTC_TICK_SECONDS)
+            self.assertGreater(result["remote_timestamp"], previous_timestamp)
+            previous_timestamp = result["remote_timestamp"]
+        self.assertEqual(stream.cli, ["ota status", "ota progress", "ota candidate", "ota settings"])
+        self.assertEqual(sum(command[0] == 26 for command in stream.commands), 1)
+        self.assertFalse(any(command[0] in (5, 6) for command in stream.commands))
+        self.assertFalse(manager.abort_dispatched)
+
+    def test_coarse_receiver_rtc_aggregate_inspect_keeps_four_strictly_increasing_replies(self):
+        _, stream, manager = setup()
+        stream.coarse_clock = True
+        manager.login()
+        received_at = manager.last_received_at
+        result = manager.inspect()
+        stamps = [value["remote_timestamp"] for value in result["observations"]]
+        self.assertEqual(len(stamps), 4)
+        self.assertTrue(all(new > old for old, new in zip(stamps, stamps[1:])))
+        self.assertGreaterEqual(stream.cli_dispatch_times[0],
+                                received_at + management.RECEIVER_RTC_TICK_SECONDS)
+        self.assertTrue(manager.session)
+
+    def test_equal_or_older_replay_still_refused_after_receiver_tick_wait(self):
+        for delta in (0, -1):
+            with self.subTest(delta=delta):
+                _, stream, manager = setup()
+                stream.coarse_clock = True
+                manager.login()
+                manager.query("status")
+                timestamp = manager.last_timestamp
+                received_at = manager.last_received_at
+                stream.cli_mutator = lambda frame: message("mode=fleet duty=2.0%", timestamp=timestamp + delta)
+                with self.assertRaisesRegex(ota.Error, "stale/replayed"):
+                    manager.query("settings")
+                self.assertGreaterEqual(stream.cli_dispatch_times[-1],
+                                        received_at + management.RECEIVER_RTC_TICK_SECONDS)
+                self.assertFalse(manager.session)
+                self.assertFalse(manager.abort_dispatched)
+
+    def test_receiver_tick_must_fit_command_and_session_deadlines_before_any_cli_dispatch(self):
+        for operation in ("status", "abort"):
+            for boundary in ("command", "session"):
+                with self.subTest(operation=operation, boundary=boundary):
+                    clock, stream, manager = setup()
+                    manager.login()
+                    if boundary == "command":
+                        manager.timeout = 0.5
+                    else:
+                        manager.session_deadline = clock() + 0.5
+                    before = len(stream.commands)
+                    with self.assertRaisesRegex(ota.NoUsbResponse, "tick exceeds CLI/session deadline"):
+                        manager.query(operation, **({"abort_guard": (10, 5, stream.image_hash)}
+                                                    if operation == "abort" else {}))
+                    self.assertEqual(len(stream.commands), before)
+                    self.assertFalse(stream.cli)
+                    self.assertFalse(manager.session)
+                    self.assertFalse(manager.abort_dispatched)
+
+    def test_cancel_during_receiver_tick_wait_invalidates_session_without_abort(self):
+        for operation in ("status", "abort"):
+            with self.subTest(operation=operation):
+                _, stream, manager = setup()
+                manager.login()
+                before = len(stream.commands)
+                with patch.object(manager.stock, "sleep", side_effect=ota.Cancelled("synthetic wait cancellation")), \
+                        self.assertRaises(ota.Cancelled):
+                    manager.query(operation, **({"abort_guard": (10, 5, stream.image_hash)}
+                                                if operation == "abort" else {}))
+                self.assertEqual(len(stream.commands), before)
+                self.assertFalse(manager.session)
+                self.assertFalse(manager.abort_dispatched)
+
+    def test_receiver_tick_elapsed_needs_no_extra_sleep_and_oversleep_cannot_dispatch(self):
+        clock, stream, manager = setup()
+        manager.login()
+        clock.sleep(management.RECEIVER_RTC_TICK_SECONDS + 1)
+        with patch.object(manager.stock, "sleep") as sleep:
+            manager._wait_for_receiver_tick(clock() + 3)
+        sleep.assert_not_called()
+        _, stream, manager = setup()
+        manager.login()
+        with patch.object(manager.stock, "sleep", side_effect=lambda seconds: manager.stock.clock.sleep(4)), \
+                self.assertRaisesRegex(ota.NoUsbResponse, "tick deadline"):
+            manager.query("status")
+        self.assertFalse(stream.cli)
+        self.assertFalse(manager.session)
+
+    def test_queue_drain_exhausting_deadline_cannot_dispatch_cli_after_tick(self):
+        clock, stream, manager = setup()
+        manager.login()
+        with patch.object(manager, "drain", side_effect=lambda deadline: clock.sleep(3)), \
+                self.assertRaisesRegex(ota.NoUsbResponse, "dispatch deadline"):
+            manager.query("status")
+        self.assertFalse(stream.cli)
+        self.assertFalse(manager.session)
+        self.assertFalse(manager.abort_dispatched)
+
+    def test_aggregate_inspect_uses_one_login_four_allowlisted_queries_and_no_clock_mutation(self):
+        _, stream, manager = setup()
+        manager.login()
+        result = manager.inspect()
+        self.assertEqual(stream.cli, ["ota status", "ota progress", "ota candidate", "ota settings"])
+        self.assertEqual(sum(payload[0] == 26 for payload in stream.commands), 1)
+        self.assertEqual([value["operation"] for value in result["observations"]],
+                         ["status", "progress", "candidate", "settings"])
+        self.assertEqual(len(set(value["remote_timestamp"] for value in result["observations"])), 4)
+        self.assertTrue(manager.session)
+        self.assertFalse(manager.abort_dispatched)
+        self.assertFalse(any(payload[0] in (5, 6, 9, 13, 15) for payload in stream.commands))
+
+    def test_aggregate_inspect_stops_on_first_error_preserving_prior_observations(self):
+        _, stream, manager = setup()
+        manager.login()
+        def bad_progress(frame):
+            return message("Err - candidate storage unavailable", timestamp=stream.remote_time) \
+                if stream.cli[-1] == "ota progress" else frame
+        stream.cli_mutator = bad_progress
+        with self.assertRaises(ota.Refused):
+            manager.inspect()
+        self.assertEqual(stream.cli, ["ota status", "ota progress"])
+        self.assertEqual([value["operation"] for value in manager.observations], ["status"])
+        self.assertFalse(manager.session)
+        self.assertFalse(manager.abort_dispatched)
+
+    def test_aggregate_inspect_requires_existing_fresh_session_and_preserves_cancel(self):
+        _, stream, manager = setup()
+        with self.assertRaises(ota.Error):
+            manager.inspect()
+        self.assertEqual(stream.cli, [])
+        manager.login()
+        stream.cancel_cmd = 2
+        with self.assertRaises(ota.Cancelled):
+            manager.inspect()
+        self.assertFalse(manager.session)
+        self.assertFalse(manager.abort_dispatched)
+
     def test_real_stock_login_cli_sync_frames_no_raw_census_or_local_cli(self):
         clock, stream, manager = setup()
         manager.login()
@@ -526,6 +753,20 @@ class ManagementCliTests(Scratch):
         result, error = self.invoke("abort", durable=True)
         self.assertIsNone(error)
         self.assertTrue(result["reply"]["durable_abort_confirmed"])
+
+    def test_cli_aggregate_inspect_persists_one_session_and_closes_uart(self):
+        result, error = self.invoke("inspect")
+        self.assertIsNone(error)
+        self.assertEqual(result["outcome"], "remote-management-inspection")
+        self.assertEqual([value["operation"] for value in result["observations"]],
+                         ["status", "progress", "candidate", "settings"])
+        self.assertFalse(result["installation_confirmed"])
+
+    def test_cli_aggregate_cancel_is_not_abort_and_does_not_continue(self):
+        result, error = self.invoke("inspect", cancel=True)
+        self.assertIsInstance(error, ota.Cancelled)
+        self.assertEqual(result["observations"], [])
+        self.assertFalse(result["abort_dispatched"])
 
     def test_cli_legacy_abort_exits_error_and_cancel_is_not_receiver_abort(self):
         result, error = self.invoke("abort")

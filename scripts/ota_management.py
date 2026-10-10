@@ -2,6 +2,7 @@
 """Identity-bound remote OTA CLI over stock encrypted MeshCore management.
 
 Only status/progress/candidate/settings and explicitly selected abort are sent.
+inspect aggregates the four read-only queries under one fresh admin login.
 No password, contact creation, ACL changes, key export, local CLI, reset, BEGIN
 or RF census is used. Provision contacts and receiver admin ACL separately.
 Blank CMD26 login requires the sender's existing receiver admin ACL entry.
@@ -12,6 +13,10 @@ identity or a request nonce. Unique contact-prefix guards, queue drain, a fresh
 admin login and increasing remote timestamps provide stock-API correlation,
 NOT independently verifiable cryptographic request/reply evidence. MeshCore's
 wire MAC is only two bytes. Unsigned OTA census is a different transport.
+Before each CLI dispatch, wait 2.01 monotonic seconds after the last accepted
+login/reply: receiver replies can add one second to their unique RTC timestamp.
+This allows two coarse RTC ticks without weakening equal/older replay refusal;
+the wait consumes the existing command/session deadline.
 Abort transmits exactly "ota abort <generation> <counter> <image-sha256>".
 The receiver must atomically compare those guards before durable mutation;
 there is no unguarded/plain-abort fallback. Post-abort readback must prove state.
@@ -36,6 +41,7 @@ PHASES = frozenset(("idle", "erasing", "receiving", "verifying", "ready", "commi
                     "trial", "installed", "aborted", "failed", "cache-sealed", "unknown"))
 MAX_CONTACTS = 4096
 MAX_MESSAGES = 256
+RECEIVER_RTC_TICK_SECONDS = 2.01
 TRUST = {
     "transport": "stock-encrypted-pairwise-remote-cli",
     "companion_mac_checked": True,
@@ -132,6 +138,7 @@ class RemoteManagement:
         self.timeout, self.wall_clock, self.max_skew = timeout, wall_clock, max_skew
         self.session = False
         self.last_timestamp = None
+        self.last_received_at = None
         self.abort_dispatched = False
         self.discarded_messages = 0
         self.session_deadline = 0
@@ -208,6 +215,7 @@ class RemoteManagement:
 
     def login(self):
         self.session = False
+        self.last_received_at = None
         deadline = self.stock.clock() + self.timeout
         self.stock.expected_name = self.binding.sender_name
         if self.stock.key != self.binding.sender or self.stock.identify(deadline)[:4] != self.binding.normal:
@@ -228,10 +236,25 @@ class RemoteManagement:
                 raise ota.Refused("fresh target login does not prove current admin role")
             self.last_timestamp = struct.unpack_from("<I", frame, 8)[0]
             self.timestamp(self.last_timestamp)
+            self.last_received_at = self.stock.clock()
             self.session = True
-            self.session_deadline = self.stock.clock() + 300
+            self.session_deadline = self.last_received_at + 300
             return
         raise ota.NoUsbResponse("remote admin login deadline")
+
+    def _wait_for_receiver_tick(self, deadline):
+        if self.last_received_at is None:
+            raise ota.Error("accepted remote login/reply receipt time required before CLI dispatch")
+        ready = self.last_received_at + RECEIVER_RTC_TICK_SECONDS
+        if ready >= deadline:
+            raise ota.NoUsbResponse("receiver RTC tick exceeds CLI/session deadline; no CLI dispatched")
+        while True:
+            now = self.stock.clock()
+            if now >= deadline:
+                raise ota.NoUsbResponse("receiver RTC tick deadline; no CLI dispatched")
+            if now >= ready:
+                return
+            self.stock.sleep(min(0.1, ready - now, deadline - now))
 
     def query(self, operation, *, abort_guard=None):
         if operation not in COMMANDS or not self.session or self.stock.clock() >= self.session_deadline:
@@ -246,8 +269,11 @@ class RemoteManagement:
             command = COMMANDS[operation].encode("ascii")
         deadline = min(self.stock.clock() + self.timeout, self.session_deadline)
         try:
+            self._wait_for_receiver_tick(deadline)
             self.drain(deadline)
             since = self.stock.clock()
+            if since >= deadline:
+                raise ota.NoUsbResponse("remote CLI dispatch deadline; no CLI dispatched")
             payload = b"\x02\x01\x00" + bytes(4) + self.binding.target[:6] + command
             if operation == "abort":
                 self.abort_dispatched = True
@@ -286,6 +312,7 @@ class RemoteManagement:
                 else:
                     parsed = fields(operation, text)
                 self.last_timestamp = remote_time
+                self.last_received_at = self.stock.clock()
                 result = {"operation": operation, "target_public_key": self.binding.target.hex(),
                           "remote_timestamp": remote_time, "reply": parsed, **TRUST}
                 self.observations = (self.observations + [result])[-16:]
@@ -329,10 +356,15 @@ class RemoteManagement:
         result["outcome"] = "candidate-abort-readback" if confirmed else "transport-stop-only-or-unproven"
         return result
 
+    def inspect(self):
+        observations = [self.query(operation) for operation in ("status", "progress", "candidate", "settings")]
+        return {"operation": "inspect", "outcome": "remote-management-inspection",
+                "target_public_key": self.binding.target.hex(), "observations": observations, **TRUST}
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("operation", choices=tuple(COMMANDS))
+    parser.add_argument("operation", choices=tuple(COMMANDS) + ("inspect",))
     parser.add_argument("--serial", required=True)
     parser.add_argument("--by-id", required=True)
     parser.add_argument("--by-path")
@@ -372,7 +404,12 @@ def main(argv=None):
             with ota.radio_guard(stock, binding, args.artifacts, mode="background"):
                 manager = RemoteManagement(stock, binding, args.target_name, args.timeout, max_skew=args.max_clock_skew)
                 manager.login()
-                result = manager.abort(*guards) if args.operation == "abort" else manager.query(args.operation)
+                if args.operation == "abort":
+                    result = manager.abort(*guards)
+                elif args.operation == "inspect":
+                    result = manager.inspect()
+                else:
+                    result = manager.query(args.operation)
     except (ota.Error, OSError, ValueError, TimeoutError) as exc:
         result = {"outcome": "host-cancelled" if isinstance(exc, ota.Cancelled) else "remote-management-incomplete",
                   "operation": args.operation, "error": str(exc),
