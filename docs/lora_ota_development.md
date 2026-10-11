@@ -369,9 +369,132 @@ returned all four inspection surfaces on both targets without clock mutation:
 confirmed floor/counter 4, candidate generations 2/4, 6,106 received and total
 blocks, zero missing, 512,852 bytes, block size 84, and fleet mode at 2% duty.
 
-Lifecycle abort/restart qualification remains outstanding at this stage; the
-installation and initial remote status records alone do not establish those
-operations.
+The bounded counter-5 run then sent 16 common blocks without repair, COMMIT or
+receiver abort. Both encrypted inspection readbacks reported Receiving,
+generations 3/5, received 16/6,106, missing 6,090 and confirmed floor 4.
+The first guarded abort selected target 41's generation 3/counter 5/image.
+Candidate and status preflight replies succeeded, but no abort reply arrived
+after dispatch; the saved result reports execution outcome unknown. Subsequent
+target-41 USB readback failed with a broken pipe and remote login timed out.
+Target 3B remained responsive and Receiving generation 5; its abort was not
+dispatched. No automatic abort retry or candidate restart followed.
+
+Exact flashed ARM ELF analysis found an abort/recovery crypto call chain using
+approximately 4,092 bytes of a 4,096-byte loop-task stack, before exception and
+alignment reserve. This is a stack-budget defect; the actual fault PC was not
+captured. A user-confirmed single ordinary reset recovered target 41 without
+flashing or erasing data. Local and subsequent encrypted remote inspection
+confirmed durable Aborted generation 4, counter 5, all 16 retained blocks and
+unchanged confirmed floor 4/image. The journal therefore advanced before the
+observed loss of responsiveness; the missing acknowledgement must not be
+described as a pre-journal refusal. Repeated abort was withheld until the
+stack fix was installed.
+
+The frozen corrective APP is 508,628 bytes (6,056 blocks), SHA-256
+`0aff68cf99d915ed946c36d6a43dc46b17fb19688c38cc6ac11493ba6168ef5b`.
+Its exact linked ARM ELF, SHA-256
+`b05a87d7d0b0c6b1b692ea1fba742dc39819a4422cab84de43c0021df1061455`,
+has a worst reachable guarded-abort chain of 3,068 bytes, including task-top
+alignment, leaving 1,028 bytes of the existing 4,096-byte task stack. The
+analysis includes pre-append and post-append recovery, both recovery callbacks,
+actual Ed25519 verification, journal/flash error paths, USB/kernel descendants
+and encrypted replies. This meets the 3,072-byte limit and 1,024-byte minimum
+reserve without enlarging the task or weakening authorization or persistence.
+The earlier corrective build failed that limit and is not an installation
+candidate. Source review and native regressions passed for the frozen final
+build; this stack qualification applies to its abort paths, not arbitrary
+commands or other builds.
+
+The old installed APP's signed-RF durable abort is conditionally bounded at
+2,944 bytes, including recovery callbacks, but its cold-restoration path reaches
+3,104 bytes. Retirement therefore requires fresh authenticated durable
+Receiving evidence and a nonpending old-manifest census, with no reset,
+reconfiguration, competing OTA control or receiver mutation between that proof
+and dispatch. The native signed primitive has no CLI acknowledgement; its
+durable outcome requires independent inspection. Neither its conditional
+analysis nor the new APP's stack qualification establishes a hardware outcome.
+
+One guarded, target-bound signed-RF abort then retired 3B's old counter-5
+attempt from Receiving generation 5 to Aborted generation 6. The final proof
+was 47.607 seconds old at the actual UART dispatch. Independent RF, fresh
+encrypted inspection and physical readback confirmed both old attempts
+Aborted (41 generation 4, 3B generation 6), with the original nonces, all
+16 blocks, confirmed floor 4/image and identities/settings/ACL preserved.
+No reset or automatic abort retry was needed. This primitive has no CLI
+acknowledgement; the independent durable readbacks establish its outcome.
+
+The corrective APP was then transferred to both receivers at counter 6,
+using 6,059 shared missing-union block transmissions for the 6,056-block image.
+Both reported Ready, received signed COMMITs and reported Installed with floor
+6. The deployment command stopped at its final encrypted inspection because
+installation rebooted the receiver clocks into 2024; it did not retry COMMIT,
+abort or weaken freshness. Independent locked APP readbacks confirmed the
+exact corrective image, floor 6, floor sequences 4/6, candidate generations
+5/7 and all 6,056 blocks. Forwarding was restored on, OTA duty was observed at
+2%, and ordinary reboots preserved the image, floor, identities, settings and
+ACLs. Explicit correction of freshly measured slow clocks then enabled all
+four encrypted inspection surfaces on both targets.
+
+A counter-7 background attempt sent exactly 16 common blocks, with zero
+repairs and no COMMIT. Encrypted remote inspection reported Receiving,
+generations 6/8, received 16/6,056, missing 6,040, 508,628 bytes, block size 84,
+fleet duty 2% and unchanged confirmed floor 6. Selected encrypted aborts on
+both receivers returned acknowledgements and durable postflight readbacks:
+Aborted generations 7/9, with all 16 blocks retained. Repeating each abort
+against its current Aborted generation also returned an acknowledgement,
+without advancing the generation or changing progress, installed image,
+confirmed floor, identity or settings.
+
+The first signed-restart qualification stopped before REUPLOAD or BEGIN:
+the host incorrectly required zero progress in its Aborted preflight,
+although durable abort deliberately retains received blocks. Independent
+encrypted inspection confirmed both Aborted generations and all 16 blocks
+unchanged after that refusal. The corrected host binds retained Aborted
+progress to the original attempt receipts, separately from a different
+manifest's synthetic zero-progress pending state. Both terminal contexts must
+pass before either signed REUPLOAD; an unconfirmed restart is not retried.
+
+The next paired restart passed both encrypted and RF Aborted preflights,
+sent one signed REUPLOAD per receiver and observed Receiving generations
+8/10 with fresh nonces and zero received blocks. Both new attempt receipts
+were persisted before data transmission. Sixteen common blocks, with zero
+repairs or COMMITs, produced observed progress 4, 8, 12 and 16. Subsequent
+encrypted remote inspection confirmed the new generations, received
+16/6,056, missing 6,040 and unchanged confirmed floor 6/image/settings.
+
+One bounded live RF census per receiver then returned the restarted
+generation/nonce and retained 16-block bitmap. Each reply passed the current
+context parser and was refused against the original resume receipt, without
+sending BEGIN, data, REUPLOAD, COMMIT or abort. This is host rejection of a
+stale resume context against fresh unsigned RF evidence, not proof that a
+receiver rejected a stale mutating packet.
+
+A separate encrypted negative test sent one selected abort using each original
+generation (6/8) against the restarted candidates (8/10). Both receivers
+returned `Err - OTA abort mismatch`. Fresh encrypted inspection and locked
+local postflight readbacks confirmed the current candidates, all 16 blocks,
+installed image, floor and settings unchanged. No corrective abort or retry
+was sent. This establishes receiver-side rejection of those stale selected
+abort commands, with the stock companion transport's existing trust limits.
+
+Final selected aborts against current generations 8/10 returned acknowledgements
+and durable Aborted generations 9/11. All four encrypted inspection surfaces
+on both receivers then showed Aborted counter 7, received 16/6,056, missing
+6,040, the exact candidate and confirmed image, floor 6 and fleet duty 2%.
+Ordinary APP reboots preserved those generations, progress, installed image,
+floor sequences 4/6, identities, settings and ACLs, verified through locked
+local readback. Remote inspection preceded reboot; no candidate-7 clock
+correction was used to bypass the resulting freshness boundary.
+
+Cleanup removed only the two owned temporary stock administrator grants,
+using the original authorization receipt. Independent locked readback
+confirmed 41's original empty ACL and 3B's original administrator entry,
+with Aborted generations 9/11, all 16 blocks, the confirmed image/floor and
+normal forwarding-on, OTA 2%, mesh duties 2%/50%, TX2, names and radio profile
+unchanged. Existing stock contacts were not removed. This completes the
+two-receiver background start, durable abort, repeated abort, explicit restart,
+resumed progress, stale-context refusal and reboot-persistence bench outcome;
+it does not extend qualification to larger fleets or arbitrary failure modes.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:

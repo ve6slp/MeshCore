@@ -2873,6 +2873,300 @@ def stock_async_noise(stream):
     return secret
 
 
+class RetainedRestartFleetSerial(FleetSerial):
+    """Durable same-candidate ABORT retains counts/nonce until signed REUPLOAD."""
+    def __init__(self, clock, c):
+        super().__init__(clock, c)
+        self.reuploads = []
+        self.drop_reupload = False
+        for node in self.nodes.values():
+            node["aborted"] = False
+
+    def remote(self, wire):
+        attempt, frame = ota.retry_payload(wire)
+        if frame[0] == 10 and self.nodes[frame[1:33]]["aborted"]:
+            assert attempt not in self.seen
+            self.seen.add(attempt)
+            key = frame[1:33]
+            node = self.nodes[key]
+            assert frame[33:65] == self.candidate.digest
+            first = struct.unpack_from(">H", frame, 65)[0]
+            report = census(self.candidate, first, node["received"], node["generation"], lifecycle=9,
+                            floor=node["floor"], nonce=node["nonce"], target=key, challenge=0)
+            report = report[:87] + b"\x05" + report[88:]
+            if self.report_mutator is not None:
+                report = self.report_mutator(key, report)
+            self.schedule(0.1, lambda: self.reply(b"\x88\x08\x40\x31\x00" + ota.retry_frame(report, attempt)))
+            return
+        if frame[0] == 14:
+            assert attempt not in self.seen
+            self.seen.add(attempt)
+            assert len(frame) == 165
+            key = frame[33:65]
+            node = self.nodes[key]
+            ota.verify(OWNER, ota.REUPLOAD_DOMAIN + frame[:101], frame[101:])
+            assert frame[1:33] == OWNER and frame[65:97] == self.candidate.digest
+            assert struct.unpack_from(">I", frame, 97)[0] == node["generation"]
+            self.reuploads.append(key)
+            if node["aborted"] and node["permission"] and not self.drop_reupload:
+                node["aborted"] = False
+                node["generation"] += 1
+                node["nonce"] = hashlib.sha256(node["nonce"]).digest()[:16]
+                node["received"].clear()
+            return
+        if frame[0] == 1:
+            assert not any(node["aborted"] for node in self.nodes.values())
+        return super().remote(wire)
+
+
+class PartialRestartTests(Scratch):
+    def restart_pair(self, total=6056):
+        c = ota.Candidate.build(None, candidate(84 * total).image, 6,
+                                board="xiao_nrf52840_sense", role_id=1, counter=7)
+        clock = Clock()
+        stream = RetainedRestartFleetSerial(clock, c)
+        stock = ota.Stock(ota.Frames(stream, clock), OWNER, clock, clock.sleep)
+        stock.identify()
+        bindings = []
+        for key, generation, nonce in (
+                (TARGET, 6, "ba20679c058546567fc393762219b80c"),
+                (TARGET2, 8, "3733241189e5f1e1ff9dd435cae5c236")):
+            stream.nodes[key].update(floor=6, generation=generation, nonce=bytes.fromhex(nonce),
+                                     received=set(range(16)))
+            bindings.append(replace(binding(c), target=key, floor=6, min_generation=generation,
+                                    by_path=STOCK_PATH, id_path=STOCK_ID_PATH,
+                                    usb_vid=0x10C4, usb_pid=0xEA60, sender_name="synthetic-stock"))
+        original = ota.BackgroundCampaign(stock, bindings, c, NORMAL, clock() + 10000, 0.8, clock, clock.sleep)
+        receipts = [target.attempt_receipt(target.authorize(retries=1)) for target in original.targets]
+        bindings = [replace(b, min_generation=old["generation"] + 2, reupload_generation=old["generation"] + 1,
+                            allow_reupload=True) for b, old in zip(bindings, receipts)]
+        for node in stream.nodes.values():
+            node["aborted"] = True
+            node["generation"] += 1
+        campaign = ota.BackgroundCampaign(stock, bindings, c, NORMAL, clock() + 10000, 0.8, clock, clock.sleep)
+        stream.commands.clear()
+        stream.raw_packets.clear()
+        stream.rf_packets.clear()
+        return clock, stream, stock, campaign, receipts
+
+    def run_restart(self, clock, stock, campaign, receipts, **options):
+        return ota.partial_background_operation(
+            stock, [target.binding for target in campaign.targets], campaign.transport.candidate,
+            self.directory, blocks=16, duty=0.8, restart_receipts=receipts, clock=clock, **options)
+
+    def assert_no_restart_data(self, stream):
+        self.assertFalse(stream.deliveries)
+        self.assertFalse(any(ota.retry_payload(raw[2:])[1][0] in (1, 3, 4, 12, 15)
+                             for raw in stream.raw_packets))
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+        self.assertEqual((stream.profile, stream.tx_power), (NORMAL, 2))
+        self.assertTrue(all(node["commits"] == 0 for node in stream.nodes.values()))
+
+    def test_nonzero_retained_pair_preflight_then_both_fresh_zero_begin_receipts_before_any_data(self):
+        clock, stream, stock, campaign, receipts = self.restart_pair()
+        history = json.loads(json.dumps(receipts))
+        events = []
+        saved_at_first_data = []
+        def event(item):
+            if item["event"] == "rf_tx_request" and item["kind"] == 1 and not saved_at_first_data:
+                for key in (TARGET, TARGET2):
+                    saved_at_first_data.append(ota.private_read(self.directory / ("attempt-" + key.hex() + ".json")))
+            events.append(item)
+        result = self.run_restart(clock, stock, campaign, receipts, event_callback=event)
+        self.assertTrue(result["operation_complete"])
+        self.assertTrue(result["restart_selected"])
+        self.assertEqual(receipts, history)
+        self.assertEqual(stream.reuploads, [TARGET, TARGET2])
+        first_reupload = next(i for i, item in enumerate(events)
+                              if item["event"] == "rf_tx_request" and item["kind"] == 14)
+        preflight = [item for item in events[:first_reupload] if item["event"] == "census_parsed"]
+        self.assertEqual([item["target_public_key"] for item in preflight], [TARGET.hex(), TARGET2.hex()])
+        self.assertEqual([(item["lifecycle"], item["generation"], item["received"], item["total"],
+                           item["bitmap"], item["begin_nonce"]) for item in preflight],
+                         [(9, generation, 16, 6056, "ffff" + "00" * 14, None) for generation in (7, 9)])
+        self.assertTrue(all(not item["status_authenticated"] for item in preflight))
+        for old, saved in zip(receipts, saved_at_first_data):
+            self.assertEqual(saved["generation"], old["generation"] + 2)
+            self.assertNotEqual(saved["begin_nonce"], old["begin_nonce"])
+            self.assertEqual((saved["received_blocks"], saved["bitmap"]), (0, "00" * 16))
+            self.assertFalse(saved["status_authenticated"])
+            self.assertFalse(saved["installation_confirmed"])
+        self.assertEqual(len(saved_at_first_data), 2)
+        receiving = [item for item in events if item["event"] == "census_parsed" and item["received"] == 0]
+        self.assertEqual([(item["lifecycle"], item["generation"]) for item in receiving], [(3, 8), (3, 10)])
+        self.assertEqual([index for _, index, _ in stream.deliveries], list(range(16)))
+        self.assertEqual((result["initial_block_transmissions"], result["repair_block_transmissions"]), (16, 0))
+        for key, old in zip((TARGET, TARGET2), receipts):
+            node = stream.nodes[key]
+            self.assertEqual((node["received"], node["generation"]), (set(range(16)), old["generation"] + 2))
+            checkpoint = ota.private_read(self.directory / ("checkpoint-" + key.hex() + ".json"))
+            self.assertEqual((checkpoint["received_blocks"], checkpoint["bitmap"]), (16, "ffff" + "00" * 14))
+        self.assertFalse(result["receiver_abort_sent"])
+        self.assertFalse(result["commit_sent"])
+        self.assertFalse(result["transfer_complete"])
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertEqual(ota.private_read(self.directory / "result.json"), result)
+        self.assertEqual((stream.profile, stream.tx_power, stream.direct), (NORMAL, 2, 0))
+
+    def test_retained_history_does_not_bind_active_progress_or_persist_a_new_attempt(self):
+        _, stream, _, campaign, receipts = self.restart_pair(total=40)
+        ota.validate_partial_restart([target.binding for target in campaign.targets], campaign.transport.candidate,
+                                     receipts)
+        for target, old in zip(campaign.targets, receipts):
+            target.reupload_generation = old["generation"] + 1
+            target.reupload_enabled = True
+            target.restart_receipt = dict(old)
+            report = target.authorize(retries=1)
+            self.assertEqual((report["received"], report["bits"]), (16, 0xFFFF))
+            self.assertTrue(target.pending_reupload)
+            self.assertEqual(target.activation_generation, old["generation"] + 2)
+            self.assertIsNone(target.generation)
+            self.assertIsNone(target.begin_nonce)
+            self.assertEqual((target.received, target.previous, target.attempt_recorded), (0, {}, False))
+        self.assertFalse(stream.reuploads)
+        self.assert_no_restart_data(stream)
+
+    def test_retained_census_divergence_on_either_target_prevents_both_reuploads(self):
+        mutations = (
+            (1, OWNER), (33, bytes(32)), (65, b"\x00\x01"), (67, b"\xff\x7f"),
+            (83, struct.pack(">H", 15)), (83, struct.pack(">H", 41)),
+            (85, struct.pack(">H", 39)), (87, b"\x01"), (88, struct.pack(">I", 6)),
+            (88, struct.pack(">I", 8)), (88, struct.pack(">I", 0xFFFFFFFF)),
+            (92, b"\x03"), (92, b"\x02"), (92, b"\x05"), (93, b"\x00"),
+            (94, struct.pack(">I", 5)), (94, struct.pack(">I", 7)),
+            (98, struct.pack(">I", 6)), (98, struct.pack(">I", 8)),
+            (103, bytes(16)), (103, NONCE), (102, b"\x02"),
+            (67, (0xFFFF | (1 << 40)).to_bytes(16, "little")),
+            (83, struct.pack(">H", 17)),  # All 40 blocks fit in this bitmap window.
+        )
+        for key in (TARGET, TARGET2):
+            for offset, value in mutations:
+                _, stream, _, campaign, receipts = self.restart_pair(total=40)
+                replacement = value
+                if offset == 88 and value in (struct.pack(">I", 6), struct.pack(">I", 8)):
+                    replacement = struct.pack(">I", stream.nodes[key]["generation"] + (1 if value[-1] == 8 else -1))
+                stream.report_mutator = lambda selected, report: (
+                    report[:offset] + replacement + report[offset + len(replacement):] if selected == key else report)
+                with self.subTest(target=key.hex(), offset=offset, value=replacement.hex()):
+                    result = campaign.upload_partial(16, restart_receipts=receipts)
+                    self.assertFalse(result["operation_complete"])
+                    self.assertEqual(result["targets"][0 if key == TARGET else 1]["stage"], "restart-aborted-preflight")
+                    self.assertFalse(stream.reuploads)
+                    self.assertTrue(all(node["aborted"] for node in stream.nodes.values()))
+                    self.assert_no_restart_data(stream)
+
+    def test_missing_explicit_pair_or_divergent_receipt_never_authorizes_retained_reupload(self):
+        for selection in ("none", "empty", "single", "swapped"):
+            _, stream, _, campaign, receipts = self.restart_pair(total=40)
+            selected = {"none": None, "empty": [], "single": receipts[:1], "swapped": list(reversed(receipts))}[selection]
+            with self.subTest(selection=selection):
+                if selected is None:
+                    self.assertFalse(campaign.upload_partial(16)["operation_complete"])
+                else:
+                    with self.assertRaises(ota.Error):
+                        campaign.upload_partial(16, restart_receipts=selected)
+                    self.assertFalse(stream.commands)
+                self.assertFalse(stream.reuploads)
+                self.assert_no_restart_data(stream)
+        mutations = {"schema": 2, "image_size": 1, "total_blocks": 39, "first": 1,
+                     "received_blocks": 15, "bitmap": "ff" * 16, "begin_nonce": "00" * 16,
+                     "counter": 6, "floor": 5, "generation": 0xFFFFFFFE, "min_generation": 7,
+                     "image_sha256": "00" * 32, "manifest_hash": "00" * 32,
+                     "normal_profile": [919000, *NORMAL[1:4]], "sender_profile": [*NORMAL[:4], 0],
+                     "tx_power_dbm": 3, "normal_duty_percent": 2.0, "status_authenticated": True,
+                     "installation_confirmed": True, "outcome": "ready-observed-unsigned",
+                     "by_path": "wrong", "sender_name": "wrong", "extra": True}
+        for field, value in mutations.items():
+            _, stream, _, campaign, receipts = self.restart_pair(total=40)
+            receipts[0][field] = value
+            with self.subTest(field=field), self.assertRaises(ota.Error):
+                campaign.upload_partial(16, restart_receipts=receipts)
+            self.assertFalse(stream.commands)
+            self.assert_no_restart_data(stream)
+
+    def test_invalid_new_begin_never_persists_invalid_context_or_sends_any_data(self):
+        mutations = ((88, struct.pack(">I", 7)), (88, struct.pack(">I", 9)), (103, None),
+                     (103, bytes(16)), (83, b"\x00\x10"), (67, b"\xff\xff"),
+                     (87, b"\x03"), (92, b"\x04"), (94, struct.pack(">I", 7)),
+                     (98, struct.pack(">I", 6)))
+        for key in (TARGET, TARGET2):
+            for offset, value in mutations:
+                clock, stream, stock, campaign, receipts = self.restart_pair(total=40)
+                old = receipts[0 if key == TARGET else 1]
+                replacement = bytes.fromhex(old["begin_nonce"]) if value is None else value
+                if offset == 88:
+                    replacement = struct.pack(">I", old["generation"] + (1 if value[-1] == 7 else 3))
+                def mutate(selected, report):
+                    if selected == key and not stream.nodes[key]["aborted"]:
+                        return report[:offset] + replacement + report[offset + len(replacement):]
+                    return report
+                stream.report_mutator = mutate
+                directory = self.directory / f"invalid-{key.hex()}-{offset}-{replacement.hex()}"
+                directory.mkdir(mode=0o700)
+                with self.subTest(target=key.hex(), offset=offset, value=replacement.hex()):
+                    result = ota.partial_background_operation(
+                        stock, [target.binding for target in campaign.targets], campaign.transport.candidate,
+                        directory, blocks=16, duty=0.8, restart_receipts=receipts, clock=clock)
+                    self.assertFalse(result["operation_complete"])
+                    self.assertFalse((directory / ("attempt-" + key.hex() + ".json")).exists())
+                    self.assertEqual(result["targets"][0 if key == TARGET else 1]["stage"], "restart-signed-reupload")
+                    self.assertEqual(stream.reuploads, [TARGET] if key == TARGET else [TARGET, TARGET2])
+                    self.assertEqual(ota.private_read(directory / "result.json"), result)
+                    self.assert_no_restart_data(stream)
+
+    def test_erasing_poll_requires_zero_progress_before_receiving_receipt(self):
+        for invalid_second_report in (False, True):
+            clock, stream, stock, campaign, receipts = self.restart_pair(total=40)
+            active_calls = Counter()
+            def mutate(key, report):
+                if stream.nodes[key]["aborted"]:
+                    return report
+                active_calls[key] += 1
+                if active_calls[key] == 1:
+                    return report[:92] + b"\x02" + report[93:]
+                if invalid_second_report and key == TARGET and active_calls[key] == 2:
+                    return report[:67] + b"\x01" + report[68:83] + b"\x00\x01" + report[85:]
+                return report
+            stream.report_mutator = mutate
+            directory = self.directory / str(invalid_second_report)
+            directory.mkdir(mode=0o700)
+            events = []
+            result = ota.partial_background_operation(
+                stock, [target.binding for target in campaign.targets], campaign.transport.candidate,
+                directory, blocks=16, duty=0.8, restart_receipts=receipts, clock=clock, event_callback=events.append)
+            with self.subTest(invalid_second_report=invalid_second_report):
+                self.assertEqual(result["operation_complete"], not invalid_second_report)
+                self.assertEqual(stream.reuploads, [TARGET] if invalid_second_report else [TARGET, TARGET2])
+                if invalid_second_report:
+                    self.assertFalse((directory / ("attempt-" + TARGET.hex() + ".json")).exists())
+                    self.assert_no_restart_data(stream)
+                else:
+                    for key in (TARGET, TARGET2):
+                        saved = ota.private_read(directory / ("attempt-" + key.hex() + ".json"))
+                        self.assertEqual(saved["received_blocks"], 0)
+                        observed = [item["lifecycle"] for item in events if item["event"] == "census_parsed"
+                                    and item["target_public_key"] == key.hex() and item["received"] == 0]
+                        self.assertEqual(observed, [2, 3])
+
+    def test_unconfirmed_reupload_or_changed_terminal_snapshot_never_retries_or_falls_back(self):
+        for changed_snapshot in (False, True):
+            _, stream, _, campaign, receipts = self.restart_pair(total=40)
+            stream.drop_reupload = True
+            if changed_snapshot:
+                def mutate(key, report):
+                    if stream.reuploads:
+                        return report[:67] + b"\xff\xff\x01" + report[70:83] + b"\x00\x11" + report[85:]
+                    return report
+                stream.report_mutator = mutate
+            with self.subTest(changed_snapshot=changed_snapshot):
+                result = campaign.upload_partial(16, restart_receipts=receipts)
+                self.assertFalse(result["operation_complete"])
+                self.assertEqual(stream.reuploads, [TARGET])
+                self.assertTrue(all(node["aborted"] for node in stream.nodes.values()))
+                self.assert_no_restart_data(stream)
+
+
 class BackgroundTests(Scratch):
     def test_full_6031_block_flood_repairs_and_installs_under_stock_async_echo_traffic(self):
         _, stream, stock, campaign = fleet_setup(candidate(506524), duty=0.8)

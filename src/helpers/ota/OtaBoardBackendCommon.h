@@ -814,15 +814,10 @@ public:
     resolveRunningExtent(bank0, before, current);
     const bool original_context_required = !current.active_image_extent ||
         (!bank0.bank_0_crc && state_status == State::ReadStatus::Found && State::phase(state) == State::kPhaseFailedMax);
-    OtaBoardOriginalSnapshotProvider original(state_, floor_, running_, qualified_);
     if (original_context_required) {
       auto& snapshot = scratch.snapshot;
-      OtaBoardOriginalSnapshotProvider::Context context;
-      if (!original.read(snapshot, context) ||
-          memcmp(snapshot.running.settings, before.settings, sizeof(before.settings)) ||
-          snapshot.running.image != before.image || snapshot.running.capacity != before.capacity)
+      if (!readOriginalRunningContext(before, snapshot, current))
         return Result::TooLate;
-      current = snapshot.image;
     } else {
       current.active_image_extent = (current.active_image_extent + 3u) & ~uint32_t(3);
       if (current.active_image_extent > before.capacity) return Result::TooLate;
@@ -903,12 +898,8 @@ public:
     resolveRunningExtent(bank0, after, current_after);
     if (original_context_required) {
       auto& snapshot = scratch.snapshot;
-      OtaBoardOriginalSnapshotProvider::Context context;
-      if (!original.read(snapshot, context) ||
-          memcmp(snapshot.running.settings, after.settings, sizeof(after.settings)) ||
-          snapshot.running.image != after.image || snapshot.running.capacity != after.capacity)
+      if (!readOriginalRunningContext(after, snapshot, current_after))
         return Result::TooLate;
-      current_after = snapshot.image;
     } else if (current_after.active_image_extent) {
       current_after.active_image_extent = (current_after.active_image_extent + 3u) & ~uint32_t(3);
       if (current_after.active_image_extent > after.capacity) return Result::TooLate;
@@ -945,6 +936,18 @@ public:
   }
 
 private:
+  __attribute__((noinline)) bool readOriginalRunningContext(const OtaNrf52RunningContext& expected,
+      OtaBoardOriginalImageSnapshot& snapshot, ::ota::storage::XiaoOtaActiveExtentInfo& image) const {
+    OtaBoardOriginalSnapshotProvider original(state_, floor_, running_, qualified_);
+    OtaBoardOriginalSnapshotProvider::Context context;
+    if (!original.read(snapshot, context) ||
+        memcmp(snapshot.running.settings, expected.settings, sizeof(expected.settings)) ||
+        snapshot.running.image != expected.image || snapshot.running.capacity != expected.capacity)
+      return false;
+    image = snapshot.image;
+    return true;
+  }
+
   __attribute__((noinline)) static void resolveRunningExtent(
       const ::ota::storage::XiaoOtaBank0Settings& bank0, const OtaNrf52RunningContext& running,
       ::ota::storage::XiaoOtaActiveExtentInfo& out) {

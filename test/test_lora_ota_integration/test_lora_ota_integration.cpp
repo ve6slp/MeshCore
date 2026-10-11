@@ -9722,9 +9722,11 @@ struct ReenteringProofVerifier : ::ota::trust::SignatureVerifier {
   const ::ota::trust::SignatureVerifier& actual;
   std::function<void()> hook;
   mutable bool called = false;
+  mutable unsigned calls = 0;
   explicit ReenteringProofVerifier(const ::ota::trust::SignatureVerifier& verifier) : actual(verifier) {}
   bool verify(const uint8_t* signature, size_t signature_len, const uint8_t* message,
               size_t message_len, const uint8_t* key, size_t key_len) const override {
+    ++calls;
     if (!called) { called = true; hook(); }
     return actual.verify(signature, signature_len, message, message_len, key, key_len);
   }
@@ -9911,6 +9913,353 @@ TEST(LoraOtaProofStack, RecoveryReentryFailsClosedAndTheAuthorizedOuterAbortStil
   EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
   EXPECT_TRUE(nested.called);
   EXPECT_EQ(usb::UsbOtaResult::Ok, q.f.abort());
+}
+
+TEST(LoraOtaAdminAbort, GuardedTextPartialUsesRealRecoveryAndPreservesItsWorkspaceAcrossReentryAndColdRetry) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  for (const uint32_t generation : {3u, 5u}) {
+    SCOPED_TRACE(generation);
+    UnadmittedFixture f(0x584e3430, 1);
+    f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseConfirmed, 4, 17);
+    f.boot.setFloor(4);
+    f.reattach();
+    for (int tick = 0; tick < 10; ++tick) f.boot.observer.tick(true);
+    f.manifest(4);
+    ::ota::storage::XiaoOtaCommandV3Fields consumed;
+    OtaSessionId installed_session;
+    installed_session.campaignId = 4;
+    installed_session.sessionId = 1;
+    installed_session.attemptId = 1;
+    ASSERT_TRUE(f.provider.buildInstallCommandV3(f.canonical, f.signature, f.owner.publicKey(),
+        installed_session, f.owner.publicKey(), consumed));
+    ASSERT_TRUE(::ota::storage::XiaoOtaCommandRecordV3::writeNext(f.command, consumed));
+    f.image.resize(512852, 0x47);
+    f.manifest(5);
+    uint8_t authorization[164];
+    ASSERT_EQ(sizeof(authorization), encodeOtaTargetAuthorization(f.fx.target_public_key, f.owner.publicKey(),
+        f.canonical, f.signature, authorization, sizeof(authorization)));
+    ASSERT_TRUE(f.fx.integration.handleReceivedFrame(authorization, sizeof(authorization), 1));
+    Store::Snapshot selected;
+    ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(selected));
+    selected.sessionId = generation;
+    ASSERT_TRUE(f.fx.candidate_store.append(selected));
+    f.fx.integration.leanReceiver().restore();
+    const auto admitted = f.fx.integration.leanReceiver().status();
+    const auto sign = [](void* context, const uint8_t* message, size_t length, uint8_t out[64]) {
+      static_cast<::ota::test::Ed25519TestSigner*>(context)->sign(message, length, out);
+    };
+    for (unsigned block = 0; block < 16; ++block) {
+      uint8_t frame[kOtaOwnerSignedBlockMaxBytes];
+      const auto length = signAndEncodeOtaBlock(admitted.manifestHash, block, f.image.data() + block * 84, 84,
+          &f.owner, sign, frame, sizeof(frame), f.owner.publicKey());
+      ASSERT_NE(0u, length);
+      ASSERT_TRUE(f.fx.integration.handleReceivedFrame(frame, length, 2 + block));
+    }
+    const auto before = f.fx.integration.leanReceiver().status();
+    ASSERT_EQ(Store::Phase::Receiving, before.phase);
+    ASSERT_EQ(16u, before.receivedBlocks);
+    ASSERT_EQ(6106u, before.totalBlocks);
+    ASSERT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
+    const auto command = guardedAbortText(before);
+    const auto floor = std::vector<uint8_t>(f.boot.floor_flash.rawBuffer(),
+        f.boot.floor_flash.rawBuffer() + f.boot.floor_flash.rawSize());
+    const auto state = std::vector<uint8_t>(f.boot.state_flash.rawBuffer(),
+        f.boot.state_flash.rawBuffer() + f.boot.state_flash.rawSize());
+    const auto commands = std::vector<uint8_t>(f.command_flash.rawBuffer(),
+        f.command_flash.rawBuffer() + f.command_flash.rawSize());
+    const auto staged = std::vector<uint8_t>(f.fx.image_flash.rawBuffer(),
+        f.fx.image_flash.rawBuffer() + f.fx.image_flash.rawSize());
+    ReenteringProofVerifier verifier(f.fx.sig_verifier);
+    OtaBoardUnadmittedCommandRecovery recovery(f.command, f.boot.state, f.boot.floor, f.fx.image_region,
+        verifier, f.running, f.qualified, f.target, f.role);
+    struct RecoveryTrace {
+      OtaBoardUnadmittedCommandRecovery& recovery;
+      const ReenteringProofVerifier& verifier;
+      unsigned beforeAppend = 0, afterAppend = 0;
+    } trace{recovery, verifier};
+    f.fx.integration.attachUnadmittedAbort(&trace, [](void* context, const Store::Snapshot& candidate, bool cancel) {
+      auto& trace = *static_cast<RecoveryTrace*>(context);
+      if (cancel) {
+        ++trace.afterAppend;
+        EXPECT_EQ(Store::Phase::Aborted, candidate.phase);
+      } else {
+        ++trace.beforeAppend;
+        EXPECT_EQ(Store::Phase::Receiving, candidate.phase);
+      }
+      const auto signatures = trace.verifier.calls;
+      const auto result = trace.recovery.recover(candidate, cancel);
+      EXPECT_GE(trace.verifier.calls - signatures, 2u);
+      return result;
+    });
+    verifier.hook = [&]() {
+      const auto programs = f.fx.candidate_flash.programOpCount();
+      const auto erases = f.command_flash.eraseOpCount();
+      EXPECT_EQ(Result::Busy, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+      EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+      EXPECT_EQ(erases, f.command_flash.eraseOpCount());
+    };
+    ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+    ASSERT_TRUE(verifier.called);
+    EXPECT_EQ(1u, trace.beforeAppend);
+    EXPECT_EQ(1u, trace.afterAppend);
+    const auto aborted = f.fx.integration.leanReceiver().status();
+    EXPECT_EQ(Store::Phase::Aborted, aborted.phase);
+    EXPECT_EQ(generation + 1, aborted.generation);
+    EXPECT_EQ(5u, aborted.counter);
+    EXPECT_EQ(16u, aborted.receivedBlocks);
+    EXPECT_EQ(6106u, aborted.totalBlocks);
+    EXPECT_EQ(0, std::memcmp(before.imageHash, aborted.imageHash, 32));
+    EXPECT_EQ(0, std::memcmp(before.beginNonce, aborted.beginNonce, sizeof(before.beginNonce)));
+    EXPECT_FALSE(f.sink.isActive());
+    char reply[160];
+    formatOtaAdminAbortResult(reply, sizeof(reply), Result::Ok);
+    EXPECT_STREQ("OK - OTA aborted", reply);
+    const auto programs = f.fx.candidate_flash.programOpCount();
+    ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+    EXPECT_EQ(1u, trace.beforeAppend);
+    EXPECT_EQ(2u, trace.afterAppend);
+    EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(0, std::memcmp(floor.data(), f.boot.floor_flash.rawBuffer(), floor.size()));
+    EXPECT_EQ(0, std::memcmp(state.data(), f.boot.state_flash.rawBuffer(), state.size()));
+    EXPECT_EQ(0, std::memcmp(commands.data(), f.command_flash.rawBuffer(), commands.size()));
+    EXPECT_EQ(0, std::memcmp(staged.data(), f.fx.image_flash.rawBuffer(), staged.size()));
+    f.fx.integration = OtaFirmwareIntegration();
+    f.reattach();
+    ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+    EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+    EXPECT_EQ(generation + 1, f.fx.integration.leanReceiver().status().generation);
+    EXPECT_EQ(16u, f.fx.integration.leanReceiver().status().receivedBlocks);
+    EXPECT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
+  }
+}
+
+TEST(LoraOtaAdminAbort, PostAppendRealRecoveryFailureReturnsErrorButColdRetryPreservesTheDurableAbort) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f(0x584e3430, 1);
+  f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseConfirmed, 4, 17);
+  f.boot.setFloor(4);
+  f.reattach();
+  f.manifest(5);
+  auto& receiver = f.fx.integration.leanReceiver();
+  ASSERT_EQ(Result::Ok, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  ASSERT_EQ(Result::Ok, receiver.putBlock(0, f.image.data(), 84));
+  const auto initial = receiver.status();
+  const auto command = guardedAbortText(initial);
+  struct RecoveryFailure {
+    OtaBoardUnadmittedCommandRecovery& recovery;
+    unsigned checks = 0, cleanups = 0;
+  } failure{f.recovery};
+  f.fx.integration.attachUnadmittedAbort(&failure, [](void* context, const Store::Snapshot& candidate, bool cancel) {
+    auto& failure = *static_cast<RecoveryFailure*>(context);
+    const auto result = failure.recovery.recover(candidate, cancel);
+    if (cancel) {
+      ++failure.cleanups;
+      EXPECT_EQ(Store::Phase::Aborted, candidate.phase);
+      return result == Result::Ok ? Result::IoError : result;
+    }
+    ++failure.checks;
+    return result;
+  });
+  const auto result = handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str());
+  EXPECT_EQ(Result::IoError, result);
+  EXPECT_EQ(1u, failure.checks);
+  EXPECT_EQ(1u, failure.cleanups);
+  char reply[160];
+  formatOtaAdminAbortResult(reply, sizeof(reply), result);
+  EXPECT_STREQ("Err - OTA abort I/O error", reply);
+  Store::Snapshot durable;
+  ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(durable));
+  EXPECT_EQ(Store::Phase::Aborted, durable.phase);
+  EXPECT_EQ(initial.generation + 1, durable.sessionId);
+  EXPECT_EQ(1u, durable.receivedBlocks);
+  const auto programs = f.fx.candidate_flash.programOpCount();
+  f.fx.integration = OtaFirmwareIntegration();
+  f.reattach();
+  ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+  EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+  EXPECT_EQ(initial.generation + 1, f.fx.integration.leanReceiver().status().generation);
+  EXPECT_EQ(1u, f.fx.integration.leanReceiver().status().receivedBlocks);
+  EXPECT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
+}
+
+TEST(LoraOtaAdminAbort, BootInspectionReentryCannotOverwriteTheLeasedOuterReadback) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f(0x584e3430, 1);
+  f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseConfirmed, 4, 17);
+  f.boot.setFloor(4);
+  f.reattach();
+  f.manifest(5);
+  auto& receiver = f.fx.integration.leanReceiver();
+  ASSERT_EQ(Result::Ok, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  ASSERT_EQ(Result::Ok, receiver.putBlock(0, f.image.data(), 84));
+  const auto selected = receiver.status();
+  struct Inspection {
+    UnadmittedFixture& fixture;
+    std::string command;
+    bool reentered = false;
+  } inspection{f, guardedAbortText(selected)};
+  f.fx.integration.attachBootLifecycle(&inspection, [](void* context, OtaBootLifecycleEvidence& out) {
+    auto& inspection = *static_cast<Inspection*>(context);
+    auto& f = inspection.fixture;
+    if (!inspection.reentered) {
+      inspection.reentered = true;
+      const auto programs = f.fx.candidate_flash.programOpCount();
+      EXPECT_EQ(Result::Busy, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(),
+          inspection.command.c_str()));
+      EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+    }
+    return f.boot.observer.read(true, out);
+  });
+  ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(),
+      inspection.command.c_str()));
+  EXPECT_TRUE(inspection.reentered);
+  EXPECT_EQ(Store::Phase::Aborted, receiver.status().phase);
+  EXPECT_EQ(selected.generation + 1, receiver.status().generation);
+  EXPECT_EQ(1u, receiver.status().receivedBlocks);
+  EXPECT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
+  const auto programs = f.fx.candidate_flash.programOpCount();
+  ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(),
+      inspection.command.c_str()));
+  EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaAdminAbort, ReusedInspectionNeverRevivesAnOmittedBootCandidateSnapshot) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture owner(0x584e3430, 1);
+  owner.manifest(5);
+  ASSERT_EQ(Result::Ok, owner.fx.integration.leanReceiver().begin(owner.owner.publicKey(),
+      owner.canonical, owner.signature, false, false));
+  struct Projection {
+    Store::Snapshot candidate;
+    OtaBootLifecycleEvidence boot;
+    bool provide = true;
+  } projection;
+  ASSERT_EQ(Store::LoadResult::Found, owner.fx.candidate_store.load(projection.candidate));
+  const auto selected = owner.fx.integration.leanReceiver().status();
+  projection.candidate.phase = Store::Phase::Committed;
+  projection.candidate.receivedBlocks = projection.candidate.totalBlocks;
+  projection.boot.phase = usb::UsbOtaPhase::Installed;
+  projection.boot.imageVerified = projection.boot.floorKnown = true;
+  projection.boot.counter = projection.boot.confirmedFloor = selected.counter;
+  projection.boot.transactionNonce = selected.transactionNonce;
+  std::memcpy(projection.boot.imageHash, selected.imageHash, 32);
+  LeanFixture empty;
+  empty.admins.add(owner.owner.publicKey());
+  empty.integration.attachBootLifecycle(&projection,
+      [](void* context, OtaBootLifecycleEvidence& out) {
+        out = static_cast<Projection*>(context)->boot;
+        return true;
+      }, [](void* context, const OtaBootLifecycleEvidence&, Store::Snapshot& out) {
+        const auto& projection = *static_cast<Projection*>(context);
+        if (projection.provide) out = projection.candidate;
+        return true;
+      });
+  const auto command = guardedAbortText(selected);
+  const auto programs = empty.candidate_flash.programOpCount();
+  EXPECT_EQ(Result::TooLate, handleOtaAdminAbortCommand(empty.integration, owner.owner.publicKey(),
+      command.c_str()));
+  projection.provide = false;
+  EXPECT_EQ(Result::Mismatch, handleOtaAdminAbortCommand(empty.integration, owner.owner.publicKey(),
+      command.c_str()));
+  projection.provide = true;
+  EXPECT_EQ(Result::TooLate, handleOtaAdminAbortCommand(empty.integration, owner.owner.publicKey(),
+      command.c_str()));
+  EXPECT_EQ(programs, empty.candidate_flash.programOpCount());
+}
+
+TEST(LoraOtaAdminAbort, RealRecoveryCannotRevokeAReplacementAfterGuardSelection) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f(0x584e3430, 1);
+  f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseConfirmed, 4, 17);
+  f.boot.setFloor(4);
+  f.reattach();
+  f.stage(5);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto selected = f.fx.integration.leanReceiver().status();
+  const auto command = guardedAbortText(selected);
+  Store::Snapshot replacement;
+  ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(replacement));
+  replacement.phase = Store::Phase::Receiving;
+  replacement.sessionId += 2;
+  ReenteringProofVerifier verifier(f.fx.sig_verifier);
+  OtaBoardUnadmittedCommandRecovery recovery(f.command, f.boot.state, f.boot.floor, f.fx.image_region,
+      verifier, f.running, f.qualified, f.target, f.role);
+  f.fx.integration.attachUnadmittedAbort(&recovery, &OtaBoardUnadmittedCommandRecovery::invoke);
+  uint32_t programs = 0;
+  verifier.hook = [&]() {
+    ASSERT_TRUE(f.fx.candidate_store.reset(replacement));
+    ASSERT_TRUE(f.fx.candidate_store.markReceived(0));
+    f.fx.integration.leanReceiver().restore();
+    programs = f.fx.candidate_flash.programOpCount();
+  };
+  EXPECT_EQ(Result::Mismatch, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+  ASSERT_TRUE(verifier.called);
+  EXPECT_EQ(programs, f.fx.candidate_flash.programOpCount());
+  Store::Snapshot durable;
+  ASSERT_EQ(Store::LoadResult::Found, f.fx.candidate_store.load(durable));
+  EXPECT_EQ(Store::Phase::Receiving, durable.phase);
+  EXPECT_EQ(selected.generation + 2, durable.sessionId);
+  EXPECT_EQ(1u, durable.receivedBlocks);
+  EXPECT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
+}
+
+TEST(LoraOtaLifecycle, HigherCounterDoesNotImplicitlyReplaceReceivingAndExplicitAbortReuploadKeepsFloor) {
+  using Result = usb::UsbOtaResult;
+  using Store = ::ota::storage::OtaCandidateStore;
+  UnadmittedFixture f(0x584e3430, 1);
+  f.boot.setState(::ota::storage::XiaoOtaStateReader::kPhaseConfirmed, 4, 17);
+  f.boot.setFloor(4);
+  f.reattach();
+  f.manifest(5);
+  auto& receiver = f.fx.integration.leanReceiver();
+  ASSERT_EQ(Result::Ok, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  ASSERT_EQ(Result::Ok, receiver.putBlock(0, f.image.data(), 84));
+  const auto initial = receiver.status();
+  const auto journal = std::vector<uint8_t>(f.fx.candidate_flash.rawBuffer(),
+      f.fx.candidate_flash.rawBuffer() + f.fx.candidate_flash.rawSize());
+  f.manifest(6);
+  EXPECT_EQ(Result::Denied, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  f.image[0] ^= 1;
+  f.manifest(6);
+  EXPECT_EQ(Result::Busy, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  EXPECT_EQ(Result::Busy, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, true, false));
+  EXPECT_EQ(0, std::memcmp(journal.data(), f.fx.candidate_flash.rawBuffer(), journal.size()));
+  const auto command = guardedAbortText(initial);
+  ASSERT_EQ(Result::Ok, handleOtaAdminAbortCommand(f.fx.integration, f.owner.publicKey(), command.c_str()));
+  const auto aborted = receiver.status();
+  EXPECT_EQ(initial.generation + 1, aborted.generation);
+  EXPECT_EQ(Result::Busy, receiver.begin(f.owner.publicKey(), f.canonical, f.signature, false, false));
+  uint8_t authorization[164], hash[32];
+  ASSERT_EQ(sizeof(authorization), encodeOtaTargetAuthorization(f.fx.target_public_key, f.owner.publicKey(),
+      f.canonical, f.signature, authorization, sizeof(authorization)));
+  ASSERT_TRUE(f.fx.integration.handleReceivedFrame(authorization, sizeof(authorization), 20));
+  computeOtaManifestHash(f.canonical, hash);
+  OtaLeanReceiver::Status pending;
+  ASSERT_TRUE(receiver.pendingReuploadStatus(hash, pending));
+  EXPECT_EQ(Store::Phase::Aborted, receiver.status().phase);
+  EXPECT_EQ(aborted.generation, pending.generation);
+  EXPECT_EQ(6u, pending.counter);
+  uint8_t reupload[kOtaReuploadFrameBytes] = {kOtaReuploadKind}, message[160];
+  std::memcpy(reupload + 1, f.owner.publicKey(), 32);
+  std::memcpy(reupload + 33, f.fx.target_public_key, 32);
+  std::memcpy(reupload + 65, hash, 32);
+  usb::putBE32(reupload + 97, aborted.generation);
+  const auto length = buildOtaReuploadMessage(reupload, message);
+  f.owner.sign(message, length, reupload + 101);
+  ASSERT_TRUE(f.fx.integration.handleReceivedFrame(reupload, sizeof(reupload), 21));
+  const auto fresh = receiver.status();
+  EXPECT_EQ(Store::Phase::Receiving, fresh.phase);
+  EXPECT_EQ(6u, fresh.counter);
+  EXPECT_EQ(initial.generation + 2, fresh.generation);
+  EXPECT_EQ(0u, fresh.receivedBlocks);
+  EXPECT_NE(0, std::memcmp(initial.beginNonce, fresh.beginNonce, sizeof(initial.beginNonce)));
+  EXPECT_NE(0, std::memcmp(initial.imageHash, fresh.imageHash, sizeof(initial.imageHash)));
+  EXPECT_EQ(4u, f.fx.integration.bootLifecycle().confirmedFloor);
 }
 
 TEST(LoraOtaProofStack, StreamingStateWindowsHashEveryByteWithBoundedReadsAndShortFinalChunk) {

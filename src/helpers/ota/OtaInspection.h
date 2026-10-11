@@ -12,7 +12,7 @@ struct OtaAdminAbortGuard {
   uint8_t imageHash[32] = {};
 };
 
-inline bool parseOtaAdminAbortGuard(const char* command, OtaAdminAbortGuard& out) {
+__attribute__((noinline)) inline bool parseOtaAdminAbortGuard(const char* command, OtaAdminAbortGuard& out) {
   if (!command || std::strncmp(command, "abort ", 6)) return false;
   command += 6;
   OtaAdminAbortGuard parsed;
@@ -48,7 +48,7 @@ inline bool parseOtaAdminAbortGuard(const char* command, OtaAdminAbortGuard& out
   return true;
 }
 
-inline usb::UsbOtaResult handleOtaAdminAbortCommand(OtaFirmwareIntegration& integration,
+__attribute__((noinline)) inline usb::UsbOtaResult handleOtaAdminAbortCommand(OtaFirmwareIntegration& integration,
     const uint8_t admin_public_key[32], const char* command) {
   OtaAdminAbortGuard guard;
   if (!parseOtaAdminAbortGuard(command, guard)) return usb::UsbOtaResult::BadRequest;

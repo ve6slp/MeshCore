@@ -421,18 +421,44 @@ public:
   }
 
 private:
+  struct ReadbackWorkspace {
+    ::ota::storage::OtaCandidateStore::Snapshot candidate;
+    OtaLeanReceiver::Status bootSnapshot;
+    uint8_t canonical[59], signature[64];
+  };
+
+  __attribute__((noinline)) static void clearReadback(Readback& out) { out = Readback(); }
+  __attribute__((noinline)) static void clearReadbackSnapshot(Readback& out) { out.snapshot = OtaLeanReceiver::Status(); }
+  __attribute__((noinline)) static void clearBootReadbackCandidate(
+      ::ota::storage::OtaCandidateStore::Snapshot& out) {
+    out = ::ota::storage::OtaCandidateStore::Snapshot();
+  }
+  __attribute__((noinline)) static void captureBootReadbackSnapshot(
+      const ::ota::storage::OtaCandidateStore::Snapshot& candidate, OtaLeanReceiver::Status& out) {
+    out = OtaLeanReceiver::snapshotStatus(candidate);
+  }
+
   Readback readbackWithStatus(const OtaBootLifecycleEvidence& boot, const uint8_t* manifest_hash,
                               const OtaLeanReceiver::Status& st) const {
-    using Phase = ::ota::storage::OtaCandidateStore::Phase;
     Readback out;
+    ReadbackWorkspace workspace;
+    populateReadback(boot, manifest_hash, st, out, workspace);
+    return out;
+  }
+
+  __attribute__((noinline)) void populateReadback(const OtaBootLifecycleEvidence& boot,
+      const uint8_t* manifest_hash, const OtaLeanReceiver::Status& st, Readback& out,
+      ReadbackWorkspace& workspace) const {
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    clearReadback(out);
     if (st.storageUnavailable) {
       out.snapshot.storageUnavailable = true;
-      return out;
+      return;
     }
     out.emptyStore = lean_.hasStore() && !st.valid;
     if (st.valid && (!manifest_hash || !std::memcmp(manifest_hash, st.manifestHash, 32))) {
       out.snapshot = st;
-      out.phase = phaseForCandidate(st, boot);
+      out.phase = phaseForCandidate(st, boot, workspace);
       const bool superseded = boot.phase == usb::UsbOtaPhase::Installed && boot.imageVerified &&
                               boot.floorKnown && boot.confirmedFloor >= st.counter;
       if (st.localCache || st.counter > boot.counter ||
@@ -441,36 +467,65 @@ private:
            !superseded) ||
           (boot.transactionNonce && boot.transactionNonce == st.transactionNonce &&
            boot.counter == st.counter && !std::memcmp(boot.imageHash, st.imageHash, 32) &&
-           out.phase == boot.phase)) return out;
+           out.phase == boot.phase)) return;
       if (superseded && (st.phase == Phase::Receiving || st.phase == Phase::Verifying || st.phase == Phase::Ready)) {
-        out.snapshot = OtaLeanReceiver::Status();
+        clearReadbackSnapshot(out);
         out.phase = usb::UsbOtaPhase::Unknown;
       }
     }
-    ::ota::storage::OtaCandidateStore::Snapshot candidate;
+    auto& candidate = workspace.candidate;
+    clearBootReadbackCandidate(candidate);
     if (boot_candidate_ && boot_candidate_(boot_ctx_, boot, candidate) &&
         validBootCandidate(boot, candidate)) {
-      const auto snapshot = OtaLeanReceiver::snapshotStatus(candidate);
+      auto& snapshot = workspace.bootSnapshot;
+      captureBootReadbackSnapshot(candidate, snapshot);
       if (!manifest_hash || !std::memcmp(manifest_hash, snapshot.manifestHash, 32)) {
         out.snapshot = snapshot;
         out.phase = boot.phase == usb::UsbOtaPhase::Unknown ? usb::UsbOtaPhase::CommitPending : boot.phase;
         out.bootCandidate = true;
       }
     }
-    return out;
   }
 
-public:
-  usb::UsbOtaResult abortAuthenticatedAdminCommand(const uint8_t admin_public_key[32],
-      uint32_t generation, uint32_t counter, const uint8_t image_hash[32]) {
-    if (!lean_.currentAdmin(admin_public_key)) return usb::UsbOtaResult::Denied;
-    const auto boot = bootLifecycle();
-    const auto view = inspectReadback(boot);
+  __attribute__((noinline)) void captureAdminAbortBoot(OtaBootLifecycleEvidence& out) const {
+    out = OtaBootLifecycleEvidence();
+    if (boot_lifecycle_ && !boot_lifecycle_(boot_ctx_, out)) out = OtaBootLifecycleEvidence();
+  }
+  __attribute__((noinline)) void captureAdminAbortStatus(OtaLeanReceiver::Status& out) const {
+    out = lean_.inspectStatus();
+  }
+
+  // Unwind inspection buffers before the recovery callback's signature verification.
+  __attribute__((noinline)) usb::UsbOtaResult inspectAdminAbortContext() const {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return usb::UsbOtaResult::Busy;
+    struct Scratch {
+      OtaBootLifecycleEvidence boot;
+      OtaLeanReceiver::Status status;
+      Readback view;
+      ReadbackWorkspace workspace;
+    };
+    static Scratch scratch;
+    auto& boot = scratch.boot;
+    auto& view = scratch.view;
+    captureAdminAbortBoot(boot);
+    captureAdminAbortStatus(scratch.status);
+    populateReadback(boot, nullptr, scratch.status, view, scratch.workspace);
     if (view.snapshot.storageUnavailable) return usb::UsbOtaResult::Unavailable;
     if (!view.snapshot.valid) return view.emptyStore ? usb::UsbOtaResult::Mismatch : usb::UsbOtaResult::Unavailable;
     if (view.bootCandidate || boot.phase == usb::UsbOtaPhase::Trial ||
         view.phase == usb::UsbOtaPhase::Trial || view.phase == usb::UsbOtaPhase::Installed)
       return usb::UsbOtaResult::TooLate;
+    return usb::UsbOtaResult::Ok;
+  }
+
+public:
+  __attribute__((noinline)) usb::UsbOtaResult abortAuthenticatedAdminCommand(const uint8_t admin_public_key[32],
+      uint32_t generation, uint32_t counter, const uint8_t image_hash[32]) {
+    if (!lean_.currentAdmin(admin_public_key)) return usb::UsbOtaResult::Denied;
+    const auto context = inspectAdminAbortContext();
+    if (context != usb::UsbOtaResult::Ok) return context;
     const auto result = lean_.abortAuthenticatedAdmin(admin_public_key, generation, counter, image_hash);
     if (result == usb::UsbOtaResult::Ok) {
       commit_reboot_pending_ = false;
@@ -886,7 +941,7 @@ private:
     if (boot.phase != usb::UsbOtaPhase::Installed && boot.phase != usb::UsbOtaPhase::Failed) return false;
     return validBootCandidate(boot, candidate, true);
   }
-  static bool validBootCandidate(const OtaBootLifecycleEvidence& boot,
+  __attribute__((noinline)) static bool validBootCandidate(const OtaBootLifecycleEvidence& boot,
                                  const ::ota::storage::OtaCandidateStore::Snapshot& candidate,
                                  bool retiring = false) {
     using Phase = ::ota::storage::OtaCandidateStore::Phase;
@@ -905,7 +960,8 @@ private:
            (boot.phase != usb::UsbOtaPhase::Installed ||
             (boot.floorKnown && boot.confirmedFloor == st.counter));
   }
-  static bool validCandidateGeometry(const ::ota::storage::OtaCandidateStore::Snapshot& candidate, bool complete) {
+  __attribute__((noinline)) static bool validCandidateGeometry(
+      const ::ota::storage::OtaCandidateStore::Snapshot& candidate, bool complete) {
     meshcore::ota::protocol::OtaDescriptor descriptor;
     if (meshcore::ota::protocol::decodeOtaDescriptorCanonical(candidate.canonical, sizeof(candidate.canonical),
           descriptor) != meshcore::ota::protocol::OtaDescriptorCodecResult::Ok ||
@@ -918,8 +974,8 @@ private:
         (complete && candidate.receivedBlocks != candidate.totalBlocks)) return false;
     return true;
   }
-  usb::UsbOtaPhase phaseForCandidate(const OtaLeanReceiver::Status& st,
-                                    const OtaBootLifecycleEvidence& boot) const {
+  __attribute__((noinline)) usb::UsbOtaPhase phaseForCandidate(const OtaLeanReceiver::Status& st,
+                                    const OtaBootLifecycleEvidence& boot, ReadbackWorkspace& workspace) const {
     if (!st.valid) return usb::UsbOtaPhase::Unknown;
     if (st.localCache) return st.phase == ::ota::storage::OtaCandidateStore::Phase::Ready ?
                                 usb::UsbOtaPhase::CacheSealed : candidatePhase(st.phase);
@@ -927,7 +983,8 @@ private:
       if (boot.phase == usb::UsbOtaPhase::Failed) return usb::UsbOtaPhase::Failed;
       if ((boot.phase == usb::UsbOtaPhase::Trial || boot.phase == usb::UsbOtaPhase::Installed) &&
           !std::memcmp(boot.imageHash, st.imageHash, 32)) {
-        uint8_t canonical[59], signature[64];
+        auto& canonical = workspace.canonical;
+        auto& signature = workspace.signature;
         if (lean_.exportCandidateForUpload(canonical, signature) &&
             lean_.verifySignature(st.ownerPublicKey, canonical, sizeof(canonical), signature) &&
             (boot.phase == usb::UsbOtaPhase::Trial ||

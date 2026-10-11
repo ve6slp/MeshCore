@@ -566,7 +566,10 @@ private:
           generation != UINT32_MAX && st.generation == generation + 1u));
   }
 
-  Result abortAuthorized(const uint8_t signer_public_key[32], const uint8_t signature[64],
+  __attribute__((noinline)) void readAbortDurableStatus(Status& out) const { out = inspectStatus(); }
+  __attribute__((noinline)) void readAbortCachedStatus(Status& out) const { out = status(); }
+
+  __attribute__((noinline)) Result abortAuthorized(const uint8_t signer_public_key[32], const uint8_t signature[64],
                           const uint8_t image_hash[32], uint32_t generation,
                           bool local_owner_trusted, bool authenticated_admin, uint32_t expected_counter = 0) {
     static std::atomic_flag busy = ATOMIC_FLAG_INIT;
@@ -574,12 +577,14 @@ private:
     if (!lease) return Result::Busy;
     auto& scratch = abortScratch();
     if (authenticated_admin) {
-      const auto durable = inspectStatus();
+      auto& durable = scratch.durable;
+      readAbortDurableStatus(durable);
       if (durable.storageUnavailable) return Result::Unavailable;
       if (!matchesAbortGuard(durable, generation, expected_counter, image_hash)) return Result::Mismatch;
       if (durable.localCache) return Result::Denied;
       // Adopt only this guarded, durably acknowledged revocation after a marker verification error.
-      const auto cached = status();
+      auto& cached = scratch.cached;
+      readAbortCachedStatus(cached);
       if (durable.phase == ::ota::storage::OtaCandidateStore::Phase::Aborted &&
           cached.valid && durable.generation == cached.generation + 1u &&
           !std::memcmp(durable.manifestHash, cached.manifestHash, 32) &&
@@ -589,7 +594,8 @@ private:
         candidate_.receivedBlocks = durable.receivedBlocks;
         seal_pending_ = false;
       }
-      if (!matchesAbortGuard(status(), generation, expected_counter, image_hash)) return Result::Mismatch;
+      readAbortCachedStatus(cached);
+      if (!matchesAbortGuard(cached, generation, expected_counter, image_hash)) return Result::Mismatch;
     } else if (!reloadStorage()) {
       return Result::Unavailable;
     }
@@ -631,7 +637,8 @@ private:
     }
     if (aborted) {
       if (authenticated_admin) {
-        const auto durable = inspectStatus();
+        auto& durable = scratch.durable;
+        readAbortDurableStatus(durable);
         if (durable.storageUnavailable) return Result::Unavailable;
         if (!matchesAbortGuard(durable, generation, expected_counter, image_hash)) return Result::Mismatch;
       }
@@ -648,10 +655,13 @@ private:
       if (checked != Result::Ok) return checked;
     }
     if (authenticated_admin) {
-      const auto durable = inspectStatus();
+      auto& durable = scratch.durable;
+      readAbortDurableStatus(durable);
       if (durable.storageUnavailable) return Result::Unavailable;
+      auto& cached = scratch.cached;
+      readAbortCachedStatus(cached);
       if (!matchesAbortGuard(durable, generation, expected_counter, image_hash) ||
-          !matchesAbortGuard(status(), generation, expected_counter, image_hash)) return Result::Mismatch;
+          !matchesAbortGuard(cached, generation, expected_counter, image_hash)) return Result::Mismatch;
       if (!isCurrentAdmin(signer_public_key)) return Result::Denied;
       using Phase = ::ota::storage::OtaCandidateStore::Phase;
       const auto revocable = [](Phase phase) {
@@ -683,6 +693,7 @@ private:
     meshcore::ota::protocol::OtaDescriptor descriptor;
     uint8_t message[usb::kAbortSignedBytes];
     ::ota::storage::OtaCandidateStore::Snapshot snapshot;
+    Status durable, cached;
   };
   __attribute__((noinline)) static AbortScratch& abortScratch() {
     static AbortScratch scratch;

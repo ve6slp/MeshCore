@@ -43,7 +43,7 @@ HUPCL is disabled so close does not drop modem lines; no sequential fallback.
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -780,7 +780,10 @@ class Sender:
         self.reupload_enabled = reupload or reupload_generation is not None
         self.pending_generation = None
         self.activation_generation = None
+        self.activation_complete = False
         self.pending_reupload = False
+        self.restart_receipt = None
+        self.restart_aborted_report = None
         self.event_callback, self.event_start = event_callback, clock()
         self.attempt_callback, self.attempt_recorded = attempt_callback, False
 
@@ -916,7 +919,8 @@ class Sender:
                       begin_nonce=None if self.begin_nonce is None else self.begin_nonce.hex(),
                       bitmap=report["bits"].to_bytes(16, "little").hex(), status_authenticated=False)
             if (self.attempt_callback is not None and not self.attempt_recorded
-                    and not post_commit and not self.pending_reupload and self.begin_nonce is not None):
+                    and not post_commit and not self.pending_reupload and self.begin_nonce is not None
+                    and (self.restart_receipt is None or report["lifecycle"] == 3)):
                 self.attempt_callback(self.attempt_receipt(report))
                 self.attempt_recorded = True
             return report
@@ -960,18 +964,35 @@ class Sender:
         if lifecycle == 9:
             if not allow_pending or not self.reupload_enabled:
                 raise Error("pending ABORTED requires explicit REUPLOAD; no auto-abort/clear")
-            if (start != first or first != 0 or total != c.total or received or bits or phase != 5
+            if (start != first or first != 0 or total != c.total or phase != 5
                     or not 0 < generation < 0xFFFFFFFF or generation + 1 < b.min_generation
                     or (self.reupload_generation is not None and generation != self.reupload_generation)
                     or (self.pending_generation is not None and generation != self.pending_generation)
                     or known != 1 or floor != b.floor
                     or counter != c.counter or self.generation is not None):
-                raise Error("pending REUPLOAD hash/phase/old-generation/zero-progress/floor mismatch")
+                raise Error("pending REUPLOAD hash/phase/old-generation/floor mismatch")
+            report = {"first": first, "bits": bits, "received": received, "total": total,
+                      "generation": generation, "lifecycle": lifecycle, "phase": phase}
+            if self.restart_receipt is None:
+                if received or bits:
+                    raise Error("pending REUPLOAD requires synthetic zero progress without an original restart receipt")
+            else:
+                old = self.restart_receipt
+                old_bits = int.from_bytes(bytes.fromhex(old["bitmap"]), "little")
+                if (generation != old["generation"] + 1 or nonce.hex() != old["begin_nonce"]
+                        or not old["received_blocks"] <= received <= total
+                        or bits >> count or bits.bit_count() > received or bits & old_bits != old_bits
+                        or received > bits.bit_count() + total - count
+                        or (self.restart_aborted_report is not None and report != self.restart_aborted_report)):
+                    raise Error("retained ABORTED restart generation/nonce/progress/bitmap mismatch")
+                # Retained history is not new-attempt progress or resume authority.
+                self.restart_aborted_report = dict(report)
             self.pending_reupload = True
             self.pending_generation = generation
             self.activation_generation = generation + 1
-            return {"first": first, "bits": 0, "received": 0, "total": total,
-                    "generation": generation, "lifecycle": lifecycle, "phase": phase}
+            return report
+        if self.restart_receipt is not None and self.restart_aborted_report is None:
+            raise Error("explicit restart requires retained ABORTED preflight; no active-attempt fallback")
         if (start != first or first >= c.total or total != c.total or received > total or received < self.received
                 or phase not in (1, 2, 3) or generation < b.min_generation
                 or (self.reupload_generation is not None and generation != self.reupload_generation + 1)
@@ -984,6 +1005,11 @@ class Sender:
             raise Error("RF progress/generation/cache/floor/bitmap mismatch")
         if not any(nonce) or (self.begin_nonce is not None and nonce != self.begin_nonce):
             raise Error("RF census belongs to an unbound or different BEGIN attempt")
+        if (self.activation_generation is not None and not self.activation_complete
+                and (received or bits or phase != 1 or lifecycle not in (2, 3))):
+            raise Error("REUPLOAD did not create a fresh remote candidate with zero bitmap")
+        if self.restart_receipt is not None and nonce.hex() == self.restart_receipt["begin_nonce"]:
+            raise Error("explicit restart BEGIN must have a fresh nonce")
         self.begin_nonce = nonce
         self.generation = generation
         self.received = received
@@ -1071,7 +1097,7 @@ class Sender:
         self.emit("auth_exhausted", attempts=retries)
         raise Error("target did not admit candidate; operator must resolve cache/admin state")
 
-    def activate_prepared(self):
+    def activate_prepared(self, *, retry_pending=True):
         if not self.pending_reupload or not self.reupload_enabled or self.pending_generation is None:
             raise Error("explicit REUPLOAD requires freshly observed prepared ABORTED descriptor")
         c, b = self.candidate, self.binding
@@ -1079,6 +1105,8 @@ class Sender:
         frame = prefix + self.stock.sign(REUPLOAD_DOMAIN + prefix, self.deadline)
         for attempt in range(1, 4):
             if self.pending_reupload:
+                if not retry_pending and attempt > 1:
+                    raise Error("explicit restart REUPLOAD unconfirmed; no automatic retry")
                 self.emit("reupload_request", attempt=attempt, observed_generation=self.pending_generation)
                 self.send(frame)
                 self.emit("reupload_sent", attempt=attempt, observed_generation=self.pending_generation,
@@ -1092,6 +1120,7 @@ class Sender:
             if report["received"] or report["bits"] or report["phase"] != 1:
                 raise Error("REUPLOAD did not create a fresh remote candidate with zero bitmap")
             if report["lifecycle"] == 3:
+                self.activation_complete = True
                 self.emit("reupload_receiving", generation=report["generation"])
                 return report
             if report["lifecycle"] != 2:
@@ -1409,6 +1438,8 @@ class BackgroundCampaign:
         """Explicit new BEGIN pair and bounded prefix; never repair or COMMIT.
 
         This deliberate stop is not cancellation and does not abort receivers.
+        Restart requires both receipt-bound retained ABORTED preflights, then
+        fresh zero-progress BEGINs; an unconfirmed REUPLOAD is never retried.
         Attempt callbacks persist both contexts before the first data block.
         """
         if type(blocks) is not int or not 1 <= blocks <= 32 or blocks >= self.transport.candidate.total:
@@ -1417,11 +1448,13 @@ class BackgroundCampaign:
             raise Error("partial pair requires a fresh explicitly selected campaign")
         if restart_receipts is not None:
             validate_partial_restart([target.binding for target in self.targets], self.transport.candidate,
-                                     restart_receipts)
+                                     restart_receipts, profile=self.transport.original,
+                                     tx_power=self.transport.stock.tx_power, duty=self.transport.duty)
             for target, old in zip(self.targets, restart_receipts):
                 target.binding.permit_reupload(None, True)
                 target.reupload_generation = old["generation"] + 1
                 target.reupload_enabled = True
+                target.restart_receipt = dict(old)
         current = 0
         try:
             if restart_receipts is not None:
@@ -1432,7 +1465,7 @@ class BackgroundCampaign:
                         raise Error("explicit restart requires BOTH prior durable ABORTED generations; no resume fallback")
                 self.stage = "restart-signed-reupload"
                 for current, (target, old) in enumerate(zip(self.targets, restart_receipts)):
-                    target.activate_prepared()
+                    target.activate_prepared(retry_pending=False)
                     if (target.generation != old["generation"] + 2
                             or target.begin_nonce.hex() == old["begin_nonce"]):
                         raise Error("explicit restart did not create its exact new generation/fresh nonce")
@@ -1651,10 +1684,12 @@ class BackgroundCampaign:
                            else "shared-campaign-incomplete", complete=complete)
 
 
-def validate_partial_restart(bindings, candidate, receipts):
+def validate_partial_restart(bindings, candidate, receipts, *, profile=None, tx_power=None, duty=None):
     """Validate explicit NEW-attempt history, never reinterpret it as resume."""
     if not isinstance(receipts, list) or len(receipts) != 2:
         raise Error("restart needs both original attempt receipts, not a single-target guess")
+    BackgroundCampaign.validate_bindings(bindings, candidate)
+    originals = []
     for binding, receipt in zip(bindings, receipts):
         if (not isinstance(receipt, dict) or receipt.get("schema") != ATTEMPT_RECEIPT_SCHEMA
                 or receipt.get("target_public_key") != binding.target.hex()
@@ -1676,6 +1711,16 @@ def validate_partial_restart(bindings, candidate, receipts):
         nonce = receipt.get("begin_nonce")
         if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce) or not any(bytes.fromhex(nonce)):
             raise Error("new-attempt restart needs an original nonzero BEGIN nonce")
+        minimum = receipt.get("min_generation")
+        if type(minimum) is not int or not 0 < minimum <= receipt["generation"]:
+            raise Error("new-attempt restart needs original positive min-generation history")
+        originals.append(replace(binding, min_generation=minimum, allow_reupload=False, reupload_generation=None))
+    old_duty = receipts[0].get("normal_duty_percent")
+    if type(old_duty) not in (int, float) or not math.isfinite(old_duty) or not 0 < old_duty <= 100:
+        raise Error("new-attempt restart needs original paired bounded duty context")
+    BackgroundCampaign.validate_resume_receipts(
+        originals, candidate, receipts, old_duty / 100 if duty is None else duty,
+        profile=profile, tx_power=tx_power)
 
 
 def partial_background_operation(stock, bindings, candidate, artifacts, blocks=16, timeout=1800, duty=0.02,

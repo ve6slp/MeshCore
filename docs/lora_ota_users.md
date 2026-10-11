@@ -302,6 +302,12 @@ Installed, local cache, unavailable storage and exhausted generation states
 are refused. Existing host cancellation and transport-stop APIs remain
 separate and do not claim a receiver abort.
 
+`Err - OTA abort mismatch` means the selected context no longer matches;
+inspect the current candidate rather than substituting its generation and
+retrying automatically. A missing acknowledgement leaves execution outcome
+unknown: the durable journal may already have advanced. Inspect before
+deciding whether any further mutation is appropriate.
+
 Restarting the same counter after abort requires explicit existing signed,
 target-bound REUPLOAD authorization before a new BEGIN. It is not strict
 resume: the new attempt has the original generation plus two, a fresh BEGIN
@@ -311,6 +317,14 @@ cannot act on its replacement. After deliberately authorizing the restart,
 identical-image signed blocks remain valid immutable content because block
 signatures do not bind an attempt generation/nonce. Do not claim those
 content-identical blocks are distinguishable from newly sent blocks.
+
+Keep the original owned attempt receipts when deliberately restarting.
+Aborted preflight can retain nonzero progress; it must match the selected
+old context rather than be mistaken for a fresh empty attempt. For a paired
+restart, both old contexts must pass before either REUPLOAD is sent. Only the
+new generation and nonce may start at zero, and both new contexts are saved
+before sending blocks. An unconfirmed restart REUPLOAD is not automatically
+retried; inspect both receivers before choosing any further operation.
 
 ### Passive repeater radio-fault readback
 
