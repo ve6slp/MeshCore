@@ -1,6 +1,9 @@
 # Building and testing optional LoRa OTA
 
-Base this feature on `dev`, keep unrelated changes out, and follow
+The upstream baseline is MeshCore **1.18.0**, released 2026-10-15.
+The `companion-v1.18.0`, `repeater-v1.18.0` and `room-server-v1.18.0`
+tags all resolve to `81dbae592ffad40b4212bc0b37e82b38da08f4bc`.
+Keep unrelated changes out and follow
 [CONTRIBUTING](../CONTRIBUTING.md): 2-space C++ indentation,
 camelCase/PascalCase, roughly 100-column lines (`.clang-format` permits 110), and
 public API documentation/examples. For this embedded feature, prefer static
@@ -11,6 +14,21 @@ environments enable `MESHCORE_LORA_OTA=1`; ordinary environment RF/path defaults
 are unchanged. See [the product guide](lora_ota_users.md) for environments,
 installation, deployment and recovery, and [design](lora_ota_design.md) for
 transaction boundaries. Soak work stays in the public fork; no upstream PR.
+
+The release merge retains upstream's configured direct-ACK retransmit delay,
+multipart ACK spacing, zero transport-code scope handling, nRF52 power-management
+configuration changes, BLE/WiFi variants and new board support. OTA direct
+forwarding retains its lower background priority while using the same configured
+delay. Native routing regressions exercise ordinary, OTA-enabled and
+installer-independent relay builds, including a nonzero delay and extra ACK
+copies.
+
+The 1.18.0 integration builds ordinary XIAO nRF52 companion/repeater firmware,
+all six opt-in OTA companion/repeater environments and the XIAO
+installer-independent relay. Hardware milestones below describe their exact
+earlier images; no radio was flashed as part of the release merge. In particular,
+the frozen corrective APP's measured stack reserve is not a measurement of a
+newly linked 1.18.0 image.
 
 Bench USB conversion is fresh provisioning, not an in-field OTA transaction.
 Prefer the simplest supported vendor flash workflow and allow a clean slate
@@ -100,7 +118,7 @@ ordinary encrypted admin commands, not a new OTA trust or local-owner bypass.
 `test-ota-disabled` (environment `native_lora_ota_disabled`) compiles the real
 `Mesh`, `Dispatcher`, `Packet` and `StaticPoolPacketManager` with
 `MESHCORE_LORA_OTA=0` and checks that ordinary routing, priorities, airtime
-scheduling and packet ownership match upstream `dev`; unknown payload type
+scheduling and packet ownership match upstream 1.18.0; unknown payload type
 `0x0C` is handled like any other unknown type. `test-ota-queue-compatibility`
 (environment `native_lora_ota_queue`) runs the same fixture with OTA compiled in
 to check the queue reserve, priorities and ownership. Both are part of

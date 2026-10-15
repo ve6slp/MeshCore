@@ -2,6 +2,9 @@
 
 This optional feature is **off in ordinary builds**. It is being soaked in a
 public fork; no upstream pull request or production-readiness claim is implied.
+The current source baseline is **MeshCore 1.18.0**. Hardware milestones below
+were obtained with earlier feature builds; the release integration does not
+itself qualify a new image on hardware.
 Direct nRF52840 updates have succeeded on hardware, including normal-radio
 restoration. A full one-hop stock-sender routed nRF52840 installation has also
 succeeded, including selective loss repair, durable counter advancement and
@@ -438,7 +441,7 @@ It does not grant receiver administrator permission or perform a deployment.
 
 ## Deploy through an unchanged stock companion
 
-`OTA_DEPLOY_TRANSPORT=stock` uses ordinary MeshCore **1.17.1** USB signing and raw
+`OTA_DEPLOY_TRANSPORT=stock` uses ordinary MeshCore **1.17.1 or 1.18.0** USB signing and raw
 packet commands. It does not require the native OTA USB command. It supports
 zero-hop off-channel `direct` delivery, normal-channel `directed` delivery
 through **one explicitly selected relay**, and `background` collection by
@@ -448,6 +451,10 @@ delivery is software-tested; its hardware experiment is still pending.
 Create your own owned mode-0600 JSON binding. Replace every angle-bracket field;
 `normal_profile` is the **receiver's actual normal radio configuration**, not
 an assumed sender profile. `floor` is its current confirmed anti-rollback floor.
+`stock_version` is required and must be exactly `1.17.1` or `1.18.0`; the
+observed USB release must match it exactly, using USB protocol 13 or 14,
+respectively. The observed firmware may have an optional leading `v` and
+hexadecimal build suffix, such as `v1.18.0-81dbae59`.
 
 ```text
 {
@@ -455,6 +462,7 @@ an assumed sender profile. `floor` is its current confirmed anti-rollback floor.
   "serial": "<sender USB serial>",
   "sender_public_key": "<full sender key>",
   "target_public_key": "<full receiver key>",
+  "stock_version": "1.17.1",
   "floor": <confirmed counter>,
   "min_generation": 1,
   "normal_profile": [<frequency_khz>, <bandwidth_hz>, <sf>, <cr>]
@@ -826,7 +834,7 @@ paths, unsupported boards or production readiness.
 The stock companion keeps sending its ordinary notifications (adverts, path
 updates, message tickles, ordinary received-packet logs and similar) during a
 long transfer. The uploader discards only well-formed notifications of the
-known MeshCore 1.17.1 kinds it never uses. Its RF-log demultiplexer also validates
+known MeshCore 1.17.1/1.18.0 kinds it never uses. Its RF-log demultiplexer also validates
 the payload shape of echoed OTA traffic, including signed blocks and retry
 envelopes, then counts and removes non-consumed echoes from the USB response
 queue. It does not suppress those packets on air or claim their signatures

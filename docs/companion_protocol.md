@@ -61,8 +61,11 @@ Hosts must bind READY and Installed to the expected target, descriptor, counter,
 generation, scope and freshness. RF status is currently unsigned and is not
 independent cryptographic attestation.
 
-The unchanged MeshCore 1.17.1 stock adapter uses existing signing/raw RF commands,
-not CMD67; it supports direct zero-hop delivery only.
+The stock adapter for unchanged MeshCore 1.17.1/1.18.0 companions uses existing
+signing/raw RF commands, not CMD67. It supports direct zero-hop delivery,
+directed delivery through one explicitly selected relay, and background
+collection by exactly two receivers. See the [stock companion guide](lora_ota_users.md#deploy-through-an-unchanged-stock-companion)
+for release-bound USB protocol checks and delivery limits.
 
 ## Important Security Note
 

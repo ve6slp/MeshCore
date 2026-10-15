@@ -52,7 +52,7 @@ def candidate(size=168):
 def binding(c=None):
     c = c or candidate()
     return ota.Binding("ABCDEF0123456789", OWNER, TARGET, 4, 10, NORMAL[:4],
-                       hashlib.sha256(c.image).digest(), c.digest)
+                       "1.17.1", hashlib.sha256(c.image).digest(), c.digest)
 
 
 BINDING = binding()
@@ -84,7 +84,7 @@ def pending_census(c, generation=9, floor=4, nonce=NONCE):
     return frame[:87] + b"\x05" + frame[88:]
 
 
-# Well-formed ordinary MeshCore 1.17.1 pushes the stock uploader never consumes.
+# Well-formed ordinary MeshCore 1.17.1/1.18.0 pushes the uploader never consumes.
 ORDINARY_PUSHES = (
     b"\x80" + bytes(32), b"\x81" + bytes(32), b"\x82" + bytes(8), b"\x83",
     b"\x84\x10\xc0\xff" + bytes(10), b"\x85" + bytes(7), b"\x85" + bytes(13), b"\x86" + bytes(7),
@@ -143,6 +143,7 @@ class FakeSerial:
         self.tx_fails = False
         self.fail_restore = False
         self.version = b"v1.17.1"
+        self.protocol_version = 13
         self.wrong_identity = False
         self.name = b"synthetic-stock"
         self.drop_start = 0
@@ -203,7 +204,7 @@ class FakeSerial:
         self.clock.sleep(self.command_delay + (self.sign_delay if cmd == 35 else 0))
         if cmd == 22:
             frame = bytearray(82)
-            frame[:2] = b"\x0d\x0d"
+            frame[:2] = bytes([13, self.protocol_version])
             frame[4:8] = b"\x99\x88\x77\x66"  # Synthetic PIN sentinel; never logged.
             frame[60:60 + len(self.version)] = self.version
             frame[80] = self.profile[4]
@@ -670,16 +671,55 @@ class PathBindingTests(Scratch):
                 self.fail("settling anchor race yielded")
         stream.close.assert_called_once()
 
-    def inspect_setup(self, directory):
-        path = self.directory / "binding.json"
+    def inspect_setup(self, directory, release="1.17.1"):
+        path = self.directory / f"binding-{release}.json"
         if not path.exists():
-            ota.private_write(path, self.binding_value())
+            ota.private_write(path, dict(self.binding_value(), stock_version=release))
         argv = ["inspect", "--serial", "0001", "--by-id", STOCK_ID, "--by-path", STOCK_PATH,
                 "--sender-key", OWNER.hex(), "--sender-name", "synthetic-stock", "--target", TARGET.hex(),
                 "--binding", str(path), "--artifacts", str(directory)]
         clock, stream, _, _ = setup()
         stream.profile = (907525, 250000, 7, 8, 1)
         return argv, clock, stream
+
+    def test_118_inspect_reads_actual_protocol14_without_rf_or_private_device_fields(self):
+        directory = self.directory / "inspect-118"
+        argv, clock, stream = self.inspect_setup(directory, "1.18.0")
+        stream.version, stream.protocol_version = b"v1.18.0-81dbae59", 14
+        @contextmanager
+        def uart(*args, **kwargs):
+            yield stream
+        frames = ota.Frames
+        output = io.StringIO()
+        with patch.object(ota, "validated_stock_uart", uart), \
+                patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                patch.object(ota, "radio_guard", side_effect=AssertionError("read-only must not mutate radio")), \
+                redirect_stdout(output):
+            ota.main(argv)
+        result = ota.private_read(directory / "result.json")
+        self.assertEqual(result["version"], "v1.18.0-81dbae59")
+        self.assertEqual(result["radio_profile"], list(stream.profile))
+        self.assertEqual([command[0] for command in stream.commands], [1, 22])
+        self.assertFalse(result["hardware_readiness_confirmed"])
+        self.assertNotIn("GPS-HIDE", output.getvalue())
+        self.assertNotIn("99887766", output.getvalue())
+
+    def test_inspect_binding_cannot_cross_authorize_the_other_supported_release(self):
+        frames = ota.Frames
+        for bound, observed, protocol in (("1.17.1", b"v1.18.0", 14),
+                                          ("1.18.0", b"v1.17.1", 13)):
+            directory = self.directory / f"inspect-{bound}"
+            argv, clock, stream = self.inspect_setup(directory, bound)
+            stream.version, stream.protocol_version = observed, protocol
+            @contextmanager
+            def uart(*args, **kwargs):
+                yield stream
+            with self.subTest(bound=bound), patch.object(ota, "validated_stock_uart", uart), \
+                    patch.object(ota, "Frames", side_effect=lambda port: frames(port, clock)), \
+                    self.assertRaisesRegex(ota.Error, "binding stock_version"):
+                ota.main(argv)
+            self.assertEqual([command[0] for command in stream.commands], [1, 22])
+            self.assertFalse(list(directory.iterdir()))
 
     def test_inspect_only_starts_queries_and_publishes_redacted_public_summary_without_radio_guard(self):
         directory = self.directory / "inspect"
@@ -1090,6 +1130,7 @@ class ResumeTests(Scratch):
         b = original.binding
         ota.private_write(path, {"schema": 1, "serial": b.serial,
                                  "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "stock_version": b.stock_version,
                                  "floor": 1, "min_generation": 2, "normal_profile": list(NORMAL[:4])})
         image, source = self.directory / "ordinary.bin", self.directory / "original-attempt.json"
         image.write_bytes(original.candidate.image)
@@ -1127,6 +1168,25 @@ class ResumeTests(Scratch):
 
 
 class DirectedTests(Scratch):
+    def test_118_directed_signed_deploy_preserves_normal_profile_and_unsigned_install_truth(self):
+        clock, stream, stock, original = routed_setup(width=3, duty=0.8)
+        stream.version, stream.protocol_version = b"v1.18.0-81dbae59", 14
+        approved = replace(original.binding, stock_version="1.18.0")
+        with ota.radio_guard(stock, approved, self.directory, mode="directed") as profile:
+            sender = ota.Sender(stock, approved, original.candidate, profile, clock() + 10000,
+                                0, 0, 0.8, clock, clock.sleep, mode="directed",
+                                relay=RELAY, path_hash_bytes=3)
+            result = sender.deploy(300)
+        self.assertEqual(result["outcome"], "native-installed-reported-unsigned")
+        self.assertEqual(result["confirmed_floor"], original.candidate.counter)
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertEqual(stream.received, set(range(original.candidate.total)))
+        self.assertEqual(stream.commit_count, 1)
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+        self.assertTrue(ota.private_read(self.directory / "radio-unchanged.json")["normal_profile_unchanged"])
+
     def test_retry_and_path_limits_reject_malformed_nested_and_exhausted_attempts(self):
         report = census(candidate())
         for wire in (b"\x11", b"\x11" + bytes(4) + report,
@@ -1162,6 +1222,7 @@ class DirectedTests(Scratch):
         path = self.directory / "binding.json"
         ota.private_write(path, {"schema": 1, "serial": BINDING.serial,
                                  "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "stock_version": BINDING.stock_version,
                                  "floor": 4, "min_generation": 10, "normal_profile": list(NORMAL[:4])})
         image, manifest = self.directory / "ordinary.bin", self.directory / "manifest.bin"
         image.write_bytes(c.image)
@@ -1197,6 +1258,7 @@ class DirectedTests(Scratch):
         path = self.directory / "binding.json"
         ota.private_write(path, {"schema": 1, "serial": BINDING.serial,
                                  "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                                 "stock_version": BINDING.stock_version,
                                  "floor": 4, "min_generation": 10, "normal_profile": list(NORMAL[:4])})
         image = self.directory / "ordinary.bin"
         image.write_bytes(c.image)
@@ -1670,20 +1732,24 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ota.Error):
             stock.sign(b"message", sender.deadline)
 
-    def test_release_version_accepts_only_full_1171_optional_v_and_hex_build_suffix(self):
-        for version in (b"v1.17.1", b"1.17.1", b"v1.17.1-d929643",
-                        b"1.17.1-d929643", b"v1.17.1-ABCDEF"):
-            _, stream, stock, _ = setup()
-            stream.version = version
-            with self.subTest(version=version):
-                self.assertEqual(stock.identify(), NORMAL)
-                self.assertEqual(stock.version, version.decode("ascii"))
-                self.assertTrue(stock.identified)
-                self.assertEqual([cmd[0] for cmd in stream.commands], [1, 22])
-        invalid = (b"", b"v1.17.0-d929643", b"v1.18.0", b"v1.17.10", b"v11.17.1",
-                   b"V1.17.1", b" v1.17.1", b"v1.17.1 ", b"v1.17.1\n", b"v1.17.1-",
-                   b"v1.17.1-main", b"v1.17.1-abc-dirty", b"v1.17.1+abc",
-                   b"v1.17.1-rc1", b"v1.17.1\xff", b"prefix1.17.1")
+    def test_release_versions_accept_only_full_release_optional_v_and_hex_build_suffix(self):
+        for release, protocol in (("1.17.1", 13), ("1.18.0", 14)):
+            for spelling in (release, "v" + release, release + "-d929643",
+                             "v" + release + "-81dbae59", "v" + release + "-ABCDEF"):
+                _, stream, stock, _ = setup()
+                stock.bind(replace(binding(), stock_version=release))
+                stream.version, stream.protocol_version = spelling.encode("ascii"), protocol
+                with self.subTest(version=spelling):
+                    self.assertEqual(stock.identify(), NORMAL)
+                    self.assertEqual(stock.version, spelling)
+                    self.assertTrue(stock.identified)
+                    self.assertEqual([cmd[0] for cmd in stream.commands], [1, 22])
+        invalid = (b"", b"v1.17.0-d929643", b"v1.18.1", b"v1.19.0", b"v1.17.10", b"v11.17.1",
+                   *(("v" + release + suffix).encode("ascii")
+                     for release in ("1.17.1", "1.18.0")
+                     for suffix in (" ", "\n", "-", "-main", "-abc-dirty", "+abc", "-rc1")),
+                   b"V1.18.0", b" v1.18.0", b"v1.18.00", b"v11.18.0",
+                   b"V1.17.1", b" v1.17.1", b"v1.17.1\xff", b"prefix1.17.1", b"v1.18.0\xff")
         for version in invalid:
             _, stream, stock, _ = setup()
             stock.identify()
@@ -1692,6 +1758,51 @@ class ProtocolTests(unittest.TestCase):
                 stock.identify()
             self.assertFalse(stock.identified)
             self.assertIsNone(stock.version)
+
+    def test_supported_releases_cannot_cross_authorize_radio_sign_or_rf(self):
+        for bound, observed, protocol in (("1.17.1", b"v1.18.0-81dbae59", 14),
+                                          ("1.18.0", b"v1.17.1-d929643", 13)):
+            for action in ("radio", "sign", "raw"):
+                _, stream, stock, sender = setup()
+                stock.bind(replace(binding(), stock_version=bound))
+                stream.version, stream.protocol_version = observed, protocol
+                with self.subTest(bound=bound, action=action), \
+                        self.assertRaisesRegex(ota.Error, "binding stock_version"):
+                    if action == "radio":
+                        stock.radio((919000, 250000, 5, 5, 0))
+                    elif action == "sign":
+                        stock.sign(b"message", sender.deadline)
+                    else:
+                        stock.ok(b"\x41\x00" + ota.packet(b"\x07" + sender.candidate.digest[:4]))
+                self.assertEqual([cmd[0] for cmd in stream.commands], [1, 22])
+                self.assertFalse(stock.identified)
+                self.assertIsNone(stock.version)
+
+    def test_release_protocol_pair_must_match_exact_upstream_release(self):
+        for release, protocol in (("1.17.1", 14), ("1.18.0", 13),
+                                  ("1.18.0", 15), ("1.17.1", 12)):
+            _, stream, stock, _ = setup()
+            stock.bind(replace(binding(), stock_version=release))
+            stream.version, stream.protocol_version = release.encode("ascii"), protocol
+            with self.subTest(release=release, protocol=protocol), \
+                    self.assertRaisesRegex(ota.Error, "release/protocol mismatch"):
+                stock.sign(b"message", 100)
+            self.assertEqual([cmd[0] for cmd in stream.commands], [1, 22])
+            self.assertFalse(stock.identified)
+
+    def test_protocol14_does_not_authorize_response_code14_private_key_frames(self):
+        _, stream, stock, _ = setup()
+        stock.bind(replace(binding(), stock_version="1.18.0"))
+        stream.version, stream.protocol_version = b"v1.18.0", 14
+        original = stream.reply
+        def wrong_code(frame):
+            original(b"\x0e" + frame[1:] if frame[0] == 13 else frame)
+        stream.reply = wrong_code
+        with self.assertRaises(ota.NoUsbResponse):
+            stock.identify()
+        self.assertEqual([command[0] for command in stream.commands], [1, 22])
+        self.assertFalse(stock.identified)
+        self.assertIsNone(stock.version)
 
     def test_non_release_versions_block_radio_sign_and_rf_with_no_startup_fallback(self):
         for version in (b"v1.17.1-main", b"v1.17.1-abc-dirty", b"v1.17.10", b"v1.17.1+abc"):
@@ -2487,11 +2598,27 @@ class ReuploadTests(unittest.TestCase):
 
 
 class ArtifactTests(Scratch):
+    def test_binding_requires_explicit_supported_release_without_build_or_v_spelling(self):
+        base = {"schema": 1, "serial": BINDING.serial,
+                "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+                "floor": 4, "min_generation": 10, "normal_profile": list(NORMAL[:4])}
+        for index, version in enumerate((None, "", "v1.18.0", "1.18.0-81dbae59",
+                                         "1.17.1-main", "1.18.1", "1.19.0", 14, True, [])):
+            path = self.directory / f"invalid-{index}.json"
+            ota.private_write(path, base if version is None else dict(base, stock_version=version))
+            with self.subTest(version=version), self.assertRaisesRegex(ota.Error, "stock_version"):
+                ota.Binding.load(path, BINDING.serial, OWNER, TARGET)
+        for version in ("1.17.1", "1.18.0"):
+            path = self.directory / f"valid-{version}.json"
+            ota.private_write(path, dict(base, stock_version=version))
+            self.assertEqual(ota.Binding.load(path, BINDING.serial, OWNER, TARGET).stock_version, version)
+
     def test_ordinary_binding_needs_no_approval_ledger_or_candidate_capsule(self):
         path = self.directory / "ordinary-binding.json"
         ota.private_write(path, {
             "schema": 1, "serial": BINDING.serial,
             "sender_public_key": OWNER.hex(), "target_public_key": TARGET.hex(),
+            "stock_version": BINDING.stock_version,
             "floor": BINDING.floor, "min_generation": BINDING.min_generation,
             "normal_profile": list(BINDING.normal),
         })
@@ -3168,6 +3295,36 @@ class PartialRestartTests(Scratch):
 
 
 class BackgroundTests(Scratch):
+    def test_118_shared_flood_repairs_both_targets_and_commits_only_matching_attempts(self):
+        clock, stream, stock, original = fleet_setup(duty=0.8)
+        stream.version, stream.protocol_version = b"v1.18.0", 14
+        approved = [replace(target.binding, stock_version="1.18.0") for target in original.targets]
+        stream.losses[TARGET][1], stream.losses[TARGET2][3] = 1, 1
+        stock_async_noise(stream)
+        with ota.radio_guard(stock, approved[0], self.directory, mode="background") as profile:
+            campaign = ota.BackgroundCampaign(stock, approved, original.transport.candidate, profile,
+                                              clock() + 10000, 0.8, clock, clock.sleep)
+            result = campaign.deploy(300)
+        self.assertTrue(result["operation_complete"])
+        self.assertEqual(result["initial_block_transmissions"], original.transport.candidate.total)
+        self.assertEqual(result["repair_block_transmissions"], 2)
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertEqual([node["commits"] for node in stream.nodes.values()], [1, 1])
+        self.assertTrue(all(node["received"] == set(range(original.transport.candidate.total))
+                            for node in stream.nodes.values()))
+        self.assertEqual(stream.profile, NORMAL)
+        self.assertFalse(any(command[0] == 11 for command in stream.commands))
+        self.assertTrue(ota.private_read(self.directory / "radio-unchanged.json")["normal_profile_unchanged"])
+
+    def test_background_bindings_cannot_mix_supported_stock_releases(self):
+        _, stream, _, campaign = fleet_setup()
+        bindings = [target.binding for target in campaign.targets]
+        bindings[1] = replace(bindings[1], stock_version="1.18.0")
+        with self.assertRaisesRegex(ota.Error, "same stock endpoint"):
+            ota.BackgroundCampaign.validate_bindings(bindings, campaign.transport.candidate)
+        self.assertFalse(stream.commands)
+
     def test_full_6031_block_flood_repairs_and_installs_under_stock_async_echo_traffic(self):
         _, stream, stock, campaign = fleet_setup(candidate(506524), duty=0.8)
         stream.losses = {TARGET: {0: 1, 186: 1}, TARGET2: {186: 1, 6029: 1}}
@@ -4070,7 +4227,7 @@ class BackgroundTests(Scratch):
             ota.private_write(path, {"schema": 1, "serial": b.serial,
                                      "sender_public_key": b.sender.hex(), "target_public_key": b.target.hex(),
                                      "floor": b.floor, "min_generation": b.min_generation,
-                                     "normal_profile": list(b.normal)})
+                                     "stock_version": b.stock_version, "normal_profile": list(b.normal)})
             paths.append(path)
         image = self.directory / "ordinary.bin"
         manifest = self.directory / "canonical.bin"

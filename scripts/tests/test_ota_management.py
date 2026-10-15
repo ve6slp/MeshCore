@@ -132,11 +132,13 @@ class ManagementSerial(FakeSerial):
         return len(wire)
 
 
-def setup():
+def setup(release="1.17.1"):
     clock = Clock()
     stream = ManagementSerial(clock)
+    stream.version = ("v" + release).encode("ascii")
+    stream.protocol_version = {"1.17.1": 13, "1.18.0": 14}[release]
     stock = ota.Stock(ota.Frames(stream, clock, keep_login_pushes=True), OWNER, clock, clock.sleep)
-    manager = management.RemoteManagement(stock, binding(), NAME, timeout=3,
+    manager = management.RemoteManagement(stock, replace(binding(), stock_version=release), NAME, timeout=3,
                                           wall_clock=lambda: NOW, max_skew=120)
     return clock, stream, manager
 
@@ -194,6 +196,56 @@ def restart_setup():
 
 
 class ManagementTests(unittest.TestCase):
+    def test_118_remote_inspect_and_guarded_abort_keep_fresh_admin_and_transport_trust_bounds(self):
+        _, stream, manager = setup("1.18.0")
+        stream.version = b"v1.18.0-81dbae59"
+        stream.coarse_clock = stream.durable_abort = True
+        manager.login()
+        inspected = manager.inspect()
+        self.assertEqual([reply["operation"] for reply in inspected["observations"]],
+                         ["status", "progress", "candidate", "settings"])
+        for generation in (10, 11):
+            result = manager.abort(generation, 5, stream.image_hash)
+            self.assertTrue(result["reply"]["durable_abort_confirmed"])
+            self.assertEqual(result["candidate_after"]["reply"]["generation"], "11")
+            self.assertFalse(result["confirmed_boot_status_unchanged"])
+            self.assertFalse(result["status_authenticated"])
+            self.assertFalse(result["installation_confirmed"])
+        self.assertEqual(stream.abort_mutations, 1)
+        self.assertEqual(sum(command[0] == 26 for command in stream.commands), 1)
+        self.assertNotIn("ota abort", stream.cli)
+        self.assertFalse(any(command[0] in (11, 33, 34, 35, 65, 66, 67) for command in stream.commands))
+        self.assertFalse(inspected["status_authenticated"])
+        self.assertFalse(inspected["installation_confirmed"])
+        self.assertFalse(inspected["cryptographic_request_correlation"])
+        stamps = [item["remote_timestamp"] for item in manager.observations]
+        self.assertTrue(all(new > old for old, new in zip(stamps, stamps[1:])))
+
+    def test_supported_release_binding_mismatch_blocks_management_before_contacts_or_login(self):
+        for bound, observed, protocol in (("1.17.1", b"v1.18.0", 14),
+                                          ("1.18.0", b"v1.17.1", 13)):
+            _, stream, manager = setup(bound)
+            stream.version, stream.protocol_version = observed, protocol
+            with self.subTest(bound=bound), self.assertRaisesRegex(ota.Error, "binding stock_version"):
+                manager.login()
+            self.assertEqual([command[0] for command in stream.commands], [1, 22])
+            self.assertFalse(manager.session)
+            self.assertFalse(manager.abort_dispatched)
+            self.assertFalse(stream.cli)
+
+    def test_118_guarded_abort_replacement_race_cannot_mutate_new_candidate(self):
+        _, stream, manager = setup("1.18.0")
+        stream.durable_abort = True
+        manager.login()
+        stream.before_abort = lambda stream: setattr(stream, "generation", 12)
+        with self.assertRaisesRegex(ota.Refused, "guarded OTA abort refused: mismatch"):
+            manager.abort(10, 5, stream.image_hash)
+        self.assertEqual(stream.phase, "receiving")
+        self.assertEqual(stream.generation, 12)
+        self.assertEqual(stream.abort_mutations, 0)
+        self.assertFalse(manager.session)
+        self.assertEqual(stream.cli[-1], f"ota abort 10 5 {stream.image_hash}")
+
     def test_without_tick_spacing_fast_coarse_login_and_first_reply_have_same_timestamp(self):
         _, stream, manager = setup()
         stream.coarse_clock = True
@@ -706,8 +758,8 @@ class ManagementTests(unittest.TestCase):
 
 
 class ManagementCliTests(Scratch):
-    def invoke(self, operation, *, cancel=False, durable=False):
-        clock, stream, real_manager = setup()
+    def invoke(self, operation, *, cancel=False, durable=False, release="1.17.1"):
+        clock, stream, real_manager = setup(release)
         stream.durable_abort = durable
         if cancel:
             stream.cancel_cmd = 2
@@ -732,7 +784,7 @@ class ManagementCliTests(Scratch):
         frames_factory = lambda port, **kw: original_frames(port, clock, **kw)
         manager_factory = lambda *unused, **kw: real_manager
         output = io.StringIO()
-        with patch.object(ota.Binding, "load", return_value=binding()), \
+        with patch.object(ota.Binding, "load", return_value=real_manager.binding), \
                 patch.object(ota, "validated_stock_uart", uart), \
                 patch.object(ota, "Stock", stock_factory), patch.object(ota, "Frames", frames_factory), \
                 patch.object(management, "RemoteManagement", manager_factory), redirect_stdout(output):
@@ -745,6 +797,20 @@ class ManagementCliTests(Scratch):
         self.assertNotIn("PRIVATE", output.getvalue())
         self.assertTrue((artifacts / "radio-unchanged.json").exists())
         return ota.private_read(artifacts / "result.json"), error
+
+    def test_118_cli_remote_inspection_and_durable_guarded_abort_persist_and_close_uart(self):
+        result, error = self.invoke("inspect", release="1.18.0")
+        self.assertIsNone(error)
+        self.assertEqual(result["outcome"], "remote-management-inspection")
+        self.assertEqual(len(result["observations"]), 4)
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        result, error = self.invoke("abort", durable=True, release="1.18.0")
+        self.assertIsNone(error)
+        self.assertTrue(result["reply"]["durable_abort_confirmed"])
+        self.assertEqual(result["candidate_after"]["reply"]["generation"], "11")
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
 
     def test_cli_queries_and_explicit_abort_result_persist_uart_closes(self):
         result, error = self.invoke("progress")

@@ -114,11 +114,11 @@ void tick(Pending& pending, uint32_t now, bool tx_active, bool outbound_queued,
 #define FIRMWARE_VER_CODE 14
 
 #ifndef FIRMWARE_BUILD_DATE
-#define FIRMWARE_BUILD_DATE "14 Aug 2026"
+#define FIRMWARE_BUILD_DATE "15 Oct 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.17.1"
+#define FIRMWARE_VERSION "v1.18.0"
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Signed direct, directed or shared-flood OTA through a stock 1.17.1 companion.
+"""Signed direct, directed or shared-flood OTA through stock 1.17.1 or 1.18.0.
 
 Uses normal USB identity, signing, raw packet and measured-TX commands; never
 native OTA CMD67, key export, contact mutation, reset or flash operations.
 A caller-owned binding supplies exact sender/target identities, receiver normal
 radio, confirmed floor and optional candidate hash/generation guards. No lab
 inventory, approval ledger or private build provenance is used.
+The binding's explicit stock_version must match the observed release exactly;
+only an optional leading v and hexadecimal build suffix are accepted on USB.
 
 Deploy admits and transfers the selected board/role/image/counter, requires
 fresh complete READY, signs one COMMIT and waits for matching native Installed
@@ -71,6 +73,8 @@ COMMIT_DOMAIN = b"MeshCore/OTA/commit/v2"
 REUPLOAD_DOMAIN = b"MeshCore/OTA/reupload/v1"
 RECEIPT_SCHEMA = 2
 ATTEMPT_RECEIPT_SCHEMA = 3
+STOCK_RELEASE_PROTOCOLS = {"1.17.1": 13, "1.18.0": 14}
+STOCK_RELEASE_PATTERN = re.compile(rb"v?(1\.17\.1|1\.18\.0)(?:-[0-9a-fA-F]+)?")
 
 
 class Error(RuntimeError):
@@ -108,6 +112,11 @@ def full_key(text):
     if key == bytes(32):
         raise Error("zero identity forbidden")
     return key
+
+
+def validate_stock_version(version):
+    if not isinstance(version, str) or version not in STOCK_RELEASE_PROTOCOLS:
+        raise Error("binding stock_version must be exactly 1.17.1 or 1.18.0")
 
 
 def verify(key, message, signature):
@@ -153,6 +162,7 @@ class Binding:
     floor: int
     min_generation: int
     normal: tuple
+    stock_version: str
     image_hash: bytes | None = None
     manifest_hash: bytes | None = None
     reupload_generation: int | None = None
@@ -172,6 +182,8 @@ class Binding:
                 or full_key(value.get("sender_public_key")) != sender
                 or full_key(value.get("target_public_key")) != target or sender == target):
             raise Error("deployment binding does not match this sender/target")
+        version = value.get("stock_version")
+        validate_stock_version(version)
         if value.get("by_path") != by_path:
             raise Error("explicit --by-path must match the deployment binding")
         id_path, vid, pid = value.get("id_path"), value.get("usb_vid"), value.get("usb_pid")
@@ -202,7 +214,7 @@ class Binding:
         allow_reupload = value.get("allow_reupload", False)
         if type(allow_reupload) is not bool:
             raise Error("allow_reupload must be an explicit boolean")
-        return cls(serial, sender, target, floor, generation, tuple(profile),
+        return cls(serial, sender, target, floor, generation, tuple(profile), version,
                    full_key(value["image_sha256"]) if "image_sha256" in value else None,
                    full_key(value["manifest_hash"]) if "manifest_hash" in value else None, old_generation,
                    by_path, id_path, vid, pid, name, allow_reupload)
@@ -391,7 +403,7 @@ def block_message(candidate, index):
     return message, prefix
 
 
-# Ordinary MeshCore 1.17.1 companion pushes (examples/companion_radio/MyMesh.cpp)
+# Ordinary MeshCore 1.17.1/1.18.0 pushes (examples/companion_radio/MyMesh.cpp)
 # that this uploader never consumes, with the exact lengths that firmware emits.
 # 0x88 LOG_RX_DATA needs payload-aware demux: it also carries census/ACK replies.
 UNUSED_PUSH_LENGTHS = {
@@ -595,6 +607,16 @@ class Stock:
         self.sleep, self.pending_tx = sleep, None
         self.identified, self.tx_power = False, None
         self.expected_name, self.name, self.version = expected_name, None, None
+        self.expected_version = None
+
+    def bind(self, binding):
+        validate_stock_version(binding.stock_version)
+        if self.key != binding.sender:
+            raise Error("stock companion full public identity does not match binding")
+        if self.expected_version != binding.stock_version or self.expected_name != binding.sender_name:
+            self.identified = False
+            self.name, self.version = None, None
+        self.expected_name, self.expected_version = binding.sender_name, binding.stock_version
 
     def command(self, payload, expected=(0, 1), deadline=None):
         if not payload or payload[0] not in (1, 11, 22, 33, 34, 35, 56, 65):
@@ -637,11 +659,17 @@ class Stock:
             raise Error("stock public sender name does not match public label guard")
         device = self.command(b"\x16\x0a", (13, 1), deadline)
         # DeviceQuery includes a PIN at [4:8]. Never decode, persist or log it.
-        if len(device) != 82 or device[1] != 13 or device[80] not in (0, 1):
-            raise Error("requires stock MeshCore 1.17.1 DeviceQuery/repeat readback")
+        if len(device) != 82 or device[80] not in (0, 1):
+            raise Error("requires stock MeshCore 1.17.1/1.18.0 DeviceQuery/repeat readback")
         version = device[60:80].split(b"\x00", 1)[0]
-        if re.fullmatch(rb"v?1\.17\.1(?:-[0-9a-fA-F]+)?", version) is None:
-            raise Error("requires stock MeshCore release 1.17.1 with optional hex build suffix")
+        release = STOCK_RELEASE_PATTERN.fullmatch(version)
+        if release is None:
+            raise Error("requires stock MeshCore release 1.17.1 or 1.18.0 with optional hex build suffix")
+        release = release[1].decode("ascii")
+        if device[1] != STOCK_RELEASE_PROTOCOLS[release]:
+            raise Error("stock MeshCore release/protocol mismatch (1.17.1=13, 1.18.0=14)")
+        if self.expected_version is not None and release != self.expected_version:
+            raise Error("stock companion release does not match binding stock_version")
         profile = (*struct.unpack_from("<II", info, 48), info[56], info[57], device[80])
         validate_profile(profile)
         power = struct.unpack_from("<b", info, 2)[0]
@@ -755,6 +783,7 @@ class Sender:
             raise Error("normal-channel duty must be in (0,1]")
         binding.check_candidate(candidate)
         binding.permit_reupload(reupload_generation, reupload)
+        stock.bind(binding)
         self.stock, self.binding, self.candidate = stock, binding, candidate
         self.mode, self.relay, self.path_hash_bytes = mode, relay, path_hash_bytes
         self.path = relay[:path_hash_bytes] if relay is not None else b""
@@ -1330,7 +1359,7 @@ class BackgroundCampaign:
                 or any(len(b.target) != 32 or not any(b.target) or b.target == b.sender for b in bindings)):
             raise Error("background requires exactly two distinct full target identities")
         first = bindings[0]
-        common = ("serial", "sender", "normal", "by_path", "id_path", "usb_vid", "usb_pid", "sender_name")
+        common = ("serial", "sender", "stock_version", "normal", "by_path", "id_path", "usb_vid", "usb_pid", "sender_name")
         if any(any(getattr(b, key) != getattr(first, key) for key in common) for b in bindings):
             raise Error("background targets require the same stock endpoint/sender and normal radio profile")
         for b in bindings:
@@ -1779,7 +1808,7 @@ def partial_background_operation(stock, bindings, candidate, artifacts, blocks=1
 
 @contextmanager
 def radio_guard(stock, binding, directory, restoring=False, mode="direct"):
-    stock.expected_name = binding.sender_name
+    stock.bind(binding)
     original = stock.identify()
     if mode != "direct" and original[:4] != binding.normal:
         raise Error(f"{mode} sender must already match the bound normal radio profile; no retune")
@@ -2161,6 +2190,7 @@ def main(argv=None):
     with termination_cleanup():
         with validated_stock_uart(binding, args.by_id, dtr=args.client_dtr) as stream:
             stock = Stock(Frames(stream), binding.sender, expected_name=binding.sender_name)
+            stock.bind(binding)
             stock.frames.event_callback = public_event
             if args.operation == "inspect":
                 profile = stock.identify()

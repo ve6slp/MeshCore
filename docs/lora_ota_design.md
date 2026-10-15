@@ -59,8 +59,11 @@ replayed, reordered and pre-reboot requests cannot retune it. Directed delivery
 uses the mesh; background uses a configured channel and selective repair. Both
 always use reliable attempt-diverse framing, so a retry can avoid a relay that
 already suppressed a lost copy; the legacy unframed form is not offered by hosts. Airtime budgets
-apply to normal-channel traffic. The stock 1.17.1 adapter uses existing signing,
-raw RF and physical-TX counters, not native CMD67; it is direct/zero-hop only.
+apply to normal-channel traffic. The stock 1.17.1/1.18.0 adapter uses existing signing,
+raw RF and physical-TX counters, not native CMD67. It supports direct zero-hop
+delivery, directed delivery through one explicitly selected relay, and
+background collection by exactly two receivers, with the same lifecycle and
+unsigned-status limits.
 
 COMMIT is a separate signed action. Hosts wait for READY before one COMMIT and
 then for matching Installed. Every fresh BEGIN, including ABORT followed by an

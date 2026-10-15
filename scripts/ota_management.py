@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Identity-bound remote OTA CLI over stock encrypted MeshCore management.
 
+Stock 1.17.1 and 1.18.0 senders require the binding's exact stock_version.
 Only status/progress/candidate/settings and explicitly selected abort are sent.
 inspect aggregates the four read-only queries under one fresh admin login.
 No password, contact creation, ACL changes, key export, local CLI, reset, BEGIN
@@ -217,7 +218,7 @@ class RemoteManagement:
         self.session = False
         self.last_received_at = None
         deadline = self.stock.clock() + self.timeout
-        self.stock.expected_name = self.binding.sender_name
+        self.stock.bind(self.binding)
         if self.stock.key != self.binding.sender or self.stock.identify(deadline)[:4] != self.binding.normal:
             raise ota.Error("management sender full identity/normal profile mismatch; no retune")
         self.contact(deadline)

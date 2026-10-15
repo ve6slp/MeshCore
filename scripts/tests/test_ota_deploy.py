@@ -360,12 +360,26 @@ class StockDeployTests(stock_fixture.Scratch):
             stock.Candidate.build(None, image, 9, board="xiao_nrf52840", role_id=0, counter=9)
 
     def test_stock_deploy_cli_needs_no_external_ready_receipt_and_restores(self):
+        self.stock_deploy_cli("1.17.1", 13)
+
+    def test_118_stock_deploy_cli_signed_transfer_ready_commit_installed_and_restore(self):
+        self.serial.version = b"v1.18.0-81dbae59"
+        original = self.serial.reply
+        def noisy(data):
+            for push in stock_fixture.ORDINARY_PUSHES:
+                original(push)
+            original(data)
+        self.serial.reply = noisy
+        self.stock_deploy_cli("1.18.0", 14)
+
+    def stock_deploy_cli(self, release, protocol):
+        self.serial.protocol_version = protocol
         image = self.directory / "app.bin"
         image.write_bytes(self.candidate.image)
         binding = self.directory / "binding.json"
         stock.private_write(binding, {"schema": 1, "authorized": True, "serial": "ABCDEF0123456789",
             "sender_public_key": stock_fixture.OWNER.hex(), "target_public_key": stock_fixture.TARGET.hex(),
-            "stock_version": "1.17.1", "floor": 4, "min_generation": 10,
+            "stock_version": release, "floor": 4, "min_generation": 10,
             "normal_profile": list(stock_fixture.NORMAL[:4]), "image_kind": "ordinary-app",
             "image_sha256": hashlib.sha256(self.candidate.image).hexdigest(),
             "manifest_hash": self.candidate.digest.hex()})
@@ -390,6 +404,11 @@ class StockDeployTests(stock_fixture.Scratch):
         self.assertEqual(result["lifecycle"], 8)
         self.assertEqual(self.serial.commit_count, 1)
         self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
+        self.assertEqual(self.serial.received, set(range(self.candidate.total)))
+        self.assertEqual(result["confirmed_floor"], self.candidate.counter)
+        self.assertFalse(result["status_authenticated"])
+        self.assertFalse(result["installation_confirmed"])
+        self.assertTrue((artifacts / "restored.json").exists())
 
 
 class MakeDeployDefaultTests(unittest.TestCase):

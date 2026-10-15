@@ -68,6 +68,8 @@ public:
   unsigned long window = 3600000;
   int rx_delay = 0;
   int ota_received = 0;
+  uint32_t direct_delay = 0;
+  uint8_t extra_acks = 0;
   Mesh(Radio& radio, Clock& clock, Random& random, RealtimeClock& rtc,
        mesh::PacketManager& manager, Tables& tables)
       : mesh::Mesh(radio, clock, random, rtc, manager, tables) {
@@ -77,6 +79,8 @@ public:
 protected:
   bool allowPacketForward(const mesh::Packet*) override { return true; }
   uint32_t getRetransmitDelay(const mesh::Packet*) override { return 0; }
+  uint32_t getDirectRetransmitDelay(const mesh::Packet*) override { return direct_delay; }
+  uint8_t getExtraAckTransmitCount() const override { return extra_acks; }
   int calcRxDelay(float, uint32_t) const override { return rx_delay; }
   unsigned long getDutyCycleWindowMs() const override { return window; }
   void onOtaDataRecv(mesh::Packet*) override { ++ota_received; }
@@ -170,6 +174,59 @@ TEST_F(Fixture, OrdinaryFloodOriginsAndRelaysKeepDifferentPriorities) {
   ack->setPathHashSizeAndCount(1, 2);
   EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(3, 0), mesh.receive(ack));
   mesh.releasePacket(ack);
+}
+
+TEST_F(Fixture, ForwardedOrdinaryDirectPacketUsesConfiguredDelay) {
+  mesh.direct_delay = 137;
+  auto* p = packet(PAYLOAD_TYPE_RAW_CUSTOM, ROUTE_TYPE_DIRECT);
+  p->setPathHashSizeAndCount(1, 1);
+  p->path[0] = 0xAB;
+  EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(0, 137), mesh.receive(p));
+  EXPECT_EQ(0, p->getPathHashCount());
+  mesh.releasePacket(p);
+}
+
+TEST_F(Fixture, ForwardedOtaDirectPacketKeepsPriorityAtConfiguredDelay) {
+  mesh.direct_delay = 137;
+  auto* p = packet(PAYLOAD_TYPE_LORA_OTA, ROUTE_TYPE_DIRECT);
+  p->setPathHashSizeAndCount(1, 1);
+  p->path[0] = 0xAB;
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
+  EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(mesh::ota::kOtaForwardPriority, 137), mesh.receive(p));
+#else
+  EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(0, 137), mesh.receive(p));
+#endif
+  EXPECT_EQ(0, p->getPathHashCount());
+  mesh.releasePacket(p);
+}
+
+TEST_F(Fixture, ForwardedDirectAcksApplyConfiguredDelayOnceBeforeSpacedCopies) {
+  mesh.direct_delay = 137;
+  mesh.extra_acks = 2;
+  for (bool multipart : {false, true}) {
+    auto* p = packet(multipart ? PAYLOAD_TYPE_MULTIPART : PAYLOAD_TYPE_ACK, ROUTE_TYPE_DIRECT);
+    p->setPathHashSizeAndCount(1, 1);
+    p->path[0] = 0xAB;
+    p->payload_len = multipart ? 5 : 4;
+    memset(p->payload, 0x55, p->payload_len);
+    if (multipart) p->payload[0] = (2 << 4) | PAYLOAD_TYPE_ACK;
+    EXPECT_EQ(ACTION_RELEASE, mesh.receive(p));
+    mesh.releasePacket(p);
+    ASSERT_EQ(3, manager.getOutboundTotal());
+    for (int i = 0; i < 3; ++i) {
+      const uint32_t scheduled = clock.now + mesh.direct_delay + (multipart ? 900 : 0) + i * 300;
+      EXPECT_EQ(nullptr, manager.getNextOutbound(scheduled - 1));
+      auto* copy = manager.getNextOutbound(scheduled);
+      ASSERT_NE(nullptr, copy);
+      EXPECT_TRUE(copy->isRouteDirect());
+      EXPECT_EQ(0, copy->getPathHashCount());
+      EXPECT_EQ(i < 2 ? PAYLOAD_TYPE_MULTIPART : PAYLOAD_TYPE_ACK, copy->getPayloadType());
+      if (i < 2) EXPECT_EQ(2 - i, copy->payload[0] >> 4);
+      EXPECT_EQ(0, memcmp(copy->payload + (i < 2 ? 1 : 0), "\x55\x55\x55\x55", 4));
+      mesh.releasePacket(copy);
+    }
+    EXPECT_EQ(8, manager.getFreeCount());
+  }
 }
 
 TEST_F(Fixture, OrdinaryTransmissionUsesDevHalfMtuBudgetWithoutRequeueing) {
