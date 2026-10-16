@@ -15,8 +15,11 @@ succeeded, including selective loss repair, durable counter advancement and
 post-reboot RF observations (see below). Stock shared-flood background delivery
 has installed firmware on **two Sense receivers**, including paired
 resume, durable floors and post-reboot RF observations.
-ESP32-S3 and SenseCAP Solar hardware updates, larger fleets and native-host
-encrypted multicast delivery have **not yet been verified on hardware**.
+An actual Solar P1 Pro has also completed fresh USB commissioning with its
+genuine Solar ROLE1 pair/APP, initialized floor 0, restored normal configuration
+and administrator access, and ordinary reboot retention. Solar RF upgrades,
+ESP32-S3 hardware updates, larger fleets and native-host encrypted multicast
+delivery have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
 OTA-administrator permission on the receiver. It is independent of the ordinary
@@ -72,7 +75,7 @@ Any destructive provisioning must explicitly select the intended physical
 device; it is not an automatic recovery fallback. SWD is for stuck-device
 recovery, not the normal bench workflow.
 
-For the paired XIAO nRF52840 installer, use
+For the paired nRF52840 installer (XIAO or Solar), use
 `make build-xiao-ota-usb-app` and the guarded
 `make commission-xiao-ota-usb` phases in the
 [USB bench recipe](../bootloader/xiao_nrf52840_ota/README.md).
@@ -89,8 +92,11 @@ is already present, use it directly. Fresh admission comes from the actual
 configured USB transport, not a retained RAM marker or a reset/power sequence.
 Local physical USB is trusted; the host's explicit fresh-provisioning consent
 does not add an authentication bit to the vendor protocol. Normal boot, BLE and
-field OTA keep their protections. This simplified profile is software-verified
-but **not yet hardware-qualified**.
+field OTA keep their protections. This profile has completed actual fresh USB
+commissioning on a Solar P1 Pro, including new identity creation, qualified
+floor-0 initialization and retention across an ordinary APP reboot. That does
+not qualify RF installation, other board variants or physical power-loss
+recovery.
 
 An older experimental paired bootloader may lock its own BOOT region even in
 USB recovery mode. Host options and a factory reset cannot remove that installed

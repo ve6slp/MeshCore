@@ -578,6 +578,45 @@ relay flags, `MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=0`, `-1` or `101` must fail
 the native build at the explicit compile-time guard; these are expected build
 failures, not runtime tests.
 
+#### Solar P1 Pro fresh USB bench — 2026-10-16 UTC
+
+An actual Solar P1 Pro repeater was freshly commissioned using the genuine
+`sensecap_solar_p1` BSP and ROLE1 installer, not relabeled XIAO artifacts.
+The compiler context binds `seeed_sensecap_solar`, nRF52840,
+`MESHCORE_LORA_OTA=1` and `SENSECAP_OTA_COMPILED_ROLE_ID=1`.
+The frozen 510,372-byte bootstrap APP's SHA-256 is
+`81f7d930a7303c7df70ad8a41424f37b9252cc55699ba7ccfaeb059fec4a506c`.
+Its normal defaults and actual readbacks are 910.525 MHz/BW62.5/SF7/CR5/TX22.
+The matching primary uses 34,872 of 38,912 load bytes; the 16,844-byte
+returning installer's SHA-256 is
+`80f5f9a5c196af2470f771991c045656b3466f805ef2bd2d3f14341e1e0b9b71`.
+
+The original vendor BOOT identified itself as
+`0.9.2-OTAFIX2.2-BP1.3`, Solar P1, S140 7.3.0. Its compound preload and
+BOOT-only replacement were separate guarded transfers, each after explicit
+physical entry and serial/VID/PID/USB-branch checks. The BOOT-only upload did
+not automatically produce a USB endpoint; no APP write was attempted then.
+One requested physical reset entered the new CDC-only recovery profile.
+The separate final ordinary-APP transfer exercised its approved fresh reset.
+The Solar and base XIAO share BOOT VID/PID 2886:0044; those IDs alone were not
+used to infer the physical board.
+
+Actual APP readback showed a newly generated public identity and empty ACL,
+`writes=allowed marker=qualified proof=qualified-state`, install capability,
+and a durable floor 0 at sequence 1. Its idle `boot=unknown` status correctly
+reported that no signed OTA image had yet been installed.
+The name, original two administrator permissions, radio profile, TX22,
+50% mesh duty and forwarding were explicitly restored. An ordinary APP reboot
+retained that identity, ACL, configuration and floor. An initial readback had
+one queued startup packet; a later independent readback, without another
+reboot, showed zero errors and an empty queue. The software RTC reset to 2024
+on reboot; a pre-reboot time correction was not claimed as clock persistence.
+
+These observations qualify this Solar pair's fresh USB commissioning and
+ordinary reboot retention, not Solar RF installation, authenticated abort
+stack bounds, outdoor soak or physical power-cut recovery. The previous
+Sense APP's linked-image stack bound is not inherited by this Solar image.
+
 ### PacketManager compatibility
 
 Existing `PacketManager` implementations compile and behave unchanged, with or
