@@ -63,6 +63,23 @@ def package_payload(path, kind, expected=None):
         return raw, init
 
 
+def verify_app_compiler(*, board, role, pio_board, mcu, compiler):
+    profiles = {
+        "xiao_nrf52840": ("seeed-xiao-afruitnrf52-nrf52840", "XIAO_OTA_COMPILED_ROLE_ID",
+                         {"XIAO_NRF52": 1}),
+        "xiao_nrf52840_sense": ("seeed-xiao-afruitnrf52-nrf52840", "XIAO_OTA_COMPILED_ROLE_ID",
+                               {"XIAO_NRF52": 1}),
+        "sensecap_solar_p1": ("seeed_sensecap_solar", "SENSECAP_OTA_COMPILED_ROLE_ID", {}),
+    }
+    require(board in profiles and type(role) is int and role in (0, 1),
+            "invalid APP compiler board/ROLE")
+    expected_board, role_define, board_defines = profiles[board]
+    require(pio_board == expected_board and mcu == "nrf52840" and
+            all(type(v) is int for v in compiler.values()) and
+            compiler == dict(board_defines, MESHCORE_LORA_OTA=1, **{role_define: role}),
+            "APP compiler context is not the matching board/ROLE installer")
+
+
 def verify_app_context(context_path, app_package, *, board, role):
     require(context_path is not None, "requires actual APP compiler build context")
     context = read_json(context_path)
@@ -70,13 +87,8 @@ def verify_app_context(context_path, app_package, *, board, role):
     require(context["schema"] == "xiao-ota-app-build-v1" and type(context["role"]) is int and
             context["board_profile"] == board and context["role"] == role,
             "APP build board/ROLE differs from selected pair")
-    require(board in ("xiao_nrf52840", "xiao_nrf52840_sense") and
-            context["pio_board"] == "seeed-xiao-afruitnrf52-nrf52840" and
-            context["mcu"] == "nrf52840" and
-            all(type(v) is int for v in context["compiler"].values()) and
-            context["compiler"] == {"XIAO_NRF52": 1, "MESHCORE_LORA_OTA": 1,
-                                     "XIAO_OTA_COMPILED_ROLE_ID": role},
-            "APP compiler context is not the matching XIAO installer")
+    verify_app_compiler(board=board, role=role, pio_board=context["pio_board"],
+                        mcu=context["mcu"], compiler=context["compiler"])
     require(context["image_sha256"] == digest(app) and context["image_bytes"] == len(app) and
             context["zip_sha256"] == build.sha(app_package),
             "APP image/ZIP differs from its actual build context")
@@ -136,8 +148,9 @@ def verify_pair(pair, *, board=None, role=None):
             0 < used <= capacity <= (len(cf2_raw) - 16) // 8, "invalid CF2 geometry")
     ids = [value for key, value in struct.iter_unpack("<II", cf2_raw[16:16 + used * 8])
            if key == host.boot_info.CF2_BOOTLOADER_BOARD_ID]
-    expected_usb = host.USB_BOARD_IDS.get(selected)
-    require(len(ids) == 1 and (expected_usb is None or ids[0] == expected_usb),
+    expected_usb = (0x28860044 if selected == "sensecap_solar_p1"
+                    else host.USB_BOARD_IDS[selected])
+    require(len(ids) == 1 and ids[0] == expected_usb,
             "artifact CF2 does not match the selected BSP USB identity")
     cf2 = ids[0]
     elf = pair / "primary.elf"

@@ -54,7 +54,9 @@ XIAO_OTA_PAIR_DIR ?= $(TMPDIR)/ota-boot-builds/$(XIAO_OTA_PAIR_BOARD)-role$(XIAO
 XIAO_OTA_PAIR_APP_PACKAGE ?=
 XIAO_OTA_PAIR_APP_CONTEXT ?=
 XIAO_OTA_APP_FREEZE_DIR ?=
-XIAO_OTA_APP_ENV = $(if $(strip $(ENV)),$(ENV),$(if $(filter 1,$(XIAO_OTA_PAIR_ROLE_ID)),Xiao_nrf52_repeater_ota_usb,Xiao_nrf52_companion_radio_ota_usb))
+XIAO_OTA_APP_CONFIG ?= $(CURDIR)/platformio.ini
+XIAO_OTA_APP_ENV = $(if $(strip $(ENV)),$(ENV),$(if $(filter sensecap_solar_p1,$(XIAO_OTA_PAIR_BOARD)),$(if $(filter 1,$(XIAO_OTA_PAIR_ROLE_ID)),SenseCap_Solar_repeater_ota_usb,SenseCap_Solar_companion_radio_ota_usb),$(if $(filter 1,$(XIAO_OTA_PAIR_ROLE_ID)),Xiao_nrf52_repeater_ota_usb,Xiao_nrf52_companion_radio_ota_usb)))
+XIAO_OTA_TOOLS_TEST_PATTERN ?= test_*.py
 XIAO_OTA_PAIR_PACKAGE_DIR ?= $(XIAO_OTA_PAIR_DIR)-packages
 XIAO_OTA_PAIR_VERIFY_ONLY ?= 0
 XIAO_OTA_USB_PORT ?=
@@ -171,6 +173,7 @@ verify-xiao-ota-bootloader-pair-packages: package-xiao-ota-bootloader-pair
 build-xiao-ota-usb-app: tmpdir
 	@test -n "$(XIAO_OTA_PAIR_BOARD)" && test -n "$(XIAO_OTA_PAIR_ROLE_ID)" && test -n "$(XIAO_OTA_APP_FREEZE_DIR)" || { echo 'Select board, ROLE and a new APP freeze directory.' >&2; exit 1; }
 	$(PYTHON) bootloader/xiao_nrf52840_ota/tools/record_app_context.py \
+	  --config-input "$(XIAO_OTA_APP_CONFIG)" \
 	  --config-output "$(XIAO_OTA_APP_FREEZE_DIR).ini" --environment "$(XIAO_OTA_APP_ENV)"
 	XIAO_OTA_APP_BOARD="$(XIAO_OTA_PAIR_BOARD)" XIAO_OTA_APP_ROLE="$(XIAO_OTA_PAIR_ROLE_ID)" \
 	  XIAO_OTA_APP_FREEZE="$(XIAO_OTA_APP_FREEZE_DIR)" \
@@ -191,7 +194,7 @@ sign-xiao-ota-image: tmpdir
 	  --image "$(XIAO_OTA_IMAGE)" --board "$(XIAO_OTA_BOARD)" --role-id "$(XIAO_OTA_ROLE_ID)" --counter "$(XIAO_OTA_COUNTER)" \
 	  --active-image "$(XIAO_OTA_ACTIVE_IMAGE)" --output-dir "$(OTA_ARTIFACT_DIR)"
 test-xiao-ota-bootloader-tools: tmpdir
-	$(PYTHON) -m unittest discover -s bootloader/xiao_nrf52840_ota/tests -p 'test_*.py'
+	$(PYTHON) -m unittest discover -s bootloader/xiao_nrf52840_ota/tests -p '$(XIAO_OTA_TOOLS_TEST_PATTERN)'
 
 XIAO_OTA_BOOT_PROCESS_SOURCES = \
 	bootloader/xiao_nrf52840_ota/src/xiao_ota_boot_io.c \

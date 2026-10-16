@@ -82,14 +82,43 @@ make build-xiao-ota-usb-app \
 ```
 
 An explicit `ENV=...` selects an existing configured installer environment;
-the compiler flags, not its name, must match the requested role. Capture
-currently supports the XIAO family, not a Solar APP qualification contract.
+`XIAO_OTA_APP_ENV=...` overrides that selection. Otherwise board/role select
+the matching XIAO or Solar companion/repeater USB OTA environment.
+The compiler flags and actual PlatformIO board, not the environment name,
+must match the requested board/role. Solar uses `sensecap_solar_p1`,
+`seeed_sensecap_solar` and `SENSECAP_OTA_COMPILED_ROLE_ID`; it is never
+relabeled as XIAO. The legacy target and context schema names remain compatible.
+The primary's CF2 USB board ID must match the pinned BSP (Solar: 2886:0044).
+USB IDs are not physical-board evidence: Solar and base XIAO share that boot
+VID/PID. Commissioning still requires the operator-selected physical endpoint,
+with no USB discovery, endpoint fallback or board inference.
 The context binds the operator-trusted build's board profile, actual compiler
 role, firmware/ZIP/ELF hashes and radio defaults; it is not a signature or RF
 qualification. Pair/package/commission checks reject mismatches before DFU.
 **Default repeater USB builds remain 869.618/BW62.5/SF8/CR5/TX22.** They are not
 the nRF lab's 907.525/BW250/SF7/CR5/TX2 configuration. Review the captured defaults
 and use an appropriately configured environment before bench deployment.
+`XIAO_OTA_APP_CONFIG=/absolute/path/to/private.ini` preserves a private full
+PlatformIO configuration when generating the capture configuration; its default
+is the project's `platformio.ini`. Keep site-specific radio overrides under
+ignored `.tmp`, not in ordinary variant defaults. For example, a Solar repeater
+whose intended normal profile is 910.525/BW62.5/SF7/CR5/TX22 must capture those
+actual defaults, not another lab node's frequency:
+
+```sh
+make build-xiao-ota-usb-app \
+  XIAO_OTA_PAIR_BOARD=sensecap_solar_p1 XIAO_OTA_PAIR_ROLE_ID=1 \
+  XIAO_OTA_APP_ENV=SenseCap_Solar_repeater_ota_usb \
+  XIAO_OTA_APP_CONFIG="$PWD/.tmp/my-solar/firmware.ini" \
+  XIAO_OTA_APP_FREEZE_DIR="$PWD/.tmp/ota-boot-builds/my-solar-app"
+```
+
+This is build/package support, not evidence of physical Solar installation or RF
+qualification. Fresh commissioning must explicitly restore the desired normal
+profile, identity, permissions and repeater settings.
+
+Run capture/package/commission host regressions without building firmware:
+`make test-xiao-ota-bootloader-tools XIAO_OTA_TOOLS_TEST_PATTERN=test_package_pair.py`.
 
 ## Bootstrap and recovery constraints
 

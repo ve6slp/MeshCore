@@ -1,4 +1,4 @@
-"""PlatformIO build-only target freezing actual XIAO APP compiler context and bytes."""
+"""PlatformIO build-only target freezing actual nRF52840 APP compiler context and bytes."""
 import json
 import os
 import argparse
@@ -11,6 +11,7 @@ import re
 def selected_defines(values):
     selected = {}
     wanted = {"XIAO_NRF52", "MESHCORE_LORA_OTA", "XIAO_OTA_COMPILED_ROLE_ID",
+              "SENSECAP_OTA_COMPILED_ROLE_ID",
               "LORA_FREQ", "LORA_BW", "LORA_SF", "LORA_CR", "LORA_TX_POWER"}
     for value in values:
         if isinstance(value, (list, tuple)):
@@ -35,16 +36,13 @@ def freeze(source, target, env):
     board = os.environ["XIAO_OTA_APP_BOARD"]
     role = int(os.environ["XIAO_OTA_APP_ROLE"])
     output = Path(os.environ["XIAO_OTA_APP_FREEZE"]).resolve()
-    compiler = {key: int(defines[key], 0) for key in
-                ("XIAO_NRF52", "MESHCORE_LORA_OTA", "XIAO_OTA_COMPILED_ROLE_ID")}
-    paired.require(board in ("xiao_nrf52840", "xiao_nrf52840_sense") and role in (0, 1) and
-                   compiler == {"XIAO_NRF52": 1, "MESHCORE_LORA_OTA": 1,
-                                "XIAO_OTA_COMPILED_ROLE_ID": role},
-                   "actual compiler board/ROLE is not the selected installer")
+    compiler = {key: int(value, 0) for key, value in defines.items()
+                if key in ("XIAO_NRF52", "MESHCORE_LORA_OTA", "XIAO_OTA_COMPILED_ROLE_ID",
+                           "SENSECAP_OTA_COMPILED_ROLE_ID")}
     pio_board = env.GetProjectOption("board")
     mcu = env.BoardConfig().get("build.mcu")
-    paired.require(pio_board == "seeed-xiao-afruitnrf52-nrf52840" and mcu == "nrf52840",
-                   "actual compiler board is not the selected XIAO family")
+    paired.verify_app_compiler(board=board, role=role, pio_board=pio_board,
+                               mcu=mcu, compiler=compiler)
     paired.require(output.is_relative_to(paired.build.ROOT / ".tmp/ota-boot-builds") and
                    not output.exists(), "requires a new project-owned APP freeze directory")
     build_dir = Path(env.subst("$BUILD_DIR"))
@@ -74,11 +72,12 @@ if "Import" in globals():
     Import("env")
     env.AddCustomTarget("xiao-app-context",
         dependencies=["$BUILD_DIR/${PROGNAME}.zip", "$BUILD_DIR/${PROGNAME}.elf"],
-        actions=freeze, title="Freeze XIAO OTA APP build context", always_build=True)
+        actions=freeze, title="Freeze nRF52840 OTA APP build context", always_build=True)
 elif __name__ == "__main__":
     import package_pair as paired
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-output", type=Path, required=True)
+    parser.add_argument("--config-input", type=Path, default=paired.build.ROOT / "platformio.ini")
     parser.add_argument("--environment", required=True)
     args = parser.parse_args()
     output = args.config_output.resolve()
@@ -86,7 +85,7 @@ elif __name__ == "__main__":
                    re.fullmatch(r"[A-Za-z0-9_.-]+", args.environment),
                    "requires a project-owned config and explicit environment name")
     output.parent.mkdir(parents=True, exist_ok=True)
-    text = (paired.build.ROOT / "platformio.ini").read_text()
+    text = args.config_input.read_text()
     text += (f"\n[env:{args.environment}]\nextra_scripts = create-uf2.py\n"
              "  post:bootloader/xiao_nrf52840_ota/tools/record_app_context.py\n")
     paired.require(not output.exists() or output.read_text() == text,
