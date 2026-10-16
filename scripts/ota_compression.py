@@ -14,12 +14,30 @@ RAW_BLOCK = 84
 POLL = 0x13
 REPORT = 0x14
 FRAGMENT = 0x15
+CAPABILITY_REQUEST = 0x16
+CAPABILITY_REPORT = 0x17
+CAPABILITY_VERSION = 1
+CAPABILITY_DOMAIN = b"MeshCore/OTA/codec-capability/v1"
 LZMA = 0xA0
 LZMA_THUMB = 0xA1
 RAW = 0
 HEADER = 18
 SIGNATURE = 64
 DOMAIN = b"MeshCore/OTA/lzma1/v1"
+
+def capability_request(target, manifest_hash, challenge, profile):
+    if (len(target) != 32 or len(manifest_hash) != 32 or len(challenge) != 16 or
+            not any(challenge) or profile not in (LZMA, LZMA_THUMB)):
+        raise ValueError("invalid stateless codec capability context")
+    return bytes([CAPABILITY_REQUEST]) + target + manifest_hash + challenge + bytes([CAPABILITY_VERSION, profile])
+
+
+def capability_report(frame, request):
+    if (len(request) != 83 or request[0] != CAPABILITY_REQUEST or len(frame) != 151 or
+            frame[:83] != bytes([CAPABILITY_REPORT]) + request[1:] or
+            frame[83:87] != struct.pack(">HH", GROUP, 8192)):
+        raise ValueError("stateless codec capability target/request/profile/bounds mismatch")
+    return CAPABILITY_DOMAIN + frame[:87]
 
 
 def manifest_thumb(canonical):
@@ -133,7 +151,8 @@ def plan(image, *, width=1, hops=1, retry=True, recipients=1, bw=62500, sf=7, cr
     # fresh initial group query and a raw census checkpoint per group/recipient.
     compressed_polls = sum(1 + math.ceil(math.ceil(len(g.stored) / capacity) / 4) for g in encoded) * recipients
     raw_polls = math.ceil(raw_packets / 4) * recipients
-    compressed_control_air = compressed_polls * air([wire(87), wire(95)]) + len(encoded) * recipients * air([wire(67), wire(123)])
+    preflight_air = recipients * air([wire(83), wire(151)])
+    compressed_control_air = preflight_air + compressed_polls * air([wire(87), wire(95)]) + len(encoded) * recipients * air([wire(67), wire(123)])
     raw_control_air = raw_polls * air([wire(67), wire(123)])
     wins = (compressed_packets < raw_packets and
             compressed_air + compressed_control_air < raw_air + raw_control_air)
@@ -156,6 +175,7 @@ def plan(image, *, width=1, hops=1, retry=True, recipients=1, bw=62500, sf=7, cr
         "compressed_data_wire_bytes": sum(compressed_sizes) * recipients,
         "raw_data_wire_bytes": sum(raw_sizes),
         "compressed_progress_poll_pairs": compressed_polls,
+        "compressed_preflight_pairs": recipients, "compressed_preflight_air_s": preflight_air,
         "raw_progress_poll_pairs": raw_polls,
         "compressed_group_census_pairs": len(encoded) * recipients,
         "compressed_data_air_s": compressed_air, "raw_data_air_s": raw_air,

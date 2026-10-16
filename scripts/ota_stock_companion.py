@@ -345,7 +345,8 @@ def valid_retry_inner(payload):
     if not payload:
         return False
     sizes = {2: 156, 3: 153, 4: 165, 6: 42, 7: 5, 8: 164, 10: 67,
-             11: CENSUS_REPORT_BYTES, 14: 165, compression.POLL: 87, compression.REPORT: 95}
+             11: CENSUS_REPORT_BYTES, 14: 165, compression.POLL: 87, compression.REPORT: 95,
+             compression.CAPABILITY_REQUEST: 83, compression.CAPABILITY_REPORT: 151}
     return (72 <= len(payload) <= 155 if payload[0] == 1
             else 82 < len(payload) <= 171 if payload[0] == compression.FRAGMENT
             else len(payload) == sizes.get(payload[0]))
@@ -371,8 +372,10 @@ def raw_rx(frame):
 def rf_metadata(frame, payload, target, manifest):
     header = frame[3] if len(frame) >= 5 else None
     kind = payload[0] if payload else None
-    target_offset = {11: 1, 13: 33, 16: 33}.get(kind)
-    hash_offset = {11: 33, 13: 65, 16: 65}.get(kind)
+    target_offset = {11: 1, 13: 33, 16: 33, compression.REPORT: 1,
+                     compression.CAPABILITY_REPORT: 1}.get(kind)
+    hash_offset = {11: 33, 13: 65, 16: 65, compression.REPORT: 33,
+                   compression.CAPABILITY_REPORT: 33}.get(kind)
     decoded = rf_packet(frame)
     attempt = retry_payload(decoded[3])[0] if decoded is not None else None
     return {"usb_length": len(frame), "packet_length": max(0, len(frame) - 3),
@@ -430,7 +433,7 @@ PENDING_LIMIT = 256
 
 
 def ota_nonreply(payload):
-    if not payload or payload[0] in (11, 13, 16, compression.REPORT):
+    if not payload or payload[0] in (11, 13, 16, compression.REPORT, compression.CAPABILITY_REPORT):
         return False
     return (valid_retry_inner(payload) or
             (payload[0] in (12, 15) and len(payload) == 171) or
@@ -569,7 +572,8 @@ class Frames:
         for timestamp, frame in self.pending:
             if frame[0] == 0x88:
                 payload = raw_rx(frame)
-                offset = {11: 1, 13: 33, 16: 33}.get(payload[0]) if payload else None
+                offset = {11: 1, 13: 33, 16: 33, compression.REPORT: 1,
+                          compression.CAPABILITY_REPORT: 1}.get(payload[0]) if payload else None
                 if (preserve_other_targets and offset is not None
                         and payload[offset:offset + 32] != target):
                     kept.append((timestamp, frame))
@@ -586,7 +590,8 @@ class Frames:
             for i, (timestamp, frame) in enumerate(self.pending):
                 if frame[0] == 0x88:
                     payload = raw_rx(frame)
-                    if (preserve_unmatched and payload and payload[0] in (11, 13, 16)
+                    if (preserve_unmatched and payload and payload[0] in
+                            (11, 13, 16, compression.REPORT, compression.CAPABILITY_REPORT)
                             and timestamp >= since and not predicate(payload)):
                         continue
                     self.pending.pop(i)
@@ -610,6 +615,7 @@ class Stock:
         self.identified, self.tx_power = False, None
         self.expected_name, self.name, self.version = expected_name, None, None
         self.expected_version = None
+        self.next_normal = clock()
 
     def bind(self, binding):
         validate_stock_version(binding.stock_version)
@@ -798,7 +804,6 @@ class Sender:
         self.direct_bandwidth = 250000
         self.burst_blocks = 4
         self.clock, self.sleep = clock, sleep
-        self.next_normal = clock()
         self.lease_end = 0
         self.target_normal_after = 0
         self.generation = None
@@ -821,6 +826,7 @@ class Sender:
             raise Error("unsupported compression algorithm; only raw/lzma")
         self.compression_mode = compression_mode
         self.compression_groups, self.compression_plan = (), None
+        self.compression_preflight_verified = False
         if compression_mode == "lzma":
             hops = (0 if mode == "direct" else 1 if mode == "directed" else 63) if max_relay_hops is None else max_relay_hops
             if (mode == "direct" and hops != 0) or (mode == "directed" and hops != 1):
@@ -838,11 +844,19 @@ class Sender:
         if self.event_callback is not None:
             self.event_callback({"event": event, "elapsed_s": round(self.clock() - self.event_start, 3), **fields})
 
+    @property
+    def next_normal(self):
+        return self.stock.next_normal
+
+    @next_normal.setter
+    def next_normal(self, value):
+        self.stock.next_normal = value
+
     def rf_observer(self, phase):
         return (lambda data: self.emit(phase=phase, **data)) if self.event_callback is not None else None
 
-    def wait_until(self, when):
-        if when >= self.deadline:
+    def wait_until(self, when, *, deadline=None):
+        if when >= (self.deadline if deadline is None else deadline):
             raise DeadlineExpired("campaign deadline expired")
         if when > self.clock():
             self.sleep(when - self.clock())
@@ -1066,16 +1080,20 @@ class Sender:
         self.previous[first] = report
         return report
 
-    def leave_direct(self):
+    def leave_direct(self, *, deadline=None):
         if self.lease_end:
-            self.stock.radio(self.normal)
+            if deadline is None:
+                self.stock.radio(self.normal)
+            else:
+                self.stock.radio(self.normal, deadline)
             self.profile, self.lease_end = self.normal, 0
             self.emit("lease_leave", frequency_khz=self.normal[0])
-        self.wait_until(max(self.target_normal_after, self.next_normal))
+        self.wait_until(max(self.target_normal_after, self.next_normal), deadline=deadline)
 
     def negotiate(self):
         if self.mode != "direct":
             return
+        self.preflight_compression()
         # Receiver ignores in-flight renewals. Wait out the old bounded lease,
         # then negotiate on normal frequency with a new signed token.
         self.leave_direct()
@@ -1130,6 +1148,7 @@ class Sender:
         raise Error("signed normal-channel direct ACK retries exhausted")
 
     def authorize(self, retries=3):
+        self.preflight_compression()
         c, b = self.candidate, self.binding
         signature = self.stock.sign(c.canonical, self.deadline)
         frame = b"\x08" + hashlib.sha256(b.target).digest()[:8] + b.sender + c.canonical + signature
@@ -1175,6 +1194,7 @@ class Sender:
         raise Error("REUPLOAD activation/Receiving deadline exhausted")
 
     def upload(self, *, ready_once=False, resume_receipt=None):
+        self.preflight_compression()
         if resume_receipt is None:
             report = self.authorize()
         else:
@@ -1247,6 +1267,38 @@ class Sender:
             result["transfer_encoding"] = (("lzma1-g8064-armt" if self.compression_plan["arm_thumb"]
                                            else "lzma1-g8064") if self.compression_plan["selected"] == "lzma" else "raw")
         return result
+
+    def preflight_compression(self, retries=3):
+        if (self.compression_preflight_verified or self.compression_plan is None or
+                self.compression_plan["selected"] != "lzma"):
+            return
+        if self.lease_end or self.profile != self.normal:
+            raise Error("codec preflight requires the normal channel before admission/lease")
+        profile = compression.LZMA_THUMB if self.compression_plan["arm_thumb"] else compression.LZMA
+        for attempt in range(retries):
+            request = compression.capability_request(self.binding.target, self.candidate.digest,
+                                                     os.urandom(16), profile)
+            self.room(15)
+            since = self.send(request)
+            try:
+                _, frame = self.stock.frames.receive(
+                    lambda p: p[:83] == bytes([compression.CAPABILITY_REPORT]) + request[1:],
+                    since, min(self.deadline, self.clock() + 25),
+                    self.rf_observer("codec-preflight"), self.binding.target, self.candidate.digest,
+                    route_predicate=self.reply_route, preserve_unmatched=self.mode == "background")
+            except TimeoutError:
+                if attempt + 1 == retries:
+                    raise Error("receiver codec preflight unavailable/unsupported; no AUTH, lease or raw fallback")
+                continue
+            try:
+                message = compression.capability_report(frame, request)
+            except ValueError as exc:
+                raise Error(str(exc)) from exc
+            verify(self.binding.target, message, frame[-64:])
+            self.compression_preflight_verified = True
+            self.emit("codec_preflight_verified", profile=profile, target_public_key=self.binding.target.hex())
+            return
+        raise Error("codec preflight exhausted")
 
     def compression_progress(self, group, retries=3):
         if self.generation is None or self.begin_nonce is None:
@@ -1379,6 +1431,7 @@ class Sender:
                 or type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{32}", nonce)
                 or not any(bytes.fromhex(nonce))):
             raise Error("commit requires matching target/owner/manifest/counter/attempt READY receipt")
+        self.preflight_compression()
         self.generation = receipt["generation"]
         # Fresh census must show this exact BEGIN attempt; an ABORT/reupload since
         # the receipt has a new nonce and is refused here and by the receiver.
@@ -1651,6 +1704,8 @@ class BackgroundCampaign:
     def upload(self, *, resume_receipts=None):
         current = 0
         try:
+            for current, target in enumerate(self.targets):
+                target.preflight_compression()
             if resume_receipts is not None:
                 self.resuming = True
                 self.stage = "resume-validation"

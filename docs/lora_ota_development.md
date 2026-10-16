@@ -117,7 +117,7 @@ make test-ota-integration OTA_COMPRESSION_IMAGE=/path/to/firmware.bin \
 ```
 
 Solar builds freeze a genuine ROLE1 APP and compiler context under
-`.tmp/ota-boot-builds/compression-solar-role1-lzma-final`. Choose a new
+`.tmp/ota-boot-builds/compression-solar-role1-lzma-fix01`. Choose a new
 `OTA_COMPRESSION_FREEZE` for a new immutable freeze. ARM builds use a separate
 `.tmp/compression/arm-build` so native/ESP tests do not discard `.su` evidence.
 `ota-compression-arm-size` uses the installed Cortex-M4 toolchain, actual decoder
@@ -132,7 +132,8 @@ alone hide static-state growth.
 The persistent JSON report measures production variable fragments, per-packet
 signatures, metadata, zero padding, route-aware RF/USB byte counts, group raw
 fallback, real input hashes, and whole-transfer selection. Models include
-quarter-burst progress and group census overhead at BW62.5/SF7/CR5/preamble32;
+stateless signed-capability preflight, quarter-burst progress and group census
+overhead at BW62.5/SF7/CR5/preamble32;
 2%/3% duty estimates are shown both physically and with stock's 1.5 guard.
 They exclude admission/final surveys/loss/repairs/contention/whole-second stock
 counters/physical-TX completion pacing/flash CPU and are not elapsed-time claims.
@@ -165,11 +166,11 @@ signed framing, one-hop width1/retry, 83 useful fragment bytes) gives:
 | Input | Raw bytes | Stored LZMA+Thumb bytes | RAW → compressed signed data packets |
 | --- | ---: | ---: | ---: |
 | Earlier genuine Solar `8942cf5e…` | 510388 | 328434 | 6077 → 3987 |
-| Codec-capable Solar APP `298a9efc…` | 519588 | 335036 | 6186 → 4068 |
+| Codec-capable Solar APP `e75d267d…` | 519924 | 335492 | 6190 → 4075 |
 | Synthetic incompressible control | 510388 | 510388 | 6077 → 6203; **RAW selected** |
 
 The genuine Cortex-M4 linked SDK/filter/wrapper is7280 text bytes. Against that
-earlier genuine Solar ELF, whole-APP `.text` grows9200 bytes, `.data` is unchanged,
+earlier genuine Solar ELF, whole-APP `.text` grows9536 bytes, `.data` is unchanged,
 and `.bss` grows23440 bytes (different build/radio constants are disclosed).
 The single23364-byte workspace contains two8064 buffers,7164 decoder bytes
 (7040 probabilities plus persistent SDK/wrapper state), and72 protocol/diagnostic
@@ -180,6 +181,14 @@ codec path, but this is not whole-task/IRQ/prebuilt-library proof. The separate
 352-byte signed-fragment handler executes before deferred decode, not around it.
 These values are reproducible evidence for this artifact, not universal size
 promises; use the generated report for a subsequent APP.
+
+Review regressions additionally cover RAW-only receivers rejected with zero
+AUTH/sign/lease/erase/metadata operations; target-signed stateless preflight
+freshness, full request/profile binding and portable/Thumb support without
+admission/admin access; expired direct campaigns and leave failures restoring
+the exact original repeatON profile under an independent deadline; and actual
+two-target LZMA-winning streams with aggregate physical-transmitter duty checked
+at every packet, including AUTH and group transitions.
 
 Focused regressions:
 

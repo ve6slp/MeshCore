@@ -6,6 +6,12 @@ namespace mesh { namespace ota {
 static constexpr uint8_t kOtaCompressionPollKind = 0x13;
 static constexpr uint8_t kOtaCompressionReportKind = 0x14;
 static constexpr uint8_t kOtaCompressedFragmentKind = 0x15;
+static constexpr uint8_t kOtaCodecCapabilityRequestKind = 0x16;
+static constexpr uint8_t kOtaCodecCapabilityReportKind = 0x17;
+static constexpr size_t kOtaCodecCapabilityRequestBytes = 83;
+static constexpr size_t kOtaCodecCapabilityPrefixBytes = 87;
+static constexpr size_t kOtaCodecCapabilityReportBytes = kOtaCodecCapabilityPrefixBytes + 64;
+static constexpr uint8_t kOtaCodecCapabilityVersion = 1;
 static constexpr uint8_t kOtaLzmaProfile = 0xa0;
 static constexpr uint8_t kOtaLzmaThumbProfile = 0xa1;
 static constexpr uint8_t kOtaCompressionRawProfile = 0;
@@ -17,6 +23,15 @@ static constexpr size_t kOtaCompressionHeaderBytes = 18;
 static constexpr size_t kOtaCompressionFragmentOverhead = kOtaCompressionHeaderBytes + 64;
 static constexpr size_t kOtaCompressionMaxDataBytes = 89;
 static constexpr size_t kOtaCompressionMaxFrameBytes = kOtaCompressionFragmentOverhead + kOtaCompressionMaxDataBytes;
+
+inline size_t buildOtaCodecCapabilityMessage(const uint8_t* prefix, uint8_t* out, size_t capacity) {
+  static constexpr char domain[] = "MeshCore/OTA/codec-capability/v1";
+  const size_t size = sizeof(domain) - 1 + kOtaCodecCapabilityPrefixBytes;
+  if (!prefix || !out || capacity < size || prefix[0] != kOtaCodecCapabilityReportKind) return 0;
+  std::memcpy(out, domain, sizeof(domain) - 1);
+  std::memcpy(out + sizeof(domain) - 1, prefix, kOtaCodecCapabilityPrefixBytes);
+  return size;
+}
 
 // CMD65 + priority, LOG_RX_DATA + SNR/RSSI, Mesh header/path-size. Account
 // for maximum path growth, not just the path on the first transmission.

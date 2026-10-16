@@ -52,7 +52,12 @@ and no unbound legacy COMMIT.
 commands and native `upload`/`deploy`. The default remains `--compression raw`.
 The receiving APP must already support the new capability extension; bootstrap
 that APP using RAW first. An older APP explicitly fails capability negotiation,
-not a success-shaped raw fallback. No fresh USB conversion, trust key, counter
+not a success-shaped raw fallback. A fresh target-signed read-only capability
+query runs before any AUTH, candidate erase, admission signing or direct lease,
+without requiring CLI login/contact permission or an existing candidate. Every
+fleet target must pass before any target is admitted. Earlier codec prototypes
+without this stateless proof also require the updated RAW bootstrap.
+No fresh USB conversion, trust key, counter
 reset or changed bootloader is required.
 
 Compression uses independent raw-LZMA1 8064-byte groups (lc0/lp1/pb1,
@@ -89,6 +94,10 @@ binding/signing/framing logic is used over the selected, locked native endpoint.
 An encrypted native channel cannot silently become a raw signed host stream:
 selected compression rejects that request. Native RAW cache/channel workflows
 remain unchanged.
+Normal-channel duty pacing belongs to the physical transmitter, not individual
+fleet recipients. Native direct cleanup uses its own bounded deadline and always
+attempts to restore the exact original profile, including repeatON, even after
+the campaign expires; uncertain/failed cleanup is reported, never hidden.
 
 For native strict directed/background restart use one original
 `--stream-resume-receipt` per target; stock uses its existing `--resume-receipt`.

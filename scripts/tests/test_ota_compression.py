@@ -8,6 +8,7 @@ import zlib
 import lzma
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ota_compression as codec
@@ -15,7 +16,8 @@ import ota_stock_companion as stock
 import ota_uploader as native
 import ota_management as management
 from test_ota_stock_companion import (Clock, FakeSerial, NORMAL, NONCE, OWNER, OWNER_PRIVATE, TARGET,
-                                     RELAY, RelaySerial, Scratch, binding, candidate)
+                                     TARGET2, TARGET_PRIVATE, RELAY, RelaySerial, Scratch, binding,
+                                     candidate, census)
 
 
 class CompressionSerial(FakeSerial):
@@ -27,12 +29,20 @@ class CompressionSerial(FakeSerial):
         self.fragments = 0
         self.reply_attempt, self.reply_mode, self.reply_mutator = None, "relay", None
         self.seen_replies = set()
+        self.target, self.target_private = TARGET, TARGET_PRIVATE
+        self.capability_mutator = None
 
     def remote(self, frame):
         if frame[0] in (17, 18):
             self.reply_attempt, frame = stock.retry_payload(frame)
             assert self.reply_attempt and frame is not None
-        if frame[0] == codec.POLL:
+        if frame[0] == codec.CAPABILITY_REQUEST:
+            prefix = bytes([codec.CAPABILITY_REPORT]) + frame[1:] + struct.pack(">HH",codec.GROUP,8192)
+            response = prefix + self.target_private.sign(codec.CAPABILITY_DOMAIN + prefix)
+            if self.capability_mutator:
+                response = self.capability_mutator(response)
+            self.schedule(.1, lambda: self.push(response))
+        elif frame[0] == codec.POLL:
             index = struct.unpack_from(">H", frame, 85)[0]
             group = self.groups[index]
             complete = all(i in self.received for i in range(index * 96, min(
@@ -44,7 +54,7 @@ class CompressionSerial(FakeSerial):
             self.schedule(.1, lambda: self.push(report))
         elif frame[0] == codec.FRAGMENT:
             prefix = frame[:-64]
-            stock.verify(OWNER, codec.signed_message(TARGET, self.candidate.digest, self.generation,
+            stock.verify(OWNER, codec.signed_message(self.target, self.candidate.digest, self.generation,
                                                     self.nonce, prefix), frame[-64:])
             self.fragments += 1
             if self.drop_fragment:
@@ -74,8 +84,86 @@ class CompressionSerial(FakeSerial):
         else:
             RelaySerial.push(self, payload)
 
+class FleetCompressionSerial(CompressionSerial):
+    """Two receiver states behind one actual USB transmitter/clock."""
+    def __init__(self, clock, c):
+        super().__init__(clock,c)
+        self.keys = {TARGET: TARGET_PRIVATE,
+                     TARGET2: Ed25519PrivateKey.from_private_bytes(bytes([3])*32)}
+        self.received_by = {target: set() for target in self.keys}
+        self.buffers_by = {target: {} for target in self.keys}
+        self.admitted_targets = set()
+        self.unsupported = set()
+
+    def remote(self, frame):
+        if frame[0] in (17,18):
+            self.reply_attempt, frame = stock.retry_payload(frame)
+        if frame[0] == 8:
+            self.target = next(target for target in self.keys
+                               if hashlib.sha256(target).digest()[:8] == frame[1:9])
+            stock.verify(OWNER,self.candidate.canonical,frame[-64:])
+            self.admitted_targets.add(self.target)
+        elif frame[0] in (10,codec.CAPABILITY_REQUEST,codec.POLL):
+            self.target = frame[1:33]
+        self.received = self.received_by[self.target]
+        self.buffers = self.buffers_by[self.target]
+        self.target_private = self.keys[self.target]
+        if frame[0] == codec.CAPABILITY_REQUEST and self.target in self.unsupported:
+            return
+        if frame[0] in (8,10):
+            first = struct.unpack_from(">H",frame,65)[0] if frame[0] == 10 else 0
+            response = census(self.candidate,first=first,received=self.received,target=self.target)
+            self.schedule(.1,lambda: self.push(response))
+        else:
+            super().remote(frame)
+
 
 class CompressionTests(unittest.TestCase):
+    def test_raw_only_receiver_rejects_lzma_before_authorize_override_signing_or_lease(self):
+        c = candidate(16384)
+        for mode in ("direct","directed"):
+            clock = Clock()
+            serial = FakeSerial(clock,c) if mode == "direct" else RelaySerial(clock,c)
+            transport = stock.Stock(stock.Frames(serial,clock),OWNER,clock,clock.sleep)
+            sender = stock.Sender(transport,binding(c),c,NORMAL,clock()+10000,
+                                  919000 if mode == "direct" else 0,
+                                  60000 if mode == "direct" else 0,.02,clock,clock.sleep,
+                                  compression_mode="lzma",mode=mode,
+                                  relay=None if mode == "direct" else RELAY)
+            original_remote = serial.remote
+            def raw_only(frame):
+                _, inner = stock.retry_payload(frame)
+                if inner[0] != codec.CAPABILITY_REQUEST:
+                    return original_remote(frame)
+            with patch.object(serial,"remote",side_effect=raw_only), patch.object(
+                    sender,"authorize",wraps=sender.authorize) as authorize:
+                with self.assertRaisesRegex(stock.Error,"preflight.*unsupported"):
+                    sender.upload()
+            authorize.assert_not_called()
+            self.assertFalse(serial.admitted)
+            self.assertFalse(serial.received)
+            self.assertFalse(any(command[0] in (11,33,34,35) for command in serial.commands))
+            inners = [stock.retry_payload(frame)[1] for _,_,frame in serial.rf_packets]
+            self.assertTrue(inners)
+            self.assertTrue(all(frame[0] == codec.CAPABILITY_REQUEST for frame in inners))
+
+    def test_stateless_capability_full_context_bounds_and_target_signature_fail_closed(self):
+        c = candidate(16384)
+        for offset in (1,33,65,81,82,83,85,150):
+            clock = Clock()
+            serial = CompressionSerial(clock,c)
+            def corrupt(frame):
+                bad = bytearray(frame); bad[offset] ^= 1
+                return bytes(bad)
+            serial.capability_mutator = corrupt
+            sender = stock.Sender(stock.Stock(stock.Frames(serial,clock),OWNER,clock,clock.sleep),
+                                  binding(c),c,NORMAL,clock()+10000,0,0,.5,clock,clock.sleep,
+                                  compression_mode="lzma",mode="directed",relay=RELAY)
+            with self.assertRaises(stock.Error):
+                sender.authorize()
+            self.assertFalse(serial.admitted)
+            self.assertFalse(any(command[0] in (33,34,35) for command in serial.commands))
+
     def test_selected_sdk_sources_and_license_match_pinned_upstream_hashes(self):
         root = Path(__file__).resolve().parents[2] / "src/helpers/ota/third_party/lzma"
         for source in json.loads((root / "sources.json").read_text()):
@@ -170,6 +258,37 @@ class CompressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 codec.report(bad, TARGET, c.digest, 10, NONCE, 0, 10)
 
+    def test_fresh_separate_commit_preflights_before_census_or_signing_without_readmission(self):
+        c = candidate(16384)
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                clock = Clock()
+                serial = CompressionSerial(clock,c)
+                transport = stock.Stock(stock.Frames(serial,clock),OWNER,clock,clock.sleep)
+                def fresh_sender():
+                    return stock.Sender(transport,binding(c),c,NORMAL,clock()+10000,0,0,.5,
+                                        clock,clock.sleep,compression_mode="lzma",
+                                        mode="directed",relay=RELAY)
+                uploader = fresh_sender()
+                attempt = uploader.attempt_receipt(uploader.authorize())
+                ready = uploader.upload(resume_receipt=attempt)
+                committer = fresh_sender()
+                committer.bind_resume(attempt)
+                before = len(serial.rf_packets)
+                commands = len(serial.commands)
+                if corrupt:
+                    serial.capability_mutator = lambda frame: frame[:-1] + bytes([frame[-1] ^ 1])
+                    with self.assertRaises(stock.Error):
+                        committer.commit(ready)
+                    self.assertEqual(0,serial.commit_count)
+                    self.assertFalse(any(command[0] in (33,34,35) for command in serial.commands[commands:]))
+                else:
+                    committer.commit(ready)
+                    self.assertEqual(1,serial.commit_count)
+                frames = [stock.retry_payload(frame)[1] for _,_,frame in serial.rf_packets[before:]]
+                self.assertEqual(codec.CAPABILITY_REQUEST,frames[0][0])
+                self.assertFalse(any(frame[0] in (8,codec.FRAGMENT) for frame in frames))
+
     def test_requested_compression_that_loses_truthfully_runs_unchanged_raw(self):
         image = struct.pack("<II", 0x20010000, 0x27009) + hashlib.shake_256(b"random RAW").digest(2040)
         canonical = native.deploy_manifest(image, "xiao_nrf52840", 0, 5)
@@ -186,6 +305,90 @@ class CompressionTests(unittest.TestCase):
 
 
 class NativeCompressionTests(Scratch):
+    def stream_setup(self, c, clock, serial, targets=(TARGET,), mode="background"):
+        paths = []
+        for index,target in enumerate(targets):
+            path = self.directory / ("binding-" + str(index) + ".json")
+            stock.private_write(path,{"schema":1,"serial":"synthetic","stock_version":"1.17.1",
+                                     "sender_public_key":OWNER.hex(),"target_public_key":target.hex(),
+                                     "floor":4,"min_generation":10,"normal_profile":list(NORMAL[:4]),
+                                     "image_sha256":hashlib.sha256(c.image).hexdigest(),
+                                     "manifest_hash":c.digest.hex()})
+            paths.append(path)
+        args = SimpleNamespace(stream_binding=paths,target=list(targets),mode=mode,
+                               artifact_dir=self.directory,stream_resume_receipt=[],reupload=False,
+                               frequency_khz=919000 if mode == "direct" else 0,
+                               lease_ms=60000 if mode == "direct" else 0,duty_milli_percent=2000,
+                               relay_key=RELAY if mode == "directed" else None,path_hash_bytes=1,
+                               max_relay_hops=0 if mode == "direct" else 1,
+                               command="upload",channel=255,routed_retry=True)
+        real_stock, real_frames = stock.Stock, stock.Frames
+        def run(deadline):
+            with patch.object(stock,"Stock",side_effect=lambda frames,key: real_stock(
+                    frames,key,clock,clock.sleep)), patch.object(stock,"Frames",
+                    side_effect=lambda stream: real_frames(stream,clock)):
+                return native.compressed_host_stream(
+                    SimpleNamespace(stream=serial,buffer=bytearray()),Mock(),args,c.canonical,c.image,OWNER,deadline)
+        return run
+
+    def test_expired_direct_campaign_restores_exact_original_repeat_on_with_own_cleanup_budget(self):
+        c, clock = candidate(16384), Clock()
+        serial = CompressionSerial(clock,c)
+        run = self.stream_setup(c,clock,serial,mode="direct")
+        def expired(sender, **options):
+            serial.profile = sender.profile = (919000,250000,5,5,0)
+            clock.now = sender.deadline + 1
+            sender.lease_end = clock()+30
+            sender.target_normal_after = clock()+40
+            raise stock.DeadlineExpired("injected expired campaign")
+        with patch.object(stock.Sender,"upload",expired), self.assertRaisesRegex(
+                stock.DeadlineExpired,"injected expired campaign"):
+            run(clock()+1000)
+        self.assertEqual(NORMAL,serial.profile)
+        writes = [command for command in serial.commands if command[0] == 11]
+        self.assertEqual([0,1],[command[-1] for command in writes])
+
+    def test_leave_timeout_still_unconditionally_attempts_original_profile_restore(self):
+        c, clock = candidate(16384), Clock()
+        serial = CompressionSerial(clock,c)
+        run = self.stream_setup(c,clock,serial,mode="direct")
+        def expired(sender, **options):
+            serial.profile = sender.profile = (919000,250000,5,5,0)
+            clock.now = sender.deadline + 1
+            sender.lease_end = clock()+30
+            sender.target_normal_after = clock()+200
+            raise stock.DeadlineExpired("injected expired campaign")
+        with patch.object(stock.Sender,"upload",expired), self.assertRaises(stock.DeadlineExpired):
+            run(clock()+1000)
+        self.assertEqual(NORMAL,serial.profile)
+        self.assertEqual(1,[c[-1] for c in serial.commands if c[0] == 11][-1])
+
+    def test_native_fleet_shares_physical_duty_including_authorization_and_group_boundaries(self):
+        c, clock = candidate(16384), Clock()
+        serial = FleetCompressionSerial(clock,c)
+        run = self.stream_setup(c,clock,serial,targets=(TARGET,TARGET2))
+        result = run(clock()+10000)
+        self.assertEqual({TARGET,TARGET2},serial.admitted_targets)
+        self.assertTrue(all(bits == set(range(c.total)) for bits in serial.received_by.values()))
+        self.assertTrue(all(r["transfer_encoding"] == "lzma1-g8064-armt" for r in result["targets"]))
+        inners = [stock.retry_payload(frame)[1] for _,_,frame in serial.rf_packets]
+        self.assertEqual(2,sum(frame[0] == 8 for frame in inners))
+        groups = {struct.unpack_from(">H",frame,5)[0] for frame in inners if frame[0] == codec.FRAGMENT}
+        self.assertGreater(len(groups),1)
+        for index,((before,profile,_),(after,_,_)) in enumerate(zip(serial.rf_packets,serial.rf_packets[1:])):
+            quiet = max(.15,stock.airtime(len(serial.raw_packets[index]),profile))*(1/.02-1)
+            self.assertGreaterEqual(after+1e-6,before+.15+quiet)
+
+    def test_unsupported_second_fleet_target_causes_zero_auth_for_both(self):
+        c, clock = candidate(16384), Clock()
+        serial = FleetCompressionSerial(clock,c)
+        serial.unsupported.add(TARGET2)
+        run = self.stream_setup(c,clock,serial,targets=(TARGET,TARGET2))
+        with self.assertRaisesRegex(stock.Error,"preflight.*unsupported"):
+            run(clock()+10000)
+        self.assertEqual(set(),serial.admitted_targets)
+        self.assertFalse(any(command[0] in (33,34,35) for command in serial.commands))
+
     def test_cli_selects_host_stream_only_after_abi_probe_and_truthful_raw_fallback_keeps_cache(self):
         from test_ota_uploader import CliLifecycleTests
         for random_control in (False,True):

@@ -167,6 +167,71 @@ TEST(LoraOtaCompression, CapabilityAndProgressQueriesAreFreshBoundReadOnlyAndUse
   EXPECT_FALSE(f.integration.handleReceivedFrame(query,sizeof(query),101));
 }
 
+TEST(LoraOtaCompression, StatelessIdentitySignedPreflightNeedsNoAdmissionOrAdminAndCannotTouchFlash) {
+  using namespace mesh::ota;
+  CompressionFixture f;
+  f.admins.count=0;
+  f.integration.setLeanTargetPublicKey(f.ownerKey);
+  f.integration.attachRfIdentity(&f.owner,[](void* ctx,const uint8_t* bytes,size_t len,uint8_t sig[64]) {
+    static_cast<::ota::test::Ed25519TestSigner*>(ctx)->sign(bytes,len,sig);
+  },nullptr,907525);
+  uint8_t request[kOtaCodecCapabilityRequestBytes]={kOtaCodecCapabilityRequestKind};
+  std::memcpy(request+1,f.ownerKey,32);
+  computeOtaManifestHash(f.canonical,request+33);
+  std::memset(request+65,0x51,16);
+  request[81]=kOtaCodecCapabilityVersion; request[82]=kOtaLzmaThumbProfile;
+  const auto erases=f.image_flash.eraseOpCount(),writes=f.image_flash.programOpCount();
+  const auto metadata=f.candidate_flash.programOpCount(),metadata_erases=f.candidate_flash.eraseOpCount();
+  uint8_t wrapped[176],reply[176],message[128]; size_t reply_len;
+  const auto len=encodeOtaRetryAttempt(7,request,sizeof(request),wrapped,sizeof(wrapped));
+  ASSERT_TRUE(f.integration.handleReceivedFrame(wrapped,len,100));
+  ASSERT_TRUE(f.integration.pollOutboundControlFrame(reply,sizeof(reply),reply_len));
+  uint32_t attempt; const uint8_t* inner; size_t inner_len;
+  ASSERT_TRUE(parseOtaRetryAttempt(reply,reply_len,attempt,inner,inner_len));
+  EXPECT_EQ(7u,attempt); ASSERT_EQ(kOtaCodecCapabilityReportBytes,inner_len);
+  EXPECT_EQ(kOtaCodecCapabilityReportKind,inner[0]);
+  EXPECT_EQ(0,std::memcmp(request+1,inner+1,sizeof(request)-1));
+  EXPECT_EQ(8064u,usb::getBE16(inner+83)); EXPECT_EQ(8192u,usb::getBE16(inner+85));
+  const auto signed_len=buildOtaCodecCapabilityMessage(inner,message,sizeof(message));
+  ASSERT_TRUE(f.receiver().verifySignature(f.ownerKey,message,signed_len,inner+87));
+  EXPECT_FALSE(f.receiver().status().valid);
+  EXPECT_EQ(erases,f.image_flash.eraseOpCount()); EXPECT_EQ(writes,f.image_flash.programOpCount());
+  EXPECT_EQ(metadata,f.candidate_flash.programOpCount()); EXPECT_EQ(metadata_erases,f.candidate_flash.eraseOpCount());
+  EXPECT_EQ(0u,f.workspace.diagnostics.slices);
+  for (unsigned kind=0;kind<4;++kind) {
+    auto bad=std::vector<uint8_t>(request,request+sizeof(request));
+    if (kind==0) bad[81]=2;
+    if (kind==1) bad[82]=0xd1;
+    if (kind==2) std::memset(bad.data()+65,0,16);
+    if (kind==3) bad.pop_back();
+    EXPECT_FALSE(f.integration.handleReceivedFrame(bad.data(),bad.size(),101));
+  }
+  EXPECT_EQ(metadata,f.candidate_flash.programOpCount()); EXPECT_EQ(erases,f.image_flash.eraseOpCount());
+  f.receiver().attachCompressionWorkspace(&f.workspace,false);
+  EXPECT_FALSE(f.integration.handleReceivedFrame(request,sizeof(request),102));
+  request[82]=kOtaLzmaProfile;
+  ASSERT_TRUE(f.integration.handleReceivedFrame(request,sizeof(request),103));
+  ASSERT_TRUE(f.integration.pollOutboundControlFrame(reply,sizeof(reply),reply_len));
+  ASSERT_EQ(kOtaCodecCapabilityReportBytes,reply_len);
+  EXPECT_EQ(kOtaLzmaProfile,reply[82]);
+  EXPECT_EQ(metadata,f.candidate_flash.programOpCount()); EXPECT_EQ(erases,f.image_flash.eraseOpCount());
+}
+
+TEST(LoraOtaCompression, RawOnlyReceiverStatelessPreflightCannotBeginEraseOrPublishCandidate) {
+  using namespace mesh::ota;
+  LeanFixture f;
+  uint8_t request[kOtaCodecCapabilityRequestBytes]={kOtaCodecCapabilityRequestKind};
+  std::memcpy(request+1,f.target_public_key,32); std::memset(request+65,0x51,16);
+  request[81]=kOtaCodecCapabilityVersion; request[82]=kOtaLzmaThumbProfile;
+  const auto erases=f.image_flash.eraseOpCount(),writes=f.image_flash.programOpCount();
+  const auto metadata=f.candidate_flash.programOpCount(),metadata_erases=f.candidate_flash.eraseOpCount();
+  EXPECT_FALSE(f.integration.handleReceivedFrame(request,sizeof(request)));
+  f.integration.loop();
+  EXPECT_FALSE(f.integration.leanReceiver().status().valid);
+  EXPECT_EQ(erases,f.image_flash.eraseOpCount()); EXPECT_EQ(writes,f.image_flash.programOpCount());
+  EXPECT_EQ(metadata,f.candidate_flash.programOpCount()); EXPECT_EQ(metadata_erases,f.candidate_flash.eraseOpCount());
+}
+
 TEST(LoraOtaCompression, ComputedCapacityFitsEveryBoundaryAndConsumesAllAvailableStockTxRxSpace) {
   using namespace mesh::ota;
   for(unsigned width=1;width<=3;++width) for(unsigned hops=0;hops<=63;++hops)

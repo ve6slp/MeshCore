@@ -1034,6 +1034,7 @@ private:
         return lean_.handleCompressedFragment(frame, frame_len) == usb::UsbOtaResult::Ok ?
             LeanControlResult::Handled : LeanControlResult::Rejected;
       case kOtaCompressionPollKind: return handleCompressionPoll(frame, frame_len, now_ms);
+      case kOtaCodecCapabilityRequestKind: return handleCodecCapability(frame, frame_len, now_ms);
       case kOtaTargetAuthorizationKind:
       case kOtaAuthorizationKind: return handleAuthorizationControl(frame, frame_len);
       case kOtaCommitKind: return handleCommitControl(frame, frame_len, now_ms);
@@ -1041,6 +1042,31 @@ private:
       case kOtaReuploadKind: return handleReuploadControl(frame, frame_len);
       default: return handleInformationalControlFrame(frame, frame_len, now_ms);
     }
+  }
+
+  __attribute__((noinline)) LeanControlResult handleCodecCapability(
+      const uint8_t* frame, size_t len, uint32_t now_ms) {
+    if (len != kOtaCodecCapabilityRequestBytes || !lean_.haveTargetPublicKey() ||
+        !lean_.compressionAvailable() || !rf_sign_) return LeanControlResult::Rejected;
+    if (std::memcmp(frame + 1, lean_.targetPublicKey(), 32)) return LeanControlResult::Handled;
+    if (!usb::beginNonceBound(frame + 65) || frame[81] != kOtaCodecCapabilityVersion ||
+        (frame[82] != kOtaLzmaProfile &&
+         !(frame[82] == kOtaLzmaThumbProfile && lean_.compressionCapability() == kOtaLzmaThumbProfile)))
+      return LeanControlResult::Rejected;
+    if (pending_control_frame_valid_) return LeanControlResult::Handled;
+    // Stateless identity-signed proof: no candidate/store/permission/entropy access.
+    auto* out = pending_control_frame_;
+    out[0] = kOtaCodecCapabilityReportKind;
+    std::memcpy(out + 1, frame + 1, kOtaCodecCapabilityRequestBytes - 1);
+    usb::putBE16(out + 83, kOtaCompressionGroupBytes);
+    usb::putBE16(out + 85, 8192);
+    uint8_t message[128];
+    const auto size = buildOtaCodecCapabilityMessage(out, message, sizeof(message));
+    if (!size) return LeanControlResult::Rejected;
+    rf_sign_(rf_ctx_, message, size, out + kOtaCodecCapabilityPrefixBytes);
+    pending_control_frame_len_ = kOtaCodecCapabilityReportBytes;
+    pending_control_frame_valid_ = true; pending_control_due_ms_ = now_ms;
+    return LeanControlResult::Handled;
   }
 
   __attribute__((noinline)) LeanControlResult handleCompressionPoll(

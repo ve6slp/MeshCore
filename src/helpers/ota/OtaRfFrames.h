@@ -302,6 +302,8 @@ inline bool validOtaRetryInner(const uint8_t* frame, size_t len) {
     case kOtaCompressedFragmentKind: return validOtaCompressedFragment(frame, len);
     case kOtaCompressionPollKind: return len == kOtaCompressionPollBytes;
     case kOtaCompressionReportKind: return len == kOtaCompressionReportBytes;
+    case kOtaCodecCapabilityRequestKind: return len == kOtaCodecCapabilityRequestBytes;
+    case kOtaCodecCapabilityReportKind: return len == kOtaCodecCapabilityReportBytes;
     case kOtaAuthorizationKind: return len == kOtaAuthorizationFrameBytes;
     case kOtaTargetAuthorizationKind: return len == 164;
     case kOtaCommitKind: return len == kOtaCommitFrameBytes;

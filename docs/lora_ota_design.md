@@ -54,9 +54,22 @@ The authenticated profile, not image-byte heuristics, controls filtering.
 Unknown profiles or missing capability reports fail explicitly.
 This extension has offline/build validation only, not nRF/ESP hardware acceptance.
 
-New frame kinds are capability/progress poll `0x13` (87 bytes), report `0x14`
+Before AUTH/BEGIN, signing an admission, or negotiating a lease, the host requires
+a fresh **target-identity-signed, stateless** capability proof. Request `0x16`
+(83 bytes) is `[kind1,target32,manifest32,random-challenge16,version1,profile1]`,
+currently capability version1 and profileA0/A1. Report `0x17` (151 bytes) echoes
+the82 context bytes, adds group-size2=8064 and dictionary-size2=8192, then
+signature64 over `MeshCore/OTA/codec-capability/v1 || report-prefix87`.
+The receiver reads no candidate, storage, entropy or administrator/contact state;
+unsupported firmware/profiles fail before any admission/erase. No CLI login,
+version or ELF-symbol heuristic substitutes for this proof. Fleets preflight
+**all** recipients before admitting any. A fresh Sender/resume performs it anew.
+Separate `Sender.commit()` also preflights a fresh compressed Sender before any
+census or COMMIT signing, after validating its READY receipt locally.
+
+Admitted transfers use progress poll `0x13` (87 bytes), report `0x14`
 (95 bytes) and fragment `0x15`. Poll/report bind full target32, manifest32,
-generation4, BEGIN nonce16 and group2. Reports are unsigned, fresh/attempt-bound
+generation4, BEGIN nonce16 and group2. These progress reports are unsigned, fresh/attempt-bound
 information, not authenticated installation evidence. Queries do not BEGIN,
 restore, program or advance the floor.
 
@@ -115,6 +128,12 @@ host-stream frontend with per-target private bindings/attempt receipts, channel
 255 and reliable routed framing; it never reinterprets CMD67 cache records.
 Default native cache/autonomous RAW and encrypted-channel behavior are retained.
 Recipient/nonce-bound signatures require separate compressed streams per target.
+All recipient Senders share the physical Stock transmitter's normal-channel
+quiet-window deadline, including preflight, AUTH and group boundaries; creating
+or switching a recipient never resets duty pacing. Native direct cleanup has an
+independent120-second budget (final20 seconds reserved for exact original
+five-field radio restoration), with unconditional nested-finally restoration
+even when campaign or leave deadlines expire. Failures remain explicit.
 For genuine firmware a two-target shared RAW flood can therefore beat two
 compressed streams, and is truthfully selected instead of weakening signatures.
 

@@ -497,6 +497,9 @@ def compressed_host_stream(node, evidence, args, canonical, image, identity, dea
         for bound in bindings
     ]
     try:
+        # Prove every recipient before any target's admission can mutate storage.
+        for sender in senders:
+            sender.preflight_compression()
         if len(senders) == 1:
             options = {"resume_receipt": resumes[0]} if resumes else {}
             result = (senders[0].deploy(args.install_timeout, **options) if args.command == "deploy" else
@@ -520,10 +523,14 @@ def compressed_host_stream(node, evidence, args, canonical, image, identity, dea
     finally:
         # No START/autonomous uploader is left running. Restore/read back the
         # direct sender's original radio just as stock host streaming does.
+        cleanup_deadline = transport.clock() + 120
         if args.mode == "direct":
-            senders[0].leave_direct()
-            transport.radio(original, deadline)
-        elif transport.identify(deadline) != original:
+            try:
+                # Reserve the final20s even if lease-return cleanup times out.
+                senders[0].leave_direct(deadline=cleanup_deadline - 20)
+            finally:
+                transport.radio(original, cleanup_deadline)
+        elif transport.identify(cleanup_deadline) != original:
             raise UploaderError("native host-stream normal radio/repeat changed")
     evidence.log("ota_command_result", command=args.command,
                  frontend="native-host-stream-not-native-cache", **result)

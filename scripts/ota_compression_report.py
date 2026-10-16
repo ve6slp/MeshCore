@@ -65,7 +65,8 @@ def resource_report(args):
                 if any(token in line for token in (
                         "OtaLzma::", "LzmaDec_", "BranchConv_ARMT", "handleCompressedFragment(",
                         "advanceCompressedGroup(", "advanceCompressedCodec",
-                        "handleLeanControlFrame(", "handleReceivedFrame(", "onControlDataRecv(")):
+                        "handleCodecCapability(", "handleLeanControlFrame(",
+                        "handleReceivedFrame(", "onControlDataRecv(")):
                     entries.append({"file": str(path), "entry": line})
         result["genuine_app_reachable_stack_frames"] = entries
         path = ("advanceCompressedCodec()", "advanceCompressedCodecSlice()", "OtaLzma::step()",
@@ -121,7 +122,7 @@ def measure(name, image, synthetic, arm_thumb, route):
         max_data_rf_bytes=max(lengths), max_data_usb_tx_bytes=max(lengths) + 2,
         max_data_usb_rx_bytes=max(lengths) + 3,
         data_packet_saving_fraction=1 - decision["compressed_data_packets"] / decision["raw_data_packets"],
-        new_control_max_usb_rx_bytes=95 + 5 * retry + 2 + len(path) + 3,
+        new_control_max_usb_rx_bytes=151 + 5 * retry + 2 + len(path) + 3,
         # Existing targeted AUTH is larger than new compressed controls. Do not
         # hide this legacy control/path limitation behind a safe data capacity.
         existing_auth_usb_rx_full_path_bound=164 + 5 * retry + 2 + len(path) + 3,
@@ -168,12 +169,16 @@ def main():
         "embedded_decoder": {"source": "src/helpers/ota/OtaLzma.h",
                              "origin": "unmodified 7-Zip/LZMA SDK26.04 C persistent dictionary API and ARMT filter",
                              "license": "public-domain selected files; full upstream License.txt and URL/SHA provenance retained"},
+        "capability_preflight": {"version": codec.CAPABILITY_VERSION, "request_bytes": 83,
+                                 "reply_bytes": 151, "authentication": "target Ed25519, fresh challenge and full manifest/profile context",
+                                 "ordering": "read-only proof before any AUTH/admission signing/lease; all fleet targets first"},
         "hardware_qualified": False,
         "air_model": "BW62.5kHz SF7 CR5 preamble32; estimated cumulative data/checkpoint air, NOT elapsed hardware completion time",
         "route_note": "capacity includes 176B TX/RX framing and growth; legacy_control_path_supported=false routes are packet-model-only and selected product streams explicitly refuse them before admission. Zero-hop uses the same SF7/BW62.5 model for framing comparison, not the stock off-normal direct SF5/BW250 workflow.",
         "source_sha256": {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in (
-            "scripts/ota_compression.py", "scripts/ota_stock_companion.py",
-            "src/helpers/ota/OtaCompressionWire.h", "src/helpers/ota/OtaLzma.h",
+            "scripts/ota_compression.py", "scripts/ota_stock_companion.py", "scripts/ota_uploader.py",
+            "src/helpers/ota/OtaCompressionWire.h", "src/helpers/ota/OtaFirmwareIntegration.h",
+            "src/helpers/ota/OtaRfFrames.h", "src/helpers/ota/OtaLzma.h",
             "src/helpers/ota/third_party/lzma/LzmaDec.c", "src/helpers/ota/third_party/lzma/Bra.c")},
         "resources": resource_report(args),
         "measurements": [measure(name, image, synthetic, arm_thumb, route)
