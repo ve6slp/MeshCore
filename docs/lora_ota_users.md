@@ -2,14 +2,18 @@
 
 This optional feature is **off in ordinary builds**. It is being soaked in a
 public fork; no upstream pull request or production-readiness claim is implied.
-The current source baseline is **MeshCore 1.18.0**. Hardware milestones below
-were obtained with earlier feature builds; the release integration does not
-itself qualify a new image on hardware.
+The current source baseline is **MeshCore 1.18.0**. A frozen 1.18.0 Sense repeater
+image has now been installed on both lab receivers through signed shared-flood
+background OTA, with exact-image/floor readbacks, all four encrypted inspection
+surfaces, ordinary reboot retention and original settings/access restored.
+The signing/RF sender remained stock 1.17.1. Earlier direct/routed and
+abort/restart milestones below describe their earlier feature builds; those
+modes were not rerun on the new image.
 Direct nRF52840 updates have succeeded on hardware, including normal-radio
 restoration. A full one-hop stock-sender routed nRF52840 installation has also
 succeeded, including selective loss repair, durable counter advancement and
 post-reboot RF observations (see below). Stock shared-flood background delivery
-has now installed the same image on **two Sense receivers**, including paired
+has installed firmware on **two Sense receivers**, including paired
 resume, durable floors and post-reboot RF observations.
 ESP32-S3 and SenseCAP Solar hardware updates, larger fleets and native-host
 encrypted multicast delivery have **not yet been verified on hardware**.

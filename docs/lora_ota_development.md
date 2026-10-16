@@ -26,9 +26,11 @@ copies.
 The 1.18.0 integration builds ordinary XIAO nRF52 companion/repeater firmware,
 all six opt-in OTA companion/repeater environments and the XIAO
 installer-independent relay. Hardware milestones below describe their exact
-earlier images; no radio was flashed as part of the release merge. In particular,
-the frozen corrective APP's measured stack reserve is not a measurement of a
-newly linked 1.18.0 image.
+images; no radio was flashed as part of the release merge. Subsequent bench
+qualification installed a frozen 1.18.0 image on both Sense receivers through
+shared-background OTA, with independent management and reboot readbacks.
+Its linked-image stack analysis is separate from the earlier corrective APP's
+qualification; neither bound applies to arbitrary builds or commands.
 
 Bench USB conversion is fresh provisioning, not an in-field OTA transaction.
 Prefer the simplest supported vendor flash workflow and allow a clean slate
@@ -513,6 +515,50 @@ unchanged. Existing stock contacts were not removed. This completes the
 two-receiver background start, durable abort, repeated abort, explicit restart,
 resumed progress, stale-context refusal and reboot-persistence bench outcome;
 it does not extend qualification to larger fleets or arbitrary failure modes.
+
+#### MeshCore 1.18.0 shared-background bench — 2026-10-16 UTC
+
+The frozen ROLE1 Sense APP built from `e0556316b38d8d103b60bb2bdda9e233b5bfd681`
+is 507,424 bytes, or 6,041 blocks of 84 bytes with a 64-byte final payload.
+Its SHA-256 is
+`36c9938caf211b7ab4e9b3485fdf4ab22fb7ecd24d402f017f833de20a9d7bb4`;
+the linked ELF's SHA-256 is
+`038e582dd52cb9555221515b21f7a4989690742eec259c9c707c2a0a69babf24`.
+Exact-ELF call-site stack analysis, with source-corroborated callback exclusions,
+bounds the selected authenticated admin CLI abort paths at 3,068 of 4,096 bytes,
+leaving 1,028 bytes. This is not whole-firmware stack certification.
+
+Both old Aborted counter-7 contexts passed encrypted and RF preflights before
+separate signed counter-8 replacement authorizations. The normal-radio paired
+transfer used 6,041 shared missing-union block transmissions at an explicitly
+selected 80% bench OTA duty. Both receivers reached Ready before their
+individual signed COMMITs, then reported Installed with confirmed floor 8.
+The stock signing/RF sender remained MeshCore 1.17.1, not 1.18.0.
+
+The deployment command stopped at its final encrypted boot inspection with an
+asynchronous-response timeout; COMMIT was not resent. Independent locked APP
+readbacks proved the exact new image on both receivers, confirmed floor 8,
+floor sequences 5/7, generations 10/12 and all 6,041 blocks with zero missing.
+Both post-install clocks were freshly measured in 2024. Explicit forward-only
+correction, without weakening the 120-second freshness guard, then enabled
+all four encrypted inspection surfaces on both receivers: status, candidate,
+progress and settings, including fleet mode at the observed reboot-default 2%.
+
+Single ordinary APP reboots retained the exact image, floors, generations,
+progress, identities, original ACLs and normal settings on both receivers.
+Target 41's first reconnect readback encountered startup queue activity; a
+later independent quiescent readback proved retention without another reboot.
+Final proofs showed zero APP errors and empty queues, forwarding on, OTA duty
+2%, the original 2%/50% mesh duties, TX2 and the normal
+907.525 MHz/BW250/SF7/CR5 profile. Only receipt-owned temporary administrator
+grants were removed; existing stock contacts were unchanged. Freshly measured
+slow clocks were corrected again after the reboot checks.
+
+This qualifies that 1.18.0 image's two-receiver shared-background installation,
+encrypted inspection and ordinary reboot retention. Direct/routed RF modes
+were not rerun on this image. Earlier mode and abort/restart milestones remain
+evidence for their named earlier images; stock 1.18.0/protocol-14 sender hardware,
+larger fleets and other board families remain unqualified.
 
 Focused native routing (real Mesh/Dispatcher/StaticPool/SimpleMeshTables, installer
 off), startup safety and gate-off compatibility use existing Make targets:
