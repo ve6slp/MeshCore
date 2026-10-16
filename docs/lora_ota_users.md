@@ -15,11 +15,12 @@ succeeded, including selective loss repair, durable counter advancement and
 post-reboot RF observations (see below). Stock shared-flood background delivery
 has installed firmware on **two Sense receivers**, including paired
 resume, durable floors and post-reboot RF observations.
-An actual Solar P1 Pro has also completed fresh USB commissioning with its
-genuine Solar ROLE1 pair/APP, initialized floor 0, restored normal configuration
-and administrator access, and ordinary reboot retention. Solar RF upgrades,
-ESP32-S3 hardware updates, larger fleets and native-host encrypted multicast
-delivery have **not yet been verified on hardware**.
+An actual Solar P1 Pro has also completed genuine Solar ROLE1 USB commissioning
+and a signed shared-flood RF upgrade, including interrupted-transfer resume,
+exact-image confirmation, durable floor advancement from 0 to 1 and ordinary
+reboot retention. Its normal radio, forwarding and original administrator
+access were restored. ESP32-S3 hardware updates, larger fleets and native-host
+encrypted multicast delivery have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
 OTA-administrator permission on the receiver. It is independent of the ordinary

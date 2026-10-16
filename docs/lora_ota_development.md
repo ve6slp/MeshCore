@@ -578,7 +578,7 @@ relay flags, `MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT=0`, `-1` or `101` must fail
 the native build at the explicit compile-time guard; these are expected build
 failures, not runtime tests.
 
-#### Solar P1 Pro fresh USB bench — 2026-10-16 UTC
+#### Solar P1 Pro USB commissioning and signed RF upgrade — 2026-10-16 UTC
 
 An actual Solar P1 Pro repeater was freshly commissioned using the genuine
 `sensecap_solar_p1` BSP and ROLE1 installer, not relabeled XIAO artifacts.
@@ -622,14 +622,38 @@ with 452 blocks retained. The sender was quiesced and its original profile
 restored. Receiver OTA duty was reduced to 2% before changing its radio to
 912.525 MHz; the required apply reboot retained all 452 blocks, identity,
 permissions and floor 0. Only then was high OTA duty enabled on the test channel.
-This is partial-transfer retention evidence, not a completed installation.
 High-rate floods must not use the bench's shared public 910.525 MHz channel;
 see the [RF bench policy](lora_ota_users.md#deploy-through-an-unchanged-stock-companion).
 
-These observations qualify this Solar pair's fresh USB commissioning and
-ordinary and partial-transfer reboot retention, not Solar RF installation,
-authenticated abort stack bounds, outdoor soak or physical power-cut recovery. The previous
-Sense APP's linked-image stack bound is not inherited by this Solar image.
+The retained attempt then completed on 912.525 MHz with all 6,077 blocks and
+the original generation 1, nonce, counter and image. Upload-only completion did
+not install it. One separately authorized, signed COMMIT produced an unsigned
+RF Installed report; independent local USB inspection then confirmed
+`v1.18.0-solar-ota1 (Build: 15 Oct 2026)`, `boot=confirmed`, `verified=1`,
+the exact running image above, and durable floor 1 at sequence 2 with extent
+`0x0007C9B4` (510,388 bytes). The retained candidate also reported Installed
+with 6,077/6,077 blocks and no missing data. No identity reset, replacement
+admission, abort or rollback was used to finish the transfer.
+
+After the sender was quiescent, its receipt-owned original
+907.525 MHz/BW250/SF7/CR5/TX2/repeat-OFF profile was restored. The Solar APP had
+already returned OTA duty to 2% on boot. Only the temporary stock-sender
+administrator grant was revoked; the two original administrators remained.
+The receiver's 910.525 MHz/BW62.5/SF7/CR5/TX22 profile and forwarding were
+restored at low OTA duty. One ordinary apply reboot reduced uptime from
+170 to 17 seconds and retained the exact Installed image, floor, complete
+candidate, identity, permissions and configuration. The startup queue contained
+one packet; a later settled observation showed zero errors and an empty queue.
+The software clock was corrected forward after this final reboot, not treated
+as persistent across it. Final local inspection at uptime 123 seconds showed
+normal forwarding, 50% mesh duty, 2% OTA duty and the original two administrators.
+
+These observations qualify this Solar pair's fresh USB commissioning, signed
+shared-flood RF installation, interrupted-transfer resume, durable floor
+advancement and ordinary reboot retention. They do not qualify compressed
+delivery, authenticated abort stack bounds, outdoor soak or physical power-cut
+recovery. The previous Sense APP's linked-image stack bound is not inherited
+by this Solar image.
 
 ### PacketManager compatibility
 
@@ -682,5 +706,6 @@ Adafruit nrfutil packaging.
 Tests use synthetic keys and fake serial/NOR/SDK I/O. They cover signing,
 board/role/counter binding, durable transfer/READY, one COMMIT, matching Installed,
 refusal/timeouts, restored radio and interrupted storage/rollback semantics.
-Software tests and successful builds do not qualify ESP/Solar hardware,
-routed fleet delivery or power-failure behavior on an untested board.
+Software tests and successful builds do not extend the specific hardware
+milestones above to untested ESP/Solar images, routed fleets or physical
+power-failure behavior.
