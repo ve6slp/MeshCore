@@ -612,9 +612,23 @@ one queued startup packet; a later independent readback, without another
 reboot, showed zero errors and an empty queue. The software RTC reset to 2024
 on reboot; a pre-reboot time correction was not claimed as clock persistence.
 
+The subsequent signed counter-1 transfer admitted a distinct 510,388-byte
+Solar APP, SHA-256
+`8942cf5e6e6142ac3b5318de7eaa689d3b20d3595d4665d80fd30e9eb2e28014`.
+An upload-only pause retained two of 6,077 blocks across an ordinary APP reboot;
+fresh RF observations then matched the original generation and admission nonce.
+The initial high-duty public-channel transfer was stopped on operator request,
+with 452 blocks retained. The sender was quiesced and its original profile
+restored. Receiver OTA duty was reduced to 2% before changing its radio to
+912.525 MHz; the required apply reboot retained all 452 blocks, identity,
+permissions and floor 0. Only then was high OTA duty enabled on the test channel.
+This is partial-transfer retention evidence, not a completed installation.
+High-rate floods must not use the bench's shared public 910.525 MHz channel;
+see the [RF bench policy](lora_ota_users.md#deploy-through-an-unchanged-stock-companion).
+
 These observations qualify this Solar pair's fresh USB commissioning and
-ordinary reboot retention, not Solar RF installation, authenticated abort
-stack bounds, outdoor soak or physical power-cut recovery. The previous
+ordinary and partial-transfer reboot retention, not Solar RF installation,
+authenticated abort stack bounds, outdoor soak or physical power-cut recovery. The previous
 Sense APP's linked-image stack bound is not inherited by this Solar image.
 
 ### PacketManager compatibility

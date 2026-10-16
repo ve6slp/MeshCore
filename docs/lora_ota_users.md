@@ -458,6 +458,16 @@ through **one explicitly selected relay**, and `background` collection by
 **exactly two receivers sharing one block flood**. Two-target stock background
 delivery is software-tested; its hardware experiment is still pending.
 
+**RF bench policy:** 910.525 MHz is the shared public channel on this bench.
+Never send high-rate OTA floods there. Use the operator-approved 912.525 MHz
+test channel when the transfer is not constrained to the public channel's
+airtime limits. The public-channel low-power exception is limited to 0 dBm
+with no repeats or routed path; it is not the relay-based `directed` mode
+described below. Channel 255 denotes an unscoped RAW flood, not a private RF
+frequency. Stop and quiesce the sender before changing either radio, apply
+receiver radio changes with the required reboot, and restore low OTA duty
+before returning a test receiver to the public channel.
+
 Create your own owned mode-0600 JSON binding. Replace every angle-bracket field;
 `normal_profile` is the **receiver's actual normal radio configuration**, not
 an assumed sender profile. `floor` is its current confirmed anti-rollback floor.
