@@ -471,7 +471,8 @@ void Dispatcher::checkSend() {
           }
           if (outbound->payload[0] == mesh::ota::kOtaRetryRepairAttemptKind)
             outbound_ota_category = OtaAirtimeCategory::Repair;
-          else if (inner[0] == mesh::ota::kOtaSignedBlockKind)
+          else if (inner[0] == mesh::ota::kOtaSignedBlockKind ||
+                   inner[0] == mesh::ota::kOtaCompressedFragmentKind)
             outbound_ota_category = OtaAirtimeCategory::Relay;
         }
         if (outbound->payload_len >= 4 && outbound->payload[0] == 0x4F && outbound->payload[1] == 0x54) {

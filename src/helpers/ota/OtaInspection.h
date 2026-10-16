@@ -114,6 +114,22 @@ inline void formatOtaSettings(char* out, size_t size, const OtaFirmwareIntegrati
     snprintf(out, size, "Err - settings reply too long");
 }
 
+inline void formatOtaCodec(char* out, size_t size, const OtaLeanReceiver& receiver) {
+  if (!receiver.compressionAvailable()) {
+    snprintf(out, size, "Err - codec unavailable");
+    return;
+  }
+  const auto value = receiver.compressionDiagnostics();
+  const int written = snprintf(out, size,
+      "codec=lzma1-g8064 thumb=%u measured=%u groups=%lu slices=%lu slice_us=%lu group_us=%lu heap=%lu stack=%lu",
+      receiver.compressionCapability() == kOtaLzmaThumbProfile, value.measured,
+      (unsigned long)value.groups, (unsigned long)value.slices, (unsigned long)value.maxSliceUs,
+      (unsigned long)value.maxGroupUs, (unsigned long)(value.measured ? value.minFreeHeap : 0),
+      (unsigned long)(value.measured ? value.minFreeStack : 0));
+  if (written < 0 || static_cast<size_t>(written) >= size)
+    snprintf(out, size, "Err - codec diagnostic too long");
+}
+
 inline void formatOtaAdminAbortResult(char* out, size_t size, usb::UsbOtaResult result) {
   using Result = usb::UsbOtaResult;
   if (result == Result::BadRequest) {

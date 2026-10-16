@@ -1,0 +1,52 @@
+[
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/LzmaDec.c",
+    "path": "LzmaDec.c",
+    "sha256": "4e6ec665a6df01f1722e2b2fc36dc5e3aa7c3890e0f8cb11c6a07c9a01f3309b"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/LzmaDec.h",
+    "path": "LzmaDec.h",
+    "sha256": "3aaf07b4ae4173a2d103179455dc7089b5ddbc7fc3db3c0e40964a7499c69266"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/7zTypes.h",
+    "path": "7zTypes.h",
+    "sha256": "a5d03b8cb65cd3a2a56bde46dd68fb356d2ebacd9d70283e7d4d20b4e0a64713"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/Precomp.h",
+    "path": "Precomp.h",
+    "sha256": "c8903f2e36a771a272d8981e1e9ffed5ba16ca3d2f3dca6d1414d2340a6829d0"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/Compiler.h",
+    "path": "Compiler.h",
+    "sha256": "d5e42be77d26beaa8c81d3e62ef99fc5685736cfc079779fdb9154d05fa8bc4a"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/CpuArch.h",
+    "path": "CpuArch.h",
+    "sha256": "259145c6f4b085f44284014574f39f3f562fc78466746bfb388efe06b4dd59b4"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/Bra.c",
+    "path": "Bra.c",
+    "sha256": "c90cbc0747a406d056daf3d7b2bf05cf88c55529777469db5ca15f754b7c38e8"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/Bra.h",
+    "path": "Bra.h",
+    "sha256": "bf4addce6209562a700edf040a8efc5b392bb33d4427b1513b6e3a877d04f431"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/C/RotateDefs.h",
+    "path": "RotateDefs.h",
+    "sha256": "9bc3ff572bec5611c5c2508b7d0c18706a1dc4c908ea3bd432237c33056e1f28"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/ip7z/7zip/26.04/DOC/License.txt",
+    "path": "License.txt",
+    "sha256": "dac8389b6bc39339537bc351772106afe7951cb242cdf03e855b67c3a683deb1"
+  }
+]

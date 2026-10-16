@@ -45,6 +45,78 @@ and no unbound legacy COMMIT.
 - Earlier hosts cannot drive updated firmware. Native status replies are now
   107 bytes, and COMMIT and direct-lease signatures use new domains.
 
+### Opt-in LZMA (software validated, not hardware qualified)
+
+`--compression lzma` is available on stock `upload`/`deploy`/background
+commands and native `upload`/`deploy`. The default remains `--compression raw`.
+The receiving APP must already support the new capability extension; bootstrap
+that APP using RAW first. An older APP explicitly fails capability negotiation,
+not a success-shaped raw fallback. No fresh USB conversion, trust key, counter
+reset or changed bootloader is required.
+
+Compression uses independent raw-LZMA1 8064-byte groups (lc0/lp1/pb1,
+dictionary8192) with raw84 durable
+progress, and preserves every packet's administrator signature. The host
+explicitly chooses whole-transfer RAW if compression's real packet/air model
+does not win; receipts then say `transfer_encoding: raw`. Incompressible groups
+can use an explicit raw-group profile. Invalid compressed data is an error,
+never a decoder-triggered raw fallback.
+On nRF, the authenticated Thumb profile is selected from the signed board ID;
+ESP never applies that architecture filter. Selected receipts say
+`transfer_encoding: lzma1-g8064-armt` on nRF or `lzma1-g8064` on ESP. Upload-only
+does not install: `upload()` returns READY, while `commit(receipt)` signs the
+separate COMMIT; `deploy()` deliberately combines those operations.
+
+Use the existing stock workflow with `--compression lzma`; the
+`make ota-deploy` equivalent is `OTA_UPLOAD_COMPRESSION=lzma`. A directed
+transfer still requires the explicitly selected relay. `--max-relay-hops`
+(`OTA_COMPRESSION_MAX_RELAY_HOPS`) declares a justified maximum path growth:
+zero for direct, one for directed; background otherwise conservatively reserves
+63 one-byte path entries. Do not understate a flood's path bound to improve a
+benchmark. The unchanged 176-byte serial limit includes both TX and RX framing.
+Legacy larger control messages can limit usable routes further.
+Selected compressed streams fail before admission if the declared legacy AUTH
+RX frame would exceed176: reliable paths currently have at most two path bytes
+(one-hop width1/2 fit; one-hop width3 does not). A background compressed campaign
+therefore needs an explicitly justified small `--max-relay-hops`, not the
+conservative default63. RAW route behavior is unchanged.
+
+Native compression is an **explicit host-stream frontend**, not compressed
+autonomous CMD67 cache upload. Supply one `--stream-binding` per target, an owned
+0700 `--artifact-dir`, channel255 and reliable routed framing. The same stock
+binding/signing/framing logic is used over the selected, locked native endpoint.
+An encrypted native channel cannot silently become a raw signed host stream:
+selected compression rejects that request. Native RAW cache/channel workflows
+remain unchanged.
+
+For native strict directed/background restart use one original
+`--stream-resume-receipt` per target; stock uses its existing `--resume-receipt`.
+Both require the same identity/image/manifest/generation/BEGIN nonce and original
+route/profile bindings. No silent BEGIN, REUPLOAD or attempt takeover occurs.
+Partial compressed RAM may be rebuilt after receiver reboot; durable validated
+raw progress survives. Completed groups are skipped, and final raw SHA READY plus
+separate signed COMMIT remain mandatory. Multi-target compression costs a signed
+stream per recipient; shared RAW can legitimately win for real firmware.
+
+Before and after a qualification transfer, use the existing authenticated admin
+CLI `ota codec`, or the explicit `scripts/ota_management.py codec` operation with
+the same binding/identity/login arguments as `status`. No OTA admission is needed
+for this read-only diagnostic. The reply is
+`codec=lzma1-g8064 thumb=1 measured=1 groups=... slices=... slice_us=... group_us=... heap=... stack=...`
+(`thumb=0` on ESP). `slice_us` is the worst measured SDK/filter/CRC slice;
+`group_us` is the worst cumulative validation CPU time, not RF wait/flash or
+signature time, and includes sampling overhead. `heap` is minimum sampled free
+heap (not largest contiguous allocation); `stack` is current-task high-water
+**free bytes** since boot, not decoder stack usage. Groups/slices and peaks are
+since boot; failed validations also contribute timing peaks. `measured=0` means
+no board probe, not zero decoder cost. The default `inspect` survey remains the
+original four surfaces. Reading these counters is not hardware qualification:
+record actual before/after values and normal mesh/watchdog responsiveness.
+
+See [development measurements](lora_ota_development.md#bounded-compression-validation)
+for reproducible software/build evidence and CPU/stack limitations. No compressed
+Solar or ESP RF installation or watchdog behavior is claimed.
+
 ## Install and build
 
 The current host tools target Linux (`/dev/serial/by-id`, sysfs and `flock`).

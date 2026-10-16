@@ -19,9 +19,12 @@ from enum import IntEnum
 import hashlib
 import importlib.util
 import math
+import os
 from pathlib import Path
 import struct
+import stat
 import time
+import ota_compression as compression
 
 import ota_common as lab
 
@@ -428,6 +431,106 @@ class Uploader:
                                                  else observed.generation))
 
 
+def compressed_host_stream(node, evidence, args, canonical, image, identity, deadline):
+    """Native companion's existing CMD65/signing APIs, shared stock sender.
+
+    The autonomous USB cache protocol remains raw84. This explicit host-stream
+    frontend never stages/reinterprets a compressed native cache.
+    """
+    import ota_stock_companion as stream
+    if args.channel != 255 or (args.mode != "direct" and args.routed_retry is False):
+        raise UploaderError("compressed host streaming requires channel 255 and reliable routed framing")
+    if len(args.stream_binding) != len(args.target):
+        raise UploaderError("LZMA1 host streaming requires one --stream-binding per selected target")
+    candidate = stream.Candidate(canonical, image, hashlib.sha256(canonical).digest(),
+                                 struct.unpack_from(">I", canonical, 45)[0], (len(image) + 83) // 84)
+    bindings = []
+    for path, target in zip(args.stream_binding, args.target):
+        value = stream.private_read(path)
+        if value.get("by_path") is not None:
+            raise UploaderError("native host streaming uses the selected locked by-id endpoint, not by-path bindings")
+        bound = stream.Binding.load(path, value.get("serial"), identity, target)
+        bound.check_candidate(candidate)
+        if candidate.counter <= bound.floor:
+            raise UploaderError("candidate must exceed each explicitly measured target floor")
+        bindings.append(bound)
+    common = ("serial", "sender", "stock_version", "normal", "sender_name")
+    if any(any(getattr(b, field) != getattr(bindings[0], field) for field in common) for b in bindings):
+        raise UploaderError("native compressed fleet bindings must share sender/endpoint/normal profile")
+    directory = Path(args.artifact_dir)
+    info = directory.stat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+        raise UploaderError("native compressed streaming needs an owned 0700 artifact directory")
+    resumes = [stream.private_read(p) for p in args.stream_resume_receipt]
+    if resumes and (len(resumes) != len(bindings) or args.mode == "direct"):
+        raise UploaderError("stream resume needs one original attempt receipt per target; directed/background only")
+    frames = stream.Frames(node.stream)
+    # The native STATUS probe has completed; transfer framing ownership once,
+    # retaining any already-buffered serial bytes rather than running two readers.
+    frames.buffer, node.buffer = node.buffer, bytearray()
+    transport = stream.Stock(frames, identity)
+    transport.bind(bindings[0])
+    original = transport.identify(deadline)
+    if args.mode != "direct" and tuple(original[:4]) != bindings[0].normal:
+        raise UploaderError("native compressed streaming must already use the bound normal profile")
+    hops = (0 if args.mode == "direct" else 1 if args.mode == "directed" else 63) if args.max_relay_hops is None else args.max_relay_hops
+    _, actual_plan = compression.plan(
+        image, width=args.path_hash_bytes, hops=hops, retry=args.mode != "direct",
+        recipients=len(bindings), bw=250000 if args.mode == "direct" else original[1],
+        sf=5 if args.mode == "direct" else original[2], cr=5 if args.mode == "direct" else original[3],
+        arm_thumb=compression.manifest_thumb(canonical))
+    if actual_plan["selected"] != "lzma":
+        raise UploaderError("actual bound radio/fleet does not select LZMA1; use explicit RAW native cache/START")
+    if args.reupload:
+        raise UploaderError("compressed native host streaming does not implicitly REUPLOAD; retire explicitly first")
+    # Native fleets retain all existing 1..32 target semantics. Recipient-bound
+    # signatures cost one stream per receiver; no signature amortization/cohort.
+    senders = [
+        stream.Sender(transport, bound, candidate, original, deadline, args.frequency_khz,
+                      args.lease_ms, args.duty_milli_percent / 100000, mode=args.mode,
+                      clock=transport.clock, sleep=transport.sleep,
+                      relay=args.relay_key, path_hash_bytes=args.path_hash_bytes,
+                      compression_mode="lzma", max_relay_hops=args.max_relay_hops,
+                      attempt_callback=lambda receipt: stream.private_write(
+                          directory / ("attempt-" + receipt["target_public_key"] + ".json"), receipt),
+                      event_callback=lambda event: evidence.log("ota_host_stream", stream_event=event))
+        for bound in bindings
+    ]
+    try:
+        if len(senders) == 1:
+            options = {"resume_receipt": resumes[0]} if resumes else {}
+            result = (senders[0].deploy(args.install_timeout, **options) if args.command == "deploy" else
+                      senders[0].upload(**options))
+        else:
+            for i, sender in enumerate(senders):
+                if resumes:
+                    sender.bind_resume(resumes[i])
+                    sender.census()
+                else:
+                    sender.authorize(retries=1)
+            for group in senders[0].compression_groups:
+                for sender in senders:
+                    sender.send_compressed_group(group)
+            for sender in senders:
+                for first in range(0, candidate.total, 128):
+                    if sender.census(first)["lifecycle"] != 5:
+                        raise UploaderError("native compressed fleet has not reached complete raw-SHA READY")
+            result = {"targets": [s.receipt("ready-observed-unsigned") for s in senders],
+                      "installation_confirmed": False}
+    finally:
+        # No START/autonomous uploader is left running. Restore/read back the
+        # direct sender's original radio just as stock host streaming does.
+        if args.mode == "direct":
+            senders[0].leave_direct()
+            transport.radio(original, deadline)
+        elif transport.identify(deadline) != original:
+            raise UploaderError("native host-stream normal radio/repeat changed")
+    evidence.log("ota_command_result", command=args.command,
+                 frontend="native-host-stream-not-native-cache", **result)
+    stream.private_write(directory / "stream-result.json", result)
+    return result
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--artifact-dir", help="optional new local operation-log directory")
@@ -453,6 +556,15 @@ def parser():
     deploy.add_argument("--reupload", action="store_true")
     deploy.add_argument("--install-timeout", type=float, default=300)
     for command in (upload, deploy):
+        command.add_argument("--compression", choices=("raw", "lzma"), default="raw")
+        command.add_argument("--stream-binding", type=Path, action="append", default=[],
+                             help="LZMA1 host-stream frontend: owned deployment binding per target")
+        command.add_argument("--stream-resume-receipt", type=Path, action="append", default=[],
+                             help="strict same-attempt resume, one original stream attempt receipt per target")
+        command.add_argument("--relay-key", type=full_key, help="host-stream directed one-relay route")
+        command.add_argument("--path-hash-bytes", type=int, choices=(1, 2, 3), default=1)
+        command.add_argument("--max-relay-hops", type=int,
+                             help="host-stream path-growth bound (background defaults to full 63-byte path)")
         command.add_argument("--target", required=True, type=full_key, action="append")
         command.add_argument("--mode", choices=tuple(MODES), default="directed")
         command.add_argument("--channel", type=int, default=255)
@@ -506,6 +618,28 @@ def main():
             arguments.error("select at most 32 distinct targets")
         if args.mode != "background" and len(args.target) != 1:
             arguments.error("direct and directed modes require exactly one target")
+        if args.stream_resume_receipt and args.compression != "lzma":
+            arguments.error("stream resume requires the same explicit LZMA1 host-stream frontend")
+        if args.compression == "lzma":
+            hops = (0 if args.mode == "direct" else 1 if args.mode == "directed" else 63) if args.max_relay_hops is None else args.max_relay_hops
+            _, decision = compression.plan(image, width=args.path_hash_bytes, hops=hops,
+                                            retry=args.mode != "direct", recipients=len(args.target),
+                                            bw=250000 if args.mode == "direct" else 62500,
+                                            sf=5 if args.mode == "direct" else 7,
+                                            arm_thumb=compression.manifest_thumb(canonical))
+            if decision["selected"] == "raw":
+                print("LZMA1: " + decision["reason"] + "; native raw cache/START retained.")
+                args.compression = "raw"
+            elif decision["admission_max_usb_rx_bytes"] > 176:
+                arguments.error("selected LZMA1 route exceeds legacy signed admission's 176-byte RX bound")
+            elif len(args.stream_binding) != len(args.target):
+                arguments.error("LZMA1 uses explicit host streaming; provide --stream-binding per target")
+            elif not args.artifact_dir:
+                arguments.error("LZMA1 host streaming requires --artifact-dir for durable attempt receipts")
+            elif args.channel != 255 or (args.mode != "direct" and args.routed_retry is False):
+                arguments.error("LZMA1 host streaming requires channel 255 and reliable routed framing; native encrypted cache remains RAW")
+            if args.stream_resume_receipt and args.compression != "lzma":
+                arguments.error("stream resume cannot fall back to cache/START or RAW; select the same stream mode")
     elif args.command in ("abort", "abort-cache") and not image:
         arguments.error("--image must not be empty")
     evidence = (lab.Evidence(args.artifact_dir, exclusive=True) if args.command == "cache"
@@ -526,6 +660,10 @@ def main():
         identity = full_key(info["pubkey"])
         uploader = Uploader(node, evidence, command_timeout=min(10, args.timeout))
         deadline = time.monotonic() + args.timeout
+        if getattr(args, "compression", "raw") == "lzma":
+            uploader.require_wire_version(deadline)
+            compressed_host_stream(node, evidence, args, canonical, image, identity, deadline)
+            return
         if args.command in ("upload", "cache", "deploy"):
             identity = identity if identity is not None else lab.app_info(node)["pubkey_bytes"]
             if args.command == "deploy":

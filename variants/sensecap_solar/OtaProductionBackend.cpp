@@ -7,6 +7,9 @@
 
 #include <cstring>
 #include <Ed25519.h>
+#include <FreeRTOS.h>
+#include <task.h>
+#include <utility/debug.h>
 
 #include <helpers/ota/OtaBoardBackendCommon.h>
 #include <helpers/ota/OtaFirmwareBackend.h>
@@ -490,6 +493,15 @@ bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration& int
 
   static ::ota::storage::OtaCandidateStore candidate_store(candidate_record_region);
   integration.attachCandidateStore(&candidate_store);
+  static mesh::ota::OtaLeanReceiver::CompressionWorkspace compression_workspace;
+  integration.leanReceiver().attachCompressionWorkspace(&compression_workspace, true);
+  integration.leanReceiver().setCompressionRuntimeProbe(nullptr,
+      [](void*, uint32_t& us, uint32_t& heap, uint32_t& stack) {
+        us = micros();
+        const int available = dbgHeapFree();
+        heap = available > 0 ? static_cast<uint32_t>(available) : 0;
+        stack = uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t);
+      });
   integration.attachLeanSignatureVerifier(&signature_verifier);
   integration.attachTrustProvider(trust);
   integration.attachStagingSink(staging);

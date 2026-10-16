@@ -39,6 +39,85 @@ A live candidate is not silently replaced. Explicit signed generation-bound
 abort/reupload paths preserve owner/content/purpose checks. Counter advancement
 occurs only with healthy confirmation, not staging or COMMIT admission.
 
+## Optional bounded compression extension
+
+Raw84 and the canonical59 raw-size/SHA contract remain unchanged. A new
+codec-capable APP must first arrive through the existing raw update path.
+`--compression lzma` selects independent 8064-byte (96 × raw84) groups,
+raw LZMA1/lc0/lp1/pb1/dictionary8192, only when actual signed-packet and checkpoint-air models
+beat RAW. An incompressible group is explicitly encoded as profile 0; decoder
+failure **never** selects raw fallback. Profile `0xa0` is this fixed portable
+configuration; `0xa1` additionally applies the explicit nRF ARMT/Thumb filter,
+with the raw group offset as its PC. Signed board IDs select Thumb on the host,
+and only nRF backends advertise/accept it; ESP uses the portable profile.
+The authenticated profile, not image-byte heuristics, controls filtering.
+Unknown profiles or missing capability reports fail explicitly.
+This extension has offline/build validation only, not nRF/ESP hardware acceptance.
+
+New frame kinds are capability/progress poll `0x13` (87 bytes), report `0x14`
+(95 bytes) and fragment `0x15`. Poll/report bind full target32, manifest32,
+generation4, BEGIN nonce16 and group2. Reports are unsigned, fresh/attempt-bound
+information, not authenticated installation evidence. Queries do not BEGIN,
+restore, program or advance the floor.
+
+Each fragment is `[kind1, manifest-tag4, group2, stored-length2, raw-length2,
+raw-CRC32-4, profile1, stored-offset2, variable-data, owner-signature64]`,
+big-endian integers. Every packet retains its own Ed25519 verification under
+the **current** administrator. Its signed message is
+`MeshCore/OTA/lzma1/v1 || target32 || manifest32 || generation4 ||
+BEGIN-nonce16 || fragment-header-and-data`. Context is not amortized over a
+group, and signatures cannot move between recipients or attempts.
+
+The active board backend owns exactly two 8064-byte buffers and one explicit
+decoder workspace (7040 probability bytes plus SDK state), shared with neither an unused Dispatcher integration nor
+the raw local cache. No heap, whole-image RAM or separate 32-KiB history exists.
+An entire authenticated group must pass codec, exact output/input-consumption,
+bounds and CRC checks before any of its raw bytes can be programmed. A first
+pass checks every already-received raw block for conflicts before any missing
+block is programmed. At most one raw84 preflight read, program, or bitmap
+publication runs per normal mesh tick. No new raw bitmap bits are published
+until the **whole** validated raw group has been programmed. The existing
+durable raw bitmap remains authoritative.
+Ephemeral partial compressed bytes may be dropped on reboot; resend rebuilds
+them, skips matching completed raw blocks and idempotently completes torn raw
+writes. There is no new candidate BEGIN or persistent-record version.
+
+Final raw SHA/signature verification is still mandatory before READY, followed
+by the separate signed COMMIT. Bootloader/installer and flash regions are
+unchanged. The decoder is the selected public-domain 7-Zip/LZMA SDK26.04 C
+sources, unmodified with provenance and licenses retained. Persistent SDK
+dictionary state and probabilities are off stack; the output buffer itself
+is the history, so there is no additional 8-KiB or 32-KiB dictionary allocation.
+Each normal mesh tick supplies at most128 input bytes and requests at most128
+new output bytes from one SDK call, with at most130 calls/group. Probability
+initialization (3520 entries) in the first call is also finite. Inverse Thumb
+and CRC run in separate at-most128-byte slices before any flash programming.
+A slice is not preemptible; actual MCU latency/watchdog behavior still requires
+on-device qualification. `ota codec` provides bounded, read-only timing and
+task-stack/heap diagnostics for that qualification.
+
+New fragment capacity is computed in both languages from the unchanged 176-byte
+limit minus the larger TX2/RX3 serial header, Mesh2, maximum path-width × hops,
+optional transport codes4, retry5, new header18 and signature64. There is no
+94-byte assumption: direct zero-hop gives89, one-hop width1/retry gives83,
+width3 gives81. Last fragments are variable length without padding. Explicit
+path-growth bounds must be justified; existing larger admission/census/control
+messages can impose tighter route constraints than the new fragment format.
+Selected compressed streams explicitly refuse a declared path whose legacy
+164-byte admission frame would exceed the RX limit. For reliable routing this
+means at most two path bytes, even though the new fragment format itself fits
+longer paths. The maximum capacity calculation alone does not qualify arbitrary
+long paths.
+
+Stock direct/directed/background use the shared encoder and existing CMD65 and
+signing APIs. Native `--compression lzma` explicitly selects that same
+host-stream frontend with per-target private bindings/attempt receipts, channel
+255 and reliable routed framing; it never reinterprets CMD67 cache records.
+Default native cache/autonomous RAW and encrypted-channel behavior are retained.
+Recipient/nonce-bound signatures require separate compressed streams per target.
+For genuine firmware a two-target shared RAW flood can therefore beat two
+compressed streams, and is truthfully selected instead of weakening signatures.
+
 ## Delivery and installation
 
 Native companion USB OTA is CMD67, reply30, fixed 107-byte ABI3 status. CMD66 and

@@ -1219,6 +1219,10 @@ __attribute__((noinline)) void MyMesh::formatFirmwareOtaInspection(const char* c
     return;
   }
   auto& integration = getOtaIntegration();
+  if (strcmp(command, "codec") == 0) {
+    mesh::ota::formatOtaCodec(reply, reply_size, integration.leanReceiver());
+    return;
+  }
   if (strcmp(command, "settings") == 0) {
     mesh::ota::formatOtaSettings(reply, reply_size, integration);
     return;
@@ -1618,7 +1622,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     if (strcmp(sub, "status") == 0) {
       formatFirmwareOtaStatus(reply, 160);
     } else if (strcmp(sub, "progress") == 0 || strcmp(sub, "candidate") == 0 ||
-               strcmp(sub, "settings") == 0) {
+               strcmp(sub, "settings") == 0 || strcmp(sub, "codec") == 0) {
       formatFirmwareOtaInspection(sub, reply, 160);
     } else if (strcmp(sub, "radio") == 0 || strcmp(sub, "service") == 0) {
       if (sender_timestamp != 0 || !local_usb) {

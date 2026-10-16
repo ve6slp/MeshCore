@@ -83,6 +83,104 @@ targets, `test-ota-disabled` and `test-ota-queue-compatibility`, for example
 `make test-ota-integration OTA_GTEST_FILTER='LoraOtaRoutedRetry.*'`.
 `PLATFORMIO` selects the installed runner.
 
+### Bounded compression validation
+
+All commands are offline; build targets do not access hardware:
+
+```sh
+make test-ota-compression
+make build-ota-compression-solar
+make ota-compression-report \
+  OTA_COMPRESSION_REPORT_ARGS='--image /path/to/existing/nrf-firmware.bin --baseline-elf /path/to/earlier/firmware.elf'
+PLATFORMIO_BUILD_DIR="$PWD/.tmp/compression/esp-build" \
+  make build-ota-targets OTA_TARGET_ENVS=Xiao_S3_WIO_repeater_ota_usb
+```
+
+`test-ota-compression` drives the actual Python encoder/signatures into the
+production C++ receiver/flash model, including final raw SHA and signed COMMIT,
+reboots, torn programs, current-owner/target/attempt/bounds/corrupt-codec/CRC
+failures and monotonic raw progress. It also tests actual stock/native host
+streaming and compiles the production decoder under ASan/UBSan with 40000
+malformed-input/canary trials, exact/truncated/trailing/output-limit checks and
+the slice quota. The synthetic fixture includes actual Thumb branch patterns
+across slice boundaries. Test keys and synthetic controls are explicitly nondeployment
+data. Existing raw/native cache/routed/background regression suites remain in
+`make test-ota-host test-ota-native`.
+
+For a genuine image byte-exact receiver run, select only the image-independent
+acceptance test (mutation tests intentionally depend on the default mixed
+synthetic fixture):
+
+```sh
+make test-ota-integration OTA_COMPRESSION_IMAGE=/path/to/firmware.bin \
+  OTA_GTEST_FILTER='LoraOtaCompression.ProductionPythonSignedFramesReachByteExactRawShaReadyAndOnlySignedCommit'
+```
+
+Solar builds freeze a genuine ROLE1 APP and compiler context under
+`.tmp/ota-boot-builds/compression-solar-role1-lzma-final`. Choose a new
+`OTA_COMPRESSION_FREEZE` for a new immutable freeze. ARM builds use a separate
+`.tmp/compression/arm-build` so native/ESP tests do not discard `.su` evidence.
+`ota-compression-arm-size` uses the installed Cortex-M4 toolchain, actual decoder
+headers and genuine linked SDK/APP symbols. `--image` explicitly identifies nRF
+inputs with Thumb; use `--portable-image` for ESP/non-Thumb, never an image-byte
+heuristic. Optional report `--baseline-elf` accepts a genuine
+earlier ROLE1 ELF; different radio/build constants mean its whole-image text
+delta is not perfectly controlled. Inspect `.data`, `.bss` and `.heap` separately:
+this linker reserves the remaining RAM as heap, so aggregate `size` BSS totals
+alone hide static-state growth.
+
+The persistent JSON report measures production variable fragments, per-packet
+signatures, metadata, zero padding, route-aware RF/USB byte counts, group raw
+fallback, real input hashes, and whole-transfer selection. Models include
+quarter-burst progress and group census overhead at BW62.5/SF7/CR5/preamble32;
+2%/3% duty estimates are shown both physically and with stock's 1.5 guard.
+They exclude admission/final surveys/loss/repairs/contention/whole-second stock
+counters/physical-TX completion pacing/flash CPU and are not elapsed-time claims.
+Two-target recipient-bound compressed streams are compared honestly with the
+existing shared raw stream.
+
+Decoder buffers/probabilities/SDK state are statically backend-owned, not thread
+stack; the output buffer is the history window. Genuine linked `.su` frames
+are retained separately from a small `-Os` Cortex-M4 probe, not confused with
+x86 symbols or host milliseconds. The output itself is dictionary history.
+SDK calls consume/request at most128 input/output bytes each, at most130
+calls/group, then separate at-most128-byte inverse-Thumb/CRC slices. CRC totals
+at most64512 bit iterations/group. A single SDK call is not preemptible, including
+the first call's fixed3520-probability initialization. Programming/preflight/
+bitmap publication is at most one raw84 transaction per normal mesh tick.
+Actual nRF/ESP decode latency, watchdog service, whole-thread interrupt/virtual
+call high-water stack and RF installation still require hardware qualification.
+The authenticated `ota codec` diagnostic exposes worst slice/group validation
+CPU microseconds, validated-group/slice counts, minimum sampled free heap and
+current-task high-water free stack bytes, without admission or flash mutation.
+On nRF heap is framework `dbgHeapFree()` (heap span minus `mallinfo` allocated
+bytes); on ESP it is `xPortGetFreeHeapSize()`. These are not contiguous-allocation
+guarantees. ESP stack high-water is already bytes; nRF words are converted to
+bytes. Measure before/after on the same boot/task and observe watchdog/mesh
+responsiveness; static `.su` or a host timer is not that experiment.
+
+One genuine software-only Solar ROLE1 measurement (same production encoder and
+signed framing, one-hop width1/retry, 83 useful fragment bytes) gives:
+
+| Input | Raw bytes | Stored LZMA+Thumb bytes | RAW → compressed signed data packets |
+| --- | ---: | ---: | ---: |
+| Earlier genuine Solar `8942cf5e…` | 510388 | 328434 | 6077 → 3987 |
+| Codec-capable Solar APP `298a9efc…` | 519588 | 335036 | 6186 → 4068 |
+| Synthetic incompressible control | 510388 | 510388 | 6077 → 6203; **RAW selected** |
+
+The genuine Cortex-M4 linked SDK/filter/wrapper is7280 text bytes. Against that
+earlier genuine Solar ELF, whole-APP `.text` grows9200 bytes, `.data` is unchanged,
+and `.bss` grows23440 bytes (different build/radio constants are disclosed).
+The single23364-byte workspace contains two8064 buffers,7164 decoder bytes
+(7040 probabilities plus persistent SDK/wrapper state), and72 protocol/diagnostic
+bytes. No heap or extra dictionary is allocated by the decoder. Remaining linker
+heap is143624 bytes, not measured live heap headroom. Actual linked GCC `.su`
+local frames along the active decode path total272 bytes; reserve1KiB for the
+codec path, but this is not whole-task/IRQ/prebuilt-library proof. The separate
+352-byte signed-fragment handler executes before deferred decode, not around it.
+These values are reproducible evidence for this artifact, not universal size
+promises; use the generated report for a subsequent APP.
+
 Focused regressions:
 
 ```sh

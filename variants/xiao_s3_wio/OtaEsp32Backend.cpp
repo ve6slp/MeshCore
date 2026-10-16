@@ -526,6 +526,14 @@ bool configureCompanionFirmwareOtaBackend(OtaFirmwareIntegration& target) {
                                                flash, lease, store, sink, trust, signatures, capability);
   if (outcome == Esp32ConfigureOutcome::IoError) storage_fault = true;
   if (outcome != Esp32ConfigureOutcome::Configured) return false;
+  static OtaLeanReceiver::CompressionWorkspace compression_workspace;
+  target.leanReceiver().attachCompressionWorkspace(&compression_workspace);
+  target.leanReceiver().setCompressionRuntimeProbe(nullptr,
+      [](void*, uint32_t& us, uint32_t& heap, uint32_t& stack) {
+        us = micros(); heap = xPortGetFreeHeapSize();
+        // ESP-IDF's watermark is already bytes, unlike upstream FreeRTOS.
+        stack = uxTaskGetStackHighWaterMark(nullptr);
+      });
   target.attachEntropy(nullptr, &otaEspEntropy);
   integration = &target;
   return true;

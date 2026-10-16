@@ -2786,6 +2786,8 @@ struct LeanFixture {
 
 }  // namespace
 
+#include "CompressionTests.h"
+
 namespace {
 struct AbortGenerationCleanupProbe {
   unsigned checks = 0, cleanups = 0;
