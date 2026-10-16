@@ -44,6 +44,7 @@
 #include <helpers/ota/OtaBlockSigning.h>
 #include <helpers/ota/OtaDirectRadioProfile.h>
 #include <helpers/ota/OtaUsbProtocol.h>
+#include <helpers/ota/OtaCompressionWire.h>
 
 namespace mesh {
 namespace ota {
@@ -298,6 +299,9 @@ inline bool validOtaRetryInner(const uint8_t* frame, size_t len) {
   switch (frame[0]) {
     case kOtaSignedBlockKind:
       return len >= kOtaSignedBlockMinBytes && len <= kOtaSignedBlockMaxBytes;
+    case kOtaCompressedFragmentKind: return validOtaCompressedFragment(frame, len);
+    case kOtaCompressionPollKind: return len == kOtaCompressionPollBytes;
+    case kOtaCompressionReportKind: return len == kOtaCompressionReportBytes;
     case kOtaAuthorizationKind: return len == kOtaAuthorizationFrameBytes;
     case kOtaTargetAuthorizationKind: return len == 164;
     case kOtaCommitKind: return len == kOtaCommitFrameBytes;
@@ -320,7 +324,8 @@ inline bool parseOtaRetryAttempt(const uint8_t* frame, size_t len, uint32_t& att
   inner = frame + kOtaRetryAttemptHeaderBytes;
   inner_len = len - kOtaRetryAttemptHeaderBytes;
   return attempt != 0 && validOtaRetryInner(inner, inner_len) &&
-         (frame[0] != kOtaRetryRepairAttemptKind || inner[0] == kOtaSignedBlockKind);
+         (frame[0] != kOtaRetryRepairAttemptKind || inner[0] == kOtaSignedBlockKind ||
+          inner[0] == kOtaCompressedFragmentKind);
 }
 
 inline size_t encodeOtaRetryAttempt(uint32_t attempt, const uint8_t* inner, size_t len,
@@ -328,7 +333,7 @@ inline size_t encodeOtaRetryAttempt(uint32_t attempt, const uint8_t* inner, size
   if (!attempt || !out || !validOtaRetryInner(inner, len) ||
       len > kOtaRetryAttemptMaxBytes - kOtaRetryAttemptHeaderBytes ||
       capacity < len + kOtaRetryAttemptHeaderBytes ||
-      (repair && inner[0] != kOtaSignedBlockKind)) return 0;
+      (repair && inner[0] != kOtaSignedBlockKind && inner[0] != kOtaCompressedFragmentKind)) return 0;
   std::memmove(out + kOtaRetryAttemptHeaderBytes, inner, len);
   out[0] = repair ? kOtaRetryRepairAttemptKind : kOtaRetryAttemptKind;
   usb::putBE32(out + 1, attempt);

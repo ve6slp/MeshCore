@@ -1030,6 +1030,10 @@ private:
       const uint8_t* frame, size_t frame_len, uint32_t now_ms) {
     if (frame == nullptr || frame_len == 0) return LeanControlResult::NotControlFrame;
     switch (frame[0]) {
+      case kOtaCompressedFragmentKind:
+        return lean_.handleCompressedFragment(frame, frame_len) == usb::UsbOtaResult::Ok ?
+            LeanControlResult::Handled : LeanControlResult::Rejected;
+      case kOtaCompressionPollKind: return handleCompressionPoll(frame, frame_len, now_ms);
       case kOtaTargetAuthorizationKind:
       case kOtaAuthorizationKind: return handleAuthorizationControl(frame, frame_len);
       case kOtaCommitKind: return handleCommitControl(frame, frame_len, now_ms);
@@ -1037,6 +1041,39 @@ private:
       case kOtaReuploadKind: return handleReuploadControl(frame, frame_len);
       default: return handleInformationalControlFrame(frame, frame_len, now_ms);
     }
+  }
+
+  __attribute__((noinline)) LeanControlResult handleCompressionPoll(
+      const uint8_t* frame, size_t len, uint32_t now_ms) {
+    if (len != kOtaCompressionPollBytes || !lean_.haveTargetPublicKey() || !lean_.compressionAvailable())
+      return LeanControlResult::Rejected;
+    if (std::memcmp(frame + 1, lean_.targetPublicKey(), 32)) return LeanControlResult::Handled;
+    const auto st = lean_.inspectStatus();
+    if (!st.valid || st.storageUnavailable || st.localCache ||
+        std::memcmp(frame + 33, st.manifestHash, 32) ||
+        usb::getBE32(frame + 65) != st.generation ||
+        std::memcmp(frame + 69, st.beginNonce, usb::kBeginNonceBytes) ||
+        !usb::beginNonceBound(st.beginNonce)) return LeanControlResult::Rejected;
+    const auto group = usb::getBE16(frame + 85);
+    uint16_t offset; bool complete;
+    const auto result = lean_.compressionProgress(group, offset, complete);
+    if (result != usb::UsbOtaResult::Ok) return LeanControlResult::Rejected;
+    if (pending_control_frame_valid_) return LeanControlResult::Handled;
+    auto* out = pending_control_frame_;
+    out[0] = kOtaCompressionReportKind;
+    std::memcpy(out + 1, lean_.targetPublicKey(), 32);
+    std::memcpy(out + 33, st.manifestHash, 32);
+    usb::putBE32(out + 65, st.generation);
+    std::memcpy(out + 69, st.beginNonce, usb::kBeginNonceBytes);
+    usb::putBE16(out + 85, group); usb::putBE16(out + 87, offset);
+    out[89] = complete ? 1 : 0; out[90] = lean_.compressionCapability();
+    usb::putBE16(out + 91, kOtaCompressionGroupBytes);
+    const auto decode_result = lean_.lastCompressionDecodeResult();
+    out[93] = decode_result == OtaLzma::Result::Pending ? 0 : static_cast<uint8_t>(decode_result);
+    out[94] = static_cast<uint8_t>(lean_.lastCompressionWriteResult());
+    pending_control_frame_len_ = kOtaCompressionReportBytes; pending_control_frame_valid_ = true;
+    pending_control_due_ms_ = now_ms;
+    return LeanControlResult::Handled;
   }
 
   __attribute__((noinline)) LeanControlResult handleAuthorizationControl(const uint8_t* frame, size_t frame_len) {

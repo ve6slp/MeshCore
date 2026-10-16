@@ -58,6 +58,7 @@ import stat
 import struct
 import sys
 import time
+import ota_compression as compression
 
 MAX_FRAME = 176
 BLOCK = 84
@@ -335,7 +336,7 @@ def rf_packet(frame):
 def retry_frame(payload, attempt, repair=False):
     if (type(attempt) is not int or not 0 < attempt <= 0xFFFFFFFF
             or not valid_retry_inner(payload) or len(payload) + 5 > 171
-            or (repair and payload[0] != 1)):
+            or (repair and payload[0] not in (1, compression.FRAGMENT))):
         raise Error("invalid existing OTA retry attempt/inner frame")
     return bytes([0x12 if repair else 0x11]) + struct.pack(">I", attempt) + payload
 
@@ -344,8 +345,9 @@ def valid_retry_inner(payload):
     if not payload:
         return False
     sizes = {2: 156, 3: 153, 4: 165, 6: 42, 7: 5, 8: 164, 10: 67,
-             11: CENSUS_REPORT_BYTES, 14: 165}
+             11: CENSUS_REPORT_BYTES, 14: 165, compression.POLL: 87, compression.REPORT: 95}
     return (72 <= len(payload) <= 155 if payload[0] == 1
+            else 82 < len(payload) <= 171 if payload[0] == compression.FRAGMENT
             else len(payload) == sizes.get(payload[0]))
 
 
@@ -356,7 +358,7 @@ def retry_payload(payload):
         return None, None
     attempt = struct.unpack_from(">I", payload, 1)[0]
     inner = payload[5:]
-    if not attempt or not valid_retry_inner(inner) or (payload[0] == 0x12 and inner[0] != 1):
+    if not attempt or not valid_retry_inner(inner) or (payload[0] == 0x12 and inner[0] not in (1, compression.FRAGMENT)):
         return None, None
     return attempt, inner
 
@@ -428,7 +430,7 @@ PENDING_LIMIT = 256
 
 
 def ota_nonreply(payload):
-    if not payload or payload[0] in (11, 13, 16):
+    if not payload or payload[0] in (11, 13, 16, compression.REPORT):
         return False
     return (valid_retry_inner(payload) or
             (payload[0] in (12, 15) and len(payload) == 171) or
@@ -774,7 +776,7 @@ class Sender:
     def __init__(self, stock, binding, candidate, profile, deadline, frequency, lease_ms=60000,
                  duty=0.02, clock=time.monotonic, sleep=time.sleep, reupload_generation=None, reupload=False,
                  event_callback=None, *, mode="direct", relay=None, path_hash_bytes=1, channel=255,
-                 attempt_callback=None):
+                 attempt_callback=None, compression_mode="raw", max_relay_hops=None):
         validate_transport(mode, frequency, lease_ms, channel, relay, path_hash_bytes, binding)
         validate_profile(profile)
         if mode != "direct" and tuple(profile[:4]) != binding.normal:
@@ -815,6 +817,22 @@ class Sender:
         self.restart_aborted_report = None
         self.event_callback, self.event_start = event_callback, clock()
         self.attempt_callback, self.attempt_recorded = attempt_callback, False
+        if compression_mode not in ("raw", "lzma"):
+            raise Error("unsupported compression algorithm; only raw/lzma")
+        self.compression_mode = compression_mode
+        self.compression_groups, self.compression_plan = (), None
+        if compression_mode == "lzma":
+            hops = (0 if mode == "direct" else 1 if mode == "directed" else 63) if max_relay_hops is None else max_relay_hops
+            if (mode == "direct" and hops != 0) or (mode == "directed" and hops != 1):
+                raise Error("max relay hops must match the selected direct/one-relay directed path")
+            self.compression_groups, self.compression_plan = compression.plan(
+                candidate.image, width=path_hash_bytes, hops=hops, retry=mode != "direct",
+                bw=self.direct_bandwidth if mode == "direct" else profile[1],
+                sf=5 if mode == "direct" else profile[2], cr=5 if mode == "direct" else profile[3],
+                arm_thumb=compression.manifest_thumb(candidate.canonical))
+            if (self.compression_plan["selected"] == "lzma" and
+                    self.compression_plan["admission_max_usb_rx_bytes"] > 176):
+                raise Error("selected compressed route exceeds legacy signed admission's 176-byte RX bound")
 
     def emit(self, event, **fields):
         if self.event_callback is not None:
@@ -845,7 +863,7 @@ class Sender:
             if self.next_attempt > 0xFFFFFFFF:
                 raise Error("OTA retry attempts exhausted; no wrap/replay fallback")
             attempt = self.next_attempt
-            payload = retry_frame(payload, attempt, repair=inner_kind == 1 if repair is None else repair)
+            payload = retry_frame(payload, attempt, repair=inner_kind in (1, compression.FRAGMENT) if repair is None else repair)
             self.next_attempt += 1
         route = 1 if self.mode == "background" else 2
         raw = packet(payload, self.path, self.path_hash_bytes, route=route)
@@ -1167,6 +1185,10 @@ class Sender:
         if report["lifecycle"] == 9:
             self.activate_prepared()
         self.negotiate()
+        if self.compression_plan is not None:
+            self.emit("compression_plan", **self.compression_plan)
+            if self.compression_plan["selected"] == "lzma":
+                return self.upload_compressed(ready_once=ready_once)
         first = 0
         ready_windows = set()
         windows = tuple(range(0, self.candidate.total, 128))
@@ -1221,7 +1243,87 @@ class Sender:
             result.update(mode="background", request_route="flood", channel=255,
                           floor=self.binding.floor, min_generation=self.binding.min_generation,
                           normal_profile=list(self.binding.normal), status_authenticated=False)
+        if self.compression_plan is not None:
+            result["transfer_encoding"] = (("lzma1-g8064-armt" if self.compression_plan["arm_thumb"]
+                                           else "lzma1-g8064") if self.compression_plan["selected"] == "lzma" else "raw")
         return result
+
+    def compression_progress(self, group, retries=3):
+        if self.generation is None or self.begin_nonce is None:
+            raise Error("compression requires a fresh nonce-bound candidate census")
+        for attempt in range(retries):
+            self.room(15)
+            since = self.send(compression.poll(self.binding.target, self.candidate.digest,
+                                               self.generation, self.begin_nonce, group.index))
+            try:
+                _, frame = self.stock.frames.receive(
+                    lambda p: p[:1] == bytes([compression.REPORT]) and p[1:33] == self.binding.target,
+                    since, min(self.deadline, self.clock() + (4 if self.lease_end else 25),
+                               self.lease_end or self.deadline),
+                    self.rf_observer("compression-progress"), self.binding.target, self.candidate.digest,
+                    route_predicate=self.reply_route, preserve_unmatched=self.mode == "background")
+            except TimeoutError:
+                if attempt + 1 == retries:
+                    raise Error("receiver compression capability/progress unavailable; no compressed/raw fallback")
+                continue
+            try:
+                return compression.report(frame, self.binding.target, self.candidate.digest, self.generation,
+                                          self.begin_nonce, group.index, len(group.stored),
+                                          self.compression_plan["arm_thumb"])
+            except ValueError as exc:
+                raise Error(str(exc)) from exc
+        raise Error("compression progress exhausted")
+
+    def send_compressed_group(self, group):
+        offset, complete = self.compression_progress(group)
+        retries = 0
+        capacity = self.compression_plan["capacity"]
+        while not complete:
+            before = offset
+            if offset == len(group.stored):
+                # Input is authenticated but incremental decode/filter/CRC/flash
+                # may still be working. A reboot instead reports offset zero.
+                offset, complete = self.compression_progress(group)
+                retries += 1
+                if retries > 32:
+                    raise Error("compressed group validation/programming stalled")
+                continue
+            for _ in range(self.burst_blocks):
+                prefix = group.prefix(self.candidate.digest, offset, capacity)
+                message = compression.signed_message(self.binding.target, self.candidate.digest,
+                                                     self.generation, self.begin_nonce, prefix)
+                signature = self.stock.sign(message, min(self.deadline, self.lease_end or self.deadline))
+                self.send(prefix + signature)
+                self.emit("compressed_fragment_sent", group=group.index, offset=offset,
+                          stored_bytes=len(group.stored), profile=group.profile, data_bytes=len(prefix) - 18)
+                offset += len(prefix) - 18
+                if offset == len(group.stored):
+                    break
+            offset, complete = self.compression_progress(group)
+            retries = retries + 1 if offset <= before and not complete else 0
+            if retries > 8:
+                raise Error("compressed group stalled/rejected; no decoder/raw fallback")
+
+    def upload_compressed(self, *, ready_once=False):
+        for group in self.compression_groups:
+            attempts = 0
+            while True:
+                try:
+                    self.send_compressed_group(group)
+                    self.census((group.index * 96 // 128) * 128)
+                    break
+                except LeaseExpired:
+                    attempts += 1
+                    if attempts > 8:
+                        raise Error("compressed group direct-lease retries exhausted")
+                    self.negotiate()
+        self.leave_direct()
+        for first in range(0, self.candidate.total, 128):
+            if self.census(first)["lifecycle"] != 5:
+                raise Error("compressed transfer is not complete canonical raw-SHA READY")
+        self.emit("ready_observed_unsigned", generation=self.generation, total=self.candidate.total,
+                  transfer_encoding=self.receipt("ready-observed-unsigned")["transfer_encoding"])
+        return self.receipt("ready-observed-unsigned")
 
     def attempt_receipt(self, report):
         result = self.receipt("attempt-observed-unsigned")
@@ -1392,6 +1494,8 @@ class BackgroundCampaign:
                         "installation_confirmed": False, "mode": "background", "request_route": "flood",
                         "channel": 255}
             expected.update(attempt_fields(binding, candidate, saved_profile, saved_power, duty, report))
+            if receipt.get("transfer_encoding") in ("lzma1-g8064", "lzma1-g8064-armt", "raw"):
+                expected["transfer_encoding"] = receipt["transfer_encoding"]
             expected["normal_duty_percent"] = old_duty
             normal = receipt.get("normal_profile")
             validate_profile(normal + [0] if isinstance(normal, list) else ())
@@ -1405,7 +1509,8 @@ class BackgroundCampaign:
             raise Error("background resume receipts must bind the same sender profile and TX power")
 
     def __init__(self, stock, bindings, candidate, profile, deadline, duty=0.02,
-                 clock=time.monotonic, sleep=time.sleep, event_callback=None, attempt_callback=None):
+                 clock=time.monotonic, sleep=time.sleep, event_callback=None, attempt_callback=None,
+                 compression_mode="raw", max_relay_hops=None):
         self.validate_bindings(bindings, candidate)
         first = bindings[0]
         self.transport = Sender(stock, first, candidate, profile, deadline, 0, 0, duty, clock, sleep,
@@ -1421,6 +1526,18 @@ class BackgroundCampaign:
         self.stage = "admission"
         self.error = None
         self.resuming = False
+        if compression_mode not in ("raw", "lzma"):
+            raise Error("unsupported compression algorithm")
+        if compression_mode == "lzma":
+            hops = 63 if max_relay_hops is None else max_relay_hops
+            groups, plan = compression.plan(candidate.image, hops=hops, recipients=len(bindings),
+                                            arm_thumb=compression.manifest_thumb(candidate.canonical),
+                                            bw=profile[1], sf=profile[2], cr=profile[3])
+            if plan["selected"] == "lzma" and plan["admission_max_usb_rx_bytes"] > 176:
+                raise Error("selected compressed flood path exceeds legacy signed admission's 176-byte RX bound")
+            self.transport.compression_groups, self.transport.compression_plan = groups, plan
+            for target in self.targets:
+                target.compression_groups, target.compression_plan = groups, plan
 
     def result(self, outcome, complete=False):
         return {"schema": 1, "mode": "background", "outcome": outcome, "operation_complete": complete,
@@ -1430,7 +1547,9 @@ class BackgroundCampaign:
                 "counter": self.transport.candidate.counter, "channel": 255, "target_count": 2,
                 "initial_block_transmissions": self.initial_sent,
                 "repair_block_transmissions": self.repair_sent,
-                "transfer_strategy": "shared-missing-union-resume" if self.resuming else "shared-initial-flood",
+                "transfer_strategy": ("recipient-bound-lzma" if self.transport.compression_plan is not None
+                                      and self.transport.compression_plan["selected"] == "lzma" else
+                                      "shared-missing-union-resume" if self.resuming else "shared-initial-flood"),
                 "usb_unsolicited_counts": dict(self.transport.stock.frames.unsolicited),
                 "usb_backlog": self.transport.stock.frames.backlog(),
                 "error": self.error,
@@ -1559,8 +1678,16 @@ class BackgroundCampaign:
                 self.stage = "initial-shared-flood"
                 current = None
                 keys = [target.binding.target.hex() for target in self.targets]
-                for index in range(self.transport.candidate.total):
-                    self.send_block(index, initial=True, needed_by=keys)
+                if self.transport.compression_plan is not None:
+                    self.transport.emit("compression_plan", **self.transport.compression_plan)
+                if self.transport.compression_plan is None or self.transport.compression_plan["selected"] == "raw":
+                    for index in range(self.transport.candidate.total):
+                        self.send_block(index, initial=True, needed_by=keys)
+            if self.transport.compression_plan is not None and self.transport.compression_plan["selected"] == "lzma":
+                self.stage = "recipient-bound-compressed-groups"
+                for group in self.transport.compression_groups:
+                    for current, target in enumerate(self.targets):
+                        target.send_compressed_group(group)
             self.stage = "census-selective-repair"
             windows = tuple(range(0, self.transport.candidate.total, 128))
             # Validate every window of both attempts before any repair, even
@@ -1581,12 +1708,26 @@ class BackgroundCampaign:
                         for index in range(first, min(first + 128, target.candidate.total)):
                             if not report["bits"] & (1 << (index - first)):
                                 missing.setdefault(index, []).append(target.binding.target.hex())
-                    for index, needed_by in sorted(missing.items())[:self.transport.burst_blocks]:
-                        current = None
-                        self.repairs[index] = self.repairs.get(index, 0) + 1
-                        if self.repairs[index] > 8:
-                            raise Error("shared RF block repair retries exhausted")
-                        self.send_block(index, initial=False, needed_by=needed_by)
+                    if (self.transport.compression_plan is not None and
+                            self.transport.compression_plan["selected"] == "lzma"):
+                        needed_groups = {}
+                        for index, needed_by in missing.items():
+                            needed_groups.setdefault(index // 96, set()).update(needed_by)
+                        for group, needed_by in sorted(needed_groups.items())[:self.transport.burst_blocks]:
+                            start = group * 96
+                            self.repairs[start] = self.repairs.get(start, 0) + 1
+                            if self.repairs[start] > 8:
+                                raise Error("recipient-bound compressed group repair retries exhausted")
+                            for current, target in enumerate(self.targets):
+                                if target.binding.target.hex() in needed_by:
+                                    target.send_compressed_group(self.transport.compression_groups[group])
+                    else:
+                        for index, needed_by in sorted(missing.items())[:self.transport.burst_blocks]:
+                            current = None
+                            self.repairs[index] = self.repairs.get(index, 0) + 1
+                            if self.repairs[index] > 8:
+                                raise Error("shared RF block repair retries exhausted")
+                            self.send_block(index, initial=False, needed_by=needed_by)
                     # Both fresh checkpoints must succeed before any more
                     # blocks. Rotate windows so a lossy prefix cannot starve
                     # the tail; the campaign deadline and retry bounds remain.
@@ -1641,9 +1782,9 @@ class BackgroundCampaign:
                 or receipt.get("status_authenticated") is not False
                 or receipt.get("installation_confirmed") is not False
                 or not isinstance(receipt.get("targets"), list) or len(receipt["targets"]) != 2
-                or strategy not in ("shared-initial-flood", "shared-missing-union-resume")
+                or strategy not in ("shared-initial-flood", "shared-missing-union-resume", "recipient-bound-lzma")
                 or type(receipt.get("initial_block_transmissions")) is not int
-                or receipt["initial_block_transmissions"] != (0 if strategy == "shared-missing-union-resume" else c.total)
+                or receipt["initial_block_transmissions"] != (c.total if strategy == "shared-initial-flood" else 0)
                 or type(receipt.get("repair_block_transmissions")) is not int
                 or receipt["repair_block_transmissions"] < 0):
             raise Error("background COMMIT requires this common-image two-target READY receipt")
@@ -2024,7 +2165,9 @@ def background_operation(stock, bindings, candidate, args, receipt):
                 stock, bindings, candidate, profile, time.monotonic() + args.timeout,
                 args.normal_duty_percent / 100, event_callback=public_event,
                 attempt_callback=lambda observed: private_write(
-                    args.artifacts / ("attempt-" + observed["target_public_key"] + ".json"), observed))
+                    args.artifacts / ("attempt-" + observed["target_public_key"] + ".json"), observed),
+                compression_mode=getattr(args, "compression", "raw"),
+                max_relay_hops=getattr(args, "max_relay_hops", None))
             try:
                 resume_options = {"resume_receipts": receipt} if args.resume_receipt is not None else {}
                 result = (campaign.deploy(args.install_timeout, **resume_options) if args.operation == "deploy" else
@@ -2099,6 +2242,10 @@ def main(argv=None):
     parser.add_argument("--routed-retry", action="store_true", help="redundant in on-mesh modes; refused in direct mode")
     parser.add_argument("--no-routed-retry", action="store_true", help="refused in on-mesh modes; direct remains unframed")
     parser.add_argument("--normal-duty-percent", type=float, default=2)
+    parser.add_argument("--compression", choices=("raw", "lzma"), default="raw",
+                        help="bounded LZMA1/8064, explicit nRF Thumb; RAW selected if packet/air model loses")
+    parser.add_argument("--max-relay-hops", type=int,
+                        help="path-growth bound for compression; background default full 63-byte path")
     parser.add_argument("--timeout", type=float, default=14400)
     args = parser.parse_args(argv)
     if args.mode == "background":
@@ -2217,7 +2364,8 @@ def main(argv=None):
                                     event_callback=public_event, mode=args.mode, relay=args.relay_key,
                                     path_hash_bytes=args.path_hash_bytes, channel=args.channel,
                                     attempt_callback=(lambda observed: private_write(directory / "attempt-receipt.json", observed))
-                                    if args.mode == "directed" else None)
+                                    if args.mode == "directed" else None,
+                                    compression_mode=args.compression, max_relay_hops=args.max_relay_hops)
                     resume_options = {"resume_receipt": receipt} if args.resume_receipt is not None else {}
                     if args.operation == "deploy":
                         result = sender.deploy(args.install_timeout, **resume_options)

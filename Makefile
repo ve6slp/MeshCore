@@ -36,6 +36,8 @@ OTA_UPLOAD_LEASE_MS ?= 60000
 OTA_UPLOAD_DUTY_MILLI_PERCENT ?= 2000
 OTA_UPLOAD_TIMEOUT ?= 14400
 OTA_UPLOAD_REUPLOAD ?= 0
+OTA_UPLOAD_COMPRESSION ?= raw
+OTA_COMPRESSION_MAX_RELAY_HOPS ?=
 OTA_ARTIFACT_DIR ?=
 OTA_STOCK_BINDING ?=
 OTA_STOCK_SERIAL ?=
@@ -76,6 +78,12 @@ XIAO_OTA_TEST_BOARD_TARGET ?= XIAO_OTA_TARGET_XIAO_NRF52840
 XIAO_OTA_TEST_ROLE_ID ?= $(if $(strip $(XIAO_OTA_ROLE_ID)),$(XIAO_OTA_ROLE_ID),0)
 XIAO_OTA_UPSTREAM ?= $(XIAO_OTA_VENDOR)
 OTA_NRF_REMOTE_BOOT_PROOF_PREFIX ?=
+OTA_COMPRESSION_IMAGE ?=
+OTA_COMPRESSION_BUILD_DIR := $(TMPDIR)/compression/arm-build
+OTA_COMPRESSION_FREEZE ?= $(TMPDIR)/ota-boot-builds/compression-solar-role1-lzma-final
+OTA_ARM_PREFIX ?= $(HOME)/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-
+OTA_COMPRESSION_REPORT_ARGS ?=
+export OTA_COMPRESSION_FIXTURE := $(TMPDIR)/compression/fixture.bin
 
 .PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-ota-deploy test-ota-stock-companion test-ota-management build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion ota-management build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
 
@@ -103,6 +111,34 @@ test-ota-management: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_management.py'
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
+test-ota-native test-ota-integration: test-ota-compression-fixture
+.PHONY: test-ota-compression-fixture test-ota-compression build-ota-compression-solar ota-compression-arm-size ota-compression-report
+test-ota-compression-fixture: tmpdir
+	$(PYTHON) test/test_lora_ota_integration/compression_fixture.py "$(OTA_COMPRESSION_FIXTURE)" $(if $(strip $(OTA_COMPRESSION_IMAGE)),"$(OTA_COMPRESSION_IMAGE)")
+test-ota-compression: test-ota-compression-fixture
+	$(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER='LoraOtaCompression.*'
+	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_compression.py'
+	$(CXX) -std=c++17 -Os -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src -I "$(TMPDIR)/compression" \
+	  scripts/tests/native/ota_compression_decoder_check.cpp src/helpers/ota/third_party/lzma/LzmaDec.c \
+	  src/helpers/ota/third_party/lzma/Bra.c -o "$(TMPDIR)/compression/decoder-check"
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$(TMPDIR)/compression/decoder-check"
+build-ota-compression-solar: tmpdir
+	PLATFORMIO_BUILD_DIR="$(OTA_COMPRESSION_BUILD_DIR)" $(MAKE) --no-print-directory build-xiao-ota-usb-app \
+	  XIAO_OTA_PAIR_BOARD=sensecap_solar_p1 XIAO_OTA_PAIR_ROLE_ID=1 XIAO_OTA_APP_FREEZE_DIR="$(OTA_COMPRESSION_FREEZE)"
+ota-compression-arm-size: tmpdir
+	@mkdir -p "$(TMPDIR)/compression"
+	"$(OTA_ARM_PREFIX)g++" -std=c++17 -mcpu=cortex-m4 -mthumb -Os -fno-exceptions -fno-rtti \
+	  -ffunction-sections -fdata-sections -fstack-usage -I src \
+	  -c scripts/tests/native/ota_compression_size_probe.cpp -o "$(TMPDIR)/compression/decoder-m4.o"
+	"$(OTA_ARM_PREFIX)size" "$(TMPDIR)/compression/decoder-m4.o" "$(OTA_COMPRESSION_FREEZE)/firmware.elf"
+	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(TMPDIR)/compression/decoder-m4.o" > "$(TMPDIR)/compression/decoder-m4-symbols.txt"
+	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(OTA_COMPRESSION_FREEZE)/firmware.elf" > "$(TMPDIR)/compression/solar-m4-symbols.txt"
+	@cat "$(TMPDIR)/compression/decoder-m4.su"
+ota-compression-report: ota-compression-arm-size
+	$(PYTHON) scripts/ota_compression_report.py --image "$(OTA_COMPRESSION_FREEZE)/firmware.bin" \
+	  --elf "$(OTA_COMPRESSION_FREEZE)/firmware.elf" --probe "$(TMPDIR)/compression/decoder-m4.o" \
+	  --stack-dir "$(OTA_COMPRESSION_BUILD_DIR)/SenseCap_Solar_repeater_ota_usb" \
+	  --arm-prefix "$(OTA_ARM_PREFIX)" --output "$(TMPDIR)/compression/report.json" $(OTA_COMPRESSION_REPORT_ARGS)
 # Real Mesh/Dispatcher/PacketManager behaviour with MESHCORE_LORA_OTA=0 (ordinary firmware is unchanged).
 test-ota-disabled: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native_lora_ota_disabled -f test_lora_ota_disabled
@@ -144,6 +180,12 @@ ifeq ($(OTA_DEPLOY_TRANSPORT),native)
 	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
 	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" \
 	  --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --duty-milli-percent "$(OTA_UPLOAD_DUTY_MILLI_PERCENT)" \
+	  --compression "$(OTA_UPLOAD_COMPRESSION)" \
+	  $(if $(strip $(OTA_STOCK_BINDING)),--stream-binding "$(OTA_STOCK_BINDING)") \
+	  $(if $(strip $(OTA_STOCK_RESUME_RECEIPT)),--stream-resume-receipt "$(OTA_STOCK_RESUME_RECEIPT)") \
+	  $(if $(strip $(OTA_STOCK_RELAY_KEY)),--relay-key "$(OTA_STOCK_RELAY_KEY)") \
+	  --path-hash-bytes "$(OTA_STOCK_PATH_HASH_BYTES)" \
+	  $(if $(strip $(OTA_COMPRESSION_MAX_RELAY_HOPS)),--max-relay-hops "$(OTA_COMPRESSION_MAX_RELAY_HOPS)") \
 	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
 else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
 	@test -n "$(OTA_ARTIFACT_DIR)" && test -n "$(OTA_STOCK_BINDING)" && test -n "$(OTA_STOCK_SERIAL)" && test -n "$(OTA_STOCK_SENDER_KEY)" || { echo 'Stock requires a new artifact directory, binding, serial and sender key.' >&2; exit 1; }
@@ -157,6 +199,8 @@ else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
 	  $(if $(strip $(OTA_STOCK_RESUME_RECEIPT)),--resume-receipt "$(OTA_STOCK_RESUME_RECEIPT)") \
 	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
 	  --normal-duty-percent "$$( $(PYTHON) -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)' )" \
+	  --compression "$(OTA_UPLOAD_COMPRESSION)" \
+	  $(if $(strip $(OTA_COMPRESSION_MAX_RELAY_HOPS)),--max-relay-hops "$(OTA_COMPRESSION_MAX_RELAY_HOPS)") \
 	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
 else
 	@echo 'OTA_DEPLOY_TRANSPORT must be native or stock.' >&2; exit 1

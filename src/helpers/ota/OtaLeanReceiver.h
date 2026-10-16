@@ -7,6 +7,8 @@
 #include <helpers/ota/OtaBlockSigning.h>
 #include <helpers/ota/OtaUsbProtocol.h>
 #include <helpers/ota/OtaProofScratch.h>
+#include <helpers/ota/OtaCompressionWire.h>
+#include <helpers/ota/OtaLzma.h>
 #include <ota/protocol/OtaDescriptor.h>
 #include <ota/trust/SignatureVerifier.h>
 #include <ota/runtime/OtaTrustInterfaces.h>
@@ -24,6 +26,34 @@ public:
   using UnadmittedAbortFn = Result (*)(void*, const ::ota::storage::OtaCandidateStore::Snapshot&, bool);
   // Must fill `len` bytes from a hardware/CSPRNG source or return false.
   using EntropyFn = bool (*)(void*, uint8_t*, size_t);
+  using CompressionProbeFn = void (*)(void*, uint32_t&, uint32_t&, uint32_t&);
+  struct CompressionDiagnostics {
+    uint32_t groups = 0, slices = 0, maxSliceUs = 0, maxGroupUs = 0;
+    uint32_t minFreeHeap = 0, minFreeStack = 0;
+    bool measured = false;
+  };
+
+  // Supplied once by the active board backend, not by unused Dispatcher or
+  // local-cache receivers. Buffers and decoder state never occupy RTOS stack.
+  struct CompressionWorkspace {
+    uint8_t input[kOtaCompressionGroupBytes] = {}, output[kOtaCompressionGroupBytes] = {};
+    OtaLzma decoder;
+    CompressionDiagnostics diagnostics;
+    uint8_t header[16] = {};
+    uint16_t filled = 0;
+    bool active = false, completed = false;
+    bool decoding = false, verified = false, preflight = false, marking = false;
+    uint16_t cursor = 0;
+    uint8_t decodeStage = 0;
+    uint32_t crc = 0, groupCpuUs = 0;
+    Result writeError = Result::Ok;
+    OtaLzma::Result decodeResult = OtaLzma::Result::Ok;
+    void reset() {
+      active = completed = decoding = verified = preflight = marking = false; filled = cursor = 0;
+      decodeStage = 0; crc = UINT32_MAX; groupCpuUs = 0;
+      decodeResult = OtaLzma::Result::Ok; writeError = Result::Ok;
+    }
+  };
 
   struct Status {
     bool valid = false;
@@ -51,6 +81,27 @@ public:
   void attachTerminalCheck(void* ctx, TerminalCheckFn fn) { terminal_ctx_ = ctx; terminal_check_ = fn; }
   void attachUnadmittedAbort(void* ctx, UnadmittedAbortFn fn) { unadmitted_ctx_ = ctx; unadmitted_abort_ = fn; }
   void attachEntropy(void* ctx, EntropyFn fn) { entropy_ctx_ = ctx; entropy_ = fn; }
+  void attachCompressionWorkspace(CompressionWorkspace* workspace, bool allow_thumb = false) {
+    compression_workspace_ = workspace;
+    compression_thumb_ = allow_thumb;
+    if (workspace) workspace->reset();
+  }
+  bool compressionAvailable() const { return compression_workspace_ != nullptr; }
+  uint8_t compressionCapability() const { return compression_thumb_ ? kOtaLzmaThumbProfile : kOtaLzmaProfile; }
+  void setCompressionRuntimeProbe(void* ctx, CompressionProbeFn fn) {
+    compression_probe_ctx_ = ctx; compression_probe_ = fn;
+  }
+  CompressionDiagnostics compressionDiagnostics() const {
+    auto value = compression_workspace_ ? compression_workspace_->diagnostics : CompressionDiagnostics{};
+    if (compression_probe_) {
+      uint32_t us, heap, stack;
+      compression_probe_(compression_probe_ctx_, us, heap, stack);
+      if (!value.measured || heap < value.minFreeHeap) value.minFreeHeap = heap;
+      if (!value.measured || stack < value.minFreeStack) value.minFreeStack = stack;
+      value.measured = true;
+    }
+    return value;
+  }
   bool fillEntropy(uint8_t* out, size_t len) const { return entropy_ && out && entropy_(entropy_ctx_, out, len); }
   bool storageUnavailable() const { return storage_unavailable_; }
   // Authoritative reload after a storage read failure; true once state is known.
@@ -157,6 +208,7 @@ public:
   }
 
   void restore() {
+    if (compression_workspace_) compression_workspace_->reset();
     pending_reupload_ = false;
     seal_pending_ = false;
     commit_started_ = false;
@@ -357,6 +409,7 @@ private:
       return Result::IoError;
     }
     candidate_ = next;
+    if (compression_workspace_) compression_workspace_->reset();
     pending_reupload_ = false;
     seal_pending_ = false;
     commit_started_ = false;
@@ -375,6 +428,99 @@ public:
   Result putBlock(uint16_t index, const uint8_t* data, size_t data_len) {
     if (storage_unavailable_) return Result::Unavailable;
     return acceptBlock(index, data, data_len);
+  }
+
+  // Read-only: a query never resumes storage, changes a candidate or clears a fault.
+  Result compressionProgress(uint16_t group, uint16_t& offset, bool& complete) const {
+    offset = 0; complete = false;
+    if (!compression_workspace_) return Result::Unsupported;
+    const auto& compression_ = *compression_workspace_;
+    if (storage_unavailable_) return Result::Unavailable;
+    if (!candidate_.valid || candidate_.localCache || !store_) return Result::NotFound;
+    const uint32_t start = static_cast<uint32_t>(group) * kOtaCompressionGroupBlocks;
+    if (start >= candidate_.totalBlocks) return Result::BadRequest;
+    complete = true;
+    for (uint32_t i = start; i < start + kOtaCompressionGroupBlocks && i < candidate_.totalBlocks; ++i) {
+      bool received;
+      if (!store_->readReceived(i, received)) return Result::IoError;
+      complete &= received;
+    }
+    if (!complete && compression_.active && usb::getBE16(compression_.header + 5) == group)
+      offset = compression_.filled;
+    return Result::Ok;
+  }
+
+  __attribute__((noinline)) Result handleCompressedFragment(const uint8_t* frame, size_t len) {
+    if (!compression_workspace_) return Result::Unsupported;
+    auto& compression_ = *compression_workspace_;
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    OtaBoardProofScratchLease lease(busy);
+    if (!lease) return Result::Busy;
+    if (storage_unavailable_) return Result::Unavailable;
+    using Phase = ::ota::storage::OtaCandidateStore::Phase;
+    if (!candidate_.valid || candidate_.localCache || !have_target_public_key_ ||
+        (candidate_.phase != Phase::Receiving && candidate_.phase != Phase::Verifying &&
+         candidate_.phase != Phase::Ready)) return Result::NotFound;
+    if (!validOtaCompressedFragment(frame, len)) return Result::BadRequest;
+    if (!isCurrentAdmin(candidate_.ownerPublicKey) || !usb::beginNonceBound(candidate_.beginNonce))
+      return Result::Denied;
+    uint8_t hash[32], message[256];
+    computeOtaManifestHash(candidate_.canonical, hash);
+    if (std::memcmp(frame + 1, hash, 4)) return Result::Mismatch;
+    const size_t prefix = len - 64;
+    const size_t signed_len = buildOtaCompressedMessage(target_public_key_, hash, candidate_.sessionId,
+        candidate_.beginNonce, frame, prefix, message, sizeof(message));
+    if (!signed_len || !verifyOwnerSignature(candidate_.ownerPublicKey, message, signed_len, frame + prefix))
+      return Result::Denied;
+    // No metadata/state/decode/flash effects before the CURRENT owner's signature.
+    const uint16_t group = usb::getBE16(frame + 5), stored = usb::getBE16(frame + 7);
+    const uint16_t raw = usb::getBE16(frame + 9), offset = usb::getBE16(frame + 16);
+    const uint32_t raw_start = static_cast<uint32_t>(group) * kOtaCompressionGroupBytes;
+    if (raw_start >= candidate_.exactSizeBytes) return Result::BadRequest;
+    const uint32_t remaining = candidate_.exactSizeBytes - raw_start;
+    const auto expected = remaining > kOtaCompressionGroupBytes ? kOtaCompressionGroupBytes : remaining;
+    const size_t data_len = prefix - kOtaCompressionHeaderBytes;
+    if (raw != expected || !stored || stored > raw ||
+        (frame[15] != kOtaLzmaProfile && frame[15] != kOtaCompressionRawProfile &&
+         !(compression_thumb_ && frame[15] == kOtaLzmaThumbProfile)) ||
+        (frame[15] == kOtaCompressionRawProfile && stored != raw) ||
+        offset > stored || data_len > stored - offset) return Result::BadRequest;
+    const bool same = compression_.active && !std::memcmp(compression_.header, frame, 16);
+    if (!same) {
+      if (offset != 0) return Result::Mismatch;
+      if (compression_.verified || compression_.decoding) return Result::Busy;
+      if (compression_.active && usb::getBE16(compression_.header + 5) == group)
+        return Result::Mismatch;
+      compression_.reset();
+      std::memcpy(compression_.header, frame, 16);
+      compression_.active = true;
+    }
+    if (offset < compression_.filled) {
+      if (data_len > compression_.filled - offset ||
+          std::memcmp(compression_.input + offset, frame + 18, data_len)) return Result::Mismatch;
+    } else {
+      if (offset != compression_.filled) return Result::Incomplete;
+      std::memcpy(compression_.input + offset, frame + 18, data_len);
+      compression_.filled += data_len;
+    }
+    if (compression_.filled != stored) return Result::Ok;
+    if (compression_.completed) return Result::Ok;
+    if (compression_.verified || compression_.decoding) return Result::Ok;
+    if (compression_.writeError != Result::Ok ||
+        (compression_.decodeResult != OtaLzma::Result::Ok &&
+         compression_.decodeResult != OtaLzma::Result::Pending)) return Result::Mismatch;
+    compression_.decodeResult = frame[15] == kOtaCompressionRawProfile ? OtaLzma::Result::Pending :
+        compression_.decoder.begin(compression_.input, stored, compression_.output, raw);
+    compression_.decoding = compression_.decodeResult == OtaLzma::Result::Pending;
+    if (!compression_.decoding) return Result::Mismatch;
+    return Result::Ok;
+  }
+
+  OtaLzma::Result lastCompressionDecodeResult() const {
+    return compression_workspace_ ? compression_workspace_->decodeResult : OtaLzma::Result::Bounds;
+  }
+  Result lastCompressionWriteResult() const {
+    return compression_workspace_ ? compression_workspace_->writeError : Result::Unsupported;
   }
 
   Result handleUsbCacheFrame(const uint8_t* frame, size_t len, const uint8_t local_owner[32]) {
@@ -464,6 +610,10 @@ public:
 
   void loop() {
     if (storage_unavailable_) return;
+    if (compression_workspace_) {
+      if (compression_workspace_->decoding) advanceCompressedCodec();
+      else if (compression_workspace_->verified) advanceCompressedGroup();
+    }
     if (!seal_pending_ && candidate_.valid && !candidate_.localCache &&
         candidate_.phase == ::ota::storage::OtaCandidateStore::Phase::Receiving &&
         candidate_.receivedBlocks == candidate_.totalBlocks) requestSeal();
@@ -518,6 +668,143 @@ public:
   }
 
 private:
+  __attribute__((noinline)) void advanceCompressedCodec() {
+    auto& compression_ = *compression_workspace_;
+    uint32_t before = 0, heap = 0, stack = 0;
+    if (compression_probe_) {
+      compression_probe_(compression_probe_ctx_, before, heap, stack);
+      auto& diagnostics = compression_.diagnostics;
+      if (!diagnostics.measured || heap < diagnostics.minFreeHeap) diagnostics.minFreeHeap = heap;
+      if (!diagnostics.measured || stack < diagnostics.minFreeStack) diagnostics.minFreeStack = stack;
+    }
+    advanceCompressedCodecSlice();
+    auto& diagnostics = compression_.diagnostics;
+    ++diagnostics.slices;
+    if (compression_probe_) {
+      uint32_t after;
+      compression_probe_(compression_probe_ctx_, after, heap, stack);
+      const uint32_t elapsed = after - before;
+      if (elapsed > diagnostics.maxSliceUs) diagnostics.maxSliceUs = elapsed;
+      compression_.groupCpuUs += elapsed;
+      if (!diagnostics.measured || heap < diagnostics.minFreeHeap) diagnostics.minFreeHeap = heap;
+      if (!diagnostics.measured || stack < diagnostics.minFreeStack) diagnostics.minFreeStack = stack;
+      diagnostics.measured = true;
+    }
+    if (!compression_.decoding) {
+      if (compression_.groupCpuUs > diagnostics.maxGroupUs) diagnostics.maxGroupUs = compression_.groupCpuUs;
+      if (compression_.verified) ++diagnostics.groups;
+    }
+  }
+
+  // One bounded SDK input/output slice, inverse-filter slice, or CRC slice.
+  // No candidate writes until ALL three stages have completed successfully.
+  __attribute__((noinline)) void advanceCompressedCodecSlice() {
+    auto& state = *compression_workspace_;
+    if (!isCurrentAdmin(candidate_.ownerPublicKey) ||
+        candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Receiving) {
+      // Completed-group duplicates may be checked again without programming.
+      if (candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready &&
+          candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Verifying) {
+        state.decoding = false; state.writeError = Result::Denied; return;
+      }
+      if (!isCurrentAdmin(candidate_.ownerPublicKey)) {
+        state.decoding = false; state.writeError = Result::Denied; return;
+      }
+    }
+    const auto raw = usb::getBE16(state.header + 9);
+    const size_t take = raw - state.cursor > OtaLzma::kSliceBytes ? OtaLzma::kSliceBytes : raw - state.cursor;
+    if (state.decodeStage == 0) {
+      if (state.header[15] == kOtaCompressionRawProfile) {
+        std::memcpy(state.output + state.cursor, state.input + state.cursor, take);
+        state.cursor += take;
+        if (state.cursor < raw) return;
+      } else {
+        state.decodeResult = state.decoder.step();
+        if (state.decodeResult == OtaLzma::Result::Pending) return;
+        if (state.decodeResult != OtaLzma::Result::Ok) { state.decoding = false; return; }
+      }
+      state.decodeStage = state.header[15] == kOtaLzmaThumbProfile ? 1 : 2;
+      state.cursor = 0;
+      return;
+    }
+    if (state.decodeStage == 1) {
+      if (raw - state.cursor >= 4) {
+        auto* start = state.output + state.cursor;
+        const auto end = lzma_sdk::Z7_BRANCH_CONV_DEC(ARMT)(start, take,
+            usb::getBE16(state.header + 5) * kOtaCompressionGroupBytes + state.cursor);
+        state.cursor += end - start;
+      } else state.cursor = raw;
+      if (state.cursor < raw) return;
+      state.decodeStage = 2; state.cursor = 0;
+      return;
+    }
+    for (size_t i = 0; i < take; ++i) {
+      state.crc ^= state.output[state.cursor++];
+      for (unsigned bit = 0; bit < 8; ++bit)
+        state.crc = (state.crc >> 1) ^ (0xedb88320u & (0u - (state.crc & 1u)));
+    }
+    if (state.cursor < raw) return;
+    state.decoding = false;
+    if (~state.crc != usb::getBE32(state.header + 11)) {
+      state.writeError = Result::Mismatch; return;
+    }
+    state.decodeResult = OtaLzma::Result::Ok;
+    state.verified = state.preflight = true; state.cursor = 0;
+  }
+
+  // At most one 84-byte read/program/bitmap transaction per normal mesh tick.
+  __attribute__((noinline)) void advanceCompressedGroup() {
+    auto& compression_ = *compression_workspace_;
+    if (compression_.writeError != Result::Ok) return;
+    if ((candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Receiving &&
+         candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Verifying &&
+         candidate_.phase != ::ota::storage::OtaCandidateStore::Phase::Ready) ||
+        !isCurrentAdmin(candidate_.ownerPublicKey)) {
+      compression_.writeError = Result::Denied; return;
+    }
+    const uint16_t group = usb::getBE16(compression_.header + 5);
+    const uint16_t raw = usb::getBE16(compression_.header + 9);
+    const uint16_t start = group * kOtaCompressionGroupBlocks;
+    const auto index = start + compression_.cursor / kOtaBlockMaxDataBytes;
+    const auto take = raw - compression_.cursor > kOtaBlockMaxDataBytes ?
+                      kOtaBlockMaxDataBytes : raw - compression_.cursor;
+    bool received;
+    if (!store_->readReceived(index, received)) { compression_.writeError = Result::IoError; return; }
+    if (compression_.preflight && received) {
+      uint8_t previous[kOtaBlockMaxDataBytes];
+      if (staging_sink_->readChunk(index * kOtaBlockMaxDataBytes, previous, take) !=
+          meshcore::ota::runtime::IOtaStagingSink::Result::Ok)
+        compression_.writeError = Result::IoError;
+      else if (std::memcmp(previous, compression_.output + compression_.cursor, take))
+        compression_.writeError = Result::Mismatch;
+      if (compression_.writeError != Result::Ok) return;
+    } else if (!compression_.preflight && !received) {
+      if (!compression_.marking) {
+        const auto result = staging_sink_->writeChunk(index * kOtaBlockMaxDataBytes,
+                                                      compression_.output + compression_.cursor, take);
+        if (result != meshcore::ota::runtime::IOtaStagingSink::Result::Ok) {
+          compression_.writeError = result == meshcore::ota::runtime::IOtaStagingSink::Result::IoError ?
+              Result::IoError : Result::Denied;
+          return;
+        }
+      } else {
+        // Publish progress only after the ENTIRE validated raw group was programmed.
+        if (!store_->markReceived(index)) {
+          uint16_t count;
+          if (store_->countReceived(count)) candidate_.receivedBlocks = count;
+          compression_.writeError = Result::IoError; return;
+        }
+        ++candidate_.receivedBlocks;
+      }
+    }
+    compression_.cursor += take;
+    if (compression_.cursor < raw) return;
+    if (compression_.preflight) { compression_.preflight = false; compression_.cursor = 0; return; }
+    if (!compression_.marking) { compression_.marking = true; compression_.cursor = 0; return; }
+    compression_.verified = false; compression_.completed = true;
+    if (candidate_.receivedBlocks == candidate_.totalBlocks) requestSeal();
+  }
+
   __attribute__((noinline)) bool commitSignatureValid(uint32_t counter, const uint8_t signature[64]) const {
     uint8_t manifest_hash[32] = {};
     computeOtaManifestHash(candidate_.canonical, manifest_hash);
@@ -792,6 +1079,10 @@ private:
   const ::ota::trust::SignatureVerifier* owner_signature_verifier_ = nullptr;
   bool pending_reupload_ = false;
   uint8_t pending_owner_[32] = {}, pending_canonical_[59] = {}, pending_signature_[64] = {};
+  CompressionWorkspace* compression_workspace_ = nullptr;
+  bool compression_thumb_ = false;
+  CompressionProbeFn compression_probe_ = nullptr;
+  void* compression_probe_ctx_ = nullptr;
 };
 
 }  // namespace ota

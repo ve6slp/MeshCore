@@ -35,7 +35,7 @@ import time
 
 import ota_stock_companion as ota
 
-COMMANDS = {name: "ota " + name for name in ("status", "progress", "candidate", "settings", "abort")}
+COMMANDS = {name: "ota " + name for name in ("status", "progress", "candidate", "settings", "codec", "abort")}
 ABORT_PATTERN = re.compile(rb"ota abort ([1-9][0-9]{0,9}) (0|[1-9][0-9]{0,9}) ([0-9a-f]{64})")
 ABORT_ERRORS = frozenset(("unavailable", "denied", "too late", "I/O error", "mismatch", "busy", "not found"))
 PHASES = frozenset(("idle", "erasing", "receiving", "verifying", "ready", "commit-pending",
@@ -87,6 +87,7 @@ def fields(operation, text):
         "progress": {"candidate", "phase", "received", "total", "missing", "bytes", "block"},
         "candidate": {"candidate", "phase", "counter", "generation", "image"},
         "settings": {"mode", "duty"},
+        "codec": {"codec", "thumb", "measured", "groups", "slices", "slice_us", "group_us", "heap", "stack"},
     }[operation]
     if (operation in ("candidate", "progress") and result == {"candidate": "none", "phase": "idle"}):
         return result
@@ -94,7 +95,8 @@ def fields(operation, text):
         raise ota.Error("unexpected remote OTA reply schema; payload withheld")
     if "phase" in result and result["phase"] not in PHASES:
         raise ota.Error("invalid remote OTA lifecycle phase")
-    for key in ("received", "total", "missing", "bytes", "block", "generation"):
+    for key in ("received", "total", "missing", "bytes", "block", "generation",
+                "groups", "slices", "slice_us", "group_us", "heap", "stack"):
         if key in result and not re.fullmatch(r"[0-9]{1,10}", result[key]):
             raise ota.Error("invalid remote OTA numeric field")
         if key in result and int(result[key]) > 0xFFFFFFFF:
@@ -124,6 +126,9 @@ def fields(operation, text):
             or not re.fullmatch(r"[0-9]{1,3}\.[0-9]%", result["duty"])
             or not 0 <= float(result["duty"][:-1]) <= 100):
         raise ota.Error("invalid remote OTA settings")
+    if operation == "codec" and (result["codec"] != "lzma1-g8064" or result["thumb"] not in ("0", "1")
+                                 or result["measured"] not in ("0", "1")):
+        raise ota.Error("invalid remote OTA codec diagnostic")
     return result
 
 
