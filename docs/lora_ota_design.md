@@ -52,7 +52,10 @@ with the raw group offset as its PC. Signed board IDs select Thumb on the host,
 and only nRF backends advertise/accept it; ESP uses the portable profile.
 The authenticated profile, not image-byte heuristics, controls filtering.
 Unknown profiles or missing capability reports fail explicitly.
-This extension has offline/build validation only, not nRF/ESP hardware acceptance.
+An actual Solar nRF52840 RAW decoder bootstrap and subsequent compressed RF
+installation are recorded in the
+[hardware milestone](lora_ota_development.md#solar-p1-pro-raw-decoder-bootstrap-and-compressed-rf-upgrade--2026-10-17-utc).
+ESP hardware and compressed native-host/fleet installation remain unqualified.
 
 Before AUTH/BEGIN, signing an admission, or negotiating a lease, the host requires
 a fresh **target-identity-signed, stateless** capability proof. Request `0x16`
@@ -246,5 +249,7 @@ whole remaining metadata region must read back erased. Only that verified record
 to erase. It is not a general recovery path.
 
 See [the paired bootstrap guide](../bootloader/xiao_nrf52840_ota/README.md) and
-[product guide](lora_ota_users.md). Direct nRF hardware success is established;
-ESP, Solar and routed/fleet hardware behavior are not yet qualified.
+[product guide](lora_ota_users.md). Direct nRF, one-relay routed nRF,
+two-receiver stock shared-flood and Solar RAW/compressed milestones are recorded
+in the [development guide](lora_ota_development.md). Those named bench outcomes
+do not qualify ESP, larger fleets or physical power-cut recovery.

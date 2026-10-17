@@ -19,7 +19,10 @@ An actual Solar P1 Pro has also completed genuine Solar ROLE1 USB commissioning
 and a signed shared-flood RF upgrade, including interrupted-transfer resume,
 exact-image confirmation, durable floor advancement from 0 to 1 and ordinary
 reboot retention. Its normal radio, forwarding and original administrator
-access were restored. ESP32-S3 hardware updates, larger fleets and native-host
+access were restored. It has since installed a RAW decoder bootstrap followed
+by a signed **LZMA+Thumb RF update**, with exact-image confirmation at floor 3,
+on-device decoder measurements and normal configuration retained across reboot.
+ESP32-S3 hardware updates, larger fleets and native-host
 encrypted multicast delivery have **not yet been verified on hardware**.
 
 OTA uses existing Ed25519 MeshCore identities plus a separate, private
@@ -46,7 +49,7 @@ and no unbound legacy COMMIT.
 - Earlier hosts cannot drive updated firmware. Native status replies are now
   107 bytes, and COMMIT and direct-lease signatures use new domains.
 
-### Opt-in LZMA (software validated, not hardware qualified)
+### Opt-in LZMA (Solar RF installation verified)
 
 `--compression lzma` is available on stock `upload`/`deploy`/background
 commands and native `upload`/`deploy`. The default remains `--compression raw`.
@@ -123,9 +126,17 @@ no board probe, not zero decoder cost. The default `inspect` survey remains the
 original four surfaces. Reading these counters is not hardware qualification:
 record actual before/after values and normal mesh/watchdog responsiveness.
 
-See [development measurements](lora_ota_development.md#bounded-compression-validation)
-for reproducible software/build evidence and CPU/stack limitations. No compressed
-Solar or ESP RF installation or watchdog behavior is claimed.
+The [Solar RF milestone](lora_ota_development.md#solar-p1-pro-raw-decoder-bootstrap-and-compressed-rf-upgrade--2026-10-17-utc)
+completed an actual compressed installation: 519940 raw bytes arrived in
+4074 signed compressed data fragments carrying 335494 stored bytes, versus 6190
+nominal RAW data packets for that image (34.2% fewer data packets). Control
+traffic is additional; this is not a measured 34.2% reduction in total airtime.
+All 65 groups validated, with a 920-microsecond maximum measured slice and
+60.526-millisecond maximum cumulative group validation CPU time. The node
+confirmed the exact raw image at floor 3 and retained it across an ordinary reboot.
+This is one Solar nRF52840/stock-host bench outcome, not ESP, native-host,
+worst-case watchdog/stack or outdoor qualification. See also the
+[software/build measurements](lora_ota_development.md#bounded-compression-validation).
 
 ## Install and build
 

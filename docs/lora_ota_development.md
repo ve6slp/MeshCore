@@ -149,8 +149,10 @@ calls/group, then separate at-most128-byte inverse-Thumb/CRC slices. CRC totals
 at most64512 bit iterations/group. A single SDK call is not preemptible, including
 the first call's fixed3520-probability initialization. Programming/preflight/
 bitmap publication is at most one raw84 transaction per normal mesh tick.
-Actual nRF/ESP decode latency, watchdog service, whole-thread interrupt/virtual
-call high-water stack and RF installation still require hardware qualification.
+The later Solar milestone below records actual nRF decode timing, sampled
+task headroom and RF installation. ESP decode latency, worst-case watchdog
+service and whole-thread/interrupt/virtual-call stack bounds still require
+hardware qualification beyond that named bench outcome.
 The authenticated `ota codec` diagnostic exposes worst slice/group validation
 CPU microseconds, validated-group/slice counts, minimum sampled free heap and
 current-task high-water free stack bytes, without admission or flash mutation.
@@ -761,6 +763,104 @@ advancement and ordinary reboot retention. They do not qualify compressed
 delivery, authenticated abort stack bounds, outdoor soak or physical power-cut
 recovery. The previous Sense APP's linked-image stack bound is not inherited
 by this Solar image.
+
+#### Solar P1 Pro RAW decoder bootstrap and compressed RF upgrade — 2026-10-17 UTC
+
+The same commissioned Solar ROLE1 receiver completed two further signed
+shared-flood updates through the unchanged stock 1.17.1/protocol 13 sender.
+Both images used the reviewed `f5e2cee3` production implementation, genuine
+Solar BSP/compiler context, normal 910.525 MHz defaults and existing installer.
+No fresh USB conversion, bootloader replacement, identity/trust change, floor
+reset or candidate takeover was used. All high-rate RF was confined to the
+private 912.525 MHz/BW62.5/SF7/CR5 bench channel, with receiver repeating OFF,
+receiver TX22, sender TX2 and 80% OTA pacing. Configured channel changes were
+applied by ordinary receiver reboot at 2% OTA duty before high-rate traffic.
+
+| Image | Transfer | Raw bytes | Confirmed floor / sequence / generation |
+| --- | --- | ---: | --- |
+| `v1.18.0-solar-lzma2 (Build: 16 Oct 2026)` | RAW decoder bootstrap | 519940 | 2 / 3 / 2 |
+| `v1.18.0-solar-lzma3 (Build: 16 Oct 2026)` | LZMA1+Thumb, profile `0xa1` | 519940 | 3 / 4 / 3 |
+
+The RAW bootstrap's exact SHA-256 is
+`2a4550ae79a27524e39fa983781b668ada1f6edeb1f6fdc1d3020f65c2c59ea1`.
+Its first upload stopped on a local protocol deadline with 5590/6190 raw84
+blocks retained. This was not an exhausted eight-hour campaign budget.
+The private qualification helper then used the production host's explicit
+`upload(resume_receipt=original)` path, after checking closed physical-TX and
+signing journals. It retained generation 2 and the original BEGIN nonce,
+without AUTH/re-BEGIN, and transferred the remaining 600 blocks to READY.
+Exactly one separately signed COMMIT was physically transmitted. Independent
+local inspection confirmed the image, floor 2 and explicit codec capability.
+Normal radio, forwarding, original two administrators and the sender's original
+profile were restored, then retained across an ordinary apply reboot before
+the next candidate was admitted.
+
+The compressed image's exact raw SHA-256 is
+`2f548dab7cbefea792e1ce2d73205b9a0233f3f1b5c6c95d9b73093ddfb27c85`;
+its canonical59 descriptor hash is
+`8a920cce2536799667b12247ff98202f612c728128abdf96d8b7ac6a14af8296`.
+The real receiver's target-signed stateless codec proof was verified at 1.146s,
+before the admission request at 1.190s. Actual transport receipts report
+`transfer_encoding=lzma1-g8064-armt`, not RAW or a version-based inference.
+The completed upload sent 4074 signed compressed data fragments containing
+335494 bytes. The same image's nominal RAW baseline is 6190 data packets:
+34.2% fewer data packets and35.5% fewer stored data bytes.
+The upload also sent 1299 group-progress requests, 115 raw census requests,
+one capability query and one AUTH, for 5490 physically completed TX requests.
+Sender elapsed time to READY was 7505.821s; control replies, signing, flash,
+pacing and contention make this different from an airtime-only model.
+No before/after physical-airtime counter delta was captured, so 34.2% is not
+claimed as a measured total-airtime reduction.
+
+Before COMMIT/reboot, independent local `ota codec` inspection recorded:
+
+```text
+codec=lzma1-g8064 thumb=1 measured=1 groups=65 slices=12341 slice_us=920 group_us=60526 heap=124636 stack=952
+```
+
+All 65 groups validated into the complete 6190-block, 519940-byte raw candidate.
+The maximum measured validation slice was 920 microseconds; maximum cumulative
+group validation CPU time was 60.526 milliseconds, spread across bounded slices,
+not one contiguous mesh pause. Minimum sampled free heap was 124636 bytes and
+minimum current-task high-water free stack was 952 bytes. The decoder workspace
+was 23364 bytes of instance-owned static storage, not a heap allocation.
+At the READY inspection, uptime was 7683 seconds with zero errors and an empty
+queue. These are sampled measurements on this boot/task, not decoder stack
+usage, a contiguous-allocation guarantee or worst-case watchdog/interrupt proof.
+Runtime counters reset on the following boot; their pre-reboot receipt was
+retained rather than substituting the new boot's zero counters.
+
+After a fresh full-window READY survey, exactly one signed generation 3 COMMIT
+was physically transmitted. Both campaigns' subsequent local reads encountered
+the APP endpoint disconnecting for installation; neither COMMIT was retried.
+After a bounded wait, separate local inspection confirmed the exact compressed
+image as `boot=confirmed`, `verified=1`, floor 3, sequence 4, extent `0x0007EF04`,
+and Installed candidate generation 3 with 6190/6190 blocks and no missing data.
+
+The sender's owned 907.525 MHz/BW250/SF7/CR5/TX2/repeat-OFF profile was restored.
+The receiver returned to 2% OTA duty, the temporary sender administrator alone
+was removed, and normal 910.525 MHz/BW62.5/SF7/CR5/TX22, 50% mesh duty and
+forwarding were restored. An ordinary apply reboot reduced uptime from 192
+to 17 seconds and retained the exact image/floor/candidate, identity, original
+two administrators and configuration. A separate settled read at 35 seconds
+showed zero errors and an empty queue. The software RTC again reset to 2024;
+this run does not claim retained or corrected wall-clock time.
+
+Private journal receipt fingerprints (SHA-256; not device-signed attestations):
+
+| Receipt under `.tmp/solar-lzma-lab01/build/` | SHA-256 |
+| --- | --- |
+| `phase2/normal-proof01/result.json` | `5744a2ad78ba5281eda7ae2bfa723af9c90fea7e1b527ad581990cd4dfe422d1` |
+| `phase3/upload01/product-ready.json` | `28eb0454c525abb50d4be0d1eef3e193a30ba590881c3a3cac0798b2b2daaa1c` |
+| `phase3/codec-ready01/result.json` | `a63fc623be6efcc26eeef226f4a9c1deaabcf887f712dd1975429fb3289431d1` |
+| `phase3/installed01/result.json` | `fbfa13a48264def21796dedc2f1f0f921fb79f008bdcb4e280e88b47a87a3685` |
+| `phase3/normal-proof01/result.json` | `9f63182c878d10ce3b42a5c5013860223f55106c9cdab3df85e30de5550ab7e7` |
+
+This qualifies the named Solar/stock-host RAW bootstrap, same-attempt resume,
+compressed RF installation, observed decoder resource use and ordinary reboot
+retention. It does not qualify ESP hardware, compressed native-host or
+multi-recipient delivery, outdoor/power-cut behavior, authenticated-abort stack
+bounds or all-input worst-case decoder/watchdog safety.
 
 ### PacketManager compatibility
 
