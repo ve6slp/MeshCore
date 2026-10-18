@@ -295,6 +295,35 @@ and simulated confirmation are labeled explicitly. Historical v3 Solar
 results are not v4 hardware evidence, and elapsed wall-clock time is not
 measured airtime.
 
+### Identical Solar image comparison
+
+The genuine 519940-byte Solar image with raw SHA-256
+`2f548dab7cbefea792e1ce2d73205b9a0233f3f1b5c6c95d9b73093ddfb27c85`
+completed the production v4 Python-to-C++ file-backed receiver path with
+byte-exact raw integrity and fresh signed simulated confirmation.
+
+| Quantity | Prior v3 Solar campaign | V4 identical-image software run |
+|---|---:|---:|
+| Stored compressed bytes | 335494 | 335346 |
+| Data frames | 4074 | 2650 |
+| Raw chunk size | 8064 | 8192 |
+| Manifest bytes | Different v3 format | 2467 |
+| Host transmissions | 5490 on hardware | 2892, no-loss simulated transport |
+
+V4 requires about 35% fewer data frames for this exact image; almost all of
+that gain comes from removing packet signatures, not a compression-ratio
+claim. The software run additionally sent 20 manifest slices, 189 progress
+queries, 29 signed-status queries and four admission/activation slices.
+Its 189 progress replies and 58 status reply frames are counted separately.
+
+At BW62.5 kHz/SF7/CR5 with at most one path byte, the conservative size-based
+model estimates 1523.632 seconds of host TX and 89.610 seconds of receiver
+replies, excluding loss, contention, duty waiting and platform CPU/flash time.
+These are modeled airtimes, not physical measurements; the historical v3
+7505.821-second campaign duration is elapsed time and cannot serve as an
+airtime denominator. The software driver's clock and boot confirmation are
+synthetic, not an observed Solar installation.
+
 ## Design sources
 
 * [RFC 9019, section 3](https://www.rfc-editor.org/rfc/rfc9019.html#section-3):
