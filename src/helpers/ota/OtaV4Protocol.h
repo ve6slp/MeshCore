@@ -24,6 +24,27 @@ inline constexpr size_t kManifestPrefixBytes = 4 + 1 + 1 + 2 + 32 + 59 + 64;
 inline constexpr size_t kManifestEntryBytes = 1 + 2 + 32;
 inline constexpr size_t kSignedCommandBytes = 32 + 32 + 32 + 16 + 4;
 inline constexpr size_t kCommandBytes = kSignedCommandBytes + kSignatureBytes;
+inline constexpr size_t kQueryBytes = 32 + 16;
+inline constexpr size_t kSignedStatusBytes = 169;
+inline constexpr size_t kStatusBytes = kSignedStatusBytes + kSignatureBytes;
+inline constexpr size_t kProgressQueryBytes = 32;
+inline constexpr size_t kProgressBytes = 32 + 4 + 2 + 8 + 1 + 1;
+inline constexpr size_t kLeaseParametersBytes = 4 + 4 + 1 + 1 + 4;
+inline constexpr size_t kLeaseCommandBytes = kCommandBytes + kLeaseParametersBytes;
+
+inline constexpr char kManifestDomain[] = "MeshCore OTA package v4";
+inline constexpr char kStatusDomain[] = "MeshCore OTA status v4";
+inline constexpr char kAdmitDomain[] = "MeshCore OTA admit v4";
+inline constexpr char kActivateDomain[] = "MeshCore OTA activate v4";
+inline constexpr char kAbortDomain[] = "MeshCore OTA abort v4";
+inline constexpr char kLeaseDomain[] = "MeshCore OTA lease v4";
+inline constexpr char kRepairDomain[] = "MeshCore OTA repair v4";
+
+enum Evidence : uint8_t {
+  FloorKnown = 1,
+  RunningHashKnown = 2,
+  RunningConfirmed = 4,
+};
 
 enum class Kind : uint8_t {
   Query = 1,
@@ -85,6 +106,15 @@ inline void write32(uint8_t* p, uint32_t n) {
   p[1] = static_cast<uint8_t>(n >> 16);
   p[2] = static_cast<uint8_t>(n >> 8);
   p[3] = static_cast<uint8_t>(n);
+}
+
+inline uint64_t read64(const uint8_t* p) {
+  return (static_cast<uint64_t>(read32(p)) << 32) | read32(p + 4);
+}
+
+inline void write64(uint8_t* p, uint64_t n) {
+  write32(p, static_cast<uint32_t>(n >> 32));
+  write32(p + 4, static_cast<uint32_t>(n));
 }
 
 inline uint32_t crc32(const uint8_t* p, size_t size) {

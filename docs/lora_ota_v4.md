@@ -103,8 +103,14 @@ Signed commands have owner key (32), target key (32), package hash (32), nonce
 (16), expected generation (4), signature (64). Their domain is
 `MeshCore OTA <action> v4` followed by NUL, where action is `admit`, `activate`,
 `abort`, or `repair`. The signature covers the domain and the first 116 bytes.
-Lease commands additionally bind their exact temporary radio profile and
-expiry. A lease never persists over ordinary radio preferences.
+Lease commands insert frequency kHz (u32), bandwidth Hz (u32), SF (u8), CR
+denominator (u8), and duration milliseconds (u32) before the signature. Their
+domain is `MeshCore OTA lease v4` followed by NUL. The duration is at most
+60000 ms; zero means release. Lease and repair use the current receiver
+challenge, not the admitted transaction nonce. Successful admission, abort,
+repair and lease changes consume and replace that challenge. Boot also
+replaces it. Replaying a lease cannot extend its expiry. A lease never persists
+over ordinary radio preferences. Transmission power is not changed by a lease.
 
 Queries supply a fresh host nonce. Receiver-signed status binds that nonce to
 the full identity, current transaction, generation, confirmed floor and actual
@@ -112,6 +118,47 @@ running-image evidence. Unsigned bitmap progress is scheduling advice only;
 it cannot establish authorization, READY, successful activation or installation.
 An ambiguous activation response is reconciled, never automatically re-admitted
 or blindly activated again.
+
+### Query, status and repair objects
+
+QUERY is target key (32) and fresh host nonce (16). Its header object field is
+the host's request identifier; STATUS echoes that identifier. Query tags are
+zero. STATUS signs `MeshCore OTA status v4` plus NUL and these exact fields:
+
+| Offset | Field | Bytes |
+|---:|---|---:|
+| 0 | Receiver full public key | 32 |
+| 32 | Echoed host nonce | 16 |
+| 48 | Current receiver challenge | 16 |
+| 64 | Admitted package SHA-256, or zero | 32 |
+| 96 | Admitted transaction nonce, or zero | 16 |
+| 112 | Transaction generation | 4 |
+| 116 | Candidate security counter, or zero | 4 |
+| 120 | Confirmed security floor | 4 |
+| 124 | Phase | 1 |
+| 125 | Last explicit result | 1 |
+| 126 | Next raw chunk index | 2 |
+| 128 | Missing-slice bitmap for that chunk | 8 |
+| 136 | Actual running raw-image SHA-256, or zero if unknown | 32 |
+| 168 | Evidence flags | 1 |
+| 169 | Signature | 64 |
+
+Evidence bits are 1 for known floor, 2 for known running hash, and 4 for
+confirmed running image. Unknown values are not inferred from a candidate.
+A successful installation requires a fresh valid signature, matching target,
+host nonce and package, Confirmed phase, the expected raw hash, and all three
+evidence flags with a sufficient confirmed floor.
+
+PROGRESS_QUERY is the target key (32). PROGRESS echoes the request identifier
+and contains target key (32), generation (u32), next chunk (u16), missing-slice
+bitmap (u64), phase (u8), and result (u8). A set bitmap bit means that slice
+is missing. Its full-package tag must match the active job; this unsigned
+object does not prove success or replace fresh signed reconciliation.
+
+REPAIR uses the standard signed-command shape, current receiver challenge,
+and zero package hash. It explicitly discards only OTA staging. It is refused
+while an installer command or trial is live. Metadata faults are never repaired
+as a side effect of QUERY, admission, boot, or ordinary filesystem mounting.
 
 ## Durability and device personality
 
