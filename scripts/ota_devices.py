@@ -14,16 +14,59 @@ The selected DTR state is set before opening, never toggled by this helper.
 
 import argparse
 from contextlib import contextmanager
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import sys
 import time
 
 import ota_common as lab
+
+
+def quiet_serial_factory(*args, **options):
+    """One combined modem update; no intermediate ESP reset state."""
+    if sys.platform != "linux":
+        raise lab.Error("quiet UART requires Linux combined modem control")
+    import serial.serialposix
+    import termios
+
+    class QuietSerial(serial.serialposix.Serial):
+        def _reconfigure_port(self, force_update=False):
+            super()._reconfigure_port(force_update)
+            attributes = termios.tcgetattr(self.fd)
+            if attributes[2] & termios.HUPCL:
+                attributes[2] &= ~termios.HUPCL
+                termios.tcsetattr(self.fd, termios.TCSANOW, attributes)
+                if termios.tcgetattr(self.fd)[2] & termios.HUPCL:
+                    raise lab.Error("UART HUPCL disable readback failed")
+
+        def _update_modem_state(self):
+            mask = termios.TIOCM_DTR | termios.TIOCM_RTS
+            try:
+                current = struct.unpack("i", fcntl.ioctl(self.fd, termios.TIOCMGET, struct.pack("i", 0)))[0]
+                requested = ((termios.TIOCM_DTR if self._dtr_state else 0)
+                             | (termios.TIOCM_RTS if self._rts_state else 0))
+                desired = (current & ~mask) | requested
+                if desired != current:
+                    fcntl.ioctl(self.fd, termios.TIOCMSET, struct.pack("i", desired))
+                actual = struct.unpack("i", fcntl.ioctl(self.fd, termios.TIOCMGET, struct.pack("i", 0)))[0]
+                if actual & mask != requested:
+                    raise lab.Error("combined UART modem-state readback mismatch")
+            except OSError as exc:
+                raise lab.Error("combined UART modem control unavailable; no sequential fallback") from exc
+
+        def _update_dtr_state(self):
+            self._update_modem_state()
+
+        def _update_rts_state(self):
+            self._update_modem_state()
+
+    return QuietSerial(*args, **options)
 
 
 class _Quiet:
@@ -45,15 +88,68 @@ def _endpoint(by_id):
     return path, resolved, info.st_rdev
 
 
+def physical_endpoint(by_id, serial, *, by_path=None, id_path=None, vid=None, pid=None,
+                      sys_tty=Path("/sys/class/tty"), sys_usb=Path("/sys/bus/usb/devices"),
+                      udev_data=Path("/run/udev/data")):
+    if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", serial):
+        raise ValueError("explicit physical USB serial required")
+    if by_path is None:
+        endpoint = _endpoint(by_id)
+    else:
+        path = Path(by_path)
+        if Path(by_id).parent != Path("/dev/serial/by-id"):
+            raise ValueError("informational by-id must use /dev/serial/by-id")
+        if (path.parent != Path("/dev/serial/by-path") or not id_path
+                or path.name != id_path + "-port0" or vid is None or pid is None
+                or not path.is_symlink()):
+            raise ValueError("exact by-path/ID_PATH/VID/PID binding required")
+        tty = path.resolve(strict=True)
+        info = tty.stat()
+        if tty.parent != Path("/dev") or not re.fullmatch(r"tty(?:ACM|USB)[0-9]+", tty.name) or not stat.S_ISCHR(info.st_mode):
+            raise ValueError("invalid physical USB endpoint")
+        endpoint = path, tty, info.st_rdev
+    path, tty, device_id = endpoint
+    device = (sys_tty / tty.name / "device").resolve(strict=True)
+    owners = [p for p in (device, *device.parents) if (p / "idVendor").is_file() and (p / "idProduct").is_file()]
+    if not owners:
+        raise ValueError("selected tty has no USB physical owner")
+    owner = owners[0]
+    if (owner / "serial").read_text().strip() != serial:
+        raise ValueError("physical USB serial mismatch")
+    if by_path is None:
+        matches = [p.resolve(strict=True) for p in sys_usb.iterdir()
+                   if ":" not in p.name and (p / "serial").is_file()
+                   and (p / "serial").read_text().strip() == serial]
+        if matches != [owner]:
+            raise ValueError("duplicate USB serial requires an explicit physical by-path binding")
+    else:
+        observed = (int((owner / "idVendor").read_text().strip(), 16),
+                    int((owner / "idProduct").read_text().strip(), 16))
+        data = (udev_data / f"c{os.major(device_id)}:{os.minor(device_id)}").read_text()
+        properties = dict(line[2:].split("=", 1) for line in data.splitlines() if line.startswith("E:") and "=" in line)
+        if (observed != (vid, pid) or properties.get("ID_PATH") != id_path
+                or properties.get("ID_SERIAL_SHORT") != serial
+                or properties.get("ID_VENDOR_ID", "").lower() != f"{vid:04x}"
+                or properties.get("ID_MODEL_ID", "").lower() != f"{pid:04x}"):
+            raise ValueError("physical USB path/serial/VID/PID mismatch")
+    return endpoint
+
+
 @contextmanager
-def open_companion(by_id, *, name="companion", evidence=None, dtr: bool = False):
+def open_companion(by_id, *, name="companion", evidence=None, dtr: bool = False,
+                   serial=None, by_path=None, id_path=None, vid=None, pid=None):
     """Yield a locked FramedSerial with DTR selected and RTS false before opening."""
-    path, resolved, device_id = _endpoint(by_id)
+    if serial is None and any(x is not None for x in (by_path, id_path, vid, pid)):
+        raise ValueError("physical USB metadata requires explicit serial")
+    def resolve():
+        return (_endpoint(by_id) if serial is None else
+                physical_endpoint(by_id, serial, by_path=by_path, id_path=id_path, vid=vid, pid=pid))
+    path, resolved, device_id = resolve()
     node = lab.FramedSerial(name, str(path), evidence if evidence is not None else _Quiet(),
                             no_reset=True, dtr=dtr)
     try:
         opened = os.fstat(node.fd)
-        if (_endpoint(path) != (path, resolved, device_id)
+        if (resolve() != (path, resolved, device_id)
                 or not stat.S_ISCHR(opened.st_mode) or opened.st_rdev != device_id):
             raise RuntimeError("USB endpoint changed during open")
         yield node

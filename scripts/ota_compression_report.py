@@ -1,198 +1,111 @@
 #!/usr/bin/env python3
-"""Offline production encoder/wire and genuine linked-image resource report."""
+"""Actual v4 encoder/frame accounting; estimates are not physical measurements."""
 import argparse
+from collections import Counter
 import hashlib
 import json
+import math
 from pathlib import Path
-import re
-import subprocess
-import lzma
-import sys
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-import ota_compression as codec
-import ota_stock_companion as stock
+from ota_common import Frame, Kind, physical_airtime
+from ota_compression import Package
+from ota_job import JobStore
+from ota_transport import Route
 
-
-def run(*command):
-    return subprocess.check_output(command, text=True)
-
-
-def symbols(prefix, elf):
-    found = {}
-    for line in run(prefix + "nm", "-S", "-C", "--size-sort", str(elf)).splitlines():
-        match = re.match(r"([0-9a-f]+) ([0-9a-f]+) (\w) (.*)", line)
-        if match:
-            address, size, kind, name = match.groups()
-            found[name] = {"address": int(address, 16), "bytes": int(size, 16), "kind": kind}
-    return found
+SOLAR_V3 = {"image_bytes": 519940, "stored_bytes": 335494, "raw_group_bytes": 8064,
+            "data_frames": 4074, "group_progress_tx": 1299, "census_tx": 115,
+            "authorization_tx": 1, "capability_tx": 1, "total_tx": 5490,
+            "estimated_air_s": 7505.821,
+            "source": "published prior Solar v3 baseline; not re-encoded or physically measured"}
 
 
-def resource_report(args):
-    if not args.elf:
-        return {"measured": False, "reason": "pass --elf and run ota-compression-arm-size"}
-    found = symbols(args.arm_prefix, args.elf)
-    probe = symbols(args.arm_prefix, args.probe)
-    decoder = {name: value for name, value in found.items() if any(token in name for token in (
-        "OtaLzma::", "LzmaDec_", "z7_BranchConv_ARMT_Dec"))}
-    result = {
-        "measured": True, "genuine_app_elf": str(args.elf.resolve()),
-        "compiler": run(args.arm_prefix + "gcc", "--version").splitlines()[0],
-        "elf_sha256": hashlib.sha256(args.elf.read_bytes()).hexdigest(),
-        "linked_size": run(args.arm_prefix + "size", str(args.elf)),
-        "linked_sections": run(args.arm_prefix + "size", "-A", str(args.elf)),
-        "decoder_linked_symbols": decoder,
-        "decoder_linked_code_and_readonly_bytes": sum(v["bytes"] for v in {
-            (v["address"], v["bytes"]): v for v in decoder.values()}.values()),
-        "decoder_workspace_bytes": probe["ota_decoder_workspace"]["bytes"],
-        "input_buffer_bytes": probe["ota_decoder_input"]["bytes"],
-        "output_buffer_bytes": probe["ota_decoder_output"]["bytes"],
-        "receiver_instance_bytes": probe["ota_receiver_size"]["bytes"],
-        "owned_compression_state_bytes": probe["ota_compression_state_size"]["bytes"],
-        "separate_32k_history_bytes": 0, "decoder_heap_bytes": 0,
-        "probability_bytes": 7040, "decode_slice_input_max": 128, "decode_slice_output_max": 128,
-        "decoder_slices_max": 130, "filter_slice_bytes_max": 128, "crc_slice_bytes_max": 128,
-        "crc_bit_iterations_max": 8064 * 8,
-        "flash_work": "one raw84 preflight read, raw84 program, or bitmap publish per mesh tick; bitmap publication starts only after full group program",
-        "runtime_limit": "one finite SDK call per normal mesh tick, plus separate filter/CRC stages; no measured nRF latency/watchdog claim",
-        "on_device_probe": "admin encrypted ota codec / ota_management.py codec: worst measured slice_us, cumulative validation group_us, sampled minimum heap and RTOS stack-free bytes; no keys",
-        "stack_note": "GCC .su static frames, excluding interrupts, virtual callers and prebuilt memcpy; not total RTOS stack proof",
-    }
-    if args.stack_dir:
-        entries = []
-        for path in args.stack_dir.rglob("*.su"):
-            for line in path.read_text().splitlines():
-                if any(token in line for token in (
-                        "OtaLzma::", "LzmaDec_", "BranchConv_ARMT", "handleCompressedFragment(",
-                        "advanceCompressedGroup(", "advanceCompressedCodec",
-                        "handleCodecCapability(", "handleLeanControlFrame(",
-                        "handleReceivedFrame(", "onControlDataRecv(")):
-                    entries.append({"file": str(path), "entry": line})
-        result["genuine_app_reachable_stack_frames"] = entries
-        path = ("advanceCompressedCodec()", "advanceCompressedCodecSlice()", "OtaLzma::step()",
-                "LzmaDec_DecodeToDic", "LzmaDec_DecodeReal_3")
-        frames = {name: max((int(item["entry"].split("\t")[1]) for item in entries
-                            if name in item["entry"]), default=None) for name in path}
-        result["decoder_active_callchain_local_frames"] = frames
-        if all(value is not None for value in frames.values()):
-            result["decoder_active_callchain_local_stack_bytes"] = sum(frames.values())
-        result["decoder_stack_reserve_bytes"] = 1024
-    if args.baseline_elf:
-        previous = symbols(args.arm_prefix, args.baseline_elf)
-        result["baseline_linked_size"] = run(args.arm_prefix + "size", str(args.baseline_elf))
-        result["baseline_linked_sections"] = run(args.arm_prefix + "size", "-A", str(args.baseline_elf))
-        def sections(text):
-            return {match[1]: int(match[2]) for line in text.splitlines()
-                    if (match := re.match(r"(\.\S+)\s+(\d+)\s+\d+", line))}
-        current_sections, old_sections = sections(result["linked_sections"]), sections(result["baseline_linked_sections"])
-        result["section_delta_bytes"] = {name: value - old_sections.get(name, 0)
-                                         for name, value in current_sections.items()}
-        result["the_mesh_static_delta_bytes"] = found["the_mesh"]["bytes"] - previous["the_mesh"]["bytes"]
-        result["baseline_note"] = "genuine precompression ROLE1 APP; frozen radio/build constants may differ, so not a perfectly controlled whole-image code delta"
-    return result
+def measure(package, route, recipients=1, bandwidth=62500, sf=7, cr=5):
+    route.validate()
+    if not 1 <= recipients <= 32:
+        raise ValueError("1..32 recipients required")
+    counts = {}
+
+    def object_frames(kind, size, copies=1, direction="tx"):
+        sizes = []
+        for index in range((size + 127) // 128):
+            payload = bytes(min(128, size - index * 128))
+            sizes.append(len(Frame(kind, 1, package.tag, 0, size, index, payload).encode()))
+        ota_bytes = sum(sizes) * copies
+        # Use the declared maximum grown path, separately from actual job TX.
+        rf_sizes = [n + 2 + route.max_path_bytes for n in sizes]
+        command = 2 if direction == "tx" else 3
+        entry = counts.setdefault(direction + "/" + kind.name.lower(),
+                                  {"frames": 0, "ota_bytes": 0, "mesh_bytes": 0,
+                                   "stock_serial_payload_bytes": 0, "stock_serial_wire_bytes": 0,
+                                   "native_serial_payload_bytes": 0, "native_serial_wire_bytes": 0,
+                                   "mesh_header_bytes": 0, "mesh_path_bytes": 0,
+                                   "estimated_air_s": 0})
+        entry["frames"] += len(sizes) * copies
+        entry["ota_bytes"] += ota_bytes
+        entry["mesh_bytes"] += sum(rf_sizes) * copies
+        entry["mesh_header_bytes"] += 2 * len(sizes) * copies
+        entry["mesh_path_bytes"] += route.max_path_bytes * len(sizes) * copies
+        entry["stock_serial_payload_bytes"] += sum(n + command for n in rf_sizes) * copies
+        entry["stock_serial_wire_bytes"] += sum(n + command + 3 for n in rf_sizes) * copies
+        native_command = 3 if direction == "tx" else 1
+        entry["native_serial_payload_bytes"] += sum(n + native_command for n in rf_sizes) * copies
+        entry["native_serial_wire_bytes"] += sum(n + native_command + 3 for n in rf_sizes) * copies
+        entry["estimated_air_s"] += sum(physical_airtime(n, bandwidth, sf, cr) for n in rf_sizes) * copies
+
+    object_frames(Kind.MANIFEST, len(package.manifest))
+    for chunk in package.chunks:
+        object_frames(Kind.DATA, len(chunk.stored))
+    bursts = sum(math.ceil(math.ceil(len(c.stored) / 128) / 16) for c in package.chunks)
+    surveys = 6 + bursts // 8
+    # The scheduler's no-loss, immediate-processing scenario. Real extra polls,
+    # repairs and interrupted transmissions are captured in the durable job.
+    object_frames(Kind.QUERY, 48, recipients * surveys)
+    object_frames(Kind.STATUS, 233, recipients * surveys, "rx")
+    object_frames(Kind.ADMIT, 180, recipients)
+    object_frames(Kind.ACTIVATE, 180, recipients)
+    object_frames(Kind.PROGRESS_QUERY, 32, recipients * bursts)
+    object_frames(Kind.PROGRESS, 48, recipients * bursts, "rx")
+    host_air = sum(c["estimated_air_s"] for k, c in counts.items() if k.startswith("tx/"))
+    reply_air = sum(c["estimated_air_s"] for k, c in counts.items() if k.startswith("rx/"))
+    return {"version": 4, "image_bytes": len(package.raw), "image_sha256": package.raw_hash.hex(),
+            "package_sha256": package.digest.hex(), "manifest_bytes": len(package.manifest),
+            "chunks": len(package.chunks), "codec_chunks": dict(Counter(c.codec for c in package.chunks)),
+            "stored_bytes": sum(len(c.stored) for c in package.chunks),
+            "fleet_recipients": recipients, "shared_data_streams": 1,
+            "route": route.policy(), "counts": counts,
+            "estimated_scenario_air_s": sum(c["estimated_air_s"] for c in counts.values()),
+            "estimated_host_tx_air_s": host_air, "estimated_receiver_reply_air_s": reply_air,
+            "stock_guarded_host_tx_air_s": host_air * 1.5,
+            "estimated_scenario_tx": sum(c["frames"] for k, c in counts.items() if k.startswith("tx/")),
+            "model": {"bandwidth": bandwidth, "sf": sf, "cr": cr},
+            "physical_measurement": False,
+            "route_model": "actual encoder/frame sizes; every packet charged the declared maximum grown path",
+            "scenario": "no loss, immediate receiver work, 16-slice bursts, one final confirmation survey",
+            "excludes": "loss/repairs, extra verification polls, leases, contention, CPU/flash time and duty waiting",
+            "solar_v3_published_baseline": SOLAR_V3,
+            "baseline_comparable_size_only": len(package.raw) == SOLAR_V3["image_bytes"],
+            "comparison_requires_matching_radio_and_airtime_scope": True}
 
 
-def measure(name, image, synthetic, arm_thumb, route):
-    groups, decision = codec.plan(image, arm_thumb=arm_thumb, **route)
-    # Public deterministic benchmark key/context only; never any deployed key.
-    key = Ed25519PrivateKey.from_private_bytes(bytes([1]) * 32)
-    target, nonce = bytes(range(32)), bytes([0x42]) * 16
-    manifest = hashlib.sha256(b"offline-report-manifest" + hashlib.sha256(image).digest()).digest()
-    lengths, transcript = [], hashlib.sha256()
-    width, hops, retry = route["width"], route["hops"], route["retry"]
-    path = bytes([0x73]) * (width * hops)
-    for group in groups:
-        for prefix in group.fragments(manifest, decision["capacity"]):
-            signature = key.sign(codec.signed_message(target, manifest, 1, nonce, prefix))
-            inner = prefix + signature
-            if retry:
-                inner = stock.retry_frame(inner, 1, True)
-            packet = stock.packet(inner, path, width)
-            assert len(packet) + 3 <= 176
-            lengths.append(len(packet))
-            transcript.update(packet)
-    assert len(lengths) * route["recipients"] == decision["compressed_data_packets"]
-    assert sum(lengths) * route["recipients"] == decision["compressed_data_wire_bytes"]
-    decision.update(
-        name=name, synthetic_control=synthetic,
-        stored_ratio=decision["stored_bytes"] / len(image),
-        raw_fallback_group_fraction=decision["raw_fallback_groups"] / len(groups),
-        raw_fallback_byte_fraction=sum(g.raw_bytes for g in groups if g.profile == codec.RAW) / len(image),
-        verified_actual_frame_transcript_sha256=transcript.hexdigest(),
-        max_data_rf_bytes=max(lengths), max_data_usb_tx_bytes=max(lengths) + 2,
-        max_data_usb_rx_bytes=max(lengths) + 3,
-        data_packet_saving_fraction=1 - decision["compressed_data_packets"] / decision["raw_data_packets"],
-        new_control_max_usb_rx_bytes=151 + 5 * retry + 2 + len(path) + 3,
-        # Existing targeted AUTH is larger than new compressed controls. Do not
-        # hide this legacy control/path limitation behind a safe data capacity.
-        existing_auth_usb_rx_full_path_bound=164 + 5 * retry + 2 + len(path) + 3,
-    )
-    for strategy in ("compressed", "raw"):
-        air = decision[strategy + "_data_air_s"] + decision[strategy + "_checkpoint_air_s"]
-        decision[strategy + "_estimated_duty_hours"] = {
-            str(duty): {"physical": air / duty / 3600, "stock_1p5_guard": 1.5 * air / duty / 3600}
-            for duty in (.02, .03)}
-    return decision
-
-
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", type=Path, action="append", required=True,
-                        help="explicit nRF firmware input; authenticated Thumb profile")
-    parser.add_argument("--portable-image", type=Path, action="append", default=[],
-                        help="explicit non-Thumb/ESP input")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--elf", type=Path)
-    parser.add_argument("--baseline-elf", type=Path)
-    parser.add_argument("--probe", type=Path)
-    parser.add_argument("--stack-dir", type=Path)
-    parser.add_argument("--arm-prefix", default="arm-none-eabi-")
-    args = parser.parse_args()
-    inputs = [(str(path.parent), path.read_bytes(), False, True) for path in args.image]
-    inputs += [(str(path.parent), path.read_bytes(), False, False) for path in args.portable_image]
-    inputs.extend([
-        ("synthetic-incompressible", hashlib.shake_256(b"OTA report random control").digest(510388), True, False),
-        ("synthetic-repetitive", (b"MeshCore bounded compression control\n" * 15000)[:510388], True, False),
-    ])
-    routes = [
-        dict(width=1, hops=0, retry=False, recipients=1),
-        dict(width=1, hops=1, retry=True, recipients=1),
-        dict(width=2, hops=1, retry=True, recipients=1),
-        dict(width=3, hops=1, retry=True, recipients=1),
-        dict(width=1, hops=1, retry=True, recipients=2),
-        dict(width=1, hops=63, retry=True, recipients=2),
-    ]
-    report = {
-        "codec": "independent raw LZMA1, lc0/lp1/pb1/dict8192/group8064, normal/BT4/nice273/depth1000; explicit nRF ARMT",
-        "host_encoder": {"library": "Python stdlib lzma / system liblzma", "python_version": sys.version,
-                         "module": lzma.__file__},
-        "embedded_decoder": {"source": "src/helpers/ota/OtaLzma.h",
-                             "origin": "unmodified 7-Zip/LZMA SDK26.04 C persistent dictionary API and ARMT filter",
-                             "license": "public-domain selected files; full upstream License.txt and URL/SHA provenance retained"},
-        "capability_preflight": {"version": codec.CAPABILITY_VERSION, "request_bytes": 83,
-                                 "reply_bytes": 151, "authentication": "target Ed25519, fresh challenge and full manifest/profile context",
-                                 "ordering": "read-only proof before any AUTH/admission signing/lease; all fleet targets first"},
-        "hardware_qualified": False,
-        "air_model": "BW62.5kHz SF7 CR5 preamble32; estimated cumulative data/checkpoint air, NOT elapsed hardware completion time",
-        "route_note": "capacity includes 176B TX/RX framing and growth; legacy_control_path_supported=false routes are packet-model-only and selected product streams explicitly refuse them before admission. Zero-hop uses the same SF7/BW62.5 model for framing comparison, not the stock off-normal direct SF5/BW250 workflow.",
-        "source_sha256": {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in (
-            "scripts/ota_compression.py", "scripts/ota_stock_companion.py", "scripts/ota_uploader.py",
-            "src/helpers/ota/OtaCompressionWire.h", "src/helpers/ota/OtaFirmwareIntegration.h",
-            "src/helpers/ota/OtaRfFrames.h", "src/helpers/ota/OtaLzma.h",
-            "src/helpers/ota/third_party/lzma/LzmaDec.c", "src/helpers/ota/third_party/lzma/Bra.c")},
-        "resources": resource_report(args),
-        "measurements": [measure(name, image, synthetic, arm_thumb, route)
-                         for name, image, synthetic, arm_thumb in inputs for route in routes],
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--package", type=Path)
+    source.add_argument("--job", type=Path, help="also export historical durable per-kind counters, without device access")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--recipients", type=int, default=1)
+    parser.add_argument("--path-bytes", type=int, default=1)
+    args = parser.parse_args(argv)
+    if args.job is None:
+        report = measure(Package.open(args.package), Route(max_path_bytes=args.path_bytes), args.recipients)
+    else:
+        with JobStore.open(args.job) as job:
+            report = measure(job.package, Route.from_policy(job.policy["route"]), len(job.targets))
+            row = job.db.execute("SELECT value FROM meta WHERE key='metrics'").fetchone()
+            report["historical_job_metrics"] = json.loads(row[0]) if row is not None else None
+            report["historical_job_note"] = "recorded counters, not a fresh receiver attestation or total fleet physical airtime"
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print("name / route / raw→compressed packets / stored ratio / selected")
-    for row in report["measurements"]:
-        if row["path_width"] == 1 and row["max_relay_hops"] == 1:
-            print(f'{row["name"]} / one-hop ×{row["recipient_bound_streams"]} / '
-                  f'{row["raw_data_packets"]}→{row["compressed_data_packets"]} / '
-                  f'{row["stored_ratio"]:.3%} / {row["selected"]}')
-    print("Persistent report:", args.output)
+    print(json.dumps({"report": str(args.output), "sha256": hashlib.sha256(args.output.read_bytes()).hexdigest()}))
 
 
 if __name__ == "__main__":

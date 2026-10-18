@@ -1,74 +1,256 @@
-"""Bounded companion USB framing and Ed25519 descriptor signing.
+"""OTA v4 wire objects, bounded companion framing and public signing.
 
-Only public operation summaries are logged. Opaque responses may contain GPS,
-channel keys or uninitialised padding and must never be dumped.
+No imports open devices. Opaque companion responses are never logged.
 """
-
+from dataclasses import dataclass
+from enum import IntEnum
 import fcntl
-import json
 import math
 import os
-from pathlib import Path
 import select
 import struct
 import time
+import zlib
 
+CHUNK_BYTES = 8192
+SLICE_BYTES = 128
+MAX_CHUNKS = 128
+MAX_MANIFEST = 8192
+MAX_FRAME = 151
+MAX_SERIAL_FRAME_SIZE = 176
+ZERO_HASH = bytes(32)
 CMD_APP_START = 1
 CMD_DEVICE_QUERY = 22
-CMD_SIGN_START = 33
-CMD_SIGN_DATA = 34
-CMD_SIGN_FINISH = 35
-CMD_OTA_CONTROL = 67
-RESP_OK = 0
-RESP_ERR = 1
-RESP_SELF_INFO = 5
-RESP_DEVICE_INFO = 13
-RESP_SIGN_START = 19
-RESP_SIGNATURE = 20
-MAX_SERIAL_FRAME_SIZE = 176
-ASYNC_PUSH_CODES = frozenset(range(0x80, 0x91))
+CMD_SIGN_START, CMD_SIGN_DATA, CMD_SIGN_FINISH = 33, 34, 35
+RESP_OK, RESP_ERR, RESP_SELF_INFO, RESP_DEVICE_INFO = 0, 1, 5, 13
+RESP_SIGN_START, RESP_SIGNATURE = 19, 20
 
 
-class Evidence:
-    """Optional local operation log, not an approval or qualification ledger."""
+class Error(RuntimeError):
+    pass
 
-    def __init__(self, directory=None, exclusive=False):
-        self.events = None
-        if directory is not None:
-            path = Path(directory)
-            path.mkdir(parents=True, mode=0o700, exist_ok=not exclusive)
-            self.events = (path / "events.jsonl").open("x", encoding="utf-8")
 
-    def log(self, event, **fields):
-        value = {"event": event, **fields}
-        if self.events is not None:
-            self.events.write(json.dumps(value, sort_keys=True) + "\n")
-            self.events.flush()
-        if event in ("ota_command_result", "fatal"):
-            print(json.dumps(value, sort_keys=True))
+class Kind(IntEnum):
+    QUERY = 1
+    STATUS = 2
+    MANIFEST = 3
+    ADMIT = 4
+    DATA = 5
+    PROGRESS_QUERY = 6
+    PROGRESS = 7
+    ACTIVATE = 8
+    ABORT = 9
+    LEASE = 10
+    REPAIR = 11
 
-    def finish(self, error=None):
-        if self.events is not None:
-            self.events.close()
+
+class Phase(IntEnum):
+    IDLE = 0
+    RECEIVING = 1
+    VERIFYING = 2
+    READY = 3
+    ACTIVATION_PENDING = 4
+    TRIAL = 5
+    CONFIRMED = 6
+    ABORTED = 7
+    FAILED = 8
+    METADATA_FAULT = 9
+
+
+class Result(IntEnum):
+    OK = 0
+    INVALID = 1
+    DENIED = 2
+    BUSY = 3
+    STATE = 4
+    INTEGRITY = 5
+    IO = 6
+    UNSUPPORTED = 7
+    REPLAY = 8
+
+
+def domain(action):
+    return f"MeshCore OTA {action} v4\0".encode("ascii")
+
+
+def public_key(text):
+    try:
+        value = bytes.fromhex(text)
+    except (ValueError, TypeError):
+        raise ValueError("full hexadecimal public key required") from None
+    if len(value) != 32 or not any(value):
+        raise ValueError("nonzero full 32-byte public key required")
+    return value
+
+
+def verify(key, message, signature):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes(key)).verify(bytes(signature), bytes(message))
+    except (InvalidSignature, ValueError) as exc:
+        raise Error("Ed25519 signature/identity mismatch") from exc
+
+
+def remaining(deadline, clock=None):
+    clock = time.monotonic if clock is None else clock
+    value = deadline - clock()
+    if not math.isfinite(value) or value <= 0:
+        raise TimeoutError("OTA operation deadline expired")
+    return value
+
+
+def slice_mask(total):
+    if not 0 < total <= CHUNK_BYTES:
+        raise ValueError("object length outside v4 bounds")
+    return (1 << ((total + SLICE_BYTES - 1) // SLICE_BYTES)) - 1
+
+
+@dataclass(frozen=True)
+class Frame:
+    kind: Kind
+    attempt: int
+    tag: bytes
+    object: int
+    total: int
+    slice: int
+    data: bytes
+
+    def encode(self):
+        if (not 0 < self.attempt <= 0xFFFFFFFF or len(self.tag) != 8
+                or not 0 <= self.object <= 0xFFFF or not 0 < self.total <= CHUNK_BYTES
+                or not 0 <= self.slice < (self.total + 127) // 128
+                or len(self.data) != min(128, self.total - self.slice * 128)):
+            raise ValueError("invalid v4 frame geometry")
+        prefix = struct.pack(">BBI8sHHB", 0xD4, Kind(self.kind), self.attempt,
+                             self.tag, self.object, self.total, self.slice) + self.data
+        return prefix + struct.pack(">I", zlib.crc32(prefix))
+
+    @classmethod
+    def decode(cls, data):
+        if not 24 <= len(data) <= MAX_FRAME or data[0] != 0xD4:
+            raise Error("invalid v4 frame size/magic")
+        if zlib.crc32(data[:-4]) != struct.unpack_from(">I", data, len(data) - 4)[0]:
+            raise Error("v4 frame CRC mismatch")
+        try:
+            _, kind, attempt, tag, obj, total, index = struct.unpack_from(">BBI8sHHB", data)
+            frame = cls(Kind(kind), attempt, tag, obj, total, index, data[19:-4])
+            frame.encode()
+            return frame
+        except (ValueError, struct.error) as exc:
+            raise Error("invalid v4 frame fields") from exc
+
+
+class Assembly:
+    """One bounded object; transmission attempt is deliberately not its identity."""
+    def __init__(self, kind, tag, obj, maximum=512):
+        self.kind, self.tag, self.object = kind, tag, obj
+        self.maximum, self.total = maximum, None
+        self.parts = {}
+
+    def feed(self, frame):
+        if (frame.kind != self.kind or frame.object != self.object
+                or (self.tag is not None and frame.tag != self.tag)):
+            return None
+        if frame.total > self.maximum or (self.total is not None and frame.total != self.total):
+            raise Error("inconsistent or oversized response object")
+        self.total = frame.total
+        previous = self.parts.get(frame.slice)
+        if previous is not None and previous != frame.data:
+            raise Error("conflicting response slices")
+        self.parts[frame.slice] = frame.data
+        if len(self.parts) == (self.total + 127) // 128:
+            return b"".join(self.parts[i] for i in range(len(self.parts)))
+        return None
+
+
+@dataclass(frozen=True)
+class Status:
+    target: bytes
+    query_nonce: bytes
+    challenge: bytes
+    package: bytes
+    transaction: bytes
+    generation: int
+    counter: int
+    floor: int
+    phase: Phase
+    result: Result
+    next_chunk: int
+    missing: int
+    running_hash: bytes
+    evidence: int
+    signed: bytes
+
+    @classmethod
+    def decode(cls, body, target, nonce):
+        body = bytes(body)
+        if len(body) != 233 or body[:32] != target or body[32:48] != nonce:
+            raise Error("status target/query nonce mismatch")
+        verify(target, domain("status") + body[:169], body[169:])
+        try:
+            generation, counter, floor, phase, result, chunk, missing = struct.unpack_from(">IIIBBHQ", body, 112)
+            value = cls(target, nonce, body[48:64], body[64:96], body[96:112],
+                        generation, counter, floor, Phase(phase), Result(result), chunk,
+                        missing, body[136:168], body[168], body)
+        except ValueError as exc:
+            raise Error("unknown status phase/result") from exc
+        if value.evidence & ~7 or value.next_chunk > MAX_CHUNKS or not any(value.challenge):
+            raise Error("invalid status evidence/challenge/progress")
+        return value
+
+    def installed(self, package):
+        return (self.package == package.digest and self.counter == package.counter
+                and self.phase == Phase.CONFIRMED
+                and self.evidence == 7 and self.floor >= package.counter
+                and self.running_hash == package.raw_hash and any(self.transaction))
+
+
+def signed_command(kind, owner, target, package_hash, nonce, generation, signer, lease=None):
+    actions = {Kind.ADMIT: "admit", Kind.ACTIVATE: "activate", Kind.ABORT: "abort",
+               Kind.REPAIR: "repair", Kind.LEASE: "lease"}
+    if (kind not in actions or len(owner) != 32 or not any(owner) or len(target) != 32
+            or not any(target) or len(package_hash) != 32 or len(nonce) != 16 or not any(nonce)
+            or not 0 <= generation <= 0xFFFFFFFF):
+        raise ValueError("invalid signed command context")
+    body = owner + target + package_hash + nonce + struct.pack(">I", generation)
+    if kind == Kind.LEASE:
+        if lease is None or len(lease) != 14:
+            raise ValueError("exact 14-byte lease parameters required")
+        frequency, bandwidth, sf, cr, duration = struct.unpack(">IIBBI", lease)
+        if (not 150000 <= frequency <= 2500000 or not 7000 <= bandwidth <= 500000
+                or not 5 <= sf <= 12 or not 5 <= cr <= 8 or duration > 60000):
+            raise ValueError("invalid transient lease parameters")
+        body += lease
+    elif lease is not None:
+        raise ValueError("lease parameters on non-lease command")
+    signature = signer(domain(actions[kind]) + body)
+    verify(owner, domain(actions[kind]) + body, signature)
+    return body + signature
+
+
+def physical_airtime(size, bandwidth=62500, sf=7, cr=5):
+    if not 1 <= size <= 255 or not 7000 <= bandwidth <= 500000 or not 5 <= sf <= 12 or not 5 <= cr <= 8:
+        raise ValueError("invalid LoRa airtime inputs")
+    symbol = (1 << sf) / bandwidth
+    de = int(symbol >= .016)
+    payload = 8 + max(0, math.ceil((8 * size - 4 * sf + 44) / (4 * (sf - 2 * de)))) * cr
+    return ((32 if sf <= 8 else 16) + 4.25 + payload) * symbol
 
 
 class FramedSerial:
-    def __init__(self, name, path, evidence, *, no_reset=True, dtr=False):
+    def __init__(self, name, path, evidence=None, *, no_reset=True, dtr=False):
         if not no_reset:
             raise ValueError("OTA serial access never resets the companion")
+        from ota_devices import quiet_serial_factory
         self.name, self.path, self.evidence = name, path, evidence
         self.no_reset = True
-        self.stream = None
+        self.stream = quiet_serial_factory(port=None, baudrate=115200, timeout=0,
+                                           write_timeout=2, exclusive=True)
         self.fd = None
-        self.buffer = bytearray()
-        self.pending = []
-        import serial
-        self.stream = serial.Serial(port=None, baudrate=115200, timeout=0,
-                                    write_timeout=2.0, exclusive=True)
+        self.buffer, self.pending = bytearray(), []
         try:
-            self.stream.dtr = dtr
-            self.stream.rts = False
-            self.stream.port = str(path)
+            self.stream.dtr, self.stream.rts, self.stream.port = dtr, False, str(path)
             self.stream.open()
             self.fd = self.stream.fileno()
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -82,26 +264,25 @@ class FramedSerial:
             self.stream = None
             self.fd = None
 
-    def _write_bytes(self, frame):
-        if self.stream.write(frame) != len(frame):
-            raise ConnectionError(f"{self.name}: incomplete serial write")
+    def _write_bytes(self, data):
+        if self.stream.write(data) != len(data):
+            raise ConnectionError("incomplete companion serial write")
 
     def _read_bytes(self, timeout):
-        readable, _, _ = select.select([self.fd], [], [], timeout)
-        if not readable:
+        if not select.select([self.fd], [], [], timeout)[0]:
             return b""
-        chunk = os.read(self.fd, 4096)
-        if not chunk:
-            raise ConnectionError(f"{self.name}: serial disconnected")
-        return chunk
+        data = os.read(self.fd, 4096)
+        if not data:
+            raise ConnectionError("companion disconnected")
+        return data
 
     def write_frame(self, payload):
         if not 1 <= len(payload) <= MAX_SERIAL_FRAME_SIZE:
             raise ValueError("serial frame length out of range")
         self._write_bytes(b"<" + struct.pack("<H", len(payload)) + payload)
 
-    def _extract(self):
-        frames = []
+    def poll(self, timeout=0):
+        self.buffer.extend(self._read_bytes(timeout))
         while self.buffer:
             marker = self.buffer.find(b">")
             if marker < 0:
@@ -112,89 +293,71 @@ class FramedSerial:
                 break
             length = struct.unpack_from("<H", self.buffer, 1)[0]
             if not 1 <= length <= MAX_SERIAL_FRAME_SIZE:
-                raise ValueError(f"{self.name}: invalid serial response length")
-            if len(self.buffer) < 3 + length:
+                raise Error("invalid companion frame length")
+            if len(self.buffer) < length + 3:
                 break
-            frames.append(bytes(self.buffer[3:3 + length]))
-            del self.buffer[:3 + length]
-        return frames
-
-    def poll(self, timeout=0.0):
-        self.buffer.extend(self._read_bytes(timeout))
-        for payload in self._extract():
-            # Native OTA/inspection/signing do not consume regular MeshCore pushes.
-            if payload[0] in ASYNC_PUSH_CODES:
-                if payload[0] == 0x88 and len(payload) < 3:
-                    raise ValueError(f"{self.name}: malformed RF diagnostic push")
+            payload = bytes(self.buffer[3:length + 3])
+            del self.buffer[:length + 3]
+            # Only raw RF/native bridge pushes belong to this client.
+            if 0x80 <= payload[0] <= 0x90 and payload[0] != 0x88:
                 continue
+            if payload[0] == 0x88:
+                if len(payload) < 6:
+                    raise Error("malformed RF diagnostic push")
+                width, count = (payload[4] >> 6) + 1, payload[4] & 63
+                offset = 5 + width * count
+                if ((payload[3] >> 2) & 15 != 12 or width > 3 or width * count > 64
+                        or offset + 1 >= len(payload) or payload[offset] != 0xD4
+                        or payload[offset + 1] not in (Kind.STATUS, Kind.PROGRESS)):
+                    continue
             if len(self.pending) >= 256:
-                raise ValueError(f"{self.name}: serial response backlog overflow")
+                raise Error("companion response backlog overflow")
             self.pending.append((time.monotonic(), payload))
 
     def take_pending(self, codes):
-        found = [entry for entry in self.pending if entry[1][0] in codes]
-        self.pending = [entry for entry in self.pending if entry[1][0] not in codes]
+        found = [x for x in self.pending if x[1][0] in codes]
+        self.pending = [x for x in self.pending if x[1][0] not in codes]
         return found
 
-    def wait_frame(self, codes, timeout=5.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.poll(max(0, min(0.1, deadline - time.monotonic())))
-            for index, (_, payload) in enumerate(self.pending):
-                if payload[0] in codes:
-                    self.pending.pop(index)
-                    return payload
-        raise TimeoutError(f"{self.name}: no frame with code {sorted(codes)}")
-
-    def command(self, payload, expected=(RESP_OK, RESP_ERR), timeout=5.0):
+    def command(self, payload, expected=(0, 1), timeout=5):
         if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("serial command timeout must be finite and positive")
+            raise ValueError("positive finite command timeout required")
         deadline = time.monotonic() + timeout
-        self.poll(0)
+        self.poll()
         self.take_pending(set(expected))
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"{self.name}: serial command deadline expired")
-        self.stream.write_timeout = min(2.0, remaining)
+        self.stream.write_timeout = remaining(deadline)
         self.write_frame(payload)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"{self.name}: serial command deadline expired")
-        return self.wait_frame(set(expected), remaining)
+        while time.monotonic() < deadline:
+            for _, frame in self.take_pending(set(expected)):
+                return frame
+            self.poll(min(.1, remaining(deadline)))
+        raise TimeoutError("companion response deadline expired")
 
 
-def app_info(node, *, timeout=5.0):
-    frame = node.command(bytes([CMD_APP_START]) + bytes(7) + b"ota",
+def app_info(node, *, timeout=5):
+    frame = node.command(bytes([CMD_APP_START]) + bytes(7) + b"ota-v4",
                          expected=(RESP_SELF_INFO, RESP_ERR), timeout=timeout)
-    if len(frame) < 58 or frame[0] != RESP_SELF_INFO or frame[1] != 1 or frame[4:36] == bytes(32):
-        raise ValueError("malformed companion SelfInfo")
+    if len(frame) < 58 or frame[:2] != b"\x05\x01" or not any(frame[4:36]):
+        raise Error("malformed companion SelfInfo")
     name = frame[58:].decode("utf-8")
-    if "\0" in name or any(not char.isprintable() for char in name):
-        raise ValueError("malformed public companion name")
+    if "\0" in name or any(not c.isprintable() for c in name):
+        raise Error("invalid companion public name")
     return {"role": "companion", "pubkey": frame[4:36].hex(),
-            "pubkey_bytes": frame[4:36], "name": name}
+            "pubkey_bytes": frame[4:36], "name": name,
+            "profile": (*struct.unpack_from("<II", frame, 48), frame[56], frame[57])}
 
 
-def sign_manifest(node, canonical, owner_public_key, deadline=None):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    if len(canonical) != 59 or len(owner_public_key) != 32 or owner_public_key == bytes(32):
-        raise ValueError("canonical descriptor and nonzero owner public key required")
-    verifier = Ed25519PublicKey.from_public_bytes(owner_public_key)
-
-    def options():
-        remaining = 5.0 if deadline is None else deadline - time.monotonic()
-        if not math.isfinite(remaining) or remaining <= 0:
-            raise TimeoutError("OTA manifest signing deadline expired")
-        return {"timeout": min(5.0, remaining)}
-
-    frame = node.command(bytes([CMD_SIGN_START]), expected=(RESP_SIGN_START, RESP_ERR), **options())
-    if (len(frame) != 6 or frame[:2] != bytes([RESP_SIGN_START, 0])
-            or struct.unpack_from("<I", frame, 2)[0] < len(canonical)):
-        raise RuntimeError("invalid signing-start reply or insufficient signing buffer")
-    if node.command(bytes([CMD_SIGN_DATA]) + canonical, **options()) != bytes([RESP_OK]):
-        raise RuntimeError("companion rejected descriptor signing data")
-    frame = node.command(bytes([CMD_SIGN_FINISH]), expected=(RESP_SIGNATURE, RESP_ERR), **options())
-    if len(frame) != 65 or frame[0] != RESP_SIGNATURE:
-        raise RuntimeError("invalid signature reply")
-    verifier.verify(frame[1:], canonical)
-    return frame[1:]
+def sign(node, message, owner, deadline, *, clock=None):
+    def command(body, expected=(0, 1)):
+        return node.command(body, expected=expected, timeout=min(5, remaining(deadline, clock)))
+    start = command(b"\x21", (19, 1))
+    if len(start) != 6 or start[:2] != b"\x13\x00" or struct.unpack_from("<I", start, 2)[0] < len(message):
+        raise Error("companion signing buffer too small for this authenticated object")
+    for offset in range(0, len(message), 175):
+        if command(b"\x22" + message[offset:offset + 175]) != b"\0":
+            raise Error("companion rejected signing data")
+    result = command(b"\x23", (20, 1))
+    if len(result) != 65 or result[0] != 20:
+        raise Error("invalid companion signature response")
+    verify(owner, message, result[1:])
+    return result[1:]
