@@ -344,4 +344,4 @@ not flash or authorize a physical UF2 copy. Mass erase is not normal recovery.
 
 Direct nRF hardware deployment has succeeded. Solar hardware bootstrap/update,
 ESP hardware behavior, routed/fleet delivery and untested power-loss conditions
-are not qualified. See the [product guide](../../docs/lora_ota_users.md).
+are not qualified. See the [OTA v4 contract](../../docs/lora_ota_v4.md).
