@@ -67,6 +67,8 @@ public:
                           const uint8_t signer[32], const uint8_t transaction[16],
                           uint32_t generation) = 0;
   // State = no lifecycle event; otherwise only Trial, Confirmed or Failed.
+  // Events must bind the latest successfully saved/recovered journal's nonce,
+  // generation and manifest. Unrelated previous boot outcomes return State.
   virtual Result lifecycle(Phase& phase) = 0;
   // Owns expiry/restoration, cannot mutate ordinary radio preferences.
   virtual Result lease(uint32_t frequencyKHz, uint32_t bandwidthHz, uint8_t sf,

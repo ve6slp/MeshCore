@@ -331,15 +331,21 @@ Result Receiver::admit(const uint8_t*) {
 }
 
 Result Receiver::activate() {
-  if (journal_.phase != Phase::Ready || work_ != Work::None) return Result::State;
+  if ((journal_.phase != Phase::Ready && journal_.phase != Phase::ActivationPending) ||
+      work_ != Work::None) return Result::State;
   Result r = manifest_.authorize(platform_);
   if (r != Result::Ok) return r;
   r = platform_.validateInstall(manifest_.canonical(), manifest_.bootSignature(), manifest_.signer());
   if (r != Result::Ok) return r;
-  Journal next = journal_;
-  next.phase = Phase::ActivationPending; next.lastResult = Result::Ok;
-  r = save(next);
-  if (r != Result::Ok) return r;
+  if (journal_.phase == Phase::Ready) {
+    Journal next = journal_;
+    next.phase = Phase::ActivationPending; next.lastResult = Result::Ok;
+    r = save(next);
+    if (r != Result::Ok) return r;
+  }
+  // A freshly authenticated command may reconcile the same durable intent
+  // after a power cut between the journal commit and boot-command publication.
+  // This is never an automatic retry; the platform must be idempotent.
   r = platform_.activate(manifest_.canonical(), manifest_.bootSignature(), manifest_.signer(),
                          journal_.transaction, journal_.generation);
   // The durable command may exist even if publication returned an IO failure.

@@ -28,6 +28,7 @@ public:
   std::vector<uint8_t> manifest, staging;
   bool initialized = false, revoked = false, corrupt = false, failSave = false;
   bool failRead = false, failWrite = false, failInstall = false, active = false;
+  bool failActivate = false;
   bool weakEntropy = false;
   size_t writes = 0, installs = 0, leases = 0;
   uint32_t entropy = 0;
@@ -106,7 +107,9 @@ public:
   }
   Result activate(const uint8_t[59], const uint8_t[64], const uint8_t[32],
                   const uint8_t[16], uint32_t) override {
-    active = true; ++installs; return Result::Ok;
+    if (failActivate) return Result::Io;
+    if (!active) ++installs;
+    active = true; return Result::Ok;
   }
   Result lifecycle(Phase& phase) override {
     if (!active || bootPhase == Phase::ActivationPending) return Result::State;
@@ -427,6 +430,23 @@ TEST_F(CoreTest, ActivationRechecksAuthorityFloorAndInstallationHash) {
   EXPECT_EQ(Result::Integrity, control(Kind::Activate));
   EXPECT_EQ(0u, p.installs);
   EXPECT_EQ(Phase::Ready, receiver->journal().phase);
+}
+
+TEST_F(CoreTest, UnpublishedActivationIntentRequiresExplicitCurrentSignedReconciliation) {
+  ready();
+  const auto activate = command(Kind::Activate);
+  p.failActivate = true;
+  ASSERT_EQ(Result::Io, send(Kind::Activate, activate, activate.data() + 64));
+  EXPECT_EQ(Phase::ActivationPending, p.durable.phase);
+  restart(); pump(8);
+  EXPECT_EQ(0u, p.installs);
+  p.failActivate = false; p.revoked = true;
+  EXPECT_EQ(Result::Denied, send(Kind::Activate, activate, activate.data() + 64));
+  EXPECT_EQ(0u, p.installs);
+  p.revoked = false;
+  EXPECT_EQ(Result::Ok, send(Kind::Activate, activate, activate.data() + 64));
+  EXPECT_EQ(Result::Ok, send(Kind::Activate, activate, activate.data() + 64));
+  EXPECT_EQ(1u, p.installs);
 }
 
 TEST_F(CoreTest, ConfirmedRequiresActualMatchingBootEvidenceAndRetainsTransaction) {
