@@ -340,8 +340,33 @@ TEST_F(CoreTest, CorruptDecodedChunkNeverReachesFlashAndCanBeRetried) {
   EXPECT_EQ(1u, p.durable.nextChunk);
 }
 
+TEST_F(CoreTest, FullImageHashIsCheckedEvenWhenEveryChunkHashIsValid) {
+  package[40 + 13] ^= 1; resign(true);
+  admit(); data(0); pump();
+  data(1);
+  Result r = Result::Ok;
+  for (size_t i = 0; i < 1024 && r == Result::Ok; ++i) r = receiver->tick();
+  EXPECT_EQ(Result::Integrity, r);
+  EXPECT_EQ(Phase::Failed, receiver->journal().phase);
+  EXPECT_EQ(Phase::Failed, p.durable.phase);
+  EXPECT_EQ(0u, p.installs);
+}
+
+TEST_F(CoreTest, CommandsBindFullTargetPackageChallengeAndGeneration) {
+  ASSERT_EQ(Result::Ok, upload());
+  for (size_t offset : {size_t(32), size_t(64), size_t(96), size_t(112)}) {
+    auto bytes = command(Kind::Admit);
+    bytes[offset] ^= 1; signCommand(Kind::Admit, bytes);
+    const auto tag = packageHash();
+    EXPECT_NE(Result::Ok, send(Kind::Admit, bytes, tag.data()));
+    EXPECT_FALSE(p.initialized);
+  }
+}
+
 TEST_F(CoreTest, RebootResumesVerifiedChunksAndLosesOnlyActiveRamChunk) {
   admit(); data(0); pump();
+  ASSERT_EQ(Result::Ok, upload());
+  EXPECT_EQ(1u, receiver->journal().nextChunk);
   std::vector<uint8_t> last(image.begin() + kChunkBytes, image.end());
   ASSERT_EQ(Result::Ok, send(Kind::Data, last, receiver->journal().packageHash, 1, 0));
   const auto nonce = std::vector<uint8_t>(receiver->journal().transaction,
@@ -421,6 +446,15 @@ TEST_F(CoreTest, ConfirmedRequiresActualMatchingBootEvidenceAndRetainsTransactio
   EXPECT_EQ(Phase::Confirmed, receiver->journal().phase);
   EXPECT_EQ(package, p.manifest);
   EXPECT_EQ(1u, p.installs);
+  p.running.hash[0] ^= 1;
+  std::vector<uint8_t> query(kQueryBytes);
+  std::memcpy(query.data(), p.device.publicKey(), 32);
+  uint8_t zeroTag[8] = {};
+  ASSERT_EQ(Result::Ok, send(Kind::Query, query, zeroTag));
+  size_t size; Frame frame;
+  const uint8_t* bytes = receiver->peek(size);
+  ASSERT_TRUE(decodeFrame(bytes, size, frame));
+  EXPECT_EQ(static_cast<uint8_t>(Phase::MetadataFault), frame.data[124]);
 }
 
 TEST_F(CoreTest, ExplicitIoFailuresNeverAdvanceDurableProgressOrReady) {

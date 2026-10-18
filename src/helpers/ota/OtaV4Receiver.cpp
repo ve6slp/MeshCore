@@ -26,6 +26,7 @@ Result Receiver::fault(Result value) {
   work_ = Work::None;
   recovering_ = false;
   candidateCounter_ = 0;
+  std::memset(candidateHash_, 0, sizeof(candidateHash_));
   journal_.phase = Phase::MetadataFault;
   return result(value);
 }
@@ -55,6 +56,7 @@ Result Receiver::begin() {
   replySize_ = replyFrameSize_ = 0;
   recovering_ = false;
   candidateCounter_ = 0;
+  std::memset(candidateHash_, 0, sizeof(candidateHash_));
   resetChunk();
   Result r = platform_.identity(identity_);
   if (r != Result::Ok) return fault(r);
@@ -89,6 +91,28 @@ Result Receiver::begin() {
                         manifestBytes_, manifestSize_ - 64, manifestBytes_ + manifestSize_ - 64))
     return fault(Result::Integrity);
   candidateCounter_ = manifest_.descriptor().securityCounter;
+  std::memcpy(candidateHash_, manifest_.descriptor().sha256, 32);
+  if (journal_.phase != Phase::Aborted && journal_.phase != Phase::Failed) {
+    Phase observed = journal_.phase;
+    r = platform_.lifecycle(observed);
+    if (r != Result::Ok && r != Result::State) return fault(r);
+    if (r == Result::Ok) {
+      if (observed != Phase::Trial && observed != Phase::Confirmed && observed != Phase::Failed)
+        return fault(Result::Invalid);
+      if (observed == Phase::Confirmed) {
+        RunningEvidence e;
+        r = platform_.evidence(e);
+        if (r != Result::Ok) return fault(r);
+        if ((e.flags & 7) != 7 || e.floor < candidateCounter_ ||
+            !equal(e.hash, candidateHash_, 32)) return fault(Result::Integrity);
+      }
+      if (observed != journal_.phase) {
+        Journal next = journal_; next.phase = observed; next.lastResult = Result::Ok;
+        r = save(next);
+        if (r != Result::Ok) return r;
+      }
+    }
+  }
   if (journal_.phase == Phase::Receiving || journal_.phase == Phase::Verifying ||
       journal_.phase == Phase::Ready) {
     if (journal_.phase != Phase::Receiving && journal_.nextChunk != manifest_.count())
@@ -128,6 +152,10 @@ Result Receiver::onFrame(const uint8_t* bytes, size_t size) {
   if (!decodeFrame(bytes, size, f)) return result(Result::Invalid);
   if (f.kind == Kind::Status || f.kind == Kind::Progress) return result(Result::Unsupported);
   if (f.kind == Kind::Manifest) {
+    if (!f.object && journal_.phase != Phase::MetadataFault &&
+        manifestSize_ && f.total == manifestSize_ && equal(f.tag, manifest_.hash(), 8) &&
+        equal(manifestBytes_ + static_cast<size_t>(f.slice) * kSliceBytes, f.data, f.size))
+      return result(Result::Ok);
     if (f.object || journal_.phase == Phase::MetadataFault || live(journal_.phase) ||
         journal_.phase == Phase::Receiving || journal_.phase == Phase::Verifying ||
         journal_.phase == Phase::Ready) return result(Result::State);
@@ -295,6 +323,7 @@ Result Receiver::admit(const uint8_t*) {
   r = save(next);
   if (r != Result::Ok) return r;
   candidateCounter_ = manifest_.descriptor().securityCounter;
+  std::memcpy(candidateHash_, manifest_.descriptor().sha256, 32);
   resetChunk();
   r = platform_.beginStaging(manifest_.descriptor().exactSizeBytes);
   if (r != Result::Ok) return fault(r);
@@ -342,6 +371,7 @@ Result Receiver::repair() {
   if (r != Result::Ok) return r;
   journal_ = next; manifest_ = Manifest{};
   candidateCounter_ = 0;
+  std::memset(candidateHash_, 0, sizeof(candidateHash_));
   manifestSize_ = manifestMask_ = manifestTotal_ = 0;
   resetChunk(); recovering_ = false;
   return rotateChallenge();
@@ -362,6 +392,9 @@ Result Receiver::status(uint16_t object, const uint8_t nonce[16]) {
   RunningEvidence e;
   r = platform_.evidence(e);
   if (r != Result::Ok) return r;
+  if (journal_.phase == Phase::Confirmed &&
+      ((e.flags & 7) != 7 || e.floor < candidateCounter_ ||
+       !equal(e.hash, candidateHash_, 32))) fault(Result::Integrity);
   uint8_t* b = replyBytes_;
   std::memset(b, 0, kStatusBytes);
   std::memcpy(b, identity_, 32); std::memcpy(b + 32, nonce, 16);
