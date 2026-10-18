@@ -189,7 +189,7 @@ bool xiao_ota_wire_descriptor_decode(const uint8_t in[XIAO_OTA_WIRE_DESCRIPTOR_S
  * transport's own 59-byte canonical wire descriptor and Ed25519
  * signature directly -- the SAME bytes and the SAME signature the LoRa
  * OTA transport already verified (see src/helpers/ota/OtaFirmwareBackend.h /
- * src/ota/trust/DescriptorVerifier.h), never re-derived or re-signed into
+ * src/helpers/ota/OtaV4Package.cpp), never re-derived or re-signed into
  * another form. The wire descriptor carries no per-device targeting field,
  * so a command is always installable on any device that otherwise
  * matches target/role/app_address/counter/capability policy (see
