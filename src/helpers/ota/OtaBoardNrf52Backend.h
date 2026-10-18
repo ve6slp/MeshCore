@@ -9,10 +9,10 @@
 #include <ota/platform/SenseCapQspiLayout.h>
 #include <target.h>
 
-#if !defined(XIAO_OTA_COMPILED_ROLE_ID) || !defined(MESHCORE_V4_NRF_TARGET)
+#if !defined(MESHCORE_V4_NRF_ROLE_ID) || !defined(MESHCORE_V4_NRF_TARGET)
 #error "OTA v4 requires an explicitly bound board and companion/repeater role"
 #endif
-static_assert(XIAO_OTA_COMPILED_ROLE_ID == 0 || XIAO_OTA_COMPILED_ROLE_ID == 1,
+static_assert(MESHCORE_V4_NRF_ROLE_ID == 0 || MESHCORE_V4_NRF_ROLE_ID == 1,
               "unsupported OTA role");
 
 extern RADIO_CLASS radio;
@@ -87,7 +87,7 @@ Policy nrfV4Policy() {
   Policy policy;
   policy.boardFamily = uint32_t(MESHCORE_V4_NRF_TARGET) >> 16;
   policy.boardVariant = uint32_t(MESHCORE_V4_NRF_TARGET) & 0xFFFF;
-  policy.role = XIAO_OTA_COMPILED_ROLE_ID;
+  policy.role = MESHCORE_V4_NRF_ROLE_ID;
   policy.appAddress = OTA_NRF52_INTERNAL_IMAGE_OFFSET;
   policy.maxImageBytes = OTA_NRF52_INTERNAL_IMAGE_SIZE;
   policy.bootloaderCapabilities = 1;

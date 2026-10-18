@@ -63,7 +63,7 @@
 #define OTA_NRF52_CANDIDATE_LAST_LEGAL_SECTOR_OFFSET  0x0AC000u  /* == OTA_NRF52_SECURITY_A_OFFSET - erase unit */
 #define OTA_NRF52_BACKUP_LAST_LEGAL_SECTOR_OFFSET     0x172000u  /* == OTA_NRF52_SECURITY_B_OFFSET - erase unit */
 
-/* Durable candidate metadata A/B sectors, owned by OtaCandidateStore.
+/* Durable candidate metadata A/B sectors, owned by OtaV4Journal.
  * Separate from the boot journal, security tails and userdata. */
 #define OTA_NRF52_CANDIDATE_RECORD_SIZE    0x2000u
 #define OTA_NRF52_CANDIDATE_RECORD_OFFSET  0x0AB000u
