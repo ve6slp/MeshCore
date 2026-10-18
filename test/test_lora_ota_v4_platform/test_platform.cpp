@@ -447,6 +447,73 @@ static void nrfActualBootRecordsGateMutationAndRestoration() {
   assert(::ota::platform::isOk(state.program(0x200, &zero, 1)));
   assert(!safety.normal(snapshot));
 }
+class EspTrialModel final : public mesh::ota::Esp32TrialPlatform {
+public:
+  bool runningState(::ota::storage::Esp32ImageState& out) override { out = state; return readable; }
+  bool unknownTopologyHoldAllowed() override { return holdAllowed; }
+  bool armWatchdog(uint32_t remaining) override { armedFor = remaining; return true; }
+  void disarmWatchdog() override { ++disarmed; }
+  mesh::ota::Esp32TrialConfirmation confirmHealthy() override {
+    ++confirmations;
+    if (confirmation != mesh::ota::Esp32TrialConfirmation::Unconfirmed)
+      state = ::ota::storage::Esp32ImageState::Valid;
+    return confirmation;
+  }
+  void reportUnknownService() override { ++reports; }
+  void restartWithoutRollback() override { ++restarts; }
+  void rollbackAndRestart() override { ++rollbacks; }
+  ::ota::storage::Esp32ImageState state = ::ota::storage::Esp32ImageState::PendingVerify;
+  mesh::ota::Esp32TrialConfirmation confirmation = mesh::ota::Esp32TrialConfirmation::Confirmed;
+  bool readable = true, holdAllowed = false;
+  uint32_t armedFor = 0, disarmed = 0, confirmations = 0, reports = 0, restarts = 0, rollbacks = 0;
+};
+static void espTrialKeepsRealHealthAndBootDeadlines() {
+  using namespace mesh::ota;
+  EspTrialModel healthy;
+  Esp32TrialController controller(healthy);
+  assert(controller.begin(0));
+  assert(healthy.armedFor == 45000);
+  for (uint32_t now = 0; now < 10000; now += 1000)
+    assert(controller.tick(now, true, true, true) == Esp32TrialHealthOutcome::Pending);
+  assert(controller.tick(10000, true, true, true) == Esp32TrialHealthOutcome::Confirmed);
+  assert(healthy.confirmations == 1 && healthy.disarmed == 1 && !controller.activeOrUnknown());
+  controller.tick(11000, true, true, true);
+  assert(healthy.confirmations == 1);
+  EspTrialModel late;
+  Esp32TrialController delayed(late);
+  assert(delayed.begin(40000) && late.armedFor == 5000);
+  for (uint32_t now = 40000; now < 45000; now += 1000)
+    assert(delayed.tick(now, true, true, true) == Esp32TrialHealthOutcome::Pending);
+  assert(delayed.tick(45000, true, true, true) == Esp32TrialHealthOutcome::DeadlineExpired);
+  assert(late.confirmations == 0 && late.rollbacks == 1);
+  EspTrialModel interrupted;
+  Esp32TrialController gap(interrupted);
+  assert(gap.begin(0));
+  for (uint32_t now = 0; now <= 9000; now += 1000) gap.tick(now, true, true, true);
+  assert(gap.tick(11001, true, true, true) == Esp32TrialHealthOutcome::Pending);
+  for (uint32_t now = 12001; now < 21001; now += 1000)
+    assert(gap.tick(now, true, true, true) == Esp32TrialHealthOutcome::Pending);
+  assert(gap.tick(21001, true, true, true) == Esp32TrialHealthOutcome::Confirmed);
+  EspTrialModel uncertain;
+  uncertain.confirmation = Esp32TrialConfirmation::ValidNeedsFloorReconciliation;
+  Esp32TrialController forward(uncertain);
+  assert(forward.begin(0));
+  for (uint32_t now = 0; now <= 10000; now += 1000) forward.tick(now, true, true, true);
+  assert(uncertain.confirmations == 1 && uncertain.restarts == 1 && !uncertain.rollbacks);
+}
+static void espUnknownStartupNeverConfirmsOrLoopsUnbounded() {
+  using namespace mesh::ota;
+  Esp32StartupRestartState retained = {};
+  for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    EspTrialModel unknown; unknown.readable = false; unknown.holdAllowed = true;
+    Esp32TrialController controller(unknown, &retained);
+    assert(!controller.begin(1000) && controller.activeOrUnknown());
+    if (attempt < 2) assert(unknown.restarts == 1 && !controller.unknownServiceHeld());
+    else assert(!unknown.restarts && controller.unknownServiceHeld() && unknown.disarmed == 1);
+    controller.tick(11000, true, true, true);
+    assert(!unknown.confirmations && !unknown.rollbacks);
+  }
+}
 int main() {
   journalRoundTrip();
   revokedReadyCannotResurrect();
@@ -457,5 +524,7 @@ int main() {
   genuineCanonicalInstallBoundary();
   espMetadataHasNoPersonaOrPayloadCapability();
   nrfActualBootRecordsGateMutationAndRestoration();
+  espTrialKeepsRealHealthAndBootDeadlines();
+  espUnknownStartupNeverConfirmsOrLoopsUnbounded();
   std::puts("OTA v4 journal power cuts, revocation/repair, raw staging, real signatures and ESP persona bounds passed");
 }
