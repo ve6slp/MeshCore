@@ -73,7 +73,11 @@ struct NrfRunningContext {
 
 class NrfRunningReader {
 public:
+  using BootInfo = ::ota::storage::XiaoOtaBootInfoReader;
   virtual ~NrfRunningReader() = default;
+  virtual BootInfo::RecordStatus readBootInfo(BootInfo::Info& out) const {
+    return BootInfo::classifyCurrent(out);
+  }
   virtual bool read(NrfRunningContext& out) const {
     out = NrfRunningContext();
 #if defined(NRF52840_XXAA)
@@ -117,7 +121,7 @@ public:
   bool qualified() const {
     ::ota::storage::XiaoOtaBootInfoReader::Info info;
     using Reader = ::ota::storage::XiaoOtaBootInfoReader;
-    return Reader::classifyCurrent(info) == Reader::RecordStatus::Found &&
+    return running_.readBootInfo(info) == Reader::RecordStatus::Found &&
         info.boardTargetId == ((uint32_t(policy_.boardFamily) << 16) | policy_.boardVariant) &&
         info.roleId == policy_.role && info.algorithmId == policy_.algorithmId &&
         info.keyId == policy_.keyId &&
@@ -127,7 +131,7 @@ public:
   bool stockNormal() const {
     ::ota::storage::XiaoOtaBootInfoReader::Info info;
     using Reader = ::ota::storage::XiaoOtaBootInfoReader;
-    if (Reader::classifyCurrent(info) != Reader::RecordStatus::Blank) return false;
+    if (running_.readBootInfo(info) != Reader::RecordStatus::Blank) return false;
     Snapshot snapshot;
     if (!readRunning(snapshot) || !blank(commands_) || !blank(state_) ||
         !blank(floor_) || !blank(confirm_)) return false;
@@ -415,6 +419,7 @@ public:
         NrfBootSafety::State::readNewestWithStatus(state_, state) ==
             NrfBootSafety::State::ReadStatus::Found &&
         NrfBootSafety::State::phase(state) == NrfBootSafety::State::kPhaseConfirmed &&
+        (!haveCandidate_ || bootStateMatchesCandidate(state)) &&
         safety_.normal(snapshot) && snapshot.confirmed) {
       out.floor = snapshot.floor; std::memcpy(out.hash, snapshot.rawHash, 32);
       out.flags = FloorKnown | RunningHashKnown | RunningConfirmed;
@@ -470,10 +475,7 @@ public:
     uint8_t state[NrfBootSafety::State::kRecordBytes];
     if (NrfBootSafety::State::readNewestWithStatus(state_, state) !=
         NrfBootSafety::State::ReadStatus::Found ||
-        NrfBootSafety::State::transactionNonce(state) !=
-            transactionNonce(latest_.transaction, latest_.generation, canonical_, signer_) ||
-        NrfBootSafety::State::candidateCounter(state) != read32(canonical_ + 45) ||
-        std::memcmp(NrfBootSafety::State::candidateHashSha256(state), canonical_ + 13, 32))
+        !bootStateMatchesCandidate(state))
       return Result::State;
     if (trial_.isTrialActive()) {
       if (trial_.stateReadStatus() != NrfBootSafety::State::ReadStatus::Found ||
@@ -510,6 +512,12 @@ protected:
     return stagingAllowed_ && !installPending_ && !trial_.isTrialActive() ? Result::Ok : Result::Busy;
   }
 private:
+  bool bootStateMatchesCandidate(const uint8_t state[NrfBootSafety::State::kRecordBytes]) const {
+    return haveCandidate_ && NrfBootSafety::State::transactionNonce(state) ==
+        transactionNonce(latest_.transaction, latest_.generation, canonical_, signer_) &&
+        NrfBootSafety::State::candidateCounter(state) == read32(canonical_ + 45) &&
+        !std::memcmp(NrfBootSafety::State::candidateHashSha256(state), canonical_ + 13, 32);
+  }
   bool samePublishedIntent(const uint8_t canonical[59], const uint8_t signature[64],
                             const uint8_t signer[32]) const {
     if (!haveCandidate_ || !canonical || !signature || !signer || !hooks_.isCurrentAdmin ||

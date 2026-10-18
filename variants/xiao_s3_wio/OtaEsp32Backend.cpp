@@ -163,11 +163,11 @@ Result receiptMatches(const char* key, const Journal& journal, uint32_t address)
   nvs_close(handle);
   if (loaded == ESP_ERR_NVS_NOT_FOUND) return Result::State;
   if (loaded != ESP_OK) return Result::Io;
-  return size == sizeof(receipt) && read32(receipt + 56) == crc32(receipt, 56) &&
-      !std::memcmp(receipt, journal.packageHash, 32) &&
+  if (size != sizeof(receipt) || read32(receipt + 56) != crc32(receipt, 56)) return Result::Integrity;
+  return !std::memcmp(receipt, journal.packageHash, 32) &&
       !std::memcmp(receipt + 32, journal.transaction, 16) &&
       read32(receipt + 48) == journal.generation && read32(receipt + 52) == address ?
-      Result::Ok : Result::Integrity;
+      Result::Ok : Result::State;
 }
 bool saveReceipt(const char* key, const Journal& journal, uint32_t address) {
   uint8_t receipt[60] = {};
@@ -181,6 +181,11 @@ bool saveReceipt(const char* key, const Journal& journal, uint32_t address) {
   nvs_close(handle);
   return saved && receiptMatches(key, journal, address) == Result::Ok;
 }
+bool runningReceiptMatches(const Journal& journal) {
+  const auto* app = esp_ota_get_running_partition();
+  return app && (receiptMatches("select4", journal, app->address) == Result::Ok ||
+      receiptMatches("intent4", journal, app->address) == Result::Ok);
+}
 
 bool readBootPackage(Journal& journal, uint8_t canonical[59], uint8_t signer[32], uint8_t signature[64]) {
   static uint8_t bytes[kMaxManifestBytes];
@@ -191,9 +196,7 @@ bool readBootPackage(Journal& journal, uint8_t canonical[59], uint8_t signer[32]
   if (manifest.parse(bytes, size) != Result::Ok || std::memcmp(manifest.hash(), journal.packageHash, 32) ||
       !signatures.verify(manifest.bootSignature(), 64, manifest.canonical(), 59, manifest.signer(), 32))
     return false;
-  const auto* app = esp_ota_get_running_partition();
-  if (!app || receiptMatches("select4", journal, app->address) != Result::Ok)
-    return false;
+  if (!runningReceiptMatches(journal)) return false;
   std::memcpy(canonical, manifest.canonical(), 59);
   std::memcpy(signer, manifest.signer(), 32);
   std::memcpy(signature, manifest.bootSignature(), 64);
@@ -301,8 +304,11 @@ public:
   }
   Result writeStaging(uint32_t offset, const uint8_t* data, size_t size) override {
     if (!stagingBound_) {
-      if (mutationAllowed() != Result::Ok || offset % kChunkBytes ||
-          !saveReceipt("stage4", latest_, payloadDevice.partition().address)) return Result::Busy;
+      if (mutationAllowed() != Result::Ok || offset != 0) return Result::Busy;
+      if (!saveReceipt("stage4", latest_, payloadDevice.partition().address)) {
+        storageFault = true;
+        return Result::Io;
+      }
       stagingBound_ = true;
     }
     return FirmwarePlatform::writeStaging(offset, data, size);
@@ -310,6 +316,25 @@ public:
   Result save(const Journal& journal, const uint8_t* bytes, size_t size) override {
     if (owner.ordinary || !owner.held) return Result::Busy;
     return FirmwarePlatform::save(journal, bytes, size);
+  }
+  Result repair(const Journal& idle) override {
+    const Result repaired = FirmwarePlatform::repair(idle);
+    if (repaired != Result::Ok) return repaired;
+    nvs_handle_t handle;
+    if (nvs_open("meshota", NVS_READWRITE, &handle) != ESP_OK) return Result::Io;
+    bool erased = true;
+    const char* const keys[] = {"stage4", "intent4", "select4"};
+    for (const auto* key : keys) {
+      const esp_err_t result = nvs_erase_key(handle, key);
+      erased = erased && (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND);
+    }
+    erased = erased && nvs_commit(handle) == ESP_OK;
+    nvs_close(handle);
+    stagingBound_ = false;
+    if (!erased) { storageFault = true; return Result::Io; }
+    uint32_t floor, size; uint8_t hash[32]; bool bound;
+    storageFault = !readFloor(floor, size, hash, bound);
+    return storageFault ? Result::Io : Result::Ok;
   }
   bool ordinaryAllowed() const {
     return !resetPending && !storageFaultObserved() && (!haveCandidate_ ||
@@ -327,7 +352,8 @@ public:
       out.flags |= RunningHashKnown;
       Esp32ImageState state;
       if (readEsp32EarlyRunningState(v4Sdk, state) && state == Esp32ImageState::Valid &&
-          floorBound && floorSize == size && !std::memcmp(out.hash, floorHash, 32))
+          floorBound && floorSize == size && !std::memcmp(out.hash, floorHash, 32) &&
+          (!haveCandidate_ || runningReceiptMatches(latest_)))
         out.flags |= RunningConfirmed;
     }
     return Result::Ok;
@@ -351,15 +377,18 @@ public:
   }
   Result activate(const uint8_t canonical[59], const uint8_t signature[64], const uint8_t signer[32],
                   const uint8_t transaction[16], uint32_t generation) override {
-    if (!haveCandidate_ || !transaction || generation != latest_.generation ||
+    if (!canonical || !signature || !signer || !transaction || !generation) return Result::Invalid;
+    if (!haveCandidate_ || generation != latest_.generation ||
         std::memcmp(transaction, latest_.transaction, 16) || std::memcmp(canonical, canonical_, 59) ||
-        std::memcmp(signer, signer_, 32)) return Result::Denied;
+        std::memcmp(signer, signer_, 32) || !isCurrentAdmin(signer)) return Result::Denied;
     if (resetPending) return Result::Ok;
     const Result checked = validateInstall(canonical, signature, signer);
     if (checked != Result::Ok) return checked;
     const auto* app = resolveApp(payloadDevice.partition());
     if (!app) return Result::Denied;
     resetPending = true;
+    // Bind the trial before SDK selection; its completion receipt may be torn.
+    if (!saveReceipt("intent4", latest_, app->address)) return Result::Io;
     const esp_err_t selected = esp_ota_set_boot_partition(app);
     esp_ota_img_states_t state;
     if (selected != ESP_OK || esp_ota_get_boot_partition() != app ||
@@ -374,8 +403,9 @@ public:
     uint32_t bytes; uint8_t hash[32];
     if (!runningImage(bytes, hash)) return Result::Io;
     const bool matches = bytes == read32(canonical_ + 9) && !std::memcmp(hash, canonical_ + 13, 32);
-    if (state == Esp32ImageState::PendingVerify && matches) { phase = Phase::Trial; return Result::Ok; }
-    if (state == Esp32ImageState::Valid && matches) {
+    const bool bound = matches && runningReceiptMatches(latest_);
+    if (state == Esp32ImageState::PendingVerify && bound) { phase = Phase::Trial; return Result::Ok; }
+    if (state == Esp32ImageState::Valid && bound) {
       RunningEvidence running;
       if (evidence(running) == Result::Ok && (running.flags & RunningConfirmed) &&
           running.floor >= read32(canonical_ + 45)) { phase = Phase::Confirmed; return Result::Ok; }
@@ -395,10 +425,21 @@ public:
 protected:
   Result prepareRecoveredStaging(uint32_t rawSize) override {
     stagingBound_ = false;
+    if (latest_.phase == Phase::Aborted || latest_.phase == Phase::Confirmed ||
+        latest_.phase == Phase::Failed) { staging_.invalidate(); return Result::Ok; }
     Phase boot;
     if (lifecycle(boot) == Result::Ok) { staging_.invalidate(); return Result::Ok; }
     if (!contextNormal()) { staging_.invalidate(); return Result::Ok; }
     if (!::ota::platform::isOk(payloadDevice.bind(kImageBytes))) return Result::Io;
+    // A closed SDK state with uncertain publication must not re-arm a failed
+    // trial from a replayed Activate. Fresh signed staging repair revokes it.
+    if (latest_.phase == Phase::ActivationPending || latest_.phase == Phase::Trial) {
+      const Result intent = receiptMatches("intent4", latest_, payloadDevice.partition().address);
+      const Result selected = receiptMatches("select4", latest_, payloadDevice.partition().address);
+      if (intent == Result::Io || selected == Result::Io) return Result::Io;
+      if (intent == Result::Integrity || selected == Result::Integrity ||
+          (intent == Result::Ok && selected != Result::Ok)) return Result::Integrity;
+    }
     const Result receipt = receiptMatches("stage4", latest_, payloadDevice.partition().address);
     if (latest_.nextChunk && latest_.phase != Phase::Confirmed && latest_.phase != Phase::Failed &&
         latest_.phase != Phase::Trial && receipt != Result::Ok)

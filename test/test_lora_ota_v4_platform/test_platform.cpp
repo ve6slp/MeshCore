@@ -185,7 +185,8 @@ private:
   const uint8_t* admin_;
 };
 static std::vector<uint8_t> signedPackage(const std::vector<uint8_t>& image,
-                                         const ::ota::test::Ed25519TestSigner& signer) {
+                                         const ::ota::test::Ed25519TestSigner& signer,
+                                         uint32_t counter = 9) {
   assert(image.size() <= kChunkBytes);
   std::vector<uint8_t> package(kManifestPrefixBytes + kManifestEntryBytes + 64);
   std::memcpy(package.data(), "MCO4", 4); package[4] = 4; package[5] = 13;
@@ -194,7 +195,7 @@ static std::vector<uint8_t> signedPackage(const std::vector<uint8_t>& image,
   const auto policy = testPolicy();
   descriptor.boardFamily = policy.boardFamily; descriptor.boardVariant = policy.boardVariant;
   descriptor.role = policy.role; descriptor.appAddress = policy.appAddress;
-  descriptor.exactSizeBytes = image.size(); descriptor.securityCounter = 9;
+  descriptor.exactSizeBytes = image.size(); descriptor.securityCounter = counter;
   descriptor.minBootloaderCapabilities = 1;
   descriptor.formatId = descriptor.keyId = descriptor.algorithmId = 1;
   ::ota::trust::Sha256::hash(image.data(), image.size(), descriptor.sha256);
@@ -311,6 +312,13 @@ public:
     context.image = image.data(); context.capacity = image.size(); context.settingsTailErased = true;
     le16(context.settings, 1); le16(context.settings + 4, 0xff); le32(context.settings + 8, 129);
     le16(context.settings + 2, NrfBootSafety::Bridge::crc16Compute(image.data(), 129));
+    le32(marker, BootInfo::kMagic); le16(marker + 4, 1); le16(marker + 6, sizeof(marker));
+    le32(marker + 8, 0x584e3430); le32(marker + 12, 1); le32(marker + 16, 1);
+    le16(marker + 20, 1); le16(marker + 22, 1);
+    le32(marker + 56, ::ota::storage::Crc32::computeFinalized(marker, 56));
+  }
+  BootInfo::RecordStatus readBootInfo(BootInfo::Info& out) const override {
+    return BootInfo::classify(marker, sizeof(marker), out);
   }
   bool read(NrfRunningContext& out) const override {
     out = context;
@@ -321,6 +329,7 @@ public:
   NrfRunningContext context;
   mutable unsigned reads = 0;
   bool changeOnSecondRead = false;
+  uint8_t marker[BootInfo::kStructBytes] = {};
 };
 static std::vector<uint8_t> floorRecord(uint32_t sequence, uint32_t counter, uint32_t size,
                                        const uint8_t hash[32]) {
@@ -378,6 +387,37 @@ static void nrfActualBootRecordsGateMutationAndRestoration() {
   commitState();
   assert(safety.normal(snapshot) && snapshot.confirmed);
   const uint8_t seed[32] = {17}; ::ota::test::Ed25519TestSigner signer(seed);
+  {
+    Flash stagingFlash(32768, 4096); Region payload(stagingFlash, 0, 16384), metadata(stagingFlash, 16384, 16384);
+    NrfFirmwarePlatform platform(policy, payload, metadata, commands, state, floor, confirm, verifier,
+                                 running, nullptr);
+    RuntimeHooks hooks; hooks.context = &signer;
+    hooks.isCurrentAdmin = [](void* context, const uint8_t key[32]) {
+      return !std::memcmp(key, static_cast<::ota::test::Ed25519TestSigner*>(context)->publicKey(), 32);
+    };
+    platform.attach(hooks);
+    std::vector<uint8_t> actual(running.image.begin(), running.image.begin() + 129), recovered(8192);
+    auto confirmedPackage = signedPackage(actual, signer, 7);
+    Journal out; size_t size;
+    assert(platform.recover(out, recovered.data(), recovered.size(), size) == Result::State);
+    auto journal = candidate(confirmedPackage, Phase::Confirmed, 1); journal.nextChunk = 1;
+    assert(platform.save(journal, confirmedPackage.data(), confirmedPackage.size()) == Result::Ok);
+    RunningEvidence evidence; Phase boot;
+    assert(platform.evidence(evidence) == Result::Ok && evidence.flags == 3);
+    assert(platform.lifecycle(boot) == Result::State);
+    const auto nonce = NrfFirmwarePlatform::transactionNonce(journal.transaction, journal.generation,
+        confirmedPackage.data() + 40, signer.publicKey());
+    for (size_t i = 0; i < 8; ++i) record[12 + i] = nonce >> (i * 8);
+    commitState();
+    assert(platform.evidence(evidence) == Result::Ok && evidence.flags == 7);
+    assert(platform.lifecycle(boot) == Result::Ok && boot == Phase::Confirmed);
+    journal.transaction[1] ^= 1;
+    assert(platform.save(journal, confirmedPackage.data(), confirmedPackage.size()) == Result::Ok);
+    assert(platform.evidence(evidence) == Result::Ok && evidence.flags == 3);
+    assert(platform.lifecycle(boot) == Result::State);
+    std::memset(record.data() + 12, 0, 8); le32(record.data() + 12, 111);
+    commitState();
+  }
   std::vector<uint8_t> image(257, 0x37);
   auto package = signedPackage(image, signer);
   ::ota::storage::XiaoOtaCommandV3Fields command;
