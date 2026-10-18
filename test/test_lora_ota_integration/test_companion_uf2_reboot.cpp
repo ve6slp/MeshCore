@@ -9,7 +9,7 @@
 namespace {
 
 namespace uf2 = companion_usb_uf2;
-using Phase = mesh::ota::usb::UsbOtaPhase;
+using Phase = mesh::ota::v4::Phase;
 using Reply = uf2::Reply;
 
 std::vector<uint8_t> command(const std::string& payload) {
@@ -182,8 +182,8 @@ TEST_F(CompanionUf2, OtherOpcodeIsNotClaimedByUf2Parser) {
 }
 
 TEST_F(CompanionUf2, AllTargetForbiddenPhasesRefuseWithoutMutation) {
-  for (Phase blocked : {Phase::Erasing, Phase::Receiving, Phase::Verifying, Phase::Ready,
-                        Phase::CacheSealed, Phase::CommitPending, Phase::Trial}) {
+  for (Phase blocked : {Phase::Receiving, Phase::Verifying, Phase::Ready,
+                        Phase::ActivationPending, Phase::Trial}) {
     phase = blocked;
     ASSERT_TRUE(request(command("reboot uf2")));
     EXPECT_EQ(Reply::BadState, replies.back());
@@ -212,10 +212,10 @@ TEST_F(CompanionUf2, WriteTrialBootPendingAndRfSafeguardsAllRefuse) {
   EXPECT_EQ(0u, saves);
 }
 
-TEST_F(CompanionUf2, AbortedCacheCanScheduleButSealedCacheIsNotSilentlyChanged) {
-  phase = Phase::CacheSealed;
+TEST_F(CompanionUf2, AbortedTransactionCanScheduleButReadyTransactionIsNotSilentlyChanged) {
+  phase = Phase::Ready;
   ASSERT_TRUE(request(command("reboot uf2")));
-  EXPECT_EQ(Phase::CacheSealed, phase);
+  EXPECT_EQ(Phase::Ready, phase);
   EXPECT_FALSE(pending.active);
   phase = Phase::Aborted;
   ASSERT_TRUE(request(command("reboot uf2")));
@@ -278,11 +278,11 @@ TEST_F(CompanionUf2, PermissionRevocationCancelsWithExplicitFailureEvenDuringGra
   EXPECT_EQ(0u, entries);
 }
 
-TEST_F(CompanionUf2, NewlySealedCacheCancelsPendingEntryWithoutChangingTheCache) {
+TEST_F(CompanionUf2, NewlyReadyTransactionCancelsPendingEntryWithoutChangingTheTransaction) {
   ASSERT_TRUE(request(command("reboot uf2")));
-  phase = Phase::CacheSealed;
+  phase = Phase::Ready;
   tick(2100);
-  EXPECT_EQ(Phase::CacheSealed, phase);
+  EXPECT_EQ(Phase::Ready, phase);
   EXPECT_FALSE(pending.active);
   EXPECT_EQ(Reply::BadState, replies.back());
   EXPECT_EQ(0u, saves);

@@ -10,7 +10,7 @@ void Mesh::begin() {
 
 void Mesh::loop() {
 #if MESHCORE_LORA_OTA
-  _ota.tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+  getOtaIntegration().tick(_ms->getMillis(), !isSendInProgress() && !_radio->isReceiving());
 #endif
   Dispatcher::loop();
 #if MESHCORE_LORA_OTA
@@ -20,26 +20,22 @@ void Mesh::loop() {
 
 #if MESHCORE_LORA_OTA
 __attribute__((noinline)) void Mesh::pumpOtaControl() {
-  _ota.loop();
-  // Leave the reply pending on queue/budget pressure. Census is a real RF
-  // exchange even with no USB client connected.
-  uint8_t frame[ota::kOtaDirectFrameBytes];
+  auto& ota = getOtaIntegration();
   size_t len = 0;
-  if (_mgr->getOutboundTotal() == 0 && !isSendInProgress() &&
-      _ota.peekOutboundControlFrame(frame, sizeof(frame), len, _ms->getMillis())) {
-    const auto category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
+  const uint8_t* frame = ota.peek(len);
+  if (frame && !ota.localReply() && !hasQueuedNormalTraffic() &&
+      !hasQueuedOtaTraffic() && !isSendInProgress()) {
     const auto airtime = _radio->getEstAirtimeFor(static_cast<int>(len + 4));
-    if (_ota.canTransmit(_ms->getMillis(), category, airtime, true, hasQueuedNormalTraffic())) {
+    if (ota.canTransmit(_ms->getMillis(), airtime, true, hasQueuedNormalTraffic())) {
       auto* packet = createOtaData(frame, len);
       if (packet) {
-        if (_ota.directActive() || frame[0] == ota::kOtaDirectAckKind ||
-            frame[0] == ota::kOtaDirectProfileAckKind) {
+        if (ota.leaseActive()) {
           packet->header = (packet->header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT;
           packet->path_len = 0;
           _tables->markSeen(packet);
-          if (sendPacket(packet, ota::kOtaForwardPriority)) _ota.releaseOutboundControlFrame();
+          if (sendPacket(packet, ota::kOtaForwardPriority)) ota.release();
         } else if (sendFlood(packet)) {
-          _ota.releaseOutboundControlFrame();
+          ota.release();
         }
       }
     }
@@ -76,13 +72,7 @@ int Mesh::searchChannelsByHash(const uint8_t* hash, GroupChannel channels[], int
 
 DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 #if MESHCORE_LORA_OTA
-  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA && pkt->payload_len &&
-      ota::isOtaRetryAttempt(pkt->payload[0])) {
-    uint32_t attempt; const uint8_t* inner; size_t inner_len;
-    if (!ota::parseOtaRetryAttempt(pkt->payload, pkt->payload_len, attempt, inner, inner_len) ||
-        !ota::otaRfPathFits(pkt->payload_len, pkt->path_len, pkt->hasTransportCodes()))
-      return ACTION_RELEASE;
-  }
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_LORA_OTA && !ota::validOtaPacket(pkt)) return ACTION_RELEASE;
 #endif
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     if (pkt->path_len < MAX_PATH_SIZE) {
@@ -169,11 +159,6 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
 #endif
       return routeRecvPacket(pkt);
     }
-#if MESHCORE_LORA_OTA
-    // Retry only first-hop delivery; relayed copies and echoes stay suppressed.
-    if (pkt->getPathHashCount() == 0 &&
-        (pkt->payload_len == 0 || !ota::isOtaRetryAttempt(pkt->payload[0]))) onOtaDataRecv(pkt);
-#endif
     return ACTION_RELEASE;
   }
 #endif
@@ -434,7 +419,7 @@ DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
 
 void Mesh::onOtaDataRecv(Packet* packet) {
 #if MESHCORE_LORA_OTA
-  _ota.handleReceivedFrame(packet->payload, packet->payload_len, _ms->getMillis());
+  getOtaIntegration().onFrame(packet->payload, packet->payload_len, false, _ms->getMillis());
 #else
   (void)packet;
 #endif
@@ -688,7 +673,8 @@ Packet* Mesh::createRawData(const uint8_t* data, size_t len) {
 
 Packet* Mesh::createOtaData(const uint8_t* data, size_t len) {
 #if MESHCORE_LORA_OTA
-  if (len > sizeof(Packet::payload)) return NULL;
+  ota::v4::Frame frame;
+  if (!ota::v4::decodeFrame(data, len, frame)) return nullptr;
 
   // Reserve-protected allocation is optional for downstream packet managers.
   Packet* packet = obtainNewPacket(true);

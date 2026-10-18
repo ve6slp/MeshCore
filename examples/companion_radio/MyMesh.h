@@ -29,12 +29,11 @@ inline Request classify(const uint8_t* frame, size_t len) {
 }
 
 inline bool permitted(bool writes_allowed, bool trial_active, bool boot_pending,
-                      bool rf_pending, mesh::ota::usb::UsbOtaPhase phase) {
-  using Phase = mesh::ota::usb::UsbOtaPhase;
+                      bool rf_pending, mesh::ota::v4::Phase phase) {
+  using Phase = mesh::ota::v4::Phase;
   return writes_allowed && !trial_active && !boot_pending && !rf_pending &&
-      phase != Phase::Erasing && phase != Phase::Receiving && phase != Phase::Verifying &&
-      phase != Phase::Ready && phase != Phase::CacheSealed &&
-      phase != Phase::CommitPending && phase != Phase::Trial;
+      phase != Phase::Receiving && phase != Phase::Verifying &&
+      phase != Phase::Ready && phase != Phase::ActivationPending && phase != Phase::Trial;
 }
 
 template <typename Interface, typename Manager, typename Usb>
@@ -186,7 +185,6 @@ void tick(Pending& pending, uint32_t now, bool tx_active, bool outbound_queued,
 #include "helpers/ota/OtaTrialSafeIdentityBoot.h"
 #if MESHCORE_LORA_OTA
 #include "helpers/ota/OtaFirmwareService.h"
-#include "helpers/ota/OtaRfUploader.h"
 #endif
 
 /* -------------------------------------------------------------------------------------- */
@@ -254,26 +252,20 @@ public:
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins);
-  bool setFirmwareOtaMode(const char* mode);
-  const char* getFirmwareOtaMode() const;
   bool setFirmwareOtaDutyCycle(float percent);
   float getFirmwareOtaDutyCycle() const;
-  void abortFirmwareOta();
-  void rollbackFirmwareOta();
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
   void applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr);
 
-  // Dispatches CMD_OTA_CONTROL subops 0x10..0x18 (the lean local-USB
-  // uploader/status wire contract; see helpers/ota/OtaUsbProtocol.h).
-  // Writes the fixed 107-byte ABI3 reply via _serial directly; does not use
-  // writeOKFrame()/writeErrFrame() (those are 1-2 byte legacy shapes,
-  // incompatible with this contract's fixed-layout reply requirement).
-  void handleUsbOtaProtocolOp(uint8_t op, const uint8_t* cmd_frame, int len);
-  bool isOtaAdminKey(const uint8_t key[32]) const;
-  static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #if MESHCORE_LORA_OTA
-  bool attachFirmwareOtaBackend(meshcore::ota::runtime::IOtaTrustProvider& trust_provider,
-                                meshcore::ota::runtime::IOtaStagingSink& staging_sink);
+  void handleUsbOtaProtocolOp(const uint8_t* frame, size_t len);
+  void configureV4Ota();
+  void pumpLocalOta();
+  void onOtaDataRecv(mesh::Packet* packet) override;
+  void onOtaTransmitComplete(const mesh::Packet*, bool, uint32_t) override;
+#endif
+  bool isOtaAdminKey(const uint8_t key[32]) const;
+#if MESHCORE_LORA_OTA
   // Genuine trial-boot health confirmation: setOtaTrialBootHealthSignals()
   // captures the ONE-TIME boot-init results (radio_init()/filesystem
   // begin() success, captured by main.cpp at startup, since a failed
@@ -300,33 +292,6 @@ public:
   // services ran this pass would latch a false-healthy outcome even if
   // one of them had silently failed or stalled earlier in the same tick.
   void tickOtaTrialHealth();
-  // Autonomous RF uploader pump: called once per outer loop() pass (see
-  // loop() below), entirely independent of whether a USB host is still
-  // connected -- a Start that was issued and then the cable unplugged
-  // keeps running exactly the same way, matching the "autonomous on
-  // disconnect" requirement. Sends AT MOST one frame per call (either a
-  // periodic Authorization re-broadcast or the next repair-sweep block),
-  // always airtime-budget-gated via getOtaIntegration().canTransmit().
-  void pumpOtaRfUpload();
-  // Initial background multicast only. Directed repair/control uses
-  // known contact paths, and negotiated off-frequency uses zero-hop.
-  bool floodOtaFrame(const uint8_t* frame, size_t frame_len, meshcore::ota::protocol::OtaAirtimeCategory category);
-  // Transmits a target-bound control frame (Commit/Abort/StatusPoll, all
-  // of which DO carry an explicit target field): prefers a known direct
-  // path to that contact (ordinary unicast routing, lower airtime cost)
-  // and falls back to an un-scoped flood (the embedded target field makes
-  // this safe -- every OTHER receiver's own self-check already rejects a
-  // frame not addressed to its own real identity, see OtaLeanReceiver::
-  // commit()/abort()).
-  bool sendOtaControlFrameToTarget(const uint8_t target[32], const uint8_t* frame, size_t frame_len,
-                                   meshcore::ota::protocol::OtaAirtimeCategory category);
-  static void otaSelfIdSignThunk(void* ctx, const uint8_t* message, size_t message_len, uint8_t signature_out[64]);
-  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore);
-  static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
-  static bool otaBootCandidateThunk(void* ctx, const mesh::ota::OtaBootLifecycleEvidence& boot,
-                                    ::ota::storage::OtaCandidateStore::Snapshot& out);
-  static bool otaSendThunk(void* ctx, mesh::ota::OtaRfRoute route, const uint8_t target[32],
-                            const uint8_t* frame, size_t len, meshcore::ota::protocol::OtaAirtimeCategory category);
 #endif
 
 protected:
@@ -507,8 +472,8 @@ private:
 #endif
   }
   // Returns the real, synchronous result of the underlying filesystem
-  // write (never a fabricated/optimistic true) -- see UsbOtaOp::SetContactAdmin
-  // in handleCommand(), which must not reply OK for an admin-flag change
+  // write (never a fabricated/optimistic true) -- see v4 usb::Op::SetAdmin,
+  // which must not reply OK for an admin-flag change
   // that did not actually make it to durable storage.
   bool saveContacts();
 
@@ -539,19 +504,8 @@ private:
   float pending_bw;
   uint8_t pending_sf;
   uint8_t pending_cr;
-  uint8_t _ota_selected_targets[mesh::ota::usb::kMaxSelectedTargets][32] = {};
-  uint8_t _ota_selected_target_count = 0;
 #if MESHCORE_LORA_OTA
-  // Autonomous RF uploader state -- deliberately survives a USB
-  // disconnect (nothing here is reset/paused by checkSerialInterface()'s
-  // connection tracking), matching the "autonomous on disconnect"
-  // requirement. Reset to inactive on CacheBegin (a fresh/competing
-  // candidate invalidates any in-flight push) and on successful Start.
-  bool _ota_upload_active = false;
-  mesh::ota::OtaRfUploader _ota_rf_uploader;
-  bool _ota_cache_reupload = false;
-  bool _ota_stop_upload_when_idle = false;
-  uint8_t _ota_upload_channel = 0xFF;
+  const mesh::Packet* _ota_bridge_pending = nullptr;
 #endif
 
   // False only when begin() hit a genuine identity-load failure during an

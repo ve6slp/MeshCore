@@ -268,25 +268,12 @@ public:
   virtual void formatOtaStatusReply(char *reply) {
     strcpy(reply, "OTA unsupported");
   }
-  virtual bool setOtaMode(const char* mode) {
-    (void)mode;
-    return false;
-  }
-  virtual const char* getOtaMode() {
-    return "unsupported";
-  }
   virtual bool setOtaDutyCycle(float percent) {
     (void)percent;
     return false;
   }
   virtual float getOtaDutyCycle() {
     return 0.0f;
-  }
-  virtual bool abortOtaSession() {
-    return false;
-  }
-  virtual bool rollbackOtaSession() {
-    return false;
   }
 
   virtual void startRegionsLoad() {

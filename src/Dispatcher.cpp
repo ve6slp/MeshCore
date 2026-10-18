@@ -66,8 +66,7 @@ uint32_t Dispatcher::getCADFailMaxDuration() const {
 #if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
 void Dispatcher::recordRelayAirtime(uint32_t duration_ms) {
   if (mesh::ota::isOtaPacket(outbound) &&
-      !relay_airtime.recordUsage(_ms->getMillis(),
-          meshcore::ota::protocol::OtaAirtimeCategory::Relay, duration_ms)) {
+      !relay_airtime.recordUsage(_ms->getMillis(), duration_ms)) {
     // Never continue forwarding after losing airtime accounting.
     relay_accounting_fault = true;
   }
@@ -85,12 +84,13 @@ bool Dispatcher::completeOutboundSend() {
 #endif
 #if MESHCORE_LORA_OTA
   if (outbound_is_ota) {
-    if (!active_ota->recordTransmit(_ms->getMillis(), outbound_ota_category, (uint32_t)t)) {
+    if (!active_ota->recordTransmit(_ms->getMillis(), (uint32_t)t)) {
       ++ota_accounting_failure_count;
       MESH_DEBUG_PRINTLN("%s Dispatcher: WARNING: OTA airtime accounting ring full", getLogDateTime());
     }
     outbound_is_ota = false;
   }
+  onOtaTransmitComplete(outbound, true, static_cast<uint32_t>(t));
 #endif
   if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
     float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
@@ -106,7 +106,7 @@ bool Dispatcher::completeOutboundSend() {
   } else {
     n_sent_direct++;
   }
-  releasePacket(outbound);
+  _mgr->free(outbound);
   outbound = nullptr;
   next_agc_reset_time = futureMillis(getAGCResetInterval());
   return true;
@@ -157,13 +157,23 @@ void Dispatcher::loop() {
 #endif
 #if MESHCORE_LORA_OTA
         ++tx_timeout_count;
+        if (mesh::ota::isOtaPacket(outbound)) {
+          const uint32_t duration = _ms->getMillis() - outbound_start;
+          if (!active_ota->recordTransmit(_ms->getMillis(), duration))
+            ++ota_accounting_failure_count;
+          total_air_time += duration;
+          updateTxBudget();
+          tx_budget_ms = duration > tx_budget_ms ? 0 : tx_budget_ms - duration;
+        }
+        onOtaTransmitComplete(outbound, false, static_cast<uint32_t>(_ms->getMillis() - outbound_start));
+        outbound_is_ota = false;
 #endif
         MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): WARNING: outbound packed send timed out!", getLogDateTime());
 
         _radio->onSendFinished();
         logTxFail(outbound, 2 + outbound->getPathByteLen() + outbound->payload_len);
 
-        releasePacket(outbound);  // return to pool
+        _mgr->free(outbound);  // Completion (including timeout) was reported above.
         outbound = NULL;
       } else {
         return;  // can't do any more radio activity until send is complete or timed out
@@ -234,13 +244,7 @@ bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
 
   memcpy(pkt->payload, &raw[i], pkt->payload_len);
 #if MESHCORE_LORA_OTA
-  if (mesh::ota::isOtaPacket(pkt) && pkt->payload_len &&
-      mesh::ota::isOtaRetryAttempt(pkt->payload[0])) {
-    uint32_t attempt; const uint8_t* inner; size_t inner_len;
-    if (!mesh::ota::parseOtaRetryAttempt(pkt->payload, pkt->payload_len, attempt, inner, inner_len) ||
-        !mesh::ota::otaRfPathFits(pkt->payload_len, pkt->path_len, pkt->hasTransportCodes()))
-      return false;
-  }
+  if (mesh::ota::isOtaPacket(pkt) && !mesh::ota::validOtaPacket(pkt)) return false;
 #endif
 
   return true;  // success
@@ -435,13 +439,10 @@ void Dispatcher::checkSend() {
 #endif
 #if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
       if (mesh::ota::isOtaPacket(outbound)) {
-        meshcore::ota::runtime::OtaAirtimeDecisionInput decision;
-        decision.normalTrafficActive = hasQueuedNormalTraffic();
         // Include the send-timeout envelope; payloads remain completely opaque.
         const uint32_t maximum_duration = prospective_airtime * 3 / 2;
         if (relay_accounting_fault || !_mgr->supportsOtaQueue() ||
-            !relay_airtime.canAdmit(_ms->getMillis(),
-                meshcore::ota::protocol::OtaAirtimeCategory::Relay, maximum_duration, decision)) {
+            !relay_airtime.canAdmit(_ms->getMillis(), maximum_duration, true, hasQueuedNormalTraffic())) {
           Packet* held = outbound;
           outbound = nullptr;
           sendPacket(held, mesh::ota::kOtaForwardPriority, 60000);
@@ -458,30 +459,13 @@ void Dispatcher::checkSend() {
           outbound_is_ota = false;
           return;
         }
-        using meshcore::ota::protocol::OtaMessageType;
-        using meshcore::ota::protocol::OtaAirtimeCategory;
-        outbound_ota_category = OtaAirtimeCategory::Control;
-        if (outbound->payload_len && mesh::ota::isOtaRetryAttempt(outbound->payload[0])) {
-          uint32_t attempt; const uint8_t* inner; size_t inner_len;
-          if (!mesh::ota::parseOtaRetryAttempt(outbound->payload, outbound->payload_len, attempt, inner, inner_len)) {
-            _mgr->free(outbound);
-            outbound = NULL;
-            outbound_is_ota = false;
-            return;
-          }
-          if (outbound->payload[0] == mesh::ota::kOtaRetryRepairAttemptKind)
-            outbound_ota_category = OtaAirtimeCategory::Repair;
-          else if (inner[0] == mesh::ota::kOtaSignedBlockKind ||
-                   inner[0] == mesh::ota::kOtaCompressedFragmentKind)
-            outbound_ota_category = OtaAirtimeCategory::Relay;
+        if (!mesh::ota::validOtaPacket(outbound)) {
+          releasePacket(outbound);
+          outbound = nullptr;
+          outbound_is_ota = false;
+          return;
         }
-        if (outbound->payload_len >= 4 && outbound->payload[0] == 0x4F && outbound->payload[1] == 0x54) {
-          uint8_t raw_type = outbound->payload[3];
-          if (meshcore::ota::protocol::isKnownOtaMessageType(raw_type)) {
-            outbound_ota_category = mesh::ota::otaAirtimeCategoryForMessage(static_cast<OtaMessageType>(raw_type));
-          }
-        }
-        if (!active_ota->canTransmit(_ms->getMillis(), outbound_ota_category, prospective_airtime,
+        if (!active_ota->canTransmit(_ms->getMillis(), prospective_airtime,
                                      true, hasQueuedNormalTraffic())) {
           Packet* held = outbound;
           outbound = NULL;
@@ -504,6 +488,9 @@ void Dispatcher::checkSend() {
         MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): ERROR: send start failed!", getLogDateTime());
 
         logTxFail(outbound, outbound->getRawLength());
+#if MESHCORE_LORA_OTA
+        outbound_is_ota = false;
+#endif
   
         releasePacket(outbound);  // return to pool
         outbound = NULL;
@@ -546,6 +533,9 @@ Packet* Dispatcher::obtainNewPacket(bool is_ota_bulk) {
 }
 
 void Dispatcher::releasePacket(Packet* packet) {
+#if MESHCORE_LORA_OTA
+  if (packet) onOtaTransmitComplete(packet, false, 0);
+#endif
   _mgr->free(packet);
 }
 
@@ -553,13 +543,13 @@ bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_mil
   if (packet == nullptr) return false;
   if (!Packet::isValidPathLen(packet->path_len) || packet->payload_len > MAX_PACKET_PAYLOAD) {
     MESH_DEBUG_PRINTLN("%s Dispatcher::sendPacket(): ERROR: invalid packet... path_len=%d, payload_len=%d", getLogDateTime(), (uint32_t) packet->path_len, (uint32_t) packet->payload_len);
-    _mgr->free(packet);
+    releasePacket(packet);
     return false;
   }
 #if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
   if (mesh::ota::isOtaPacket(packet)) {
     if (!_mgr->supportsOtaQueue() || _mgr->getFreeCount() <= PacketManager::kOtaAllocReserve) {
-      _mgr->free(packet);
+      releasePacket(packet);
       return false;
     }
     priority = mesh::ota::kOtaForwardPriority;
@@ -567,7 +557,7 @@ bool Dispatcher::sendPacket(Packet* packet, uint8_t priority, uint32_t delay_mil
 #endif
   if (_mgr->supportsOtaQueue()) {
     if (_mgr->tryQueueOutbound(packet, priority, futureMillis(delay_millis))) return true;
-    _mgr->free(packet);
+    releasePacket(packet);
     return false;
   }
   _mgr->queueOutbound(packet, priority, futureMillis(delay_millis));

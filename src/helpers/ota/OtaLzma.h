@@ -17,7 +17,7 @@ namespace mesh { namespace ota {
 // probabilities and CLzmaDec are instance-owned, never allocated or on stack.
 class OtaLzma {
 public:
-  static constexpr size_t kMaxOutput = 8064;
+  static constexpr size_t kMaxOutput = 8192;
   static constexpr size_t kSliceBytes = 128;
   static constexpr size_t kProbabilityCount = 1984 + 768 * 2;
   static constexpr unsigned kMaxSlices = 2 * ((kMaxOutput + kSliceBytes - 1) / kSliceBytes) + 4;

@@ -87,7 +87,12 @@ class RadioTxCompletion : public testing::Test {
     packet->payload[0] = 0x4F;
     packet->payload[1] = 0x54;
     packet->payload[2] = 1;
-    packet->payload[3] = static_cast<uint8_t>(meshcore::ota::protocol::OtaMessageType::Chunk);
+    packet->payload[3] = 0;
+    if (ota) {
+      const uint8_t tag[8] = {}, body[] = {1};
+      packet->payload_len = mesh::ota::v4::encodeFrame(mesh::ota::v4::Kind::Data, 1, tag, 0, 1, 0,
+          body, sizeof(body), packet->payload, sizeof(packet->payload));
+    }
     ASSERT_TRUE(dispatcher.sendPacket(packet, 1));
     dispatcher.loop();
     ASSERT_TRUE(dispatcher.isSendInProgress());

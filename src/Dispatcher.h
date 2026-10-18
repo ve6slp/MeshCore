@@ -9,8 +9,9 @@
 
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaFirmwareIntegration.h>
+#include <helpers/ota/OtaRfFrames.h>
 #elif MESHCORE_LORA_OTA_RELAY
-#include <ota/runtime/OtaAirtimeLimiter.h>
+#include <helpers/ota/OtaFirmwareIntegration.h>
 #ifndef MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT
 #define MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT 2
 #endif
@@ -209,16 +210,15 @@ class Dispatcher {
   uint8_t outbound_priority;
 #endif
 #if MESHCORE_LORA_OTA_RELAY && !MESHCORE_LORA_OTA
-  meshcore::ota::runtime::OtaAirtimeLimiter relay_airtime{
-      meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultWindowMs,
-      meshcore::ota::runtime::OtaAirtimeLimiter::kDefaultWindowMs / 100 *
+  mesh::ota::AirtimeBudget relay_airtime{
+      mesh::ota::AirtimeBudget::kDefaultWindowMs,
+      mesh::ota::AirtimeBudget::kDefaultWindowMs / 100 *
           (MESHCORE_LORA_OTA_RELAY_DUTY_PERCENT)};
   bool relay_accounting_fault = false;
   void recordRelayAirtime(uint32_t duration_ms);
 #endif
 #if MESHCORE_LORA_OTA
   bool outbound_is_ota;
-  meshcore::ota::protocol::OtaAirtimeCategory outbound_ota_category;
   mesh::ota::OtaFirmwareIntegration dispatcher_ota;
   mesh::ota::OtaFirmwareIntegration* active_ota;
   uint32_t tx_timeout_count, ota_accounting_failure_count;
@@ -253,7 +253,6 @@ protected:
 #endif
 #if MESHCORE_LORA_OTA
     outbound_is_ota = false;
-    outbound_ota_category = meshcore::ota::protocol::OtaAirtimeCategory::Control;
     active_ota = &dispatcher_ota;
     tx_timeout_count = ota_accounting_failure_count = 0;
 #endif
@@ -276,6 +275,9 @@ protected:
   virtual void logRx(Packet* packet, int len, float score) { }   // hooks for custom logging
   virtual void logTx(Packet* packet, int len) { }
   virtual void logTxFail(Packet* packet, int len) { }
+#if MESHCORE_LORA_OTA
+  virtual void onOtaTransmitComplete(const Packet*, bool, uint32_t) { }
+#endif
   virtual const char* getLogDateTime() { return ""; }
 
   virtual float getAirtimeBudgetFactor() const;
@@ -325,7 +327,6 @@ public:
     uint32_t budget = active_ota->dutyBudgetMs();
     return used >= budget ? 0 : budget - used;
   }
-  mesh::ota::FirmwareOtaStatus getOtaStatus(unsigned long now_ms) const { return active_ota->status(now_ms); }
   uint32_t getTxTimeoutCount() const { return tx_timeout_count; }
   uint32_t getOtaAccountingFailureCount() const { return ota_accounting_failure_count; }
 #endif

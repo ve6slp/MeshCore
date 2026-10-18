@@ -328,31 +328,11 @@ public:
   void loop();
 
 #if MESHCORE_LORA_OTA
-  // Real admin control surface reusing the SAME getOtaIntegration()/
-  // getOtaStatus()/radio-revert machinery as companion_radio's CMD_OTA_
-  // CONTROL binary handler -- reached here only via handleCommand()'s
-  // existing gates (local serial trusted-owner, or remote client->
-  // isAdmin() already checked by the PAYLOAD_TYPE_TXT_MSG caller before
-  // handleCommand() is ever invoked). No new admin/auth mechanism.
-  bool setFirmwareOtaMode(const char* mode);
+  void configureV4Ota();
   bool setFirmwareOtaDutyCycle(float percent);
-  bool setOtaMode(const char* mode) override { return setFirmwareOtaMode(mode); }
-  const char* getOtaMode() override {
-    return mesh::ota::firmwareOtaModeName(getOtaIntegration().mode());
-  }
   bool setOtaDutyCycle(float percent) override { return setFirmwareOtaDutyCycle(percent); }
   float getOtaDutyCycle() override { return getOtaIntegration().dutyCyclePercent(); }
-  void abortFirmwareOta();
-  void rollbackFirmwareOta();
-#if MESHCORE_LORA_OTA
-  static void otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]);
-  static bool otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore);
-  static bool otaBootLifecycleThunk(void* ctx, mesh::ota::OtaBootLifecycleEvidence& out);
-  static bool otaBootCandidateThunk(void* ctx, const mesh::ota::OtaBootLifecycleEvidence& boot,
-                                    ::ota::storage::OtaCandidateStore::Snapshot& out);
-#endif
   void formatFirmwareOtaStatus(char* reply, size_t reply_size);
-  void formatFirmwareOtaInspection(const char* command, char* reply, size_t reply_size);
   bool isOtaAdminKey(const uint8_t key[32]) const;
   static bool otaAdminCheckThunk(void* ctx, const uint8_t key[32]);
 #endif

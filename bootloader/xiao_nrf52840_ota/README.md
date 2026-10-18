@@ -6,8 +6,11 @@ bench recovery additionally supports fresh pair replacement. The installer proce
 backup/install/trial/rollback and returns to that recovery path when needed.
 The informational boot marker is not a signing authority: admission still uses
 the receiver's current MeshCore administrator permissions.
-Provision the intended sender contact and OTA-administrator permission explicitly.
-Admission and COMMIT check the owner's signature and current permission; the
+During initial commissioning, provision the intended sender contact and
+OTA-administrator permission explicitly. Normal firmware upgrades preserve the
+existing identity, administrator contacts and preferences; they do not require
+reprovisioning. Commissioning backup is a separate explicit operation.
+Admission and activation check the owner's signature and current permission; the
 installer verifies `command.admitted_signer_public_key_ed25519` and delegates
 administrator policy to the trusted app, not an independently pinned publisher root.
 The all-zero reference marker requires no generated key header. `--key-header`
@@ -20,6 +23,24 @@ The public vendor source is
 directory. Base XIAO, Sense XIAO and SenseCAP select their actual vendor BSP;
 Sense retains its own CF2/USB identity while sharing logical Xiao OTA family.
 Both role IDs are supported: companion 0, repeater 1.
+
+## OTA v4 platform boundary
+
+The radio receiver authenticates the complete manifest and verifies each decoded
+8192-byte raw chunk before passing sequential, at-most-128-byte writes to the
+platform. Erasure is lazy and confined to the uncheckpointed chunk. The final raw
+image SHA-256 and genuine current-administrator canonical59 signature are checked
+again before publishing the boot command. Its existing 220-byte version-3 record
+is a retained **bootloader ABI**, not compatibility with an old radio protocol.
+
+The A/B staging journal retains the full manifest, package hash and transaction
+through activation, trial and confirmation. Real boot state must bind that same
+transaction; a matching running SHA or confirmed counter alone cannot establish
+package-bound `Confirmed`. A malformed or ambiguous journal fails closed, including
+some interrupted metadata writes. Explicit fresh signed staging repair revokes
+both banks before replacement; it never clears the confirmed floor, personality
+or filesystems. Intact checkpoint recovery rehashes every verified raw chunk.
+The product contract is [OTA v4](../../docs/lora_ota_v4.md).
 
 ## Build and package, without a device
 
@@ -342,6 +363,8 @@ can remap writes into protected ExtraFS even when the UF2's own addresses look
 safe. `tools/install_uf2.py` is now an offline artifact validator only; it does
 not flash or authorize a physical UF2 copy. Mass erase is not normal recovery.
 
-Direct nRF hardware deployment has succeeded. Solar hardware bootstrap/update,
-ESP hardware behavior, routed/fleet delivery and untested power-loss conditions
-are not qualified. See the [product guide](../../docs/lora_ota_users.md).
+Earlier nRF bootloader/platform hardware evidence predates OTA v4 and does not
+qualify this rewrite. OTA v4 has native fault-test and firmware-build evidence,
+not new physical-device qualification. Solar bootstrap/update, ESP hardware
+behavior, routed/fleet delivery and untested power-loss conditions remain
+unqualified. See the [OTA v4 contract](../../docs/lora_ota_v4.md).

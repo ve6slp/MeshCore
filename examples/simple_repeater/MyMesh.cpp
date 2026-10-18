@@ -8,17 +8,12 @@
 
 #if MESHCORE_LORA_OTA
 #include <helpers/ota/OtaBoardBackendCommon.h>
+#include <helpers/ota/OtaFirmwareBackend.h>
 #include <helpers/ota/OtaInspection.h>
 #include <helpers/ota/OtaWriteGate.h>
 #include <helpers/ota/OtaMeshTrialHealthTick.h>
 #include <helpers/radiolib/RadioDriverHealthLatch.h>
-__attribute__((weak)) bool otaBoardGetBootLifecycle(mesh::ota::OtaBootLifecycleEvidence& out) {
-  out = mesh::ota::OtaBootLifecycleEvidence();
-  return false;
-}
 __attribute__((weak)) bool otaBoardBootLifecycleVerificationPending() { return false; }
-__attribute__((weak)) bool otaBoardReadBootCandidate(const mesh::ota::OtaBootLifecycleEvidence&,
-                                                    ::ota::storage::OtaCandidateStore::Snapshot&) { return false; }
 __attribute__((weak)) bool otaBoardApplyRfProfile(float, float, uint8_t, uint8_t) { return false; }
 // Weak-defaulted in examples/companion_radio/MyMesh.cpp, strong-overridden
 // in variants/*/Ota*Backend.cpp -- that TU is never linked into THIS
@@ -50,18 +45,6 @@ __attribute__((weak)) bool otaBoardEarlyBootTrialOrUnknown() {
 __attribute__((weak)) bool otaBoardEarlyBootNormalProven() {
   return false;
 }
-// Weak default matches examples/companion_radio/MyMesh.cpp's declaration
-// exactly; strong board-level overrides (variants/xiao_nrf52/OtaProductionBackend.cpp,
-// variants/sensecap_solar/OtaProductionBackend.cpp) are linked in board-wide
-// (shared build_src_filter), so this repeater TU reaches the same real
-// attach path companion uses, with a safe no-op fallback on boards lacking
-// a backend override.
-__attribute__((weak)) bool configureCompanionFirmwareOtaBackend(mesh::ota::OtaFirmwareIntegration&) {
-  return false;
-}
-// Same weak-default pattern as examples/companion_radio/MyMesh.cpp's
-// declaration (see its own comment); used by formatFirmwareOtaStatus()
-// below.
 __attribute__((weak)) const char* otaBoardInstallCapabilityStatus() {
   return "backend not configured";
 }
@@ -501,6 +484,9 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
+#if MESHCORE_LORA_OTA
+  if (getOtaIntegration().leaseActive()) return false;
+#endif
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -801,8 +787,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
 #if MESHCORE_LORA_OTA
       static std::atomic_flag reply_busy = ATOMIC_FLAG_INIT;
-      mesh::ota::OtaBoardProofScratchLease reply_lease(reply_busy);
-      if (!reply_lease) return;
+      if (reply_busy.test_and_set(std::memory_order_acquire)) return;
+      struct ReplyRelease {
+        std::atomic_flag& flag;
+        ~ReplyRelease() { flag.clear(std::memory_order_release); }
+      } reply_release{reply_busy};
       static uint8_t temp[166];
 #else
       uint8_t temp[166];
@@ -1088,24 +1077,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #endif
 
 #if MESHCORE_LORA_OTA
-  // Real attach path (trust provider + staging sink), same free-function
-  // companion calls -- attach is identity-independent crypto/staging
-  // wiring (no identity-dependent OTA send/recv dispatch happens here),
-  // called once, after self_id/ACL are established above.
-  configureCompanionFirmwareOtaBackend(getOtaIntegration());
-  // Identity-dependent wiring (must happen here, now that self_id/acl
-  // exist): without this, the repeater's lean receiver has a null admin
-  // check (every RF Authorization is fail-closed Denied, never actually
-  // admitted) and no target identity (every target-bound Commit/Abort
-  // is fail-closed Unavailable) -- this was previously missing entirely.
-  getOtaIntegration().setLeanAdminCheck(this, &MyMesh::otaAdminCheckThunk);
-  if (_identity_available_) getOtaIntegration().setLeanTargetPublicKey(self_id.pub_key);
-  getOtaIntegration().attachRfProfileIdentity(this, &MyMesh::otaSignThunk, &MyMesh::otaRadioChangeThunk,
-                                       static_cast<uint32_t>(_prefs.freq * 1000.0f + 0.5f));
-  getOtaIntegration().attachBootLifecycle(this, &MyMesh::otaBootLifecycleThunk, &MyMesh::otaBootCandidateThunk);
-#if defined(NRF52840_XXAA)
-  getOtaIntegration().attachCommitReboot(nullptr, [](void*) { board.reboot(); });
-#endif
+  configureV4Ota();
 #endif
 }
 
@@ -1122,7 +1094,7 @@ void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint3
 
 void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) {
 #if MESHCORE_LORA_OTA
-  getOtaIntegration().stopDirect();
+  getOtaIntegration().requestLeaseStop(_ms->getMillis());
 #endif
   pending_freq = freq;
   pending_bw = bw;
@@ -1133,105 +1105,55 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
 }
 
 #if MESHCORE_LORA_OTA
-bool MyMesh::setFirmwareOtaMode(const char* mode) {
-  mesh::ota::FirmwareOtaMode parsed;
-  if (!mesh::ota::parseFirmwareOtaMode(mode, parsed)) return false;
-  getOtaIntegration().setMode(parsed);
-  return true;
+void MyMesh::configureV4Ota() {
+  using namespace mesh::ota::v4;
+  RuntimeHooks hooks;
+  hooks.context = this;
+  hooks.identity = [](void* ctx, uint8_t out[32]) {
+    auto& node = *static_cast<MyMesh*>(ctx);
+    if (!node._identity_available_) return Result::State;
+    memcpy(out, node.self_id.pub_key, 32);
+    return Result::Ok;
+  };
+  hooks.isCurrentAdmin = &MyMesh::otaAdminCheckThunk;
+  hooks.sign = [](void* ctx, const char* domain, size_t domain_size, const uint8_t* data,
+                  size_t size, uint8_t out[64]) {
+    auto& node = *static_cast<MyMesh*>(ctx);
+    uint8_t message[256];
+    if (!node._identity_available_ || domain_size > sizeof(message) || size > sizeof(message) - domain_size)
+      return Result::State;
+    if (domain_size) memcpy(message, domain, domain_size);
+    memcpy(message + domain_size, data, size);
+    node.self_id.sign(out, message, domain_size + size);
+    return Result::Ok;
+  };
+  getOtaIntegration().attachProfile(this,
+      [](void* ctx, uint32_t frequency, uint32_t bandwidth, uint8_t sf, uint8_t cr, bool restore) {
+        auto& node = *static_cast<MyMesh*>(ctx);
+        if (!node._radio_available_) return false;
+        return otaBoardApplyRfProfile(restore ? node._prefs.freq : frequency / 1000.0f,
+            restore ? node._prefs.bw : bandwidth / 1000.0f,
+            restore ? node._prefs.sf : sf, restore ? node._prefs.cr : cr);
+      });
+  hooks.lease = [](void* ctx, uint32_t frequency, uint32_t bandwidth, uint8_t sf, uint8_t cr, uint32_t duration) {
+    auto& node = *static_cast<MyMesh*>(ctx);
+    if (node._temporary_radio_lease.pending()) return Result::Busy;
+    return node.getOtaIntegration().lease(node._ms->getMillis(),
+        !node.isSendInProgress() && !node._radio->isReceiving(),
+        frequency, bandwidth, sf, cr, duration);
+  };
+  getOtaIntegration().attach(otaBoardConfigureV4Backend(hooks));
 }
 
 bool MyMesh::setFirmwareOtaDutyCycle(float percent) {
   if (!std::isfinite(percent) || percent < 0.0f || percent > 100.0f) return false;
-  if (!getOtaIntegration().setDutyCyclePercent(percent)) return false;
   return setOtaAirtimeDutyCyclePercent(percent);
 }
 
-void MyMesh::abortFirmwareOta() {
-  getOtaIntegration().abortSession();
-  if (_temporary_radio_lease.pending()) {
-    _temporary_radio_lease.cancel(_ms->getMillis());
-    revertTempRadioLeaseIfDue();
-  }
-}
-
-void MyMesh::rollbackFirmwareOta() {
-  getOtaIntegration().requestRollback();
-  abortFirmwareOta();
-}
-
 void MyMesh::formatFirmwareOtaStatus(char* reply, size_t reply_size) {
-  auto& integration = getOtaIntegration();
-  const auto boot = integration.bootLifecycle();
-  const auto view = integration.inspectReadback(boot);
-  if (view.snapshot.storageUnavailable) {
-    snprintf(reply, reply_size, "Err - candidate storage unavailable");
-    return;
-  }
-  mesh::ota::formatOtaBootLifecycleStatus(reply, reply_size, boot,
-      view.emptyStore && !view.snapshot.valid ? mesh::ota::usb::UsbOtaPhase::Idle : view.phase,
-      view.snapshot.counter, view.snapshot.valid);
+  mesh::ota::formatOtaStatus(reply, reply_size, getOtaIntegration());
 }
 
-__attribute__((noinline)) void MyMesh::formatFirmwareOtaInspection(const char* command, char* reply, size_t reply_size) {
-  if (strcmp(command, "radio") == 0) {
-    mesh::RadioDriverFaultDiagnostic diagnostic;
-    if (!_radio) {
-      snprintf(reply, reply_size, "Err - radio unavailable");
-    } else if (!_radio->getDriverFaultDiagnostic(diagnostic)) {
-      snprintf(reply, reply_size, "Err - radio diagnostic unsupported");
-    } else {
-      const auto& integration = getOtaIntegration();
-      if (!mesh::formatRadioDriverFaultDiagnostic(reply, reply_size, diagnostic,
-          _radio->isInRecvMode(), isSendInProgress(),
-          integration.directActive(), integration.directPending())) {
-        snprintf(reply, reply_size, "Err - radio diagnostic too long");
-      }
-    }
-    return;
-  }
-  if (strcmp(command, "service") == 0) {
-    if (!_mgr) {
-      snprintf(reply, reply_size, "Err - packet manager unavailable");
-      return;
-    }
-    const uint32_t now_ms = _ms->getMillis();
-    const auto& integration = getDispatcherOtaIntegration();
-    mesh::RadioServiceDiagnostic diagnostic;
-    diagnostic.freeCount = _mgr->getFreeCount();
-    diagnostic.outboundTotal = _mgr->getOutboundTotal();
-    diagnostic.txTimeoutCount = getTxTimeoutCount();
-    diagnostic.otaAccountingFailureCount = getOtaAccountingFailureCount();
-    diagnostic.remainingTxBudget = getRemainingTxBudget();
-    diagnostic.remainingOtaAirtimeBudget = getRemainingOtaAirtimeBudget(now_ms);
-    diagnostic.normalTrafficQueued = hasQueuedNormalTraffic();
-    diagnostic.directActive = integration.directActive();
-    diagnostic.directPending = integration.directPending();
-    uint8_t frame[mesh::ota::kOtaDirectFrameBytes];
-    size_t frame_len = 0;
-    diagnostic.controlDue = integration.peekOutboundControlFrame(frame, sizeof(frame), frame_len, now_ms);
-    if (diagnostic.controlDue) {
-      diagnostic.controlLength = static_cast<uint16_t>(frame_len);
-      diagnostic.controlKind = frame_len > 0 ? frame[0] : 0;
-    }
-    if (!mesh::formatRadioServiceDiagnostic(reply, reply_size, diagnostic)) {
-      snprintf(reply, reply_size, "Err - service diagnostic too long");
-    }
-    return;
-  }
-  auto& integration = getOtaIntegration();
-  if (strcmp(command, "codec") == 0) {
-    mesh::ota::formatOtaCodec(reply, reply_size, integration.leanReceiver());
-    return;
-  }
-  if (strcmp(command, "settings") == 0) {
-    mesh::ota::formatOtaSettings(reply, reply_size, integration);
-    return;
-  }
-  const auto boot = integration.bootLifecycle();
-  const auto view = integration.inspectReadback(boot);
-  if (strcmp(command, "progress") == 0) mesh::ota::formatOtaProgress(reply, reply_size, view);
-  else mesh::ota::formatOtaCandidate(reply, reply_size, view);
-}
 #endif
 
 void MyMesh::applyRadioParams(float freq, float bw, uint8_t sf, uint8_t cr) {
@@ -1459,34 +1381,12 @@ bool MyMesh::otaAdminCheckThunk(void* ctx, const uint8_t key[32]) {
   return ctx != nullptr && static_cast<MyMesh*>(ctx)->isOtaAdminKey(key);
 }
 
-void MyMesh::otaSignThunk(void* ctx, const uint8_t* message, size_t len, uint8_t signature[64]) {
-  static_cast<MyMesh*>(ctx)->self_id.sign(signature, message, static_cast<int>(len));
-}
-
-bool MyMesh::otaRadioChangeThunk(void* ctx, uint32_t frequency_khz, mesh::ota::OtaDirectProfile profile, bool restore) {
-  auto* mesh = static_cast<MyMesh*>(ctx);
-  if (!mesh->_radio_available_) return false;
-  return otaBoardApplyRfProfile(restore ? mesh->_prefs.freq : frequency_khz / 1000.0f,
-                         restore ? mesh->_prefs.bw : mesh::ota::otaDirectBandwidthHz(profile) / 1000.0f,
-                         restore ? mesh->_prefs.sf : 5, restore ? mesh->_prefs.cr : 5);
-}
-bool MyMesh::otaBootLifecycleThunk(void*, mesh::ota::OtaBootLifecycleEvidence& out) {
-  return otaBoardGetBootLifecycle(out);
-}
-bool MyMesh::otaBootCandidateThunk(void*, const mesh::ota::OtaBootLifecycleEvidence& boot,
-                                  ::ota::storage::OtaCandidateStore::Snapshot& out) {
-  return otaBoardReadBootCandidate(boot, out);
-}
 #endif
 
 #if XIAO_OTA_USB_RECOVERY
 bool MyMesh::uf2RebootAllowed() {
-  const auto phase = getOtaIntegration().readback().phase;
-  using Phase = mesh::ota::usb::UsbOtaPhase;
   return !_ota_destructive_writes_disallowed_ && !otaBoardTrialHealthWindowActive() &&
-      !otaBoardBootLifecycleVerificationPending() && !getOtaIntegration().hasPendingRfWork() &&
-      phase != Phase::Erasing && phase != Phase::Receiving && phase != Phase::Verifying && phase != Phase::Ready &&
-      phase != Phase::CacheSealed && phase != Phase::CommitPending && phase != Phase::Trial;
+      !otaBoardBootLifecycleVerificationPending() && !getOtaIntegration().busy();
 }
 #endif
 
@@ -1612,43 +1512,22 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     }
 #if MESHCORE_LORA_OTA
   } else if (memcmp(command, "ota ", 4) == 0) {
-    // Real admin control surface, reached ONLY via the same trust gates
-    // handleCommand() already enforces: local serial (sender_timestamp==0,
-    // physically-present trusted owner) or a remote client already
-    // confirmed client->isAdmin() by the PAYLOAD_TYPE_TXT_MSG caller
-    // before handleCommand() is ever invoked -- no new admin/auth path.
     const char* sub = command + 4;
-    while (*sub == ' ') sub++;
-    if (strcmp(sub, "status") == 0) {
+    if (!strcmp(sub, "status") || !strcmp(sub, "progress")) {
       formatFirmwareOtaStatus(reply, 160);
-    } else if (strcmp(sub, "progress") == 0 || strcmp(sub, "candidate") == 0 ||
-               strcmp(sub, "settings") == 0 || strcmp(sub, "codec") == 0) {
-      formatFirmwareOtaInspection(sub, reply, 160);
-    } else if (strcmp(sub, "radio") == 0 || strcmp(sub, "service") == 0) {
-      if (sender_timestamp != 0 || !local_usb) {
-        strcpy(reply, "Err - local USB only");
-      } else {
-        formatFirmwareOtaInspection(sub, reply, 160);
-      }
-    } else if (strcmp(sub, "preflight") == 0 || strcmp(sub, "capability") == 0) {
-      mesh::ota::formatOtaOrdinaryWriteDiagnostic(reply, 160, _ota_destructive_writes_disallowed_,
-          strcmp(sub, "preflight") == 0 ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
-    } else if (strncmp(sub, "abort", 5) == 0) {
-      const auto result = mesh::ota::handleOtaAdminAbortCommand(getOtaIntegration(), authenticated_admin, sub);
-      using Result = mesh::ota::usb::UsbOtaResult;
-      if (result == Result::Ok) {
-        abortFirmwareOta();
-      }
-      mesh::ota::formatOtaAdminAbortResult(reply, 160, result);
-    } else if (strcmp(sub, "rollback") == 0) {
-      rollbackFirmwareOta();
-      strcpy(reply, "OK");
-    } else if (memcmp(sub, "mode ", 5) == 0) {
-      if (setFirmwareOtaMode(sub + 5)) strcpy(reply, "OK"); else strcpy(reply, "Err - bad mode");
-    } else if (memcmp(sub, "duty ", 5) == 0) {
-      if (setFirmwareOtaDutyCycle((float)atof(sub + 5))) strcpy(reply, "OK"); else strcpy(reply, "Err - bad duty");
+    } else if (!strcmp(sub, "preflight") || !strcmp(sub, "capability")) {
+      snprintf(reply, 160, "writes=%s %s", _ota_destructive_writes_disallowed_ ? "held" : "allowed",
+          !strcmp(sub, "preflight") ? otaBoardEarlyWriteDiagnostic() : otaBoardInstallCapabilityStatus());
+    } else if (!strcmp(sub, "identity")) {
+      char key[65];
+      mesh::Utils::toHex(key, self_id.pub_key, 32);
+      snprintf(reply, 160, "identity=%s available=%u durable=%u fs_fault=%u", key,
+          _identity_available_, _ota_service_.identityConfirmedLoaded(), _ota_service_.trialFilesystemFaultObserved());
+    } else if (!strcmp(sub, "lease stop")) {
+      strcpy(reply, !isSendInProgress() && !_radio->isReceiving() &&
+          getOtaIntegration().stopLease() ? "OK" : "Err - busy");
     } else {
-      strcpy(reply, "Err - usage: ota status|progress|candidate|settings|radio|service|preflight|capability|abort|rollback|mode <direct|routed|fleet>|duty <pct>");
+      strcpy(reply, "OTA v4: status|progress|identity|preflight|capability|lease stop; abort/repair require signed v4 controls");
     }
 #endif
   } else{
@@ -1658,8 +1537,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
 void MyMesh::loop() {
 #if MESHCORE_LORA_OTA
-  if (!_identity_available_) getOtaIntegration().stopDirect();
-  getOtaIntegration().tickDirect(_ms->getMillis(), !isSendInProgress() && _mgr->getOutboundTotal() == 0);
+  if (!_identity_available_ || !_radio_available_)
+    getOtaIntegration().tick(_ms->getMillis(), _radio_available_ && !isSendInProgress() && !_radio->isReceiving());
 #endif
 #ifdef WITH_BRIDGE
   bridge.loop();
@@ -1692,6 +1571,9 @@ void MyMesh::loop() {
       updateAdvertTimer(); // schedule next local advert
     }
 
+#if MESHCORE_LORA_OTA
+    if (!getOtaIntegration().leaseActive())
+#endif
     if (_temporary_radio_lease.applyIfDue(_ms->getMillis(), [this]() {
       applyRadioParams(pending_freq, pending_bw, pending_sf, pending_cr);
     })) MESH_DEBUG_PRINTLN("Temp radio params");
@@ -1725,9 +1607,7 @@ void MyMesh::loop() {
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
-#if MESHCORE_LORA_OTA && defined(NRF52840_XXAA)
-  getOtaIntegration().tickCommitReboot(_ms->getMillis(), isSendInProgress(), _mgr->getOutboundTotal() != 0);
-#endif
+
 #if XIAO_OTA_USB_RECOVERY
   if (_uf2_reboot_pending) {
     if (!uf2RebootAllowed()) {
