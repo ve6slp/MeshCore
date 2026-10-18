@@ -17,38 +17,10 @@ OTA_NRF52_TARGET_ENVS ?= Xiao_nrf52_companion_radio_ota_usb Xiao_nrf52_repeater_
 OTA_ESP32_TARGET_ENVS ?= Xiao_S3_WIO_companion_radio_ota_usb Xiao_S3_WIO_repeater_ota_usb
 OTA_TARGET_ENVS ?= $(OTA_NRF52_TARGET_ENVS) $(OTA_ESP32_TARGET_ENVS)
 
-OTA_DEPLOY_TRANSPORT ?= native
-OTA_DEPLOY_CLIENT_PORT ?=
-OTA_DEPLOY_CLIENT_DTR ?= 0
-OTA_DEPLOY_INSTALL_TIMEOUT ?= 300
-# Directed/background deploys always use attempt-diverse reliable framing; 0 is refused for on-mesh modes.
-OTA_DEPLOY_ROUTED_RETRY ?= 1
-OTA_UPLOAD_IMAGE ?=
-OTA_UPLOAD_MANIFEST ?=
-OTA_UPLOAD_BOARD ?=
-OTA_UPLOAD_ROLE_ID ?=
-OTA_UPLOAD_COUNTER ?=
-OTA_UPLOAD_TARGET ?=
-OTA_UPLOAD_MODE ?= directed
-OTA_UPLOAD_CHANNEL ?= 255
-OTA_UPLOAD_FREQ_KHZ ?= 0
-OTA_UPLOAD_LEASE_MS ?= 60000
-OTA_UPLOAD_DUTY_MILLI_PERCENT ?= 2000
-OTA_UPLOAD_TIMEOUT ?= 14400
-OTA_UPLOAD_REUPLOAD ?= 0
-OTA_UPLOAD_COMPRESSION ?= raw
-OTA_COMPRESSION_MAX_RELAY_HOPS ?=
+OTA_ARGS ?=
 OTA_ARTIFACT_DIR ?=
-OTA_STOCK_BINDING ?=
-OTA_STOCK_SERIAL ?=
-OTA_STOCK_SENDER_KEY ?=
-OTA_STOCK_RELAY_KEY ?=
-OTA_STOCK_PATH_HASH_BYTES ?= 1
-OTA_STOCK_RESUME_RECEIPT ?=
-OTA_STOCK_ARGS ?=
-OTA_MANAGEMENT_ARGS ?=
-OTA_DEVICE_PORT ?= $(OTA_DEPLOY_CLIENT_PORT)
-OTA_DEVICE_DTR ?= $(OTA_DEPLOY_CLIENT_DTR)
+OTA_DEVICE_PORT ?=
+OTA_DEVICE_DTR ?= 0
 OTA_DEVICE_TIMEOUT ?= 5
 XIAO_OTA_PAIR_BOARD ?=
 XIAO_OTA_PAIR_ROLE_ID ?=
@@ -85,7 +57,7 @@ OTA_ARM_PREFIX ?= $(HOME)/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-
 OTA_COMPRESSION_REPORT_ARGS ?=
 export OTA_COMPRESSION_FIXTURE := $(TMPDIR)/compression/fixture.bin
 
-.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-ota-deploy test-ota-stock-companion test-ota-management build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota-device-inspect ota-deploy ota-stock-companion ota-management build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
+.PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota ota-device-inspect build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
 
 build: tmpdir
 	@test -n "$(strip $(ENV))" || { echo 'Select one firmware environment with ENV=... .' >&2; exit 1; }
@@ -103,12 +75,6 @@ test: tmpdir test-ota-host
 test-ota: test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-xiao-ota-bootloader
 test-ota-host: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_*.py'
-test-ota-deploy: tmpdir
-	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_deploy.py'
-test-ota-stock-companion: tmpdir
-	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_stock_companion.py'
-test-ota-management: tmpdir
-	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_management.py'
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
 .PHONY: test-ota-v4-native
@@ -168,46 +134,8 @@ build-ota-esp32-targets:
 # Inspection never resets, configures, or infers OTA capability from USB IDs.
 ota-device-inspect:
 	$(PYTHON) scripts/ota_devices.py inspect --by-id "$(OTA_DEVICE_PORT)" --timeout "$(OTA_DEVICE_TIMEOUT)" $(if $(filter 1,$(OTA_DEVICE_DTR)),--dtr)
-ota-stock-companion:
-	$(PYTHON) scripts/ota_stock_companion.py $(OTA_STOCK_ARGS)
-ota-management:
-	$(PYTHON) scripts/ota_management.py $(OTA_MANAGEMENT_ARGS)
-
-# One selected board/role/image/counter: stage -> READY -> signed COMMIT -> matching Installed.
-ota-deploy: tmpdir
-	@test -n "$(OTA_DEPLOY_CLIENT_PORT)" && test -n "$(OTA_UPLOAD_IMAGE)" && test -n "$(OTA_UPLOAD_TARGET)" && test -n "$(OTA_UPLOAD_BOARD)" && test -n "$(OTA_UPLOAD_ROLE_ID)" && test -n "$(OTA_UPLOAD_COUNTER)" || { echo 'Select explicit client port, image, target, board, role and counter.' >&2; exit 1; }
-ifeq ($(OTA_DEPLOY_TRANSPORT),native)
-	$(PYTHON) scripts/ota_uploader.py --client-port "$(OTA_DEPLOY_CLIENT_PORT)" $(if $(filter 1,$(OTA_DEPLOY_CLIENT_DTR)),--client-dtr) \
-	  $(if $(strip $(OTA_ARTIFACT_DIR)),--artifact-dir "$(OTA_ARTIFACT_DIR)") --timeout "$(OTA_UPLOAD_TIMEOUT)" deploy \
-	  --image "$(OTA_UPLOAD_IMAGE)" $(if $(strip $(OTA_UPLOAD_MANIFEST)),--manifest "$(OTA_UPLOAD_MANIFEST)") \
-	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
-	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" \
-	  --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --duty-milli-percent "$(OTA_UPLOAD_DUTY_MILLI_PERCENT)" \
-	  --compression "$(OTA_UPLOAD_COMPRESSION)" \
-	  $(if $(strip $(OTA_STOCK_BINDING)),--stream-binding "$(OTA_STOCK_BINDING)") \
-	  $(if $(strip $(OTA_STOCK_RESUME_RECEIPT)),--stream-resume-receipt "$(OTA_STOCK_RESUME_RECEIPT)") \
-	  $(if $(strip $(OTA_STOCK_RELAY_KEY)),--relay-key "$(OTA_STOCK_RELAY_KEY)") \
-	  --path-hash-bytes "$(OTA_STOCK_PATH_HASH_BYTES)" \
-	  $(if $(strip $(OTA_COMPRESSION_MAX_RELAY_HOPS)),--max-relay-hops "$(OTA_COMPRESSION_MAX_RELAY_HOPS)") \
-	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
-else ifeq ($(OTA_DEPLOY_TRANSPORT),stock)
-	@test -n "$(OTA_ARTIFACT_DIR)" && test -n "$(OTA_STOCK_BINDING)" && test -n "$(OTA_STOCK_SERIAL)" && test -n "$(OTA_STOCK_SENDER_KEY)" || { echo 'Stock requires a new artifact directory, binding, serial and sender key.' >&2; exit 1; }
-	$(PYTHON) scripts/ota_stock_companion.py deploy --by-id "$(OTA_DEPLOY_CLIENT_PORT)" --serial "$(OTA_STOCK_SERIAL)" \
-	  $(if $(filter 1,$(OTA_DEPLOY_CLIENT_DTR)),--client-dtr) \
-	  --sender-key "$(OTA_STOCK_SENDER_KEY)" --binding "$(OTA_STOCK_BINDING)" --artifacts "$(OTA_ARTIFACT_DIR)" $(OTA_STOCK_ARGS) \
-	  --image "$(OTA_UPLOAD_IMAGE)" $(if $(strip $(OTA_UPLOAD_MANIFEST)),--manifest "$(OTA_UPLOAD_MANIFEST)") \
-	  --board "$(OTA_UPLOAD_BOARD)" --role-id "$(OTA_UPLOAD_ROLE_ID)" --counter "$(OTA_UPLOAD_COUNTER)" --target "$(OTA_UPLOAD_TARGET)" \
-	  --mode "$(OTA_UPLOAD_MODE)" --channel "$(OTA_UPLOAD_CHANNEL)" \
-	  $(if $(strip $(OTA_STOCK_RELAY_KEY)),--relay-key "$(OTA_STOCK_RELAY_KEY)") --path-hash-bytes "$(OTA_STOCK_PATH_HASH_BYTES)" \
-	  $(if $(strip $(OTA_STOCK_RESUME_RECEIPT)),--resume-receipt "$(OTA_STOCK_RESUME_RECEIPT)") \
-	  --frequency-khz "$(OTA_UPLOAD_FREQ_KHZ)" --lease-ms "$(if $(filter direct,$(OTA_UPLOAD_MODE)),$(OTA_UPLOAD_LEASE_MS),0)" --timeout "$(OTA_UPLOAD_TIMEOUT)" \
-	  --normal-duty-percent "$$( $(PYTHON) -c 'print(float("$(OTA_UPLOAD_DUTY_MILLI_PERCENT)") / 1000)' )" \
-	  --compression "$(OTA_UPLOAD_COMPRESSION)" \
-	  $(if $(strip $(OTA_COMPRESSION_MAX_RELAY_HOPS)),--max-relay-hops "$(OTA_COMPRESSION_MAX_RELAY_HOPS)") \
-	  --install-timeout "$(OTA_DEPLOY_INSTALL_TIMEOUT)" $(if $(filter 1,$(OTA_UPLOAD_REUPLOAD)),--reupload) $(if $(filter 0,$(OTA_DEPLOY_ROUTED_RETRY)),--no-routed-retry)
-else
-	@echo 'OTA_DEPLOY_TRANSPORT must be native or stock.' >&2; exit 1
-endif
+ota: tmpdir
+	$(PYTHON) scripts/ota_uploader.py $(OTA_ARGS)
 
 build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair: tmpdir
 	@test -n "$(XIAO_OTA_PAIR_BOARD)" && test -n "$(XIAO_OTA_PAIR_ROLE_ID)" || { echo 'Select XIAO_OTA_PAIR_BOARD and XIAO_OTA_PAIR_ROLE_ID.' >&2; exit 1; }
