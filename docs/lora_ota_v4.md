@@ -1,0 +1,145 @@
+# MeshCore OTA v4
+
+This is a clean-break, experimental update protocol carried by MeshCore's OTA
+payload type (`0x0c`). It does not accept the earlier lab protocol. Installing
+firmware is not commissioning a device: identity, administrators, preferences,
+and the confirmed rollback floor are never part of an application package.
+
+## Integrity and airtime
+
+The package contains one signed manifest and independently compressed 8192-byte
+raw-image chunks. Each chunk uses raw, LZMA, or LZMA with Thumb filtering,
+whichever is smallest. LZMA uses the fixed 8192-byte dictionary, `lc=0, lp=1,
+pb=1` profile; compressed data must include its end marker and have no trailing
+bytes. The last raw chunk can be shorter. Incompressible chunks stay raw.
+
+A flat list of raw chunk SHA-256 hashes is authenticated by the manifest.
+For the 519940-byte Solar image there are 64 chunks: 2048 bytes of hashes,
+plus three bytes per chunk for codec and stored length. A separately supplied
+seven-hash Merkle proof per chunk would cost 14336 bytes. Proof caching or
+multiproofs can reduce that cost, but add state and recovery complexity without
+helping this bounded, full-image transfer. The manifest is bounded to 8192 bytes
+and 128 chunks; there is no dynamically growing hash tree.
+
+Data has no signatures. Each radio slice has a CRC-32 for accidental corruption;
+the receiver hashes the complete decoded raw chunk before making durable
+progress. It then checks the exact full raw-image SHA-256 before READY and again
+at the platform's installation boundary. CRC is not an authentication mechanism.
+Hostile slices can delay a transfer, but cannot authorize a different image.
+
+## Package encoding
+
+All integers are unsigned, big-endian. The signed manifest is:
+
+| Field | Bytes |
+|---|---:|
+| ASCII `MCO4` | 4 |
+| Version (`4`) | 1 |
+| Raw chunk size log2 (`13`) | 1 |
+| Chunk count | 2 |
+| Manifest signer's public key | 32 |
+| Canonical boot image descriptor | 59 |
+| Real signature on the canonical boot descriptor | 64 |
+| Chunk entries: codec u8, stored length u16, raw SHA-256 | 35 each |
+| Manifest signature | 64 |
+
+The manifest signature covers the domain `MeshCore OTA package v4` followed by
+one NUL byte and every preceding manifest byte. The package identifier is the
+SHA-256 of the complete signed manifest. Its first eight bytes are the radio
+tag; complete hashes remain authoritative at admission and activation.
+The canonical 59-byte descriptor is an existing boot safety ABI, not an old
+radio-protocol compatibility layer. Its signature is genuine, not synthesized
+by the receiver. It binds board family, board variant, role, application
+address, exact raw size, raw hash, security counter and installer capabilities.
+Chunks follow the manifest in entry order with exactly the stated lengths.
+
+## Radio framing
+
+`src/helpers/ota/OtaV4Protocol.h` is the byte-level contract. Every frame is:
+
+| Field | Bytes |
+|---|---:|
+| Magic (`0xd4`) and kind | 2 |
+| Nonzero transmission attempt | 4 |
+| Package tag | 8 |
+| Object index | 2 |
+| Complete object length | 2 |
+| Slice index | 1 |
+| Slice bytes | 1..128 |
+| IEEE CRC-32 over header and slice | 4 |
+
+Full frames are 151 bytes with 128 useful bytes. Slices have fixed 128-byte
+geometry; only the final slice is short. The object index is the raw chunk
+index for DATA, zero for manifest/commands, and the request identifier for
+replies. Retries get a new attempt before MeshCore duplicate suppression.
+Attempts do not grant authority and do not advance durable receiver state.
+
+Stock serial's 176-byte limit is a transport constraint, not an OTA payload
+size. Adapters must account for serial command/reply bytes, the MeshCore
+header, path hash width and maximum path growth before accepting a route.
+They must reject a route that cannot carry these fixed slices rather than
+truncate, rely on implicit fragmentation, or silently change protocols.
+Native serial and stock serial carry the same OTA objects.
+
+## Authority and transaction
+
+One receiver engine owns `Receiving -> Verifying -> Ready ->
+ActivationPending -> Trial -> Confirmed`, with explicit Aborted, Failed and
+MetadataFault outcomes. No second cache receiver or RF uploader owns competing
+state. The sender can distribute the same chunks once to an admitted fleet.
+Receivers expose a next-chunk index and 64-bit missing-slice bitmap for repair.
+Only one chunk is assembled at a time; interruption loses at most that chunk's
+RAM slices, not verified durable progress.
+
+A signed manifest alone never admits or activates an update. Admission is
+signed by a current administrator, names the full receiver key and full package
+hash, and binds the receiver's unpredictable boot challenge and expected
+durable generation. Activation and abort name the admitted transaction nonce
+and generation. Current authority is checked at every state-changing boundary,
+including activation. Package-signing authority is checked before admission
+and activation. Counters must exceed the confirmed floor.
+
+Signed commands have owner key (32), target key (32), package hash (32), nonce
+(16), expected generation (4), signature (64). Their domain is
+`MeshCore OTA <action> v4` followed by NUL, where action is `admit`, `activate`,
+`abort`, or `repair`. The signature covers the domain and the first 116 bytes.
+Lease commands additionally bind their exact temporary radio profile and
+expiry. A lease never persists over ordinary radio preferences.
+
+Queries supply a fresh host nonce. Receiver-signed status binds that nonce to
+the full identity, current transaction, generation, confirmed floor and actual
+running-image evidence. Unsigned bitmap progress is scheduling advice only;
+it cannot establish authorization, READY, successful activation or installation.
+An ambiguous activation response is reconciled, never automatically re-admitted
+or blindly activated again.
+
+## Durability and device personality
+
+Verified chunk data reaches staging before its journal progress marker.
+Metadata compaction writes and verifies the replacement bank and commits its
+new generation before retiring the old bank. Torn records, generation ties,
+and ambiguous metadata fail closed; recovery must not revive a revoked READY
+record. An administrator can explicitly repair OTA staging without formatting
+the personality store or resetting the confirmed floor.
+
+The board adapter alone owns storage geometry, boot command construction,
+trial confirmation, rollback and installed-image evidence. The receiver owns
+the protocol transaction. The host owns one durable job and a transmitter-wide
+airtime scheduler, with transports limited to framing, routing and device I/O.
+An owned radio override expires and restores the unchanged ordinary settings,
+including the user's forwarding preference.
+
+## Design sources
+
+* [RFC 9019, section 3](https://www.rfc-editor.org/rfc/rfc9019.html#section-3):
+  transport-independent signed manifests, multicast distribution, decompression,
+  resumable delivery and status tracking.
+* [RFC 9124, section 4.2.11](https://www.rfc-editor.org/rfc/rfc9124.html#section-4.2.11):
+  authentic firmware is not necessarily authorized firmware; owner/operator
+  approval is a separate requirement.
+* [littlefs design](https://github.com/littlefs-project/littlefs/blob/master/DESIGN.md):
+  NOR erase/program constraints and bounded copy-on-write metadata recovery.
+
+These sources inform the design; this protocol does not claim SUIT, MCUboot or
+littlefs format compliance. Byte counts above are protocol arithmetic, not
+physical airtime measurements or a claim of production qualification.
