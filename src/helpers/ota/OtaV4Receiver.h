@@ -48,6 +48,7 @@ private:
   Journal journal_{};
   Manifest manifest_;
   bool started_ = false, recovering_ = false;
+  uint32_t candidateCounter_ = 0;
   uint8_t identity_[32] = {}, challenge_[16] = {};
   uint8_t manifestBytes_[kMaxManifestBytes] = {};
   size_t manifestSize_ = 0;
