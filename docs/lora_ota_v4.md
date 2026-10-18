@@ -222,6 +222,79 @@ Earlier v3 lab builds require a deliberate one-time bootstrap using their
 frozen tools or an explicitly approved application-only recovery procedure.
 The v4 product contains no v3 radio handler or automatic migration path.
 
+## Packages and durable jobs
+
+The host uses the explicitly selected companion's signing operation. It does
+not export its private key or read a private-key file. That companion's full
+public key must be a current OTA administrator on each target. For a repeater,
+the existing administrator ACL supplies this authority; for a companion,
+the physically trusted USB administrator operation manages it separately
+from ordinary contact permissions.
+
+The following variables represent explicit selections, not auto-discovered
+devices. The stock transport also requires `--usb-serial` with its actual
+physical serial. Use a stable physical-path anchor for duplicate serials.
+
+```sh
+make ota OTA_ARGS="build --by-id $PORT --owner $OWNER --transport stock --usb-serial $SERIAL \
+  --image $IMAGE --board sensecap_solar_p1 --role-id 1 --counter $COUNTER --output $PACKAGE"
+
+make ota OTA_ARGS="deploy --by-id $PORT --owner $OWNER --transport stock --usb-serial $SERIAL \
+  --package $PACKAGE --job $JOB --target $TARGET --flood --max-path-bytes 1 --duty 0.02"
+
+make ota OTA_ARGS="status --by-id $PORT --owner $OWNER --transport stock --usb-serial $SERIAL --job $JOB"
+```
+
+`$JOB` must name a new directory on first deploy. The host creates it with
+mode 0700 and stores its immutable package, route/target policy, signed
+observations, operation intents, transmitter cooldown and metrics separately
+from the firmware package. Package files are exclusive creations, never
+overwritten. Select a counter above the authenticated confirmed floor.
+
+Repeat the same deploy command with the existing job to resume. Changing
+targets, package, route, transport or duty policy while resuming is refused.
+A restart authenticates fresh receiver state and reconciles uncertain
+operations before sending more data. `--stage-only` stops at authenticated
+READY without authorizing activation. A later deploy of that same job
+deliberately requests activation and waits for matching signed confirmation.
+`abort --job ...` and `repair --job ...` are explicit administrator actions;
+neither is an automatic timeout or admission fallback.
+
+For an OTA-aware native companion select `--transport native`; its radio
+bridge carries the same frames. `--local` feeds that companion's own receiver
+without RF, using the same signed transaction and a target equal to its
+full public key. This is not a separate cache/upload engine.
+
+The default transfer leaves ordinary sender radio and forwarding preferences
+unchanged. Stock CMD11 persists preferences and has no autonomous expiry:
+the stock adapter refuses to call it as a supposedly temporary lease.
+Sender and receiver must already share a suitable legal radio profile.
+The declared maximum path growth must fit the 176-byte stock boundary in
+both directions; routes outside that bound fail before admission.
+
+## Evidence and limitations
+
+`make test-ota-host` builds and runs the actual native C++ receiver driver
+before the Python suite. Its end-to-end cases use real signatures and the
+production encoder, scheduler, serial framing and receiver; deterministic
+loss is injected only at the transport boundary. File-backed staging and a
+simulated boot-confirmation event do not establish physical flash or RF
+qualification. `make test-ota-v4-platform` exercises real journal/staging and
+boot command construction against fault-injected flash models.
+
+For a genuine firmware byte-stream run and a persistent encoder/frame report:
+
+```sh
+make test-ota-v4-image OTA_V4_IMAGE=/absolute/path/to/firmware.bin
+```
+
+The report defaults to `.tmp/ota-v4/image-evidence.json`. It distinguishes
+actual host execution counters, modeled RF bytes/airtime, receiver replies
+and historical physical-campaign elapsed time. Synthetic test signing keys
+and simulated confirmation are labeled explicitly. Historical v3 Solar
+results are not v4 hardware evidence, and elapsed wall-clock time is not
+measured airtime.
+
 ## Design sources
 
 * [RFC 9019, section 3](https://www.rfc-editor.org/rfc/rfc9019.html#section-3):

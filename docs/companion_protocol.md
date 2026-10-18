@@ -28,6 +28,24 @@ second cache/upload protocol. Stock companions use their existing raw-packet
 and signing operations. Neither transport changes the signed manifest,
 receiver admission, explicit activation or authenticated final readback.
 
+Native USB requests use `[67, 4, operation, body...]`; replies use
+`[30, 4, operation, result]`, with result values defined in `OtaV4Protocol.h`.
+The outer serial framing remains `<` or `>` followed by a little-endian u16
+length. OTA fields inside it are big-endian.
+
+| Operation | Body | Successful reply |
+|---|---|---|
+| 0, probe | Empty | Four-byte ABI reply |
+| 1, physical send | Complete serialized MeshCore OTA packet | ABI reply plus actual TX airtime in microseconds, u32 |
+| 2, local feed | One unchanged v4 frame | Four-byte ABI reply |
+| 4, set administrator | Existing contact's full key plus enabled u8 | Four-byte ABI reply |
+
+Operation 1 returns success only after physical TX completion, not queue
+admission. Local receiver output is pushed as `[30, 4, 3, v4_frame...]`;
+received RF is pushed as `[0x91, mesh_packet...]`. Probe does not grant
+installer authority. Administrator changes require the physically trusted
+local USB surface, not a BLE connection.
+
 The previous experimental CMD67 ABI3 cache/start/commit operations are removed.
 There is no mixed-version fallback. Earlier lab software and hardware results
 remain in the `feature/lora-ota` branch history, not the current deployment
