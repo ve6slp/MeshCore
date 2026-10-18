@@ -15,8 +15,9 @@ from ota_transport import Route
 SOLAR_V3 = {"image_bytes": 519940, "stored_bytes": 335494, "raw_group_bytes": 8064,
             "data_frames": 4074, "group_progress_tx": 1299, "census_tx": 115,
             "authorization_tx": 1, "capability_tx": 1, "total_tx": 5490,
-            "estimated_air_s": 7505.821,
-            "source": "published prior Solar v3 baseline; not re-encoded or physically measured"}
+            "elapsed_s": 7505.821,
+            "image_sha256": "2f548dab7cbefea792e1ce2d73205b9a0233f3f1b5c6c95d9b73093ddfb27c85",
+            "source": "published prior Solar v3 campaign; elapsed time is not measured airtime"}
 
 
 def measure(package, route, recipients=1, bandwidth=62500, sf=7, cr=5):
@@ -84,6 +85,7 @@ def measure(package, route, recipients=1, bandwidth=62500, sf=7, cr=5):
             "excludes": "loss/repairs, extra verification polls, leases, contention, CPU/flash time and duty waiting",
             "solar_v3_published_baseline": SOLAR_V3,
             "baseline_comparable_size_only": len(package.raw) == SOLAR_V3["image_bytes"],
+            "baseline_same_image": package.raw_hash.hex() == SOLAR_V3["image_sha256"],
             "comparison_requires_matching_radio_and_airtime_scope": True}
 
 

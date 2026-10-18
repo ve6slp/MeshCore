@@ -1,6 +1,7 @@
 """Production Python -> real native C++ receiver; no model of receiver business logic."""
 from collections import deque
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +16,7 @@ from test_ota_uploader import ADMIN, ADMIN_PRIVATE, POLICY, Scratch, TARGET, pac
 from test_ota_stock_companion import Clock
 from ota_common import Error, Frame, FramedSerial, Kind, Phase, physical_airtime
 from ota_job import JobStore
+from ota_compression_report import measure
 from ota_stock_companion import StockTransport
 from ota_transport import NativeTransport, Route, TxReceipt, packet_payload
 from ota_uploader import Scheduler
@@ -254,6 +256,23 @@ class NativeEndToEndTests(Scratch):
         scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
         scheduler.stage(clock() + 1000)
         self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    @unittest.skipUnless(os.environ.get("OTA_V4_IMAGE"), "explicit genuine firmware image target")
+    def test_genuine_firmware_image_reaches_byte_exact_signed_confirmed_state(self):
+        image = Path(os.environ["OTA_V4_IMAGE"]).read_bytes()
+        pkg, job, transport, clock = self.setup_job(image)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 100000)
+        statuses = scheduler.apply(clock() + 100000)
+        self.assertTrue(all(status.installed(pkg) for status in statuses))
+        report = measure(pkg, transport.route)
+        report["execution"] = scheduler.result()
+        report["execution_scope"] = (
+            "genuine image through production host, real-crypto native C++ receiver and file-backed "
+            "staging; synthetic test signing keys and simulated boot confirmation, not physical hardware")
+        output = Path(os.environ["OTA_V4_IMAGE_EVIDENCE"])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
     def test_explicit_abort_and_repair_preserve_confirmed_floor(self):
         _, job, transport, clock = self.setup_job(b"a" * 8192)

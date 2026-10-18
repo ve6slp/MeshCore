@@ -70,8 +70,28 @@ tmpdir:
 test: tmpdir test-ota-host
 	$(PLATFORMIO) test $(foreach e,$(NATIVE_TEST_ENVS),-e $(e))
 test-ota: test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-xiao-ota-bootloader
-test-ota-host: tmpdir
-	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_*.py'
+OTA_V4_DRIVER := $(TMPDIR)/ota-v4/receiver
+.PHONY: build-ota-v4-driver test-ota-v4-e2e test-ota-v4-platform
+build-ota-v4-driver: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-v4"
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-function -I src \
+	  scripts/tests/native/ota_v4_receiver.cpp src/helpers/ota/OtaV4Package.cpp \
+	  src/helpers/ota/OtaV4Receiver.cpp src/helpers/ota/third_party/lzma/LzmaDec.c \
+	  src/helpers/ota/third_party/lzma/Bra.c -o "$(OTA_V4_DRIVER)"
+test-ota-host: build-ota-v4-driver
+	OTA_V4_DRIVER="$(OTA_V4_DRIVER)" $(PYTHON) -m unittest discover -s scripts/tests -p 'test_*.py'
+test-ota-v4-e2e: build-ota-v4-driver
+	OTA_V4_DRIVER="$(OTA_V4_DRIVER)" $(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_deploy.py'
+OTA_V4_IMAGE ?=
+OTA_V4_IMAGE_EVIDENCE ?= $(TMPDIR)/ota-v4/image-evidence.json
+.PHONY: test-ota-v4-image
+test-ota-v4-image: build-ota-v4-driver
+	@test -n "$(OTA_V4_IMAGE)" || { echo 'Select a genuine firmware image with OTA_V4_IMAGE.' >&2; exit 1; }
+	OTA_V4_DRIVER="$(OTA_V4_DRIVER)" OTA_V4_IMAGE="$(OTA_V4_IMAGE)" OTA_V4_IMAGE_EVIDENCE="$(OTA_V4_IMAGE_EVIDENCE)" \
+	  PYTHONPATH=scripts:scripts/tests $(PYTHON) -m unittest \
+	  test_ota_deploy.NativeEndToEndTests.test_genuine_firmware_image_reaches_byte_exact_signed_confirmed_state
+test-ota-v4-platform: tmpdir
+	$(MAKE) --no-print-directory -f test/test_lora_ota_v4_platform/Makefile test
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
 .PHONY: test-ota-v4-native
