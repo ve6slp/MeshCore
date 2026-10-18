@@ -50,12 +50,9 @@ XIAO_OTA_TEST_BOARD_TARGET ?= XIAO_OTA_TARGET_XIAO_NRF52840
 XIAO_OTA_TEST_ROLE_ID ?= $(if $(strip $(XIAO_OTA_ROLE_ID)),$(XIAO_OTA_ROLE_ID),0)
 XIAO_OTA_UPSTREAM ?= $(XIAO_OTA_VENDOR)
 OTA_NRF_REMOTE_BOOT_PROOF_PREFIX ?=
-OTA_COMPRESSION_IMAGE ?=
-OTA_COMPRESSION_BUILD_DIR := $(TMPDIR)/compression/arm-build
-OTA_COMPRESSION_FREEZE ?= $(TMPDIR)/ota-boot-builds/compression-solar-role1-lzma-fix01
+OTA_BUILD_DIR ?= $(TMPDIR)/ota-v4/build
+OTA_IMAGE_FREEZE ?= $(TMPDIR)/ota-boot-builds/v4-solar-role1
 OTA_ARM_PREFIX ?= $(HOME)/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-
-OTA_COMPRESSION_REPORT_ARGS ?=
-export OTA_COMPRESSION_FIXTURE := $(TMPDIR)/compression/fixture.bin
 
 .PHONY: build upload clean tmpdir test test-ota test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility build-ota-targets build-ota-nrf52-targets build-ota-esp32-targets ota ota-device-inspect build-xiao-ota-bootloader-pair test-xiao-ota-bootloader-pair package-xiao-ota-bootloader-pair verify-xiao-ota-bootloader-pair-packages sign-xiao-ota-image test-xiao-ota-bootloader-tools test-xiao-ota-bootloader test-xiao-ota-boot-process test-nrf-unadmitted-boot-process test-ota-rf-to-boot
 
@@ -80,34 +77,25 @@ test-ota-native: tmpdir
 .PHONY: test-ota-v4-native
 test-ota-v4-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native -f test_lora_ota_v4
-test-ota-native test-ota-integration: test-ota-compression-fixture
-.PHONY: test-ota-compression-fixture test-ota-compression build-ota-compression-solar ota-compression-arm-size ota-compression-report
-test-ota-compression-fixture: tmpdir
-	$(PYTHON) test/test_lora_ota_integration/compression_fixture.py "$(OTA_COMPRESSION_FIXTURE)" $(if $(strip $(OTA_COMPRESSION_IMAGE)),"$(OTA_COMPRESSION_IMAGE)")
-test-ota-compression: test-ota-compression-fixture
-	$(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER='LoraOtaCompression.*'
-	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_compression.py'
-	$(CXX) -std=c++17 -Os -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src -I "$(TMPDIR)/compression" \
+.PHONY: test-ota-v4-decoder build-ota-solar ota-v4-arm-size
+test-ota-v4-decoder: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-v4"
+	$(CXX) -std=c++17 -Os -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src \
 	  scripts/tests/native/ota_compression_decoder_check.cpp src/helpers/ota/third_party/lzma/LzmaDec.c \
-	  src/helpers/ota/third_party/lzma/Bra.c -o "$(TMPDIR)/compression/decoder-check"
-	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$(TMPDIR)/compression/decoder-check"
-build-ota-compression-solar: tmpdir
-	PLATFORMIO_BUILD_DIR="$(OTA_COMPRESSION_BUILD_DIR)" $(MAKE) --no-print-directory build-xiao-ota-usb-app \
-	  XIAO_OTA_PAIR_BOARD=sensecap_solar_p1 XIAO_OTA_PAIR_ROLE_ID=1 XIAO_OTA_APP_FREEZE_DIR="$(OTA_COMPRESSION_FREEZE)"
-ota-compression-arm-size: tmpdir
-	@mkdir -p "$(TMPDIR)/compression"
+	  src/helpers/ota/third_party/lzma/Bra.c -o "$(TMPDIR)/ota-v4/decoder-check"
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$(TMPDIR)/ota-v4/decoder-check"
+build-ota-solar: tmpdir
+	PLATFORMIO_BUILD_DIR="$(OTA_BUILD_DIR)" $(MAKE) --no-print-directory build-xiao-ota-usb-app \
+	  XIAO_OTA_PAIR_BOARD=sensecap_solar_p1 XIAO_OTA_PAIR_ROLE_ID=1 XIAO_OTA_APP_FREEZE_DIR="$(OTA_IMAGE_FREEZE)"
+ota-v4-arm-size: tmpdir
+	@mkdir -p "$(TMPDIR)/ota-v4"
 	"$(OTA_ARM_PREFIX)g++" -std=c++17 -mcpu=cortex-m4 -mthumb -Os -fno-exceptions -fno-rtti \
 	  -ffunction-sections -fdata-sections -fstack-usage -I src \
-	  -c scripts/tests/native/ota_compression_size_probe.cpp -o "$(TMPDIR)/compression/decoder-m4.o"
-	"$(OTA_ARM_PREFIX)size" "$(TMPDIR)/compression/decoder-m4.o" "$(OTA_COMPRESSION_FREEZE)/firmware.elf"
-	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(TMPDIR)/compression/decoder-m4.o" > "$(TMPDIR)/compression/decoder-m4-symbols.txt"
-	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(OTA_COMPRESSION_FREEZE)/firmware.elf" > "$(TMPDIR)/compression/solar-m4-symbols.txt"
-	@cat "$(TMPDIR)/compression/decoder-m4.su"
-ota-compression-report: ota-compression-arm-size
-	$(PYTHON) scripts/ota_compression_report.py --image "$(OTA_COMPRESSION_FREEZE)/firmware.bin" \
-	  --elf "$(OTA_COMPRESSION_FREEZE)/firmware.elf" --probe "$(TMPDIR)/compression/decoder-m4.o" \
-	  --stack-dir "$(OTA_COMPRESSION_BUILD_DIR)/SenseCap_Solar_repeater_ota_usb" \
-	  --arm-prefix "$(OTA_ARM_PREFIX)" --output "$(TMPDIR)/compression/report.json" $(OTA_COMPRESSION_REPORT_ARGS)
+	  -c scripts/tests/native/ota_compression_size_probe.cpp -o "$(TMPDIR)/ota-v4/decoder-m4.o"
+	"$(OTA_ARM_PREFIX)size" "$(TMPDIR)/ota-v4/decoder-m4.o" "$(OTA_IMAGE_FREEZE)/firmware.elf"
+	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(TMPDIR)/ota-v4/decoder-m4.o" > "$(TMPDIR)/ota-v4/decoder-m4-symbols.txt"
+	"$(OTA_ARM_PREFIX)nm" -S -C --size-sort "$(OTA_IMAGE_FREEZE)/firmware.elf" > "$(TMPDIR)/ota-v4/solar-m4-symbols.txt"
+	@cat "$(TMPDIR)/ota-v4/decoder-m4.su"
 # Real Mesh/Dispatcher/PacketManager behaviour with MESHCORE_LORA_OTA=0 (ordinary firmware is unchanged).
 test-ota-disabled: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native_lora_ota_disabled -f test_lora_ota_disabled

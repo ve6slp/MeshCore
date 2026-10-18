@@ -183,6 +183,45 @@ airtime scheduler, with transports limited to framing, routing and device I/O.
 An owned radio override expires and restores the unchanged ordinary settings,
 including the user's forwarding preference.
 
+## Building and commissioning
+
+Ordinary firmware remains OTA-disabled. The explicit environments are
+`Xiao_nrf52_companion_radio_ota_usb`, `Xiao_nrf52_repeater_ota_usb`,
+`SenseCap_Solar_companion_radio_ota_usb`,
+`SenseCap_Solar_repeater_ota_usb`, `Xiao_S3_WIO_companion_radio_ota_usb`, and
+`Xiao_S3_WIO_repeater_ota_usb`. The role is 0 for a companion and 1 for a
+repeater. Host dependencies are declared in `requirements-ota.txt`.
+
+Use the existing system PlatformIO and Make targets:
+
+```sh
+make build ENV=Xiao_nrf52_companion_radio_usb
+make build ENV=Xiao_S3_WIO_repeater_ota_usb
+make build-ota-solar OTA_IMAGE_FREEZE="$PWD/.tmp/ota-boot-builds/my-v4-solar"
+make test-ota-v4-native
+make test-ota-v4-decoder
+make ota-v4-arm-size OTA_IMAGE_FREEZE="$PWD/.tmp/ota-boot-builds/my-v4-solar"
+make ota OTA_ARGS='--help'
+```
+
+Choose a new immutable freeze directory for each Solar build. Build and test
+commands do not flash hardware. `make ota` is the single host entry point;
+transport selection belongs to that CLI, not separate stock/native deployment
+recipes. A package is immutable; job state is separate and durable.
+
+Commissioning an nRF bootloader/installer is a separate physical bench
+operation, documented in the
+[paired bootloader recipe](../bootloader/xiao_nrf52840_ota/README.md). Select
+the exact board, role and physical device, and take a verified personality
+backup before an explicitly destructive conversion. Merely entering USB
+recovery must not erase identity, administrators or settings. An application
+OTA update never invokes commissioning, resets the rollback floor, changes
+identity, or silently falls back to USB/SWD.
+
+Earlier v3 lab builds require a deliberate one-time bootstrap using their
+frozen tools or an explicitly approved application-only recovery procedure.
+The v4 product contains no v3 radio handler or automatic migration path.
+
 ## Design sources
 
 * [RFC 9019, section 3](https://www.rfc-editor.org/rfc/rfc9019.html#section-3):
