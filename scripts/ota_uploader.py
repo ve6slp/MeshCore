@@ -1,724 +1,515 @@
 #!/usr/bin/env python3
-"""Drive the signed OTA uploader through an explicitly selected companion.
+"""One OTA v4 package, durable host job and transmitter-wide scheduler.
 
-cache only signs/stages a local image and observes CACHE_SEALED. It never starts
-RF, selects a remote target, commits or proves installation/airtime.
-deploy stages one board/role-bound image, waits for READY, commits and waits for
-the receiver's native INSTALLED status. upload and commit remain separate modes.
-ABORT requires a fresh STATUS generation and durable ABORTED readback.
-Companions must speak USB OTA ABI 3 (wire version 3): a local STATUS probe
-refuses older companions before CACHE_BEGIN. COMMIT carries the generation and
-per-BEGIN nonce observed in the fresh READY status, so it binds that exact
-attempt; there is no unbound fallback.
+build signs a package; deploy stages and explicitly activates it. --stage-only
+never activates. Reopening a job always authenticates fresh receiver state.
+No private keys are read and no serial port is selected implicitly.
 """
-
 import argparse
 from contextlib import ExitStack
-from dataclasses import dataclass
-from enum import IntEnum
-import hashlib
-import importlib.util
+import json
 import math
 import os
 from pathlib import Path
 import struct
-import stat
+import sys
 import time
-import ota_compression as compression
 
-import ota_common as lab
-
-
-class Op(IntEnum):
-    CACHE_BEGIN = 0x10
-    CACHE_PUT = 0x11
-    CACHE_SEAL = 0x12
-    ADD_TARGET = 0x13
-    START = 0x14
-    COMMIT = 0x15
-    ABORT = 0x16
-    STATUS = 0x17
-    SET_ADMIN = 0x18
+from ota_common import (Assembly, Error, Frame, Kind, Phase, Result, Status, ZERO_HASH,
+                        physical_airtime, public_key, remaining, signed_command, slice_mask)
+from ota_compression import Package, descriptor
+from ota_job import JobStore, write_exclusive
+from ota_transport import NativeTransport, Route
+from ota_stock_companion import StockTransport
 
 
-class Result(IntEnum):
-    OK = 0
-    PENDING = 1
-    BUSY = 2
-    BAD_REQUEST = 3
-    DENIED = 4
-    UNAVAILABLE = 5
-    IO_ERROR = 6
-    MISMATCH = 7
-    INCOMPLETE = 8
-    NOT_FOUND = 9
-    TOO_LATE = 10
-    BUDGET_DENIED = 11
-    UNSUPPORTED = 12
+class Scheduler:
+    def __init__(self, job, transport, *, clock=time.monotonic, sleep=time.sleep):
+        self.job, self.transport, self.clock, self.sleep = job, transport, clock, sleep
+        self.package = job.package
+        if transport.owner != job.owner:
+            raise Error("companion does not own this durable job")
+        policy = job.policy
+        self.duty = policy["duty"]
+        if not math.isfinite(self.duty) or not 0 < self.duty <= 1:
+            raise Error("invalid transmitter duty share")
+        cooldown = job.db.execute("SELECT value FROM meta WHERE key='cooldown'").fetchone()
+        self.next_tx = clock() + (float(cooldown[0]) if cooldown else 0)
+        self.statuses = {}
+        self.metrics = json.loads(job.get("metrics")) if self._has_metrics() else {
+            "tx": {}, "rx": {}, "tx_attempts": {}, "physical_or_guarded_air_s": 0.0,
+            "elapsed_s": 0.0, "repair_frames": 0}
+        self.started = clock()
 
+    def _has_metrics(self):
+        return self.job.db.execute("SELECT 1 FROM meta WHERE key='metrics'").fetchone() is not None
 
-class Phase(IntEnum):
-    UNKNOWN = 0
-    IDLE = 1
-    ERASING = 2
-    RECEIVING = 3
-    VERIFYING = 4
-    READY = 5
-    COMMIT_PENDING = 6
-    TRIAL = 7
-    INSTALLED = 8
-    ABORTED = 9
-    FAILED = 10
-    CACHE_SEALED = 11
+    def _metrics(self):
+        self.metrics["elapsed_s"] += self.clock() - self.started
+        self.started = self.clock()
+        with self.job.db:
+            self.job.db.execute("INSERT OR REPLACE INTO meta VALUES('metrics',?)",
+                                (json.dumps(self.metrics, sort_keys=True).encode(),))
 
+    def _count(self, direction, frame, packet_bytes, serial_bytes):
+        counts = self.metrics[direction].setdefault(frame.kind.name.lower(),
+                                                   {"frames": 0, "ota_bytes": 0, "mesh_bytes": 0,
+                                                    "serial_payload_bytes": 0, "serial_wire_bytes": 0})
+        counts["frames"] += 1
+        counts["ota_bytes"] += len(frame.encode())
+        counts["mesh_bytes"] += packet_bytes
+        counts["serial_payload_bytes"] += serial_bytes
+        counts["serial_wire_bytes"] += serial_bytes + (3 if serial_bytes else 0)
 
-REPLY_CODE = 30
-ABI_VERSION = 3
-REPLY_BYTES = 107
-WIRE_VERSION = 3
-NONCE_BYTES = 16
-BLOCK_BYTES = 84
-LOCAL_TARGET = bytes(32)
-SNAPSHOT_VALID = 1
-REMOTE = 2
-AGE_UNKNOWN = 0xFFFFFFFF
-MODES = {"direct": 0, "directed": 1, "background": 2}
+    def _cooldown(self, seconds):
+        with self.job.db:
+            self.job.db.execute("INSERT OR REPLACE INTO meta VALUES('cooldown',?)",
+                                (str(seconds).encode(),))
 
+    def _send(self, kind, body, deadline, *, obj=0, tag=None, indices=None, repair=False):
+        tag = self.package.tag if tag is None else tag
+        slices = range((len(body) + 127) // 128) if indices is None else indices
+        for index in slices:
+            wait = self.next_tx - self.clock()
+            if wait > 0:
+                if wait >= remaining(deadline, self.clock):
+                    raise TimeoutError("duty pacing exceeds operation deadline")
+                self.sleep(wait)
+            frame = Frame(kind, self.job.attempt(), tag, obj, len(body), index, body[index * 128:(index + 1) * 128])
+            raw_size = 0 if self.transport.local else len(self.transport.route.packet(frame.encode()))
+            serial = (len(frame.encode()) if self.transport.local else raw_size) + getattr(
+                self.transport, "serial_command_bytes", 0)
+            self._count("tx_attempts", frame, raw_size, serial)
+            if not self.transport.local:
+                reserve = physical_airtime(raw_size, *self.transport.profile[1:4]) * 1.5 / self.duty
+                # Reserve before device I/O: a crash after physical TX but before
+                # its reply must not reset the transmitter-wide airtime budget.
+                self._cooldown(reserve)
+            self._metrics()
+            receipt = self.transport.send(frame.encode(), deadline)
+            air = receipt.airtime
+            if not self.transport.local:
+                profile = self.transport.profile
+                model = physical_airtime(receipt.wire_bytes, *profile[1:4])
+                air = max(air, model)
+                self.next_tx = self.clock() + air * (1 / self.duty - 1)
+                self._cooldown(max(0, self.next_tx - self.clock()))
+            self.metrics["physical_or_guarded_air_s"] += air
+            self.metrics["repair_frames"] += int(repair)
+            serial = getattr(receipt, "serial_bytes", 0)
+            self._count("tx", frame, receipt.wire_bytes, serial)
+            self._metrics()
 
-class UploaderError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class Reply:
-    op: Op
-    result: Result
-    phase: Phase
-    flags: int
-    target: bytes
-    manifest_hash: bytes
-    received: int
-    total: int
-    counter: int
-    age_ms: int
-    retry_after_ms: int
-    generation: int
-    begin_nonce: bytes = bytes(NONCE_BYTES)
-    wire_version: int = 0
-
-    @property
-    def valid(self):
-        return bool(self.flags & SNAPSHOT_VALID)
-
-    def fresh_since(self, since, now):
-        return self.valid and self.age_ms != AGE_UNKNOWN and now - self.age_ms / 1000 >= since
-
-    def summary(self):
-        return {
-            "op": self.op.name, "result": self.result.name, "phase": self.phase.name,
-            "target": self.target.hex(), "hash": self.manifest_hash.hex(),
-            "received": self.received, "total": self.total, "counter": self.counter,
-            "snapshot_valid": self.valid, "remote": bool(self.flags & REMOTE),
-            "snapshot_age_ms": self.age_ms, "retry_after_ms": self.retry_after_ms,
-            "generation": self.generation, "begin_nonce": self.begin_nonce.hex(),
-            "wire_version": self.wire_version,
-        }
-
-    @property
-    def attempt_bound(self):
-        return self.valid and self.wire_version == WIRE_VERSION and any(self.begin_nonce)
-
-
-def decode_reply(frame):
-    if len(frame) >= 2 and frame[0] == REPLY_CODE and frame[1] < ABI_VERSION:
-        raise UploaderError(f"companion OTA ABI version {frame[1]} is unsupported; "
-                            f"update the companion to wire version {WIRE_VERSION}")
-    if len(frame) != REPLY_BYTES or frame[:2] != bytes([REPLY_CODE, ABI_VERSION]):
-        raise UploaderError("invalid OTA reply length, code or ABI version")
-    try:
-        op, result, phase = Op(frame[2]), Result(frame[3]), Phase(frame[4])
-    except ValueError as exc:
-        raise UploaderError("unknown OTA reply opcode, result or phase") from exc
-    received, total, counter, age, retry = struct.unpack_from(">HHIII", frame, 70)
-    reply = Reply(op, result, phase, frame[5], frame[6:38], frame[38:70],
-                  received, total, counter, age, retry, struct.unpack_from(">I", frame, 86)[0],
-                  frame[90:106], frame[106])
-    if reply.flags & ~(SNAPSHOT_VALID | REMOTE) or received > total:
-        raise UploaderError("invalid OTA reply flags or durable block counts")
-    if reply.wire_version not in (0, WIRE_VERSION) or (
-            reply.target == LOCAL_TARGET and reply.wire_version != WIRE_VERSION):
-        raise UploaderError("unsupported OTA wire version in reply")
-    if not reply.valid:
-        if (phase != Phase.UNKNOWN or reply.manifest_hash != bytes(32)
-                or received or total or counter or age != AGE_UNKNOWN or reply.generation
-                or any(reply.begin_nonce)):
-            raise UploaderError("invalid OTA no-snapshot reply")
-    elif age == AGE_UNKNOWN:
-        raise UploaderError("OTA snapshot has no known age")
-    return reply
-
-
-def full_key(text):
-    if len(text) != 64:
-        raise argparse.ArgumentTypeError("use the full 64-digit node public key")
-    try:
-        key = bytes.fromhex(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("node public key must be hexadecimal") from exc
-    if len(key) != 32 or key == LOCAL_TARGET:
-        raise argparse.ArgumentTypeError("use a nonzero 32-byte node public key")
-    return key
-
-
-def validate_image(canonical, image):
-    if len(canonical) != 59:
-        raise ValueError("manifest must contain exactly 59 canonical bytes")
-    if not image or len(image) > BLOCK_BYTES * 65535:
-        raise ValueError("image does not fit the uploader block geometry")
-    if struct.unpack_from(">I", canonical, 9)[0] != len(image):
-        raise ValueError("image size does not match the manifest")
-    if canonical[13:45] != hashlib.sha256(image).digest():
-        raise ValueError("image SHA-256 does not match the manifest")
-
-
-def deploy_manifest(image, board, role_id, counter, canonical=None):
-    """Use the existing shared nRF/ESP descriptor codec, never a second format."""
-    path = Path(__file__).resolve().parents[1] / "bootloader/xiao_nrf52840_ota/tools/xiao_ota_descriptor.py"
-    spec = importlib.util.spec_from_file_location("ota_deploy_descriptor", path)
-    codec = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(codec)
-    codec.assert_matches_canonical_layout_contract()
-    expected = codec.build_descriptor(board, role_id, counter, image)
-    if canonical is not None and canonical != expected:
-        raise ValueError("manifest does not match the selected board, role, image and counter")
-    validate_image(expected, image)
-    return expected
-
-
-def start_body(mode, channel, frequency_khz, lease_ms, duty_milli_percent, routed_retry=None):
-    """Directed/background START always selects attempt-diverse reliable framing.
-
-    Legacy unframed on-mesh delivery can stall behind relays that have already
-    seen a lost packet, so it is refused rather than offered as a fallback.
-    Direct mode is zero-hop on a leased channel and never carries the flag.
-    """
-    if routed_retry is None:
-        routed_retry = mode != "direct"
-    if type(routed_retry) is not bool or (routed_retry and mode == "direct"):
-        raise ValueError("routed-retry requires directed/background mode")
-    if not routed_retry and mode != "direct":
-        raise ValueError("directed/background OTA requires reliable attempt-diverse framing; "
-                         "legacy unframed on-mesh delivery is unsupported")
-    if mode not in MODES or not 0 <= channel <= 255:
-        raise ValueError("invalid OTA mode or channel")
-    if not 0 < duty_milli_percent <= 100000:
-        raise ValueError("airtime share must be in 1..100000 milli-percent")
-    if mode == "direct":
-        if channel != 255 or not 150000 <= frequency_khz <= 2500000 or not 250 <= lease_ms <= 60000:
-            raise ValueError("direct mode requires channel 255, an explicit frequency and a 250..60000 ms lease")
-    elif frequency_khz != 0 or lease_ms != 0 or (mode == "directed" and channel != 255):
-        raise ValueError("on-mesh mode requires zero frequency/lease and directed mode requires channel 255")
-    elif mode == "background" and channel == 255:
-        raise ValueError("background mode requires a configured multicast channel")
-    body = struct.pack(">BBIHI", MODES[mode], channel, frequency_khz, lease_ms, duty_milli_percent)
-    if routed_retry:
-        return body + b"\x00\x01"
-    return body
-
-
-class Uploader:
-    def __init__(self, node, evidence, command_timeout=10.0):
-        self.node = node
-        self.evidence = evidence
-        self.command_timeout = command_timeout
-
-    def exchange(self, op, body=b"", target=LOCAL_TARGET, timeout=None):
-        timeout = self.command_timeout if timeout is None else timeout
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("OTA command timeout must be finite and positive")
-        self.node.poll()
-        self.node.take_pending({REPLY_CODE, lab.RESP_ERR})
-        sent = time.monotonic()
-        self.node.write_frame(bytes([lab.CMD_OTA_CONTROL, op]) + body)
-        deadline = sent + timeout
-        while time.monotonic() < deadline:
-            self.node.poll(max(0.0, min(0.1, deadline - time.monotonic())))
-            for timestamp, frame in self.node.take_pending({REPLY_CODE, lab.RESP_ERR}):
-                if timestamp < sent:
-                    continue
-                if frame[0] == lab.RESP_ERR:
-                    raise UploaderError(f"companion rejected {op.name}; raw response withheld")
-                reply = decode_reply(frame)
-                if reply.op != op or reply.target != target:
-                    self.evidence.log("ota_unmatched_reply", **reply.summary())
-                    continue
-                self.evidence.log("ota_reply", **reply.summary())
-                return reply
-        raise TimeoutError(f"no matching OTA reply for {op.name}, target {target.hex()}")
-
-    @staticmethod
-    def require_result(reply):
-        if reply.result not in (Result.OK, Result.PENDING):
-            raise UploaderError(f"{reply.op.name}: {reply.result.name}")
-        return reply
-
-    @classmethod
-    def require_accepted(cls, reply):
-        cls.require_result(reply)
-        if reply.phase == Phase.FAILED:
-            raise UploaderError(f"{reply.op.name}: remote or cache failure")
-        return reply
-
-    def status(self, target=LOCAL_TARGET, timeout=None):
-        return self.require_result(self.exchange(Op.STATUS, target, target, timeout))
-
-    def remaining(self, deadline):
-        remaining = deadline - time.monotonic()
-        if not math.isfinite(remaining) or remaining <= 0:
-            raise TimeoutError("OTA operation deadline expired")
-        return min(self.command_timeout, remaining)
-
-    def wait_phase(self, target, phase, manifest_hash, counter, since, deadline, generation=None,
-                   prior_generation=None, begin_nonce=None):
-        while time.monotonic() < deadline:
-            reply = self.status(target, timeout=self.remaining(deadline))
-            if reply.valid and bool(reply.flags & REMOTE) != (target != LOCAL_TARGET):
-                raise UploaderError("OTA snapshot has the wrong local/remote scope")
-            now = time.monotonic()
-            fresh = reply.fresh_since(since, now)
-            if fresh and (reply.manifest_hash != manifest_hash or reply.counter != counter):
-                raise UploaderError("OTA status belongs to a different manifest or counter")
-            if (fresh and generation is not None and reply.generation != generation
-                    and not (phase == Phase.ABORTED and prior_generation is not None
-                             and reply.generation == prior_generation and reply.phase != Phase.ABORTED)):
-                raise UploaderError("OTA status belongs to a different generation")
-            # Firmware retains the BEGIN nonce in every post-READY snapshot; a zero
-            # nonce is an unknown attempt, never a match.
-            if fresh and begin_nonce is not None and (reply.begin_nonce != begin_nonce
-                                                      or not any(reply.begin_nonce)):
-                raise UploaderError("OTA status belongs to a different BEGIN attempt")
-            if fresh and (reply.phase == Phase.FAILED
-                          or (reply.phase == Phase.ABORTED and phase != Phase.ABORTED)):
-                raise UploaderError(f"OTA candidate is {reply.phase.name}")
-            if reply.phase == phase and fresh and (phase != Phase.ABORTED or reply.result == Result.OK):
-                if phase in (Phase.READY, Phase.CACHE_SEALED) and (reply.total == 0 or reply.received != reply.total):
-                    raise UploaderError("completed OTA phase has incomplete durable blocks")
-                return reply
-            time.sleep(min(max(0.1, reply.retry_after_ms / 1000), max(0.0, deadline - now)))
-        raise TimeoutError(f"no fresh {phase.name} snapshot for target {target.hex()}")
-
-    def require_wire_version(self, deadline):
-        # decode_reply refuses older ABIs; this runs before any state-changing command.
-        reply = self.status(LOCAL_TARGET, timeout=self.remaining(deadline))
-        if reply.wire_version != WIRE_VERSION:
-            raise UploaderError("companion does not report OTA wire version 3")
-        return reply
-
-    def cache(self, canonical, image, owner_public_key, deadline, reupload=False):
-        validate_image(canonical, image)
-        self.remaining(deadline)
-        self.require_wire_version(deadline)
-        signature = lab.sign_manifest(self.node, canonical, owner_public_key, deadline=deadline)
-        manifest_hash = hashlib.sha256(canonical).digest()
-        counter = struct.unpack_from(">I", canonical, 45)[0]
-        since = time.monotonic()
-        reply = self.require_accepted(self.exchange(
-            Op.CACHE_BEGIN, bytes([int(reupload)]) + owner_public_key + canonical + signature,
-            timeout=self.remaining(deadline)))
-        if reply.phase in (Phase.VERIFYING, Phase.CACHE_SEALED):
-            return self.wait_phase(LOCAL_TARGET, Phase.CACHE_SEALED, manifest_hash, counter, since, deadline)
-        if reply.result == Result.PENDING:
-            self.wait_phase(LOCAL_TARGET, Phase.RECEIVING, manifest_hash, counter, since, deadline)
-        for index, offset in enumerate(range(0, len(image), BLOCK_BYTES)):
-            data = image[offset:offset + BLOCK_BYTES]
-            body = struct.pack(">HB", index, len(data)) + data
-            while time.monotonic() < deadline:
-                reply = self.require_accepted(self.exchange(Op.CACHE_PUT, body, timeout=self.remaining(deadline)))
-                if reply.result == Result.OK:
-                    break
-                time.sleep(min(max(0.1, reply.retry_after_ms / 1000),
-                               max(0.0, deadline - time.monotonic())))
-            else:
-                raise TimeoutError(f"cache block {index} was not durably acknowledged")
-        self.require_accepted(self.exchange(Op.CACHE_SEAL, timeout=self.remaining(deadline)))
-        return self.wait_phase(LOCAL_TARGET, Phase.CACHE_SEALED, manifest_hash, counter, since, deadline)
-
-    def start(self, targets, body, mode, deadline):
-        if (not targets or len(targets) > 32 or len(set(targets)) != len(targets)
-                or any(len(target) != 32 or target == LOCAL_TARGET for target in targets)):
-            raise ValueError("select 1..32 distinct full target identities")
-        if mode != "background" and len(targets) != 1:
-            raise ValueError("direct and directed campaigns require exactly one target")
-        if (mode not in MODES or len(body) != (12 if mode == "direct" else 14) or body[0] != MODES[mode]
-                or (len(body) == 14 and body[12:] != b"\x00\x01")):
-            raise ValueError("campaign mode does not match the START body")
-        for target in targets:
-            self.require_accepted(self.exchange(Op.ADD_TARGET, target, target, self.remaining(deadline)))
-        return self.require_accepted(self.exchange(Op.START, body, timeout=self.remaining(deadline)))
-
-    def commit(self, target, canonical, deadline, generation=None):
-        if len(target) != 32 or target == LOCAL_TARGET or len(canonical) != 59:
-            raise ValueError("commit requires a full target identity and canonical manifest")
-        manifest_hash = hashlib.sha256(canonical).digest()
-        counter = struct.unpack_from(">I", canonical, 45)[0]
-        since = time.monotonic()
-        options = {} if generation is None else {"generation": generation}
-        ready = self.wait_phase(target, Phase.READY, manifest_hash, counter, since, deadline, **options)
-        return self._send_commit(target, manifest_hash, counter, ready, deadline)
-
-    def _send_commit(self, target, manifest_hash, counter, ready, deadline):
-        # Bind COMMIT to the exact BEGIN attempt observed READY; never sign an unbound one.
-        if not ready.attempt_bound:
-            raise UploaderError("READY target is not attempt-bound (OTA wire version 3 BEGIN nonce "
-                                "missing); update the receiver firmware")
-        return self.require_accepted(self.exchange(
-            Op.COMMIT, target + manifest_hash + struct.pack(">II", counter, ready.generation)
-            + ready.begin_nonce, target, self.remaining(deadline)))
-
-    def deploy(self, target, canonical, image, owner_public_key, body, mode, deadline,
-               reupload=False, install_timeout=300):
-        if len(target) != 32 or target == LOCAL_TARGET:
-            raise ValueError("deploy requires one full remote target identity")
-        if not math.isfinite(install_timeout) or install_timeout <= 0:
-            raise ValueError("installation timeout must be finite and positive")
-        self.cache(canonical, image, owner_public_key, deadline, reupload)
-        started = time.monotonic()
-        self.start([target], body, mode, deadline)
-        manifest_hash = hashlib.sha256(canonical).digest()
-        counter = struct.unpack_from(">I", canonical, 45)[0]
-        ready = self.wait_phase(target, Phase.READY, manifest_hash, counter, started, deadline)
-        blocks = (len(image) + BLOCK_BYTES - 1) // BLOCK_BYTES
-        if ready.total != blocks:
-            raise UploaderError("READY block geometry does not match the selected image")
-        committed = time.monotonic()
-        self._send_commit(target, manifest_hash, counter, ready, deadline)
-        installed = self.wait_phase(target, Phase.INSTALLED, manifest_hash, counter, committed,
-                                    min(deadline, time.monotonic() + install_timeout),
-                                    generation=ready.generation, begin_nonce=ready.begin_nonce)
-        if installed.received != blocks or installed.total != blocks:
-            raise UploaderError("INSTALLED block geometry does not match the selected image")
-        return installed
-
-    def abort(self, target, image_hash, deadline=None):
-        if len(target) != 32 or len(image_hash) != 32:
-            raise ValueError("abort requires a target identity or local cache and image SHA-256")
-        since = time.monotonic()
-        deadline = since + self.command_timeout if deadline is None else deadline
-        self.remaining(deadline)
-        while time.monotonic() < deadline:
-            observed = self.status(target, timeout=self.remaining(deadline))
-            if observed.op != Op.STATUS or observed.target != target:
-                raise UploaderError("abort STATUS has the wrong opcode or target")
-            if observed.valid and bool(observed.flags & REMOTE) != (target != LOCAL_TARGET):
-                raise UploaderError("abort STATUS has the wrong local/remote scope")
-            now = time.monotonic()
-            if observed.fresh_since(since, now):
-                if observed.phase in (Phase.UNKNOWN, Phase.IDLE):
-                    raise UploaderError("abort STATUS does not identify a candidate")
+    def _receive(self, kind, request, deadline, tag=None):
+        assembly = Assembly(kind, tag, request)
+        while self.clock() < deadline:
+            raw = self.transport.receive(deadline)
+            if raw is None:
                 break
-            time.sleep(min(max(0.1, observed.retry_after_ms / 1000), max(0.0, deadline - now)))
-        else:
-            raise TimeoutError("no fresh valid STATUS generation for abort")
-        generation = (observed.generation if observed.phase == Phase.ABORTED
-                      else (observed.generation + 1) & 0xFFFFFFFF)
-        since = time.monotonic()
-        self.require_accepted(self.exchange(
-            Op.ABORT, target + image_hash + struct.pack(">I", observed.generation),
-            target, self.remaining(deadline)))
-        return self.wait_phase(target, Phase.ABORTED, observed.manifest_hash, observed.counter,
-                               since, deadline, generation=generation,
-                               prior_generation=(None if observed.phase == Phase.ABORTED
-                                                 else observed.generation))
-
-
-def compressed_host_stream(node, evidence, args, canonical, image, identity, deadline):
-    """Native companion's existing CMD65/signing APIs, shared stock sender.
-
-    The autonomous USB cache protocol remains raw84. This explicit host-stream
-    frontend never stages/reinterprets a compressed native cache.
-    """
-    import ota_stock_companion as stream
-    if args.channel != 255 or (args.mode != "direct" and args.routed_retry is False):
-        raise UploaderError("compressed host streaming requires channel 255 and reliable routed framing")
-    if len(args.stream_binding) != len(args.target):
-        raise UploaderError("LZMA1 host streaming requires one --stream-binding per selected target")
-    candidate = stream.Candidate(canonical, image, hashlib.sha256(canonical).digest(),
-                                 struct.unpack_from(">I", canonical, 45)[0], (len(image) + 83) // 84)
-    bindings = []
-    for path, target in zip(args.stream_binding, args.target):
-        value = stream.private_read(path)
-        if value.get("by_path") is not None:
-            raise UploaderError("native host streaming uses the selected locked by-id endpoint, not by-path bindings")
-        bound = stream.Binding.load(path, value.get("serial"), identity, target)
-        bound.check_candidate(candidate)
-        if candidate.counter <= bound.floor:
-            raise UploaderError("candidate must exceed each explicitly measured target floor")
-        bindings.append(bound)
-    common = ("serial", "sender", "stock_version", "normal", "sender_name")
-    if any(any(getattr(b, field) != getattr(bindings[0], field) for field in common) for b in bindings):
-        raise UploaderError("native compressed fleet bindings must share sender/endpoint/normal profile")
-    directory = Path(args.artifact_dir)
-    info = directory.stat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
-        raise UploaderError("native compressed streaming needs an owned 0700 artifact directory")
-    resumes = [stream.private_read(p) for p in args.stream_resume_receipt]
-    if resumes and (len(resumes) != len(bindings) or args.mode == "direct"):
-        raise UploaderError("stream resume needs one original attempt receipt per target; directed/background only")
-    frames = stream.Frames(node.stream)
-    # The native STATUS probe has completed; transfer framing ownership once,
-    # retaining any already-buffered serial bytes rather than running two readers.
-    frames.buffer, node.buffer = node.buffer, bytearray()
-    transport = stream.Stock(frames, identity)
-    transport.bind(bindings[0])
-    original = transport.identify(deadline)
-    if args.mode != "direct" and tuple(original[:4]) != bindings[0].normal:
-        raise UploaderError("native compressed streaming must already use the bound normal profile")
-    hops = (0 if args.mode == "direct" else 1 if args.mode == "directed" else 63) if args.max_relay_hops is None else args.max_relay_hops
-    _, actual_plan = compression.plan(
-        image, width=args.path_hash_bytes, hops=hops, retry=args.mode != "direct",
-        recipients=len(bindings), bw=250000 if args.mode == "direct" else original[1],
-        sf=5 if args.mode == "direct" else original[2], cr=5 if args.mode == "direct" else original[3],
-        arm_thumb=compression.manifest_thumb(canonical))
-    if actual_plan["selected"] != "lzma":
-        raise UploaderError("actual bound radio/fleet does not select LZMA1; use explicit RAW native cache/START")
-    if args.reupload:
-        raise UploaderError("compressed native host streaming does not implicitly REUPLOAD; retire explicitly first")
-    # Native fleets retain all existing 1..32 target semantics. Recipient-bound
-    # signatures cost one stream per receiver; no signature amortization/cohort.
-    senders = [
-        stream.Sender(transport, bound, candidate, original, deadline, args.frequency_khz,
-                      args.lease_ms, args.duty_milli_percent / 100000, mode=args.mode,
-                      clock=transport.clock, sleep=transport.sleep,
-                      relay=args.relay_key, path_hash_bytes=args.path_hash_bytes,
-                      compression_mode="lzma", max_relay_hops=args.max_relay_hops,
-                      attempt_callback=lambda receipt: stream.private_write(
-                          directory / ("attempt-" + receipt["target_public_key"] + ".json"), receipt),
-                      event_callback=lambda event: evidence.log("ota_host_stream", stream_event=event))
-        for bound in bindings
-    ]
-    try:
-        # Prove every recipient before any target's admission can mutate storage.
-        for sender in senders:
-            sender.preflight_compression()
-        if len(senders) == 1:
-            options = {"resume_receipt": resumes[0]} if resumes else {}
-            result = (senders[0].deploy(args.install_timeout, **options) if args.command == "deploy" else
-                      senders[0].upload(**options))
-        else:
-            for i, sender in enumerate(senders):
-                if resumes:
-                    sender.bind_resume(resumes[i])
-                    sender.census()
-                else:
-                    sender.authorize(retries=1)
-            for group in senders[0].compression_groups:
-                for sender in senders:
-                    sender.send_compressed_group(group)
-            for sender in senders:
-                for first in range(0, candidate.total, 128):
-                    if sender.census(first)["lifecycle"] != 5:
-                        raise UploaderError("native compressed fleet has not reached complete raw-SHA READY")
-            result = {"targets": [s.receipt("ready-observed-unsigned") for s in senders],
-                      "installation_confirmed": False}
-    finally:
-        # No START/autonomous uploader is left running. Restore/read back the
-        # direct sender's original radio just as stock host streaming does.
-        cleanup_deadline = transport.clock() + 120
-        if args.mode == "direct":
             try:
-                # Reserve the final20s even if lease-return cleanup times out.
-                senders[0].leave_direct(deadline=cleanup_deadline - 20)
-            finally:
-                transport.radio(original, cleanup_deadline)
-        elif transport.identify(cleanup_deadline) != original:
-            raise UploaderError("native host-stream normal radio/repeat changed")
-    evidence.log("ota_command_result", command=args.command,
-                 frontend="native-host-stream-not-native-cache", **result)
-    stream.private_write(directory / "stream-result.json", result)
-    return result
+                frame = Frame.decode(raw)
+            except Error:
+                continue
+            packet, serial = getattr(self.transport, "last_rx_bytes", (0, 0))
+            self._count("rx", frame, packet, serial)
+            body = assembly.feed(frame)
+            if body is not None:
+                self._metrics()
+                return body, frame.tag
+        raise TimeoutError(f"no complete {kind.name.lower()} response")
+
+    def query(self, target, deadline, *, persist=True):
+        if target not in self.job.targets:
+            raise ValueError("query target is outside the durable job")
+        for attempt in range(3):
+            request, nonce = self.job.request(), os.urandom(16)
+            self._send(Kind.QUERY, target + nonce, deadline, obj=request, tag=bytes(8))
+            try:
+                body, tag = self._receive(Kind.STATUS, request, min(deadline, self.clock() + 30))
+                break
+            except TimeoutError:
+                if attempt == 2:
+                    raise
+        status = Status.decode(body, target, nonce)
+        if tag != status.package[:8]:
+            raise Error("signed status/header package mismatch")
+        if persist:
+            self.job.status(status)
+        self.statuses[target] = status
+        return status
+
+    def reconcile(self, deadline, *, allow_reset=False):
+        previous = {t: self.job.previous_status(t) for t in self.job.targets}
+        statuses = [self.query(t, deadline, persist=False) for t in self.job.targets]
+        resolved = []
+        for status in statuses:
+            owned_reset = False
+            for kind in (Kind.ABORT, Kind.REPAIR):
+                for (operation,) in self.job.uncertain(status.target, kind):
+                    body = self.job.db.execute("SELECT body FROM operations WHERE id=?", (operation,)).fetchone()[0]
+                    if len(body) != 180 or body[32:64] != status.target:
+                        raise Error("invalid durable mutation intent")
+                    advanced = status.generation == struct.unpack_from(">I", body, 112)[0] + 1
+                    aborted = (kind == Kind.ABORT and status.phase == Phase.ABORTED
+                               and status.package == body[64:96] and status.transaction == body[96:112])
+                    repaired = (kind == Kind.REPAIR and status.phase == Phase.IDLE
+                                and status.package == ZERO_HASH and not any(status.transaction))
+                    if advanced and (aborted or repaired):
+                        owned_reset = True
+                        resolved.append(operation)
+            old = previous[status.target]
+            if old is not None:
+                prior = Status.decode(old, status.target, old[32:48])
+                if (prior.package == self.package.digest and any(prior.transaction)
+                        and (status.package != self.package.digest
+                             or prior.transaction != status.transaction or prior.generation != status.generation)
+                        and prior.phase not in (Phase.IDLE, Phase.ABORTED, Phase.FAILED)
+                        and not owned_reset and not allow_reset):
+                    raise Error("receiver transaction changed; refusing implicit re-admission")
+        for status in statuses:
+            self.job.status(status)
+            if status.phase in (Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED):
+                for (operation,) in self.job.uncertain(status.target, Kind.ACTIVATE):
+                    body = self.job.db.execute("SELECT body FROM operations WHERE id=?", (operation,)).fetchone()[0]
+                    if (body[64:96] == status.package and body[96:112] == status.transaction
+                            and struct.unpack_from(">I", body, 112)[0] == status.generation):
+                        self.job.resolve(operation, "authenticated")
+        for operation in resolved:
+            self.job.resolve(operation, "authenticated")
+        return statuses
+
+    def _command(self, kind, target, status, deadline):
+        nonce = status.challenge if kind in (Kind.ADMIT, Kind.REPAIR) else status.transaction
+        digest = ZERO_HASH if kind == Kind.REPAIR else self.package.digest
+        body = signed_command(kind, self.job.owner, target, digest, nonce, status.generation,
+                              lambda message: self.transport.sign(message, deadline))
+        operation = self.job.intent(target, kind, body)
+        self._send(kind, body, deadline, tag=digest[:8])
+        after = self.query(target, deadline, persist=False)
+        return operation, after
+
+    def _check_active(self, status):
+        package = self.package
+        if (status.package != package.digest or status.counter != package.counter
+                or not any(status.transaction) or status.next_chunk > len(package.chunks)):
+            raise Error("receiver does not have this exact package/transaction")
+        if status.phase in (Phase.ABORTED, Phase.FAILED, Phase.METADATA_FAULT):
+            raise Error(f"receiver candidate is {status.phase.name.lower()}")
+        if status.next_chunk < len(package.chunks):
+            if status.missing & ~slice_mask(len(package.chunks[status.next_chunk].stored)):
+                raise Error("authenticated bitmap outside current chunk")
+        elif status.missing:
+            raise Error("completed cursor has a nonempty missing bitmap")
+
+    def _admit(self, status, deadline):
+        target = status.target
+        if status.package == self.package.digest and status.phase not in (Phase.IDLE, Phase.ABORTED):
+            self._check_active(status)
+            admissions = self.job.db.execute("SELECT id,body FROM operations WHERE target=? AND kind=?",
+                                              (target, int(Kind.ADMIT))).fetchall()
+            matching = [(op, body) for op, body in admissions
+                        if len(body) == 180 and body[:32] == self.job.owner
+                        and body[32:64] == target and body[64:96] == self.package.digest
+                        and struct.unpack_from(">I", body, 112)[0] + 1 == status.generation
+                        and body[96:112] != status.transaction]
+            if not matching:
+                raise Error("active receiver was not admitted by this durable job")
+            for op, _ in matching:
+                self.job.resolve(op, "authenticated")
+            return status
+        if status.phase != Phase.IDLE:
+            raise Error("non-idle receiver requires explicit abort/repair, never takeover")
+        for (op,) in self.job.uncertain(target, Kind.ADMIT):
+            body = self.job.db.execute("SELECT body FROM operations WHERE id=?", (op,)).fetchone()[0]
+            if struct.unpack_from(">I", body, 112)[0] != status.generation:
+                raise Error("uncertain admission does not match fresh idle generation")
+            self.job.resolve(op, "not-accepted")
+        if not status.evidence & 1 or self.package.counter <= status.floor:
+            raise Error("package must exceed authenticated confirmed floor")
+        operation, after = self._command(Kind.ADMIT, target, status, deadline)
+        self._check_active(after)
+        if after.generation != status.generation + 1 or after.transaction == status.challenge:
+            raise Error("admission did not create a distinct new transaction")
+        self.job.resolve(operation, "authenticated")
+        self.job.status(after)
+        return after
+
+    def progress(self, target, deadline):
+        for attempt in range(3):
+            request = self.job.request()
+            self._send(Kind.PROGRESS_QUERY, target, deadline, obj=request)
+            try:
+                body, _ = self._receive(Kind.PROGRESS, request, min(deadline, self.clock() + 30), self.package.tag)
+                break
+            except TimeoutError:
+                if attempt == 2:
+                    raise
+        if len(body) != 48 or body[:32] != target:
+            raise Error("invalid progress object")
+        generation, chunk, missing, phase, result = struct.unpack_from(">IHQBB", body, 32)
+        known = self.statuses[target]
+        if generation != known.generation or chunk > len(self.package.chunks):
+            raise Error("progress generation/cursor mismatch")
+        try:
+            phase, result = Phase(phase), Result(result)
+        except ValueError as exc:
+            raise Error("invalid progress phase/result") from exc
+        if chunk < len(self.package.chunks) and missing & ~slice_mask(len(self.package.chunks[chunk].stored)):
+            raise Error("progress bitmap outside current stored chunk")
+        # Last-result is diagnostic and can reflect unrelated/hostile packets.
+        # Unsigned progress cannot establish either permission or failure.
+        return chunk, missing, phase
+
+    def stage(self, deadline):
+        statuses = self.reconcile(deadline)
+        # Manifest is shared once. Recovery resupplies exact authenticated bytes,
+        # without changing the receiver's admitted transaction.
+        self._send(Kind.MANIFEST, self.package.manifest, deadline)
+        active = {}
+        for status in statuses:
+            if status.installed(self.package):
+                active[status.target] = (len(self.package.chunks), 0, status.phase)
+            else:
+                status = self._admit(status, deadline)
+                self.statuses[status.target] = status
+                active[status.target] = (status.next_chunk, status.missing, status.phase)
+        attempts, cycles = {}, 0
+        while True:
+            remaining(deadline, self.clock)
+            unfinished = [p[0] for p in active.values() if p[0] < len(self.package.chunks)]
+            if not unfinished:
+                fresh = self.reconcile(deadline)
+                if all(s.phase == Phase.READY or s.installed(self.package) for s in fresh):
+                    for status in fresh:
+                        self._check_active(status)
+                    return fresh
+                for s in fresh:
+                    self._check_active(s)
+                    active[s.target] = (s.next_chunk, s.missing, s.phase)
+                self.sleep(min(.05, remaining(deadline, self.clock)))
+                continue
+            chunk = min(unfinished)
+            stored = self.package.chunks[chunk].stored
+            mask = 0
+            for cursor, missing, phase in active.values():
+                if cursor == chunk and phase == Phase.RECEIVING:
+                    mask |= missing
+            if mask:
+                indices = [i for i in range((len(stored) + 127) // 128) if mask & (1 << i)][:16]
+                for index in indices:
+                    key = chunk, index
+                    attempts[key] = attempts.get(key, 0) + 1
+                    if attempts[key] > 12:
+                        raise Error("selective repair limit exhausted")
+                    self._send(Kind.DATA, stored, deadline, obj=chunk, indices=[index],
+                               repair=attempts[key] > 1)
+            for target in active:
+                if active[target][2] != Phase.CONFIRMED:
+                    active[target] = self.progress(target, deadline)
+            cycles += 1
+            if cycles % 8 == 0:
+                for status in self.reconcile(deadline):
+                    self._check_active(status)
+                    active[status.target] = (status.next_chunk, status.missing, status.phase)
+
+    def apply(self, deadline):
+        fresh = self.reconcile(deadline)
+        # Validate the entire fleet before authorizing any activation.
+        for status in fresh:
+            self._check_active(status)
+            if status.phase not in (Phase.READY, Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED):
+                raise Error("fresh authenticated READY required for activation")
+            if status.phase == Phase.CONFIRMED and not status.installed(self.package):
+                raise Error("confirmed receiver does not prove the expected running hash/floor")
+        for status in fresh:
+            if status.installed(self.package):
+                continue
+            if status.phase == Phase.READY:
+                if self.job.uncertain(status.target, Kind.ACTIVATE):
+                    raise Error("uncertain activation needs explicit reconciliation; not blindly repeated")
+                operation, after = self._command(Kind.ACTIVATE, status.target, status, deadline)
+                if after.phase not in (Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED):
+                    raise Error("activation was not authenticated as accepted")
+                self.job.resolve(operation, "authenticated")
+                self.job.status(after)
+        while True:
+            statuses = self.reconcile(deadline)
+            for status in statuses:
+                self._check_active(status)
+            if all(s.installed(self.package) for s in statuses):
+                return statuses
+            self.sleep(min(.2, remaining(deadline, self.clock)))
+
+    def mutate(self, kind, deadline):
+        statuses = self.reconcile(deadline, allow_reset=kind == Kind.REPAIR)
+        for status in statuses:
+            if kind == Kind.ABORT:
+                if (status.phase == Phase.ABORTED and status.package == self.package.digest
+                        and status.counter == self.package.counter and any(status.transaction)):
+                    continue
+                self._check_active(status)
+                if status.phase not in (Phase.RECEIVING, Phase.VERIFYING, Phase.READY):
+                    raise Error("cannot abort an activation or confirmed image")
+            operation, after = self._command(kind, status.target, status, deadline)
+            expected = Phase.ABORTED if kind == Kind.ABORT else Phase.IDLE
+            if after.phase != expected:
+                raise Error("guarded mutation not authenticated by readback")
+            self.job.resolve(operation, "authenticated")
+            self.job.status(after)
+        return [self.statuses[t] for t in self.job.targets]
+
+    def result(self):
+        self._metrics()
+        return {"package": self.package.digest.hex(), "metrics": self.metrics,
+                "unconfirmed_tx_attempts": sum(v["frames"] for v in self.metrics["tx_attempts"].values())
+                - sum(v["frames"] for v in self.metrics["tx"].values()),
+                "airtime_scope": "confirmed host TX physical measurements or conservative guard, not total fleet airtime",
+                "targets": [{"target": t.hex(), "phase": s.phase.name.lower(),
+                             "generation": s.generation, "floor": s.floor,
+                             "last_result": s.result.name.lower(),
+                             "status_authenticated": True, "installation_confirmed": s.installed(self.package)}
+                            for t, s in self.statuses.items()]}
 
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument("--artifact-dir", help="optional new local operation-log directory")
-    root.add_argument("--client-port", required=True, type=Path,
-                      help="explicit stable /dev/serial/by-id companion; no reset, RTS false")
-    root.add_argument("--client-dtr", action="store_true",
-                      help="assert DTR for TinyUSB nRF companions; ESP defaults false")
-    root.add_argument("--timeout", type=float, default=300)
     commands = root.add_subparsers(dest="command", required=True)
-    upload = commands.add_parser("upload", help="cache and start; never commit automatically")
-    cache = commands.add_parser("cache", help="local signed cache only; no remote START, READY or install")
-    deploy = commands.add_parser("deploy", help="stage one image, wait READY, commit and wait native INSTALLED")
-    for command in (upload, cache):
-        command.add_argument("--manifest", required=True, type=Path)
-        command.add_argument("--image", required=True, type=Path)
-        command.add_argument("--reupload", action="store_true")
-    deploy.add_argument("--image", required=True, type=Path)
-    deploy.add_argument("--manifest", type=Path, help="optional exact canonical descriptor; otherwise built in memory")
-    deploy.add_argument("--board", required=True,
-                        choices=("xiao_nrf52840", "xiao_nrf52840_sense", "sensecap_solar_p1", "xiao_s3_wio"))
-    deploy.add_argument("--role-id", required=True, type=int, choices=(0, 1))
-    deploy.add_argument("--counter", required=True, type=int)
-    deploy.add_argument("--reupload", action="store_true")
-    deploy.add_argument("--install-timeout", type=float, default=300)
-    for command in (upload, deploy):
-        command.add_argument("--compression", choices=("raw", "lzma"), default="raw")
-        command.add_argument("--stream-binding", type=Path, action="append", default=[],
-                             help="LZMA1 host-stream frontend: owned deployment binding per target")
-        command.add_argument("--stream-resume-receipt", type=Path, action="append", default=[],
-                             help="strict same-attempt resume, one original stream attempt receipt per target")
-        command.add_argument("--relay-key", type=full_key, help="host-stream directed one-relay route")
-        command.add_argument("--path-hash-bytes", type=int, choices=(1, 2, 3), default=1)
-        command.add_argument("--max-relay-hops", type=int,
-                             help="host-stream path-growth bound (background defaults to full 63-byte path)")
-        command.add_argument("--target", required=True, type=full_key, action="append")
-        command.add_argument("--mode", choices=tuple(MODES), default="directed")
-        command.add_argument("--channel", type=int, default=255)
-        command.add_argument("--frequency-khz", type=int, default=0)
-        command.add_argument("--lease-ms", type=int, default=0)
-        framing = command.add_mutually_exclusive_group()
-        framing.add_argument("--routed-retry", dest="routed_retry", action="store_true", default=None,
-                             help="attempt-diverse reliable framing; already the default for directed/background")
-        framing.add_argument("--no-routed-retry", dest="routed_retry", action="store_false",
-                             help="legacy unframed delivery; accepted only for zero-hop direct mode")
-        command.add_argument("--duty-milli-percent", type=int, default=2000)
-    upload.add_argument("--wait-ready", action="store_true")
-    status = commands.add_parser("status")
-    status.add_argument("--target", type=full_key, default=LOCAL_TARGET)
-    commit = commands.add_parser("commit", help="explicitly commit one READY target")
-    commit.add_argument("--target", required=True, type=full_key)
-    commit.add_argument("--manifest", required=True, type=Path)
-    abort = commands.add_parser("abort", help="generation-bound abort; fresh STATUS and durable readback required")
-    abort.add_argument("--target", required=True, type=full_key)
-    abort.add_argument("--image", required=True, type=Path)
-    abort_cache = commands.add_parser("abort-cache", help="generation-bound local cache abort; never remote")
-    abort_cache.add_argument("--image", required=True, type=Path)
-    admin = commands.add_parser("admin")
-    admin.add_argument("--target", required=True, type=full_key)
-    admin.add_argument("--enabled", required=True, type=int, choices=(0, 1))
+    build = commands.add_parser("build", help="build one signed immutable package")
+    build.add_argument("--image", type=Path, required=True)
+    build.add_argument("--board", required=True, choices=("xiao_nrf52840", "xiao_nrf52840_sense",
+                                                        "sensecap_solar_p1", "xiao_s3_wio"))
+    build.add_argument("--role-id", type=int, choices=(0, 1), required=True)
+    build.add_argument("--counter", type=int, required=True)
+    build.add_argument("--output", type=Path, required=True)
+    build.add_argument("--raw", action="store_true")
+    for name in ("deploy", "status", "abort", "repair"):
+        command = commands.add_parser(name)
+        command.add_argument("--job", type=Path, required=True)
+        if name == "deploy":
+            command.add_argument("--package", type=Path)
+            command.add_argument("--target", type=public_key, action="append", default=[])
+            command.add_argument("--stage-only", action="store_true")
+        command.add_argument("--duty", type=float)
+        command.add_argument("--flood", action="store_true", default=None)
+        command.add_argument("--path", help="explicit path bytes in hex")
+        command.add_argument("--path-width", type=int, choices=(1, 2, 3))
+        command.add_argument("--max-path-bytes", type=int,
+                             help="explicit maximum grown RX/TX path, at most20")
+    for command in commands.choices.values():
+        command.add_argument("--by-id", required=True)
+        command.add_argument("--usb-serial", help="physical serial; required for stock")
+        command.add_argument("--by-path", help="physical anchor for duplicate USB serials")
+        command.add_argument("--id-path")
+        command.add_argument("--usb-vid", type=lambda s: int(s, 16))
+        command.add_argument("--usb-pid", type=lambda s: int(s, 16))
+        command.add_argument("--dtr", action="store_true")
+        command.add_argument("--owner", required=True, type=public_key)
+        command.add_argument("--transport", choices=("native", "stock"), default="native")
+        command.add_argument("--local", action="store_true", help="native local receiver, same transaction engine")
+        command.add_argument("--timeout", type=float, default=3600)
     return root
 
 
-def main():
-    arguments = parser()
-    args = arguments.parse_args()
+def main(argv=None):
+    args = parser().parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
-        arguments.error("--timeout must be finite and positive")
-    canonical = args.manifest.read_bytes() if getattr(args, "manifest", None) is not None else None
-    image = args.image.read_bytes() if hasattr(args, "image") else None
-    if canonical is not None and len(canonical) != 59:
-        arguments.error("--manifest must contain exactly 59 canonical bytes")
-    body = None
-    if args.command == "deploy":
-        if len(args.target) != 1:
-            arguments.error("deploy selects exactly one target; use upload for fleet staging")
-        if not math.isfinite(args.install_timeout) or args.install_timeout <= 0:
-            arguments.error("--install-timeout must be finite and positive")
-        canonical = deploy_manifest(image, args.board, args.role_id, args.counter, canonical)
-    if args.command in ("upload", "cache"):
-        validate_image(canonical, image)
-    if args.command in ("upload", "deploy"):
-        body = start_body(args.mode, args.channel, args.frequency_khz, args.lease_ms, args.duty_milli_percent,
-                          args.routed_retry)
-        if len(set(args.target)) != len(args.target) or len(args.target) > 32:
-            arguments.error("select at most 32 distinct targets")
-        if args.mode != "background" and len(args.target) != 1:
-            arguments.error("direct and directed modes require exactly one target")
-        if args.stream_resume_receipt and args.compression != "lzma":
-            arguments.error("stream resume requires the same explicit LZMA1 host-stream frontend")
-        if args.compression == "lzma":
-            hops = (0 if args.mode == "direct" else 1 if args.mode == "directed" else 63) if args.max_relay_hops is None else args.max_relay_hops
-            _, decision = compression.plan(image, width=args.path_hash_bytes, hops=hops,
-                                            retry=args.mode != "direct", recipients=len(args.target),
-                                            bw=250000 if args.mode == "direct" else 62500,
-                                            sf=5 if args.mode == "direct" else 7,
-                                            arm_thumb=compression.manifest_thumb(canonical))
-            if decision["selected"] == "raw":
-                print("LZMA1: " + decision["reason"] + "; native raw cache/START retained.")
-                args.compression = "raw"
-            elif decision["admission_max_usb_rx_bytes"] > 176:
-                arguments.error("selected LZMA1 route exceeds legacy signed admission's 176-byte RX bound")
-            elif len(args.stream_binding) != len(args.target):
-                arguments.error("LZMA1 uses explicit host streaming; provide --stream-binding per target")
-            elif not args.artifact_dir:
-                arguments.error("LZMA1 host streaming requires --artifact-dir for durable attempt receipts")
-            elif args.channel != 255 or (args.mode != "direct" and args.routed_retry is False):
-                arguments.error("LZMA1 host streaming requires channel 255 and reliable routed framing; native encrypted cache remains RAW")
-            if args.stream_resume_receipt and args.compression != "lzma":
-                arguments.error("stream resume cannot fall back to cache/START or RAW; select the same stream mode")
-    elif args.command in ("abort", "abort-cache") and not image:
-        arguments.error("--image must not be empty")
-    evidence = (lab.Evidence(args.artifact_dir, exclusive=True) if args.command == "cache"
-                else lab.Evidence(args.artifact_dir))
-    node = None
-    managed = False
-    connections = ExitStack()
-    error = None
-    try:
-        identity = None
-        from ota_devices import open_companion, identify_companion
-        node = connections.enter_context(open_companion(
-            args.client_port, name="ota", evidence=evidence, dtr=args.client_dtr))
-        managed = True
-        info = identify_companion(node, timeout=min(5, args.timeout))
-        if info["role"] != "companion":
-            raise UploaderError("OTA requires a companion, not a repeater")
-        identity = full_key(info["pubkey"])
-        uploader = Uploader(node, evidence, command_timeout=min(10, args.timeout))
-        deadline = time.monotonic() + args.timeout
-        if getattr(args, "compression", "raw") == "lzma":
-            uploader.require_wire_version(deadline)
-            compressed_host_stream(node, evidence, args, canonical, image, identity, deadline)
-            return
-        if args.command in ("upload", "cache", "deploy"):
-            identity = identity if identity is not None else lab.app_info(node)["pubkey_bytes"]
-            if args.command == "deploy":
-                reply = uploader.deploy(args.target[0], canonical, image, identity, body, args.mode,
-                                        deadline, args.reupload, args.install_timeout)
+        raise ValueError("positive finite timeout required")
+    if args.local and args.transport != "native":
+        raise ValueError("local receiver feed requires native bridge")
+    if args.transport == "stock" and not args.usb_serial:
+        raise ValueError("stock transport requires explicit --usb-serial")
+    from ota_devices import open_companion
+    with ExitStack() as stack:
+        job = None
+        route = Route()
+        if args.command != "build":
+            if args.job.exists():
+                job = stack.enter_context(JobStore.open(args.job))
+                policy = job.policy
+                if policy["transport"] != args.transport or policy["local"] != args.local:
+                    raise Error("resume must preserve transport/local routing policy")
+                if getattr(args, "target", []) and args.target != job.targets:
+                    raise Error("resume cannot replace the target set")
+                route = Route.from_policy(policy["route"])
+                selected = {"flood": args.flood, "path": args.path, "width": args.path_width,
+                            "max_path_bytes": args.max_path_bytes}
+                if ((args.duty is not None and args.duty != policy["duty"])
+                        or any(value is not None and value != policy["route"][key]
+                               for key, value in selected.items())):
+                    raise Error("resume cannot silently change route or airtime policy")
+                if getattr(args, "package", None) is not None and Package.open(args.package).encode() != job.package.encode():
+                    raise Error("resume cannot replace the immutable package")
             else:
-                since = time.monotonic()
-                reply = uploader.cache(canonical, image, identity, deadline, args.reupload)
-            if args.command == "cache":
-                blocks = (len(image) + BLOCK_BYTES - 1) // BLOCK_BYTES
-                if not (reply.target == LOCAL_TARGET and not reply.flags & REMOTE
-                        and reply.phase == Phase.CACHE_SEALED
-                        and reply.manifest_hash == hashlib.sha256(canonical).digest()
-                        and reply.counter == struct.unpack_from(">I", canonical, 45)[0]
-                        and reply.received == reply.total == blocks
-                        and reply.fresh_since(since, time.monotonic())):
-                    raise UploaderError("cache did not return fresh, complete, image-bound local CACHE_SEALED")
-            elif args.command == "upload":
-                started = time.monotonic()
-                reply = uploader.start(args.target, body, args.mode, deadline)
-                if args.wait_ready:
-                    for target in args.target:
-                        reply = uploader.wait_phase(target, Phase.READY, hashlib.sha256(canonical).digest(),
-                                                    struct.unpack_from(">I", canonical, 45)[0], started, deadline)
-        elif args.command == "commit":
-            reply = uploader.commit(args.target, canonical, deadline)
-        elif args.command == "abort":
-            reply = uploader.abort(args.target, hashlib.sha256(image).digest(), deadline)
-        elif args.command == "abort-cache":
-            reply = uploader.abort(LOCAL_TARGET, hashlib.sha256(image).digest(), deadline)
-        elif args.command == "admin":
-            reply = uploader.require_accepted(uploader.exchange(
-                Op.SET_ADMIN, args.target + bytes([args.enabled]), args.target))
-            if reply.result != Result.OK:
-                raise UploaderError("administrator permission has not been durably saved")
-        else:
-            reply = uploader.status(args.target)
-        evidence.log("ota_command_result", command=args.command, **reply.summary())
-    except (Exception, SystemExit, KeyboardInterrupt) as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        evidence.log("fatal", error=error)
-        raise
-    finally:
-        connections.close()
-        if node is not None and not managed:
-            node.close()
-        evidence.finish(error)
+                if args.command != "deploy" or args.package is None or not args.target:
+                    raise Error("new job requires deploy --package and explicit --target")
+                duty = .02 if args.duty is None else args.duty
+                if not math.isfinite(duty) or not 0 < duty <= 1:
+                    raise ValueError("duty share must be in (0,1]")
+                if args.local and args.target != [args.owner]:
+                    raise ValueError("native local feed requires the companion's own full target key")
+                route = Route(bool(args.flood), bytes.fromhex(args.path or ""), args.path_width or 1,
+                              args.max_path_bytes or 0)
+                route.validate()
+                policy = {"duty": duty, "route": route.policy(), "transport": args.transport, "local": args.local}
+                job = stack.enter_context(JobStore.create(args.job, Package.open(args.package), args.owner,
+                                                         args.target, policy))
+        node = stack.enter_context(open_companion(
+            args.by_id, dtr=args.dtr, serial=args.usb_serial, by_path=args.by_path,
+            id_path=args.id_path, vid=args.usb_vid, pid=args.usb_pid))
+        transport = (NativeTransport(node, args.owner, route, local=args.local)
+                     if args.transport == "native" else StockTransport(node, args.owner, route))
+        deadline = time.monotonic() + args.timeout
+        transport.identify(deadline)
+        if job is not None:
+            profile = json.dumps(list(transport.profile)).encode()
+            previous = job.db.execute("SELECT value FROM meta WHERE key='ordinary_profile'").fetchone()
+            if previous is not None and previous[0] != profile:
+                raise Error("ordinary radio/forwarding differs from the durable job; no retune")
+            with job.db:
+                job.db.execute("INSERT OR REPLACE INTO meta VALUES('ordinary_profile',?)", (profile,))
+        error, result = None, None
+        try:
+            if args.command == "build":
+                image = args.image.read_bytes()
+                canonical = descriptor(image, args.board, args.role_id, args.counter)
+                package = Package.build(image, canonical, args.owner, lambda msg: transport.sign(msg, deadline),
+                                        compress=not args.raw)
+                write_exclusive(args.output, package.encode())
+                result = {"package": package.digest.hex(), "manifest_bytes": len(package.manifest),
+                          "image_bytes": len(image), "chunks": len(package.chunks)}
+            else:
+                scheduler = Scheduler(job, transport)
+                if args.command == "deploy":
+                    scheduler.stage(deadline)
+                    if not args.stage_only:
+                        scheduler.apply(deadline)
+                elif args.command == "status":
+                    scheduler.reconcile(deadline)
+                else:
+                    scheduler.mutate(Kind.ABORT if args.command == "abort" else Kind.REPAIR, deadline)
+                result = scheduler.result()
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            cleanup = "ordinary-profile-unchanged"
+            try:
+                transport.cleanup(time.monotonic() + 15)
+            except BaseException as exc:
+                cleanup = f"readback-unavailable:{type(exc).__name__}"
+                if error is None:
+                    raise
+                error.add_note("ordinary radio cleanup readback also failed; no sender settings were mutated")
+            finally:
+                if job is not None:
+                    with job.db:
+                        job.db.execute("INSERT OR REPLACE INTO meta VALUES('radio_cleanup',?)", (cleanup.encode(),))
+        print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (Error, OSError, ValueError, TimeoutError, KeyboardInterrupt) as exc:
+        print(f"ota_v4: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(1)

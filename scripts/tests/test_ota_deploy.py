@@ -1,457 +1,344 @@
-"""Production deploy paths with synthetic companion/receiver I/O; no hardware."""
-from contextlib import contextmanager, redirect_stdout
+"""Production Python -> real native C++ receiver; no model of receiver business logic."""
+from collections import deque
 import hashlib
-import io
-import json
-import shlex
+import os
 from pathlib import Path
-import struct
 import subprocess
-import sys
+import struct
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import ota_uploader as native
-import ota_stock_companion as stock
-import test_ota_uploader as native_fixture
-import test_ota_stock_companion as stock_fixture
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+from test_ota_uploader import ADMIN, ADMIN_PRIVATE, POLICY, Scratch, TARGET, package
+from test_ota_stock_companion import Clock
+from ota_common import Error, Frame, FramedSerial, Kind, Phase, physical_airtime
+from ota_job import JobStore
+from ota_stock_companion import StockTransport
+from ota_transport import NativeTransport, Route, TxReceipt, packet_payload
+from ota_uploader import Scheduler
+
+DRIVER = os.environ.get("OTA_V4_DRIVER")
 
 
-class NativeDeployTests(unittest.TestCase):
-    def setUp(self):
-        self.f = native_fixture.CliLifecycleTests()
-        self.f.setUp()
-        self.addCleanup(self.f.doCleanups)
-        self.f.image = struct.pack("<II", 0x20010000, 0x27009) + bytes(160)
-        self.set_image("xiao_nrf52840", 0)
-        self.sequence = []
-        self.after_commit = native.Phase.INSTALLED
-        self.commits = 0
-        self.mutate_installed = None
-        original = self.f.node.write_frame.side_effect
+class Driver:
+    def __init__(self, binary, directory, seed):
+        self.arguments = [binary, str(directory), ADMIN.hex(), seed.hex()]
+        self.process = subprocess.Popen(self.arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
 
-        def write(payload):
-            op = native.Op(payload[1])
-            if op == native.Op.CACHE_BEGIN:
-                self.f.private_key.public_key().verify(payload[-64:], self.f.canonical)
-            original(payload)
-            if op == native.Op.COMMIT:
-                self.assertEqual(payload[2:], native_fixture.TARGET + self.f.manifest_hash
-                                 + struct.pack(">II", 9, self.f.generation) + native_fixture.NONCE)
-                self.commits += 1
-                self.f.remote_phase = self.after_commit
-            if op == native.Op.STATUS and payload[2:34] == native_fixture.TARGET:
-                response = self.f.pending[-1][1]
-                decoded = native.decode_reply(response)
-                self.sequence.append(decoded.phase)
-                if decoded.phase == native.Phase.INSTALLED and self.mutate_installed is not None:
-                    self.f.pending[-1] = (self.f.pending[-1][0], self.mutate_installed(response))
-        self.f.node.write_frame.side_effect = write
+    def exchange(self, request):
+        self.process.stdin.write(request + "\n")
+        self.process.stdin.flush()
+        replies = []
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise Error("native receiver driver exited unexpectedly")
+            if line.strip() == ".":
+                return replies
+            replies.append(bytes.fromhex(line.strip()))
 
-    def set_image(self, board, role):
-        self.board, self.role = board, role
-        self.f.canonical = native.deploy_manifest(self.f.image, board, role, 9)
-        self.f.manifest_hash = hashlib.sha256(self.f.canonical).digest()
-        self.f.image_path.write_bytes(self.f.image)
-        self.f.manifest_path.write_bytes(self.f.canonical)
+    def restart(self):
+        self.close()
+        self.__init__(*([self.arguments[0], Path(self.arguments[1]), bytes.fromhex(self.arguments[3])]))
 
-    def args(self):
-        return ["deploy", "--image", str(self.f.image_path), "--board", self.board,
-                "--role-id", str(self.role), "--counter", "9", "--target", native_fixture.TARGET.hex()]
-
-    def test_transfer_ready_commit_installed_for_nrf_and_esp_roles(self):
-        for board, role in (("xiao_nrf52840", 0), ("xiao_nrf52840_sense", 1),
-                            ("sensecap_solar_p1", 0), ("xiao_s3_wio", 0), ("xiao_s3_wio", 1)):
-            with self.subTest(board=board, role=role):
-                self.setUp()
-                if board == "xiao_s3_wio":
-                    self.f.image = b"\xe9" + bytes(170)
-                self.set_image(board, role)
-                self.f.run_cli(self.args())
-                operations = [payload[1] for payload in self.f.sent_payloads()]
-                self.assertIn(native.Op.CACHE_PUT, operations)
-                self.assertLess(operations.index(native.Op.CACHE_SEAL), operations.index(native.Op.START))
-                self.assertEqual(self.sequence, [native.Phase.READY, native.Phase.INSTALLED])
-                self.assertEqual(self.commits, 1)
-                self.assertEqual(self.f.evidence.log.call_args.kwargs["phase"], "INSTALLED")
-                self.f.node.close.assert_called_once()
-
-    def test_protocol14_framed_deploy_survives_300_diagnostic_status_polls(self):
-        self.f.image = struct.pack("<II", 0x20010000, 0x27009) + bytes(84 * 300 - 8)
-        self.set_image(self.board, self.role)
-        status_count = 0
-        original = self.f.node.write_frame.side_effect
-
-        def write(payload):
-            nonlocal status_count
-            if payload[1] == native.Op.STATUS and payload[2:34] == native_fixture.TARGET:
-                status_count += 1
-                self.f.remote_phase = (native.Phase.RECEIVING if status_count <= 300
-                    else native.Phase.INSTALLED if self.commits else native.Phase.READY)
-            original(payload)
-
-        self.f.node.write_frame.side_effect = write
-        node = native_fixture.framed_node(self.f)
-        self.f.run_cli(["--timeout", "180", *self.args()], serial=node)
-        self.assertEqual(self.f.received, 300)
-        self.assertEqual(status_count, 302)
-        self.assertEqual(self.sequence[-2:], [native.Phase.READY, native.Phase.INSTALLED])
-        self.assertEqual(self.commits, 1)
-        self.assertEqual(node.pending, [])
-        self.assertEqual(self.f.evidence.log.call_args.kwargs["phase"], "INSTALLED")
-        node.close.assert_called_once()
-
-    def test_failed_rollback_and_aborted_are_terminal_after_one_commit(self):
-        for phase in (native.Phase.FAILED, native.Phase.ABORTED):
-            with self.subTest(phase=phase):
-                self.setUp()
-                self.after_commit = phase
-                with self.assertRaisesRegex(native.UploaderError, phase.name):
-                    self.f.run_cli(self.args())
-                self.assertEqual(self.commits, 1)
-                self.assertIsNotNone(self.f.evidence.finish.call_args.args[0])
-
-    def test_ready_or_pending_without_installed_times_out_not_success(self):
-        self.after_commit = native.Phase.COMMIT_PENDING
-        with self.assertRaisesRegex(TimeoutError, "INSTALLED"):
-            self.f.run_cli([*self.args(), "--install-timeout", "1"])
-        self.assertEqual(self.commits, 1)
-        self.assertEqual(self.f.evidence.log.call_args.args, ("fatal",))
-
-    def test_not_ready_never_commits(self):
-        self.f.remote_phase = native.Phase.RECEIVING
-        with self.assertRaisesRegex(TimeoutError, "READY"):
-            self.f.run_cli(self.args())
-        self.assertEqual(self.commits, 0)
-
-    def test_wrong_generation_hash_counter_and_scope_cannot_report_installed(self):
-        for offset in (5, 38, 74, 86, 90, 105):
-            with self.subTest(offset=offset):
-                self.setUp()
-                def change(response):
-                    data = bytearray(response)
-                    data[offset] ^= 2 if offset == 5 else 1
-                    return bytes(data)
-                self.mutate_installed = change
-                with self.assertRaises(native.UploaderError):
-                    self.f.run_cli(self.args())
-
-    def test_installed_with_zero_or_different_nonce_is_never_success(self):
-        for name, nonce in (("zero", bytes(16)), ("other", bytes(reversed(native_fixture.NONCE)))):
-            with self.subTest(name=name):
-                self.setUp()
-                self.mutate_installed = lambda response, n=nonce: response[:90] + n + response[106:]
-                with self.assertRaisesRegex(native.UploaderError, "different BEGIN attempt"):
-                    self.f.run_cli(self.args())
-                self.assertEqual(self.commits, 1)
-
-    def test_ready_from_unbound_or_pre_v3_receiver_never_commits(self):
-        original = self.f.reply_mutator
-        for name, mutate in (("pre-v3", lambda r: r[:106] + b"\x00"),
-                             ("zero-nonce", lambda r: r[:90] + bytes(16) + r[106:])):
-            with self.subTest(name=name):
-                self.setUp()
-                self.f.reply_mutator = (lambda op, r, mutate=mutate:
-                                        mutate(r) if r[6:38] == native_fixture.TARGET else r)
-                with self.assertRaisesRegex(native.UploaderError, "not attempt-bound"):
-                    self.f.run_cli(self.args())
-                self.assertEqual(self.commits, 0)
-                self.assertNotIn(native.Op.COMMIT, [p[1] for p in self.f.sent_payloads()])
-        self.f.reply_mutator = original
-
-    def test_explicit_manifest_must_match_board_role_counter_before_open(self):
-        wrong = native.deploy_manifest(self.f.image, self.board, 1, 9)
-        self.f.manifest_path.write_bytes(wrong)
-        with self.assertRaisesRegex(ValueError, "board, role, image and counter"):
-            self.f.run_cli([*self.args(), "--manifest", str(self.f.manifest_path)])
-        self.f.client_open.assert_not_called()
-
-    def test_explicit_esp_companion_port_uses_public_identity(self):
-        import ota_devices
-        original = self.f.node.command.side_effect
-        def command(payload, **options):
-            if payload[0] == native.lab.CMD_APP_START:
-                return original(payload, **options) + b"synthetic-ESP"
-            if payload[0] == native.lab.CMD_DEVICE_QUERY:
-                frame = bytearray(82)
-                frame[:2] = bytes([native.lab.RESP_DEVICE_INFO, 13])
-                frame[20:31] = b"Xiao_S3_WIO"
-                frame[60:66] = b"v1.17.1"[:6]
-                return bytes(frame)
-            return original(payload, **options)
-        self.f.node.command.side_effect = command
-        @contextmanager
-        def open_node(*args, **kwargs):
-            self.assertEqual(args, (Path("/dev/serial/by-id/synthetic-esp"),))
-            self.assertIs(kwargs["evidence"], self.f.evidence)
-            self.assertIs(kwargs["dtr"], False)
+    def close(self):
+        if self.process.poll() is None:
+            self.process.stdin.close()
             try:
-                yield self.f.node
-            finally:
-                self.f.node.close()
-        with patch.object(ota_devices, "open_companion", open_node), \
-                patch.object(ota_devices, "time", self.f.clock):
-            self.f.run_cli(["--client-port", "/dev/serial/by-id/synthetic-esp", *self.args()])
-        self.f.client_open.assert_called_once()
-        self.f.node.close.assert_called_once()
-        self.assertEqual(self.commits, 1)
-
-    def test_native_nrf_dtr_selection_is_explicit(self):
-        import ota_devices
-        @contextmanager
-        def open_node(*args, **kwargs):
-            self.assertEqual(args, (Path("/dev/serial/by-id/synthetic-nrf"),))
-            self.assertIs(kwargs["dtr"], True)
-            try:
-                yield self.f.node
-            finally:
-                self.f.node.close()
-        with patch.object(ota_devices, "open_companion", open_node), \
-                patch.object(ota_devices, "identify_companion", return_value={
-                    "role": "companion", "pubkey": self.f.public_key.hex()}):
-            self.f.run_cli(["--client-port", "/dev/serial/by-id/synthetic-nrf",
-                            "--client-dtr", *self.args()])
-        self.f.client_open.assert_called_once()
-        self.f.node.close.assert_called_once()
-        self.assertEqual(self.commits, 1)
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                self.process.wait(timeout=10)
+        self.process.stdout.close()
 
 
-class DeploySerial(stock_fixture.FakeSerial):
-    def __init__(self, clock, candidate):
-        super().__init__(clock, candidate)
-        self.install_lifecycle = 6
-        self.install_result = 8
-        self.status_mutator = None
+class DriverTransport:
+    """Only I/O and deterministic radio loss, never receiver state emulation."""
+    owner, local = ADMIN, False
+    serial_command_bytes = 3
+    profile = (918000, 62500, 7, 5, 1)
+    route = Route(flood=True, max_path_bytes=1)
 
-    def remote(self, rf):
-        if rf[0] == 10 and self.commit_count:
-            report = bytearray(stock_fixture.census(self.candidate, generation=self.generation,
-                lifecycle=self.install_lifecycle,
-                floor=self.candidate.counter if self.install_lifecycle == 8 else self.floor))
-            report[87] = 6 if self.install_lifecycle == 10 else 4
-            if self.status_mutator is not None:
-                report = self.status_mutator(report)
-            self.schedule(.1, lambda: self.push(bytes(report)))
-            return
-        super().remote(rf)
-        if rf[0] == 3:
-            self.schedule(.2, lambda: setattr(self, "install_lifecycle", 7))
-            self.schedule(3, lambda: setattr(self, "install_lifecycle", self.install_result))
+    def __init__(self, drivers, clock):
+        self.drivers, self.clock, self.queue = drivers, clock, deque()
+        self.sent, self.drop, self.dropped = [], set(), set()
+        self.interrupt_after = None
+        self.interrupt_activate = False
+        self.interrupt_kind = None
+        self.auto_confirm = True
 
+    def sign(self, message, _):
+        return ADMIN_PRIVATE.sign(message)
 
-class StockDeployTests(stock_fixture.Scratch):
-    def setUp(self):
-        super().setUp()
-        self.clock = stock_fixture.Clock()
-        self.candidate = stock_fixture.candidate()
-        self.serial = DeploySerial(self.clock, self.candidate)
-        self.stock = stock.Stock(stock.Frames(self.serial, self.clock), stock_fixture.OWNER,
-                                 self.clock, self.clock.sleep)
-        self.sender = stock.Sender(self.stock, stock_fixture.binding(self.candidate), self.candidate,
-            stock_fixture.NORMAL, self.clock() + 10000, 919000, duty=1,
-            clock=self.clock, sleep=self.clock.sleep)
-        self.artifacts = self.directory / "run"
-        self.artifacts.mkdir(mode=0o700)
+    def send(self, raw, _):
+        frame = Frame.decode(raw)
+        self.sent.append(frame)
+        for index, driver in enumerate(self.drivers):
+            key = index, frame.object, frame.slice
+            if frame.kind == Kind.DATA and key in self.drop and key not in self.dropped:
+                self.dropped.add(key)
+                continue
+            self.queue.extend(driver.exchange(raw.hex()))
+            if self.auto_confirm and frame.kind == Kind.ACTIVATE and frame.slice == (frame.total - 1) // 128:
+                self.queue.extend(driver.exchange("confirm"))
+        self.clock.sleep(.001)
+        if ((self.interrupt_activate and frame.kind == Kind.ACTIVATE) or frame.kind == self.interrupt_kind) \
+                and frame.slice == (frame.total - 1) // 128:
+            self.interrupt_activate = False
+            self.interrupt_kind = None
+            raise ConnectionError("synthetic lost mutation response")
+        if self.interrupt_after is not None and sum(f.kind == Kind.DATA for f in self.sent) >= self.interrupt_after:
+            self.interrupt_after = None
+            raise ConnectionError("synthetic host interruption after receiver I/O")
+        size = len(self.route.packet(raw))
+        return TxReceipt(physical_airtime(size), size, size + 3)
 
-    def guarded_deploy(self, timeout=300):
-        with stock.radio_guard(self.stock, self.sender.binding, self.artifacts):
-            return self.sender.deploy(timeout)
-
-    def test_actual_signed_transfer_ready_commit_native_installed_restores(self):
-        result = self.guarded_deploy()
-        self.assertEqual(self.serial.received, set(range(self.candidate.total)))
-        self.assertEqual(self.serial.commit_count, 1)
-        self.assertEqual(result["lifecycle"], 8)
-        self.assertEqual(result["confirmed_floor"], self.candidate.counter)
-        self.assertTrue(result["native_installed"])
-        self.assertFalse(result["installation_confirmed"])
-        self.assertFalse(result["status_authenticated"])
-        self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
-        self.assertTrue((self.artifacts / "restored.json").exists())
-
-    def test_deploy_succeeds_with_more_than_256_interleaved_ordinary_notifications(self):
-        original = self.serial.reply
-        injected = {"count": 0}
-
-        def noisy(data):
-            # A burst larger than the whole bound before the first reply, then steady interleaving.
-            pushes = stock_fixture.ORDINARY_PUSHES * (20 if not injected["count"] else 1)
-            for push in pushes:
-                original(push)
-            injected["count"] += len(pushes)
-            original(data)
-        self.serial.reply = noisy
-        result = self.guarded_deploy()
-        self.assertGreater(injected["count"], 2 * stock.PENDING_LIMIT)
-        self.assertEqual(sum(self.stock.frames.ignored.values()), injected["count"])
-        self.assertEqual(result["lifecycle"], 8)
-        self.assertEqual(self.serial.commit_count, 1)
-        self.assertEqual(self.serial.received, set(range(self.candidate.total)))
-        self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
-
-    def test_deploy_one_complete_ready_and_one_normal_return_census_no_bitmap_rescan(self):
-        self.candidate = stock_fixture.candidate(size=84 * 257)
-        self.serial = DeploySerial(self.clock, self.candidate)
-        self.serial.received = set(range(self.candidate.total))
-        self.stock = stock.Stock(stock.Frames(self.serial, self.clock), stock_fixture.OWNER,
-                                 self.clock, self.clock.sleep)
-        self.sender = stock.Sender(self.stock, stock_fixture.binding(self.candidate), self.candidate,
-            stock_fixture.NORMAL, self.clock() + 10000, 919000, duty=1,
-            clock=self.clock, sleep=self.clock.sleep)
-        result = self.guarded_deploy()
-        commit = next(i for i, (_, _, frame) in enumerate(self.serial.rf_packets) if frame[0] == 3)
-        polls = [(profile, frame) for _, profile, frame in self.serial.rf_packets[:commit] if frame[0] == 10]
-        self.assertTrue(all(struct.unpack_from(">H", frame, 65)[0] == 0 for _, frame in polls))
-        self.assertEqual(sum(profile[:4] == self.serial.target_normal for profile, _ in polls), 2)
-        self.assertEqual(sum(profile[:4] != self.serial.target_normal for profile, _ in polls), 1)
-        self.assertEqual(self.serial.commit_count, 1)
-        self.assertEqual(result["lifecycle"], 8)
-        self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
-
-    def test_failure_rollback_and_timeout_restore_without_retry(self):
-        for result in (10, 9, 6):
-            with self.subTest(result=result):
-                # Separate artifact namespace for each independent synthetic run.
-                self.clock = stock_fixture.Clock()
-                self.serial = DeploySerial(self.clock, self.candidate)
-                self.serial.install_result = result
-                self.stock = stock.Stock(stock.Frames(self.serial, self.clock), stock_fixture.OWNER,
-                                         self.clock, self.clock.sleep)
-                self.sender = stock.Sender(self.stock, stock_fixture.binding(self.candidate), self.candidate,
-                    stock_fixture.NORMAL, self.clock() + 10000, 919000, duty=1,
-                    clock=self.clock, sleep=self.clock.sleep)
-                self.artifacts = self.directory / str(result)
-                self.artifacts.mkdir(mode=0o700)
-                with self.assertRaises((stock.Error, TimeoutError)) as error:
-                    self.guarded_deploy(100)
-                self.assertIn("FAILED" if result == 10 else "ABORTED" if result == 9 else "timeout",
-                              str(error.exception))
-                self.assertEqual(self.serial.commit_count, 1)
-                self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
-
-    def test_installed_without_matching_new_floor_or_valid_candidate_rejected(self):
-        self.sender.generation = 10
-        self.sender.begin_nonce = stock_fixture.NONCE
-        for offset, value in ((93, 0), (87, 1), (98, 1), (88, 1), (103, stock_fixture.NONCE[0] ^ 1)):
-            with self.subTest(offset=offset):
-                report = bytearray(stock_fixture.census(self.candidate, lifecycle=8,
-                                                       floor=self.candidate.counter))
-                report[87] = 4
-                report[offset] = value
-                with self.assertRaises(stock.Error):
-                    self.sender.parse_census(bytes(report), 0, post_commit=True)
-        for phase in (6, 7, 8):
-            with self.subTest(zero_nonce_lifecycle=phase), \
-                    self.assertRaisesRegex(stock.Error, "different BEGIN attempt"):
-                self.sender.parse_census(stock_fixture.census(self.candidate, lifecycle=phase,
-                    floor=self.candidate.counter, nonce=bytes(16)), 0, post_commit=True)
-        report = stock_fixture.census(self.candidate, lifecycle=8, floor=self.candidate.counter)
-        self.assertEqual(self.sender.parse_census(report, 0, post_commit=True)["lifecycle"], 8)
-
-    def test_deploy_candidate_uses_shared_board_role_codec_and_floor(self):
-        image = self.candidate.image
-        for board, role in (("xiao_nrf52840", 0), ("xiao_nrf52840_sense", 1),
-                            ("sensecap_solar_p1", 1), ("xiao_s3_wio", 0), ("xiao_s3_wio", 1)):
-            raw = b"\xe9" + bytes(168) if board == "xiao_s3_wio" else image
-            candidate = stock.Candidate.build(None, raw, 4, board=board, role_id=role, counter=9)
-            self.assertEqual(candidate.canonical, native.deploy_manifest(raw, board, role, 9))
-        with self.assertRaisesRegex(stock.Error, "anti-rollback"):
-            stock.Candidate.build(None, image, 9, board="xiao_nrf52840", role_id=0, counter=9)
-
-    def test_stock_deploy_cli_needs_no_external_ready_receipt_and_restores(self):
-        self.stock_deploy_cli("1.17.1", 13)
-
-    def test_118_stock_deploy_cli_signed_transfer_ready_commit_installed_and_restore(self):
-        self.serial.version = b"v1.18.0-81dbae59"
-        original = self.serial.reply
-        def noisy(data):
-            for push in stock_fixture.ORDINARY_PUSHES:
-                original(push)
-            original(data)
-        self.serial.reply = noisy
-        self.stock_deploy_cli("1.18.0", 14)
-
-    def stock_deploy_cli(self, release, protocol):
-        self.serial.protocol_version = protocol
-        image = self.directory / "app.bin"
-        image.write_bytes(self.candidate.image)
-        binding = self.directory / "binding.json"
-        stock.private_write(binding, {"schema": 1, "authorized": True, "serial": "ABCDEF0123456789",
-            "sender_public_key": stock_fixture.OWNER.hex(), "target_public_key": stock_fixture.TARGET.hex(),
-            "stock_version": release, "floor": 4, "min_generation": 10,
-            "normal_profile": list(stock_fixture.NORMAL[:4]), "image_kind": "ordinary-app",
-            "image_sha256": hashlib.sha256(self.candidate.image).hexdigest(),
-            "manifest_hash": self.candidate.digest.hex()})
-        @contextmanager
-        def uart(*_, **kwargs):
-            yield self.serial
-        artifacts = self.directory / "cli"
-        with patch.object(stock, "validated_stock_uart", uart), \
-                patch.object(stock.time, "monotonic", self.clock), \
-                patch.object(stock.time, "sleep", self.clock.sleep), \
-                patch.object(stock.Frames.__init__, "__defaults__", (self.clock,)), \
-                patch.object(stock.Stock.__init__, "__defaults__", (self.clock, self.clock.sleep, None)), \
-                patch.object(stock.Sender.__init__, "__defaults__",
-                    (60000, .02, self.clock, self.clock.sleep, None, False, None)), \
-                redirect_stdout(io.StringIO()):
-            stock.main(["deploy", "--serial", "ABCDEF0123456789", "--by-id", "unused",
-                "--sender-key", stock_fixture.OWNER.hex(), "--target", stock_fixture.TARGET.hex(),
-                "--binding", str(binding), "--artifacts", str(artifacts), "--image", str(image),
-                "--board", "xiao_nrf52840", "--role-id", "0", "--counter", "5",
-                "--frequency-khz", "919000", "--normal-duty-percent", "100", "--timeout", "10000"])
-        result = stock.private_read(artifacts / "result.json")
-        self.assertEqual(result["lifecycle"], 8)
-        self.assertEqual(self.serial.commit_count, 1)
-        self.assertEqual(self.serial.profile, stock_fixture.NORMAL)
-        self.assertEqual(self.serial.received, set(range(self.candidate.total)))
-        self.assertEqual(result["confirmed_floor"], self.candidate.counter)
-        self.assertFalse(result["status_authenticated"])
-        self.assertFalse(result["installation_confirmed"])
-        self.assertTrue((artifacts / "restored.json").exists())
+    def receive(self, deadline):
+        if self.queue:
+            raw = self.queue.popleft()
+            self.last_rx_bytes = (len(raw) + 3, len(raw) + 4)
+            return raw
+        self.clock.sleep(max(0, deadline - self.clock()))
+        return None
 
 
-class MakeDeployDefaultTests(unittest.TestCase):
-    """The product-default Make command line, expanded without executing it."""
-    ROOT = Path(__file__).resolve().parents[2]
+class CompanionUSB:
+    """USB/physical-TX device facade only; every OTA object reaches real C++."""
+    def __init__(self, driver, clock, native):
+        self.driver, self.clock, self.native = driver, clock, native
+        self.output, self.signing, self.commands = bytearray(), bytearray(), []
+        self.sent = self.direct = 0
+        self.node = FramedSerial.__new__(FramedSerial)
+        self.node.name, self.node.buffer, self.node.pending = "synthetic USB", bytearray(), []
+        self.node.stream = SimpleNamespace(write_timeout=0)
+        self.node._write_bytes, self.node._read_bytes = self.write, self.read
 
-    def expand(self, *overrides):
-        command = ["make", "--no-print-directory", "-n", "-C", str(self.ROOT), "ota-deploy",
-                   "OTA_DEPLOY_CLIENT_PORT=/dev/serial/by-id/usb-x", "OTA_UPLOAD_IMAGE=app.bin",
-                   "OTA_UPLOAD_TARGET=" + native_fixture.TARGET.hex(), "OTA_UPLOAD_BOARD=xiao_nrf52840",
-                   "OTA_UPLOAD_ROLE_ID=0", "OTA_UPLOAD_COUNTER=9", *overrides]
-        output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
-        return [line for line in output.replace("\\\n", " ").splitlines() if "scripts/ota_" in line]
+    def push(self, payload):
+        self.output.extend(b">" + struct.pack("<H", len(payload)) + payload)
 
-    def native_args(self, *overrides):
-        (line,) = self.expand(*overrides)
-        words = shlex.split(line)
-        return native.parser().parse_args(words[words.index("scripts/ota_uploader.py") + 1:])
+    def read(self, timeout):
+        if not self.output:
+            self.clock.sleep(timeout)
+        data = bytes(self.output[:4096])
+        del self.output[:4096]
+        return data
 
-    def test_default_make_deploy_is_directed_with_reliable_framing(self):
-        arguments = self.native_args()
-        self.assertEqual(arguments.mode, "directed")
-        self.assertIsNone(arguments.routed_retry)
-        body = native.start_body(arguments.mode, arguments.channel, arguments.frequency_khz,
-                                 arguments.lease_ms, arguments.duty_milli_percent, arguments.routed_retry)
-        self.assertEqual(body[12:], b"\x00\x01")
+    def write(self, wire):
+        if wire[:1] != b"<" or len(wire) != struct.unpack_from("<H", wire, 1)[0] + 3:
+            raise AssertionError("invalid production USB framing")
+        body = wire[3:]
+        if len(body) > 176:
+            raise AssertionError("USB frame overflow")
+        self.commands.append(body)
+        command = body[0]
+        if command == 1:
+            info = bytearray(58)
+            info[:2] = b"\x05\x01"
+            info[4:36] = ADMIN
+            info[48:58] = struct.pack("<IIBB", 918000, 62500, 7, 5)
+            self.push(info + b"synthetic companion")
+        elif command == 22:
+            info = bytearray(82)
+            info[:2], info[80] = b"\x0d\x0e", 1
+            info[60:66] = b"1.18.0"
+            self.push(info)
+        elif command == 33:
+            self.signing.clear()
+            self.push(b"\x13\0" + struct.pack("<I", 8192))
+        elif command == 34:
+            self.signing.extend(body[1:])
+            self.push(b"\0")
+        elif command == 35:
+            self.push(b"\x14" + ADMIN_PRIVATE.sign(bytes(self.signing)))
+        elif command == 56:
+            if body[1] == 0:
+                self.push(b"\x18\0" + bytes(9))
+            elif body[1] == 1:
+                self.push(b"\x18\x01" + bytes(12))
+            else:
+                self.push(b"\x18\x02" + struct.pack("<IIIIIII", 0, self.sent, 0, self.direct, 0, 0, 0))
+        elif command in (65, 67):
+            op = body[2] if command == 67 else 1
+            if command == 67 and op == 0:
+                self.push(bytes([30, 4, 0, 0]))
+                return
+            local = command == 67 and op == 2
+            raw = body[3:] if command == 67 else body[2:]
+            frame = raw if local else packet_payload(raw)
+            replies = self.driver.exchange(frame.hex())
+            decoded = Frame.decode(frame)
+            if decoded.kind == Kind.ACTIVATE and decoded.slice == (decoded.total - 1) // 128:
+                replies += self.driver.exchange("confirm")
+            self.sent += int(not local)
+            self.direct += int(not local and raw[0] & 3 == 2)
+            if command == 65:
+                self.push(b"\0")
+            else:
+                self.push(bytes([30, 4, op, 0]) + (struct.pack(">I", 1000) if op == 1 else b""))
+            for reply in replies:
+                if local:
+                    self.push(bytes([30, 4, 3]) + reply)
+                else:
+                    packet = b"\x31\0" + reply
+                    self.push((b"\x91" if self.native else b"\x88\x08\xc0") + packet)
+        else:
+            raise AssertionError(f"forbidden device operation {command}")
+        self.clock.sleep(.001)
 
-    def test_make_legacy_opt_out_is_refused_for_directed_and_inert_for_direct(self):
-        arguments = self.native_args("OTA_DEPLOY_ROUTED_RETRY=0")
-        self.assertIs(arguments.routed_retry, False)
-        with self.assertRaisesRegex(ValueError, "reliable attempt-diverse"):
-            native.start_body(arguments.mode, arguments.channel, arguments.frequency_khz,
-                              arguments.lease_ms, arguments.duty_milli_percent, arguments.routed_retry)
-        direct = self.native_args("OTA_UPLOAD_MODE=direct", "OTA_UPLOAD_FREQ_KHZ=908525")
-        self.assertEqual(len(native.start_body(direct.mode, direct.channel, direct.frequency_khz, direct.lease_ms,
-                                               direct.duty_milli_percent, direct.routed_retry)), 12)
 
-    def test_make_stock_deploy_never_requests_unsupported_routed_framing(self):
-        (line,) = self.expand("OTA_DEPLOY_TRANSPORT=stock", "OTA_UPLOAD_MODE=direct", "OTA_ARTIFACT_DIR=a",
-                              "OTA_STOCK_BINDING=b", "OTA_STOCK_SERIAL=s",
-                              "OTA_STOCK_SENDER_KEY=" + native_fixture.TARGET.hex())
-        self.assertIn("scripts/ota_stock_companion.py deploy", line)
-        self.assertNotIn("routed-retry", line)
+@unittest.skipUnless(DRIVER, "parent Make target sets OTA_V4_DRIVER to the real native receiver")
+class NativeEndToEndTests(Scratch):
+    def setup_job(self, image, count=1, compress=True, local=False):
+        pkg, clock = package(image, compress), Clock()
+        drivers, targets = [], []
+        for index in range(count):
+            seed = bytes([1 if local else index + 2]) * 32
+            key = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            directory = self.directory / f"receiver-{index}"
+            directory.mkdir()
+            driver = Driver(DRIVER, directory, seed)
+            self.addCleanup(driver.close)
+            drivers.append(driver)
+            targets.append(key)
+        policy = {**POLICY, "local": local}
+        job = JobStore.create(self.directory / "job", pkg, ADMIN, targets, policy)
+        self.addCleanup(job.close)
+        transport = DriverTransport(drivers, clock)
+        return pkg, job, transport, clock
+
+    def test_raw_fleet_lost_slices_shared_once_then_selective_repair_and_signed_installation(self):
+        image = hashlib.shake_256(b"native v4 fleet").digest(20000)
+        pkg, job, transport, clock = self.setup_job(image, 2, compress=False)
+        transport.drop = {(0, 0, 2), (1, 0, 3)}
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        statuses = scheduler.apply(clock() + 1000)
+        self.assertTrue(all(s.installed(pkg) for s in statuses))
+        initial = sum((len(c.stored) + 127) // 128 for c in pkg.chunks)
+        sent = [f for f in transport.sent if f.kind == Kind.DATA]
+        self.assertEqual(len(sent), initial + 2)
+        self.assertEqual(scheduler.result()["metrics"]["repair_frames"], 2)
+        self.assertEqual(len({(f.object, f.slice) for f in sent}), initial)
+
+    def test_host_and_receiver_restart_resume_without_second_admission(self):
+        image = hashlib.shake_256(b"native v4 restart").digest(24000)
+        pkg, job, transport, clock = self.setup_job(image, compress=False)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        transport.interrupt_after = 70
+        with self.assertRaises(ConnectionError):
+            scheduler.stage(clock() + 1000)
+        self.assertEqual(scheduler.result()["unconfirmed_tx_attempts"], 1)
+        admitted = sum(f.kind == Kind.ADMIT for f in transport.sent)
+        job.close()
+        transport.drivers[0].restart()
+        transport.queue.clear()
+        with JobStore.open(self.directory / "job") as resumed:
+            scheduler = Scheduler(resumed, transport, clock=clock, sleep=clock.sleep)
+            self.assertGreater(scheduler.next_tx, clock())
+            scheduler.stage(clock() + 1000)
+            self.assertEqual(sum(f.kind == Kind.ADMIT for f in transport.sent), admitted)
+            self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    def test_compressed_independent_chunks_use_real_decoder_and_raw_hash(self):
+        branch_bytes = bytearray()
+        for offset in range(0, 20000, 4):
+            value = (0x70000 - (offset % 8192) - 4) >> 1
+            branch_bytes.extend(((value >> 11) & 255, 0xF0 | ((value >> 19) & 7),
+                                 value & 255, 0xF8 | ((value >> 8) & 7)))
+        image = bytes(branch_bytes)
+        pkg, job, transport, clock = self.setup_job(image)
+        self.assertTrue(any(c.codec == 2 for c in pkg.chunks))
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    def test_explicit_abort_and_repair_preserve_confirmed_floor(self):
+        _, job, transport, clock = self.setup_job(b"a" * 8192)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        aborted = scheduler.mutate(Kind.ABORT, clock() + 1000)
+        self.assertEqual(aborted[0].phase, Phase.ABORTED)
+        repaired = scheduler.mutate(Kind.REPAIR, clock() + 1000)
+        self.assertEqual((repaired[0].phase, repaired[0].floor), (Phase.IDLE, aborted[0].floor))
+
+    def test_current_admin_revocation_prevents_activation_and_never_claims_installation(self):
+        pkg, job, transport, clock = self.setup_job(b"admin bound" * 1000)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        transport.drivers[0].exchange("fault admin")
+        with self.assertRaisesRegex(Error, "activation"):
+            scheduler.apply(clock() + 1000)
+        self.assertFalse(scheduler.statuses[TARGET].installed(pkg))
+        self.assertTrue(job.uncertain(TARGET, Kind.ACTIVATE))
+
+    def test_lost_activation_response_reconciles_confirmed_without_blind_activation(self):
+        pkg, job, transport, clock = self.setup_job(b"activation crash" * 1000)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        transport.interrupt_activate = True
+        with self.assertRaises(ConnectionError):
+            scheduler.apply(clock() + 1000)
+        activations = sum(f.kind == Kind.ACTIVATE for f in transport.sent)
+        job.close()
+        transport.drivers[0].restart()
+        transport.queue.clear()
+        with JobStore.open(self.directory / "job") as resumed:
+            recovered = Scheduler(resumed, transport, clock=clock, sleep=clock.sleep)
+            self.assertTrue(all(s.installed(pkg) for s in recovered.apply(clock() + 1000)))
+            self.assertEqual(sum(f.kind == Kind.ACTIVATE for f in transport.sent), activations)
+
+    def serial_case(self, native, local=False):
+        pkg, job, driver_transport, clock = self.setup_job(b"production serial transport" * 700, local=local)
+        usb = CompanionUSB(driver_transport.drivers[0], clock, native)
+        transport = (NativeTransport(usb.node, ADMIN, DriverTransport.route, local=local,
+                                     clock=clock, sleep=clock.sleep) if native else
+                     StockTransport(usb.node, ADMIN, DriverTransport.route, clock=clock, sleep=clock.sleep))
+        transport.identify(clock() + 1000)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+        transport.cleanup(clock() + 1000)
+        self.assertFalse(any(c[0] == 11 for c in usb.commands))
+        self.assertEqual(scheduler.result()["unconfirmed_tx_attempts"], 0)
+        if local:
+            self.assertEqual(scheduler.result()["metrics"]["physical_or_guarded_air_s"], 0)
+
+    def test_stock_usb_framing_signing_physical_tx_and_actual_cpp_install(self):
+        self.serial_case(False)
+
+    def test_native_radio_bridge_framing_and_actual_cpp_install(self):
+        self.serial_case(True)
+
+    def test_native_local_bridge_uses_same_actual_cpp_transaction_without_rf(self):
+        self.serial_case(True, local=True)
+
+    def test_lost_abort_and_repair_responses_reconcile_owned_generation_changes(self):
+        _, job, transport, clock = self.setup_job(b"mutation recovery" * 1000)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        ready = scheduler.stage(clock() + 1000)[0]
+        transport.interrupt_kind = Kind.ABORT
+        with self.assertRaises(ConnectionError):
+            scheduler.mutate(Kind.ABORT, clock() + 1000)
+        abort_frames = sum(f.kind == Kind.ABORT for f in transport.sent)
+        transport.queue.clear()
+        aborted = scheduler.mutate(Kind.ABORT, clock() + 1000)[0]
+        self.assertEqual(aborted.generation, ready.generation + 1)
+        self.assertEqual(sum(f.kind == Kind.ABORT for f in transport.sent), abort_frames)
+        self.assertFalse(job.uncertain(TARGET, Kind.ABORT))
+        transport.interrupt_kind = Kind.REPAIR
+        with self.assertRaises(ConnectionError):
+            scheduler.mutate(Kind.REPAIR, clock() + 1000)
+        job.close()
+        transport.drivers[0].restart()
+        transport.queue.clear()
+        with JobStore.open(self.directory / "job") as resumed:
+            recovered = Scheduler(resumed, transport, clock=clock, sleep=clock.sleep)
+            idle = recovered.reconcile(clock() + 1000)[0]
+            self.assertEqual((idle.phase, idle.generation), (Phase.IDLE, aborted.generation + 1))
+            self.assertFalse(resumed.uncertain(TARGET, Kind.REPAIR))
 
 
 if __name__ == "__main__":

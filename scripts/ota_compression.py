@@ -1,187 +1,157 @@
-"""Shared bounded LZMA1 planner/framing for stock and native host streaming.
-
-No serial/device access. Receiver candidates and canonical manifests remain raw.
-"""
+"""Immutable OTA v4 packages and independent bounded LZMA1 chunks."""
 from dataclasses import dataclass
 import hashlib
-import math
+import importlib.util
 import lzma
+from pathlib import Path
 import struct
-import zlib
 
-GROUP = 8064
-RAW_BLOCK = 84
-POLL = 0x13
-REPORT = 0x14
-FRAGMENT = 0x15
-CAPABILITY_REQUEST = 0x16
-CAPABILITY_REPORT = 0x17
-CAPABILITY_VERSION = 1
-CAPABILITY_DOMAIN = b"MeshCore/OTA/codec-capability/v1"
-LZMA = 0xA0
-LZMA_THUMB = 0xA1
-RAW = 0
-HEADER = 18
-SIGNATURE = 64
-DOMAIN = b"MeshCore/OTA/lzma1/v1"
+from ota_common import CHUNK_BYTES, MAX_CHUNKS, MAX_MANIFEST, Error, domain, verify
 
-def capability_request(target, manifest_hash, challenge, profile):
-    if (len(target) != 32 or len(manifest_hash) != 32 or len(challenge) != 16 or
-            not any(challenge) or profile not in (LZMA, LZMA_THUMB)):
-        raise ValueError("invalid stateless codec capability context")
-    return bytes([CAPABILITY_REQUEST]) + target + manifest_hash + challenge + bytes([CAPABILITY_VERSION, profile])
+PREFIX_BYTES = 163
+ENTRY_BYTES = 35
+MANIFEST_BASE = PREFIX_BYTES + 64
+RAW, LZMA, LZMA_THUMB = 0, 1, 2
 
 
-def capability_report(frame, request):
-    if (len(request) != 83 or request[0] != CAPABILITY_REQUEST or len(frame) != 151 or
-            frame[:83] != bytes([CAPABILITY_REPORT]) + request[1:] or
-            frame[83:87] != struct.pack(">HH", GROUP, 8192)):
-        raise ValueError("stateless codec capability target/request/profile/bounds mismatch")
-    return CAPABILITY_DOMAIN + frame[:87]
+def filters(thumb=False, offset=0):
+    prefix = [{"id": lzma.FILTER_ARMTHUMB, "start_offset": offset}] if thumb else []
+    return prefix + [{"id": lzma.FILTER_LZMA1, "dict_size": 8192, "lc": 0, "lp": 1, "pb": 1,
+                     "mode": lzma.MODE_NORMAL, "mf": lzma.MF_BT4, "nice_len": 273, "depth": 1000}]
 
 
-def manifest_thumb(canonical):
-    """Only explicit signed nRF board IDs, never image-byte heuristics."""
-    return canonical[:4] in (b"XN40", b"SCP1")
+def descriptor(image, board, role, counter):
+    path = Path(__file__).resolve().parents[1] / "bootloader/xiao_nrf52840_ota/tools/xiao_ota_descriptor.py"
+    spec = importlib.util.spec_from_file_location("ota_boot_descriptor", path)
+    codec = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(codec)
+    codec.assert_matches_canonical_layout_contract()
+    return codec.build_descriptor(board, role, counter, image)
 
 
-def filters(arm_thumb, offset=0):
-    result = [{"id": lzma.FILTER_ARMTHUMB, "start_offset": offset}] if arm_thumb else []
-    return result + [{"id": lzma.FILTER_LZMA1, "dict_size": 8192, "lc": 0, "lp": 1, "pb": 1,
-                      "mode": lzma.MODE_NORMAL, "mf": lzma.MF_BT4, "nice_len": 273, "depth": 1000}]
-
-
-def fragment_capacity(width, hops, retry, transport_codes=False):
-    if (type(width) is not int or type(hops) is not int or width not in (1, 2, 3)
-            or not 0 <= hops <= 63 or width * hops > 64):
-        raise ValueError("invalid maximum path width/hops")
-    overhead = max(2, 3) + 2 + width * hops + 4 * bool(transport_codes) + 5 * bool(retry) + HEADER + SIGNATURE
-    return max(0, 176 - overhead)
+def validate_descriptor(canonical, image):
+    if (len(canonical) != 59 or not 0 < len(image) <= CHUNK_BYTES * MAX_CHUNKS
+            or struct.unpack_from(">I", canonical, 9)[0] != len(image)
+            or canonical[13:45] != hashlib.sha256(image).digest()
+            or canonical[4] not in (0, 1) or canonical[53:59] != struct.pack(">HHH", 1, 1, 1)):
+        raise Error("canonical59 geometry/hash/policy mismatch")
 
 
 @dataclass(frozen=True)
-class Group:
-    index: int
-    raw_bytes: int
+class Chunk:
+    codec: int
     stored: bytes
-    profile: int
-    crc32: int
-
-    def prefix(self, manifest_hash, offset, capacity):
-        if len(manifest_hash) != 32 or not 0 <= offset < len(self.stored) or not 1 <= capacity <= 89:
-            raise ValueError("invalid fragment bounds")
-        data = self.stored[offset:offset + capacity]
-        header = (bytes([FRAGMENT]) + manifest_hash[:4] +
-                  struct.pack(">HHHIBH", self.index, len(self.stored), self.raw_bytes,
-                              self.crc32, self.profile, offset))
-        assert len(header) == HEADER
-        return header + data
-
-    def fragments(self, manifest_hash, capacity):
-        return tuple(self.prefix(manifest_hash, offset, capacity) for offset in range(0, len(self.stored), capacity))
+    raw_hash: bytes
 
 
-def signed_message(target, manifest_hash, generation, nonce, prefix):
-    if (len(target) != 32 or len(manifest_hash) != 32 or not 0 <= generation <= 0xFFFFFFFF
-            or len(nonce) != 16 or not any(nonce) or prefix[:1] != bytes([FRAGMENT])
-            or not HEADER < len(prefix) <= HEADER + 89):
-        raise ValueError("unbound compressed fragment")
-    return DOMAIN + target + manifest_hash + struct.pack(">I", generation) + nonce + prefix
+@dataclass(frozen=True)
+class Package:
+    manifest: bytes
+    chunks: tuple
+    canonical: bytes
+    owner: bytes
+    raw: bytes
 
+    @property
+    def digest(self):
+        return hashlib.sha256(self.manifest).digest()
 
-def poll(target, manifest_hash, generation, nonce, group):
-    if len(target) != 32 or len(manifest_hash) != 32 or len(nonce) != 16 or not any(nonce):
-        raise ValueError("unbound compression progress query")
-    return bytes([POLL]) + target + manifest_hash + struct.pack(">I", generation) + nonce + struct.pack(">H", group)
+    @property
+    def tag(self):
+        return self.digest[:8]
 
+    @property
+    def raw_hash(self):
+        return self.canonical[13:45]
 
-def report(frame, target, manifest_hash, generation, nonce, group, stored_size, arm_thumb=False):
-    expected = bytes([REPORT]) + target + manifest_hash + struct.pack(">I", generation) + nonce + struct.pack(">H", group)
-    if (len(frame) != 95 or frame[:87] != expected or frame[89] not in (0, 1)
-            or frame[90] not in ((LZMA_THUMB,) if arm_thumb else (LZMA, LZMA_THUMB))
-            or frame[91:93] != struct.pack(">H", GROUP)):
-        raise ValueError("compression capability/progress target/manifest/attempt/profile mismatch")
-    offset = struct.unpack_from(">H", frame, 87)[0]
-    if offset > stored_size:
-        raise ValueError("compression progress outside encoded group")
-    if frame[93]:
-        raise ValueError(f"receiver LZMA1 error {frame[93]}; never raw-fallback on decode failure")
-    if frame[94]:
-        raise ValueError(f"receiver compressed-group write error {frame[94]}; durable raw progress retained")
-    return offset, bool(frame[89])
+    @property
+    def counter(self):
+        return struct.unpack_from(">I", self.canonical, 45)[0]
 
+    def encode(self):
+        return self.manifest + b"".join(c.stored for c in self.chunks)
 
-def groups(image, *, arm_thumb=False):
-    result = []
-    for index, at in enumerate(range(0, len(image), GROUP)):
-        raw = image[at:at + GROUP]
-        packed = lzma.compress(raw, format=lzma.FORMAT_RAW, filters=filters(arm_thumb, at))
-        profile = LZMA_THUMB if arm_thumb else LZMA
-        if len(packed) >= len(raw):
-            packed, profile = raw, RAW
-        result.append(Group(index, len(raw), packed, profile, zlib.crc32(raw)))
-    return tuple(result)
+    @classmethod
+    def build(cls, image, canonical, owner, signer, compress=True):
+        validate_descriptor(canonical, image)
+        if len(owner) != 32 or not any(owner):
+            raise ValueError("nonzero package signer required")
+        thumb = canonical[:4] in (b"XN40", b"SCP1")
+        chunks = []
+        for offset in range(0, len(image), CHUNK_BYTES):
+            raw = image[offset:offset + CHUNK_BYTES]
+            choices = [(raw, RAW)]
+            if compress:
+                choices.append((lzma.compress(raw, format=lzma.FORMAT_RAW,
+                                              filters=filters(False)), LZMA))
+                if thumb:
+                    choices.append((lzma.compress(raw, format=lzma.FORMAT_RAW,
+                                                  filters=filters(True)), LZMA_THUMB))
+            stored, codec = min(choices, key=lambda item: (len(item[0]), item[1]))
+            chunks.append(Chunk(codec, stored, hashlib.sha256(raw).digest()))
+        boot_signature = signer(canonical)
+        verify(owner, canonical, boot_signature)
+        unsigned = (b"MCO4\x04\x0d" + struct.pack(">H", len(chunks)) + owner + canonical
+                    + boot_signature + b"".join(
+                        bytes([c.codec]) + struct.pack(">H", len(c.stored)) + c.raw_hash for c in chunks))
+        signature = signer(domain("package") + unsigned)
+        verify(owner, domain("package") + unsigned, signature)
+        return cls.decode(unsigned + signature + b"".join(c.stored for c in chunks))
 
+    @classmethod
+    def decode(cls, capsule):
+        capsule = bytes(capsule)
+        if len(capsule) < MANIFEST_BASE or capsule[:6] != b"MCO4\x04\x0d":
+            raise Error("not an OTA v4 package")
+        count = struct.unpack_from(">H", capsule, 6)[0]
+        length = MANIFEST_BASE + ENTRY_BYTES * count
+        if not 1 <= count <= MAX_CHUNKS or length > MAX_MANIFEST or len(capsule) < length:
+            raise Error("invalid manifest bounds")
+        manifest, owner, canonical = capsule[:length], capsule[8:40], capsule[40:99]
+        if not any(owner):
+            raise Error("zero package signer")
+        verify(owner, canonical, capsule[99:163])
+        verify(owner, domain("package") + manifest[:-64], manifest[-64:])
+        raw_size = struct.unpack_from(">I", canonical, 9)[0]
+        if not 0 < raw_size <= CHUNK_BYTES * MAX_CHUNKS or count != (raw_size + 8191) // 8192:
+            raise Error("canonical image/chunk count mismatch")
+        chunks, decoded, cursor = [], [], length
+        for index in range(count):
+            at = PREFIX_BYTES + index * ENTRY_BYTES
+            codec, stored_size = struct.unpack_from(">BH", manifest, at)
+            expected_size = min(CHUNK_BYTES, raw_size - index * CHUNK_BYTES)
+            if codec not in (RAW, LZMA, LZMA_THUMB) or not 1 <= stored_size <= expected_size:
+                raise Error("invalid chunk codec/length")
+            if codec == LZMA_THUMB and canonical[:4] not in (b"XN40", b"SCP1"):
+                raise Error("Thumb codec requires an explicitly supported signed board")
+            stored = capsule[cursor:cursor + stored_size]
+            cursor += stored_size
+            if len(stored) != stored_size:
+                raise Error("truncated package chunk")
+            if codec == RAW:
+                raw = stored
+            else:
+                decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW,
+                                              filters=filters(codec == LZMA_THUMB))
+                try:
+                    raw = decoder.decompress(stored, max_length=expected_size + 1)
+                except lzma.LZMAError as exc:
+                    raise Error("invalid LZMA chunk") from exc
+                if not decoder.eof or decoder.unused_data:
+                    raise Error("chunk lacks end marker, exceeds bound or has trailing bytes")
+            digest = manifest[at + 3:at + 35]
+            if len(raw) != expected_size or hashlib.sha256(raw).digest() != digest:
+                raise Error("raw chunk SHA-256 mismatch")
+            chunks.append(Chunk(codec, stored, digest))
+            decoded.append(raw)
+        if cursor != len(capsule):
+            raise Error("trailing package bytes")
+        image = b"".join(decoded)
+        validate_descriptor(canonical, image)
+        return cls(manifest, tuple(chunks), canonical, owner, image)
 
-def physical_airtime(size, bw=62500, sf=7, cr=5):
-    symbol = (1 << sf) / bw
-    de = int(symbol >= .016)
-    symbols = 8 + max(0, math.ceil((8 * size - 4 * sf + 28 + 16) / (4 * (sf - 2 * de)))) * cr
-    return ((32 if sf <= 8 else 16) + 4.25 + symbols) * symbol
-
-
-def plan(image, *, width=1, hops=1, retry=True, recipients=1, bw=62500, sf=7, cr=5, arm_thumb=False):
-    if not image or not 1 <= recipients <= 32:
-        raise ValueError("nonempty image and 1..32 recipients required")
-    encoded = groups(image, arm_thumb=arm_thumb)
-    capacity = fragment_capacity(width, hops, retry)
-    if not capacity:
-        raise ValueError("route leaves no compressed payload capacity")
-    path = width * hops
-    wire = lambda inner: inner + 2 + path + 5 * bool(retry)
-    # No padding: final fragment is variable length. Every packet is signed.
-    compressed_sizes = [wire(HEADER + min(capacity, len(g.stored) - at) + SIGNATURE)
-                        for g in encoded for at in range(0, len(g.stored), capacity)]
-    raw_sizes = [wire(7 + min(RAW_BLOCK, len(image) - at) + SIGNATURE)
-                 for at in range(0, len(image), RAW_BLOCK)]
-    air = lambda sizes: sum(physical_airtime(n, bw, sf, cr) for n in sizes)
-    raw_packets, compressed_packets = len(raw_sizes), len(compressed_sizes) * recipients
-    raw_air, compressed_air = air(raw_sizes), air(compressed_sizes) * recipients
-    # Both strategies checkpoint after <=4 data packets. Compressed mode adds a
-    # fresh initial group query and a raw census checkpoint per group/recipient.
-    compressed_polls = sum(1 + math.ceil(math.ceil(len(g.stored) / capacity) / 4) for g in encoded) * recipients
-    raw_polls = math.ceil(raw_packets / 4) * recipients
-    preflight_air = recipients * air([wire(83), wire(151)])
-    compressed_control_air = preflight_air + compressed_polls * air([wire(87), wire(95)]) + len(encoded) * recipients * air([wire(67), wire(123)])
-    raw_control_air = raw_polls * air([wire(67), wire(123)])
-    wins = (compressed_packets < raw_packets and
-            compressed_air + compressed_control_air < raw_air + raw_control_air)
-    result = {
-        "selected": "lzma" if wins else "raw",
-        "reason": "fewer signed RF data packets and estimated checkpoint-inclusive airtime" if wins else
-                  "compression does not beat existing RAW packet/air model; RAW explicitly selected",
-        "image_bytes": len(image), "image_sha256": hashlib.sha256(image).hexdigest(),
-        "block_bytes": GROUP, "dictionary_bytes": 8192, "lc": 0, "lp": 1, "pb": 1,
-        "arm_thumb": arm_thumb, "capacity": capacity, "path_width": width,
-        "max_relay_hops": hops, "retry": retry, "recipient_bound_streams": recipients,
-        "admission_max_usb_rx_bytes": 164 + 2 + path + 5 * bool(retry) + 3,
-        "legacy_control_path_supported": 164 + 2 + path + 5 * bool(retry) + 3 <= 176,
-        "groups": len(encoded), "raw_fallback_groups": sum(g.profile == RAW for g in encoded),
-        "stored_bytes": sum(len(g.stored) for g in encoded),
-        "fragment_metadata_bytes": HEADER * compressed_packets,
-        "fragment_signature_bytes": SIGNATURE * compressed_packets,
-        "padding_bytes": 0, "compressed_data_packets": compressed_packets,
-        "raw_data_packets": raw_packets,
-        "compressed_data_wire_bytes": sum(compressed_sizes) * recipients,
-        "raw_data_wire_bytes": sum(raw_sizes),
-        "compressed_progress_poll_pairs": compressed_polls,
-        "compressed_preflight_pairs": recipients, "compressed_preflight_air_s": preflight_air,
-        "raw_progress_poll_pairs": raw_polls,
-        "compressed_group_census_pairs": len(encoded) * recipients,
-        "compressed_data_air_s": compressed_air, "raw_data_air_s": raw_air,
-        "compressed_checkpoint_air_s": compressed_control_air, "raw_checkpoint_air_s": raw_control_air,
-        "estimates_only": True,
-        "excludes": "admission/lease/COMMIT/final survey, loss, repairs, stock whole-second counters, "
-                    "TX-completion pacing, contention and flash/decode CPU; no hardware timing claim",
-    }
-    return encoded, result
+    @classmethod
+    def open(cls, path):
+        with Path(path).open("rb") as stream:
+            data = stream.read(MAX_MANIFEST + CHUNK_BYTES * MAX_CHUNKS + 1)
+        return cls.decode(data)

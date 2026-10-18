@@ -65,7 +65,7 @@ class IdentityTests(unittest.TestCase):
             "board": "Seeed Xiao S3 WIO", "fwversion": "v1.14.0", "protocol_version": 13,
         })
         self.assertEqual(node.command.call_args_list, [
-            mock.call(b"\1" + bytes(7) + b"ota", expected=(5, 1), timeout=5),
+            mock.call(b"\1" + bytes(7) + b"ota-v4", expected=(5, 1), timeout=5),
             mock.call(b"\x16\x0d", expected=(13, 1), timeout=4.75),
         ])
         self.assertNotIn(GPS.decode(), json.dumps(info))
@@ -153,6 +153,9 @@ class AccessTests(unittest.TestCase):
                                     open=mock.Mock(), close=mock.Mock(), write=mock.Mock())
         self.factory = mock.Mock(return_value=self.port)
         self.serial = SimpleNamespace(Serial=self.factory)
+        quiet = mock.patch.object(devices, "quiet_serial_factory", self.factory)
+        quiet.start()
+        self.addCleanup(quiet.stop)
 
     def test_import_never_opens_serial(self):
         with mock.patch.dict(sys.modules, serial=self.serial), \
@@ -262,15 +265,14 @@ class AccessTests(unittest.TestCase):
         node._read_bytes = mock.Mock(return_value=b"")
         self.port.write.return_value = 5
         with mock.patch.object(devices.lab.time, "monotonic",
-                               side_effect=[0, 0, 0, 0, 0.3]):
-            with self.assertRaisesRegex(TimeoutError, "no frame"):
+                               side_effect=[0, 0, 0, 0, 0, 0.3]):
+            with self.assertRaises(TimeoutError):
                 node.command(b"\x16\x0d", expected=(13,), timeout=0.25)
-        self.assertEqual(self.port.write_timeout, 0.25)
         self.port.write.assert_called_once_with(b"<\x02\0\x16\x0d")
         for size in (0, 177, 65535):
             node.buffer = bytearray(b">" + struct.pack("<H", size))
-            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "response length"):
-                node._extract()
+            with self.subTest(size=size), self.assertRaisesRegex(devices.lab.Error, "frame length"):
+                node.poll()
 
 
 if __name__ == "__main__":
