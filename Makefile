@@ -111,6 +111,9 @@ test-ota-management: tmpdir
 	$(PYTHON) -m unittest discover -s scripts/tests -p 'test_ota_management.py'
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
+.PHONY: test-ota-v4-native
+test-ota-v4-native: tmpdir
+	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native -f test_lora_ota_v4
 test-ota-native test-ota-integration: test-ota-compression-fixture
 .PHONY: test-ota-compression-fixture test-ota-compression build-ota-compression-solar ota-compression-arm-size ota-compression-report
 test-ota-compression-fixture: tmpdir
