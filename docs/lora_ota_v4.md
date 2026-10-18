@@ -21,6 +21,13 @@ multiproofs can reduce that cost, but add state and recovery complexity without
 helping this bounded, full-image transfer. The manifest is bounded to 8192 bytes
 and 128 chunks; there is no dynamically growing hash tree.
 
+The complete manifest is `227 + 35 * chunk_count` bytes, including both
+signatures: 2467 bytes for 64 chunks, or 20 radio slices. A maximum-size data
+frame spends 23 bytes on OTA framing and 128 on image data, before MeshCore
+routing overhead. This replaces the earlier 64-byte signature on each data
+packet; control/status signatures remain infrequent and independently bound
+to their purpose.
+
 Data has no signatures. Each radio slice has a CRC-32 for accidental corruption;
 the receiver hashes the complete decoded raw chunk before making durable
 progress. It then checks the exact full raw-image SHA-256 before READY and again
