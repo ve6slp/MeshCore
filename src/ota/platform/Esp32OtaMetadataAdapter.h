@@ -9,8 +9,8 @@ namespace ota { namespace platform {
 // final 16 KiB of app0; neither image slot, NVS, otadata nor userdata is reachable.
 class Esp32OtaMetadataAdapter final : public FlashDevice {
 public:
-  static constexpr uint32_t kBytes = 16384;
-  static constexpr uint32_t kOffset = 0x330000 - kBytes;
+  static constexpr uint32_t kBytes = storage::Esp32PartitionApi::kOtaMetadataBytes;
+  static constexpr uint32_t kOffset = storage::Esp32PartitionApi::kOtaMetadataOffset;
   explicit Esp32OtaMetadataAdapter(storage::Esp32PartitionApi& api) : api_(api) {}
   uint32_t totalSizeBytes() const override { return kBytes; }
   uint32_t eraseUnitBytes() const override { return 4096; }
@@ -18,7 +18,7 @@ public:
   FlashStatus read(uint32_t offset, uint8_t* out, uint32_t size) const override {
     const FlashStatus checked = check(offset, size);
     if (!isOk(checked) || (!out && size)) return !isOk(checked) ? checked : FlashStatus::InvalidArgument;
-    return api_.read(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, out, size) ==
+    return api_.readOtaMetadata(offset, out, size) ==
         storage::kEsp32Ok ? FlashStatus::Ok : FlashStatus::IoError;
   }
   FlashStatus program(uint32_t offset, const uint8_t* bytes, uint32_t size) override {
@@ -32,14 +32,14 @@ public:
         if ((previous[i] & bytes[done + i]) != bytes[done + i]) return FlashStatus::PartialProgramViolation;
       done += count;
     }
-    return api_.write(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, bytes, size) ==
+    return api_.writeOtaMetadata(offset, bytes, size) ==
         storage::kEsp32Ok ? FlashStatus::Ok : FlashStatus::IoError;
   }
   FlashStatus eraseSector(uint32_t offset) override {
     const FlashStatus checked = check(offset, 4096);
     if (!isOk(checked)) return checked;
     if (offset % 4096) return FlashStatus::Unaligned;
-    return api_.erase(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, 4096) ==
+    return api_.eraseOtaMetadata(offset, 4096) ==
         storage::kEsp32Ok ? FlashStatus::Ok : FlashStatus::IoError;
   }
 private:

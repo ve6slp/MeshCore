@@ -106,6 +106,8 @@ public:
 
 class Esp32PartitionApi {
 public:
+  static constexpr uint32_t kOtaMetadataBytes = 16384;
+  static constexpr uint32_t kOtaMetadataOffset = 0x330000 - kOtaMetadataBytes;
   virtual ~Esp32PartitionApi() = default;
   virtual Esp32SdkError inspect(Esp32PartitionSnapshot& out) const = 0;
   virtual Esp32SdkError read(const Esp32PartitionIdentity& partition, uint32_t offset,
@@ -114,6 +116,16 @@ public:
                              const uint8_t* data, uint32_t len) = 0;
   virtual Esp32SdkError erase(const Esp32PartitionIdentity& partition, uint32_t offset,
                              uint32_t len) = 0;
+  // Separate, tail-relative capability; it never grants active image access.
+  virtual Esp32SdkError readOtaMetadata(uint32_t, uint8_t*, uint32_t) const {
+    return kEsp32InvalidArgument;
+  }
+  virtual Esp32SdkError writeOtaMetadata(uint32_t, const uint8_t*, uint32_t) {
+    return kEsp32InvalidArgument;
+  }
+  virtual Esp32SdkError eraseOtaMetadata(uint32_t, uint32_t) {
+    return kEsp32InvalidArgument;
+  }
 };
 
 #if defined(ESP32_PLATFORM)
@@ -123,6 +135,9 @@ public:
   Esp32SdkError read(const Esp32PartitionIdentity&, uint32_t, uint8_t*, uint32_t) const override;
   Esp32SdkError write(const Esp32PartitionIdentity&, uint32_t, const uint8_t*, uint32_t) override;
   Esp32SdkError erase(const Esp32PartitionIdentity&, uint32_t, uint32_t) override;
+  Esp32SdkError readOtaMetadata(uint32_t, uint8_t*, uint32_t) const override;
+  Esp32SdkError writeOtaMetadata(uint32_t, const uint8_t*, uint32_t) override;
+  Esp32SdkError eraseOtaMetadata(uint32_t, uint32_t) override;
 };
 #endif
 

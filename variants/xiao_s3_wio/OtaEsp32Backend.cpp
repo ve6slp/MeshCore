@@ -410,7 +410,9 @@ public:
       if (evidence(running) == Result::Ok && (running.flags & RunningConfirmed) &&
           running.floor >= read32(canonical_ + 45)) { phase = Phase::Confirmed; return Result::Ok; }
     }
-    if (!matches && contextNormal()) {
+    // Rollback is transaction/slot evidence, not a difference in image bytes:
+    // a higher-counter package may legitimately contain the same firmware.
+    if (!bound && contextNormal()) {
       Esp32PartitionSnapshot context;
       if (v4Sdk.inspect(context) != kEsp32Ok || !Esp32S3PartitionLayout::matches(context)) return Result::Io;
       const auto inactive = context.appStates[context.next.subtype - 0x10];

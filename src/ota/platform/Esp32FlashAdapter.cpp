@@ -37,6 +37,17 @@ bool inRange(const Esp32PartitionIdentity& partition, uint32_t offset, uint32_t 
   return offset <= partition.size && len <= partition.size - offset;
 }
 
+const esp_partition_t* resolveMetadata(const Esp32PartitionApi& api, uint32_t offset, uint32_t len) {
+  if (offset > Esp32PartitionApi::kOtaMetadataBytes ||
+      len > Esp32PartitionApi::kOtaMetadataBytes - offset) return nullptr;
+  Esp32PartitionSnapshot context;
+  if (api.inspect(context) != kEsp32Ok || !Esp32S3PartitionLayout::matches(context)) return nullptr;
+  const auto expected = Esp32S3PartitionLayout::entry(2);
+  const auto* partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, static_cast<esp_partition_subtype_t>(expected.subtype), expected.label);
+  return partition && esp32PartitionEquals(identity(*partition), expected) ? partition : nullptr;
+}
+
 }  // namespace
 
 Esp32SdkError Esp32IdfPartitionApi::inspect(Esp32PartitionSnapshot& out) const {
@@ -101,6 +112,24 @@ Esp32SdkError Esp32IdfPartitionApi::erase(const Esp32PartitionIdentity& partitio
   if (sdk_partition == nullptr || !inRange(partition, offset, len) ||
       offset % 4096 != 0 || len % 4096 != 0) return ESP_ERR_INVALID_ARG;
   return esp_partition_erase_range(sdk_partition, offset, len);
+}
+
+Esp32SdkError Esp32IdfPartitionApi::readOtaMetadata(uint32_t offset, uint8_t* data, uint32_t len) const {
+  const auto* partition = resolveMetadata(*this, offset, len);
+  if (!partition || (!data && len)) return ESP_ERR_INVALID_ARG;
+  return esp_partition_read(partition, kOtaMetadataOffset + offset, data, len);
+}
+
+Esp32SdkError Esp32IdfPartitionApi::writeOtaMetadata(uint32_t offset, const uint8_t* data, uint32_t len) {
+  const auto* partition = resolveMetadata(*this, offset, len);
+  if (!partition || (!data && len)) return ESP_ERR_INVALID_ARG;
+  return esp_partition_write(partition, kOtaMetadataOffset + offset, data, len);
+}
+
+Esp32SdkError Esp32IdfPartitionApi::eraseOtaMetadata(uint32_t offset, uint32_t len) {
+  const auto* partition = resolveMetadata(*this, offset, len);
+  if (!partition || offset % 4096 || len % 4096) return ESP_ERR_INVALID_ARG;
+  return esp_partition_erase_range(partition, kOtaMetadataOffset + offset, len);
 }
 
 }  // namespace storage
