@@ -1,10 +1,6 @@
 #pragma once
 
-// Abstract hashing interface used by the descriptor verification pipeline.
-// Kept separate from any concrete algorithm so the trust pipeline is not
-// hard-wired to a single implementation (and so tests can substitute a
-// deterministic-but-clearly-fake double without it masquerading as the
-// production SHA-256 implementation).
+// Streaming hashing interface implemented by the production SHA-256 codec.
 
 #include <stdint.h>
 #include <stddef.h>

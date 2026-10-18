@@ -6,17 +6,14 @@
 // board family/variant/role, its exact flash address and size, its SHA-256
 // digest, an anti-rollback security counter, the minimum bootloader
 // capabilities required to install it, and the format/key/algorithm ids that
-// tell an external trust provider how to verify the accompanying signature.
+// identify the accompanying signature.
 //
 // This module performs NO cryptography: it only produces/parses a
-// deterministic canonical byte sequence. The actual signature bytes are
-// opaque to this module and must be verified by an IOtaTrustProvider
-// implementation supplied by the integrator (see
-// src/ota/runtime/OtaTrustInterfaces.h).
+// deterministic 59-byte big-endian sequence shared by OTA v4 packages and
+// the bootloader's signed installation command. Signature verification is
+// performed by the package and boot-safety layers, not by this codec.
 
-#include "OtaWireTypes.h"
 #include "OtaByteStream.h"
-#include <cstring>
 
 namespace meshcore {
 namespace ota {
@@ -83,83 +80,6 @@ inline OtaDescriptorCodecResult decodeOtaDescriptorCanonical(const uint8_t* src,
   if (!ok) return OtaDescriptorCodecResult::TooShort;
   return OtaDescriptorCodecResult::Ok;
 }
-
-// Bounded, no-heap reassembler for the DescriptorFragment message type,
-// which carries the canonical descriptor bytes plus an opaque signature
-// blob split across one or more fragments (e.g. for larger post-quantum
-// signatures that don't fit a single frame's payload budget).
-//
-// Fragment geometry mirrors the chunk transfer model: every fragment but the
-// last is exactly `fragmentPayloadSize` bytes; the last is whatever remains.
-class OtaDescriptorReassembler {
-public:
-  static constexpr size_t kMaxBlobSize = 256;
-  static constexpr uint8_t kMaxFragments = 8;
-
-  void reset() {
-    totalLength_ = 0;
-    fragCount_ = 0;
-    fragmentPayloadSize_ = 0;
-    receivedMask_ = 0;
-    started_ = false;
-  }
-
-  // Returns true if the fragment was accepted (including an exact-duplicate
-  // resend). Returns false and leaves state unchanged for: invalid geometry
-  // (zero/oversized fragCount, out-of-range fragIndex, totalLength exceeding
-  // kMaxBlobSize, a length that doesn't match the expected size for that
-  // fragment index), or a fragment whose fragCount/totalLength/
-  // fragmentPayloadSize conflicts with an already-started reassembly (this
-  // is treated as a distinct, non-replay-isolated concern here -- callers
-  // must reset() between campaign attempts).
-  bool addFragment(uint8_t fragIndex, uint8_t fragCount, uint16_t totalLength,
-                    uint16_t fragmentPayloadSize, const uint8_t* data, size_t len) {
-    if (fragCount == 0 || fragCount > kMaxFragments) return false;
-    if (fragIndex >= fragCount) return false;
-    if (totalLength == 0 || totalLength > kMaxBlobSize) return false;
-    if (fragmentPayloadSize == 0 || fragmentPayloadSize > totalLength) return false;
-
-    if (started_) {
-      if (fragCount != fragCount_ || totalLength != totalLength_ ||
-          fragmentPayloadSize != fragmentPayloadSize_) {
-        return false;
-      }
-    }
-
-    bool isLast = (fragIndex == static_cast<uint8_t>(fragCount - 1));
-    size_t offset = static_cast<size_t>(fragIndex) * static_cast<size_t>(fragmentPayloadSize);
-    size_t expectedLen = isLast ? (static_cast<size_t>(totalLength) - offset)
-                                 : static_cast<size_t>(fragmentPayloadSize);
-    if (len != expectedLen) return false;
-    if (offset + expectedLen > kMaxBlobSize) return false;
-
-    for (size_t i = 0; i < len; ++i) blob_[offset + i] = data[i];
-
-    started_ = true;
-    fragCount_ = fragCount;
-    totalLength_ = totalLength;
-    fragmentPayloadSize_ = fragmentPayloadSize;
-    receivedMask_ |= (1u << fragIndex);
-    return true;
-  }
-
-  bool isComplete() const {
-    if (!started_) return false;
-    uint32_t need = (fragCount_ >= 32) ? 0xFFFFFFFFu : ((1u << fragCount_) - 1u);
-    return (receivedMask_ & need) == need;
-  }
-
-  const uint8_t* blob() const { return blob_; }
-  size_t blobLength() const { return totalLength_; }
-
-private:
-  uint8_t blob_[kMaxBlobSize] = {};
-  uint16_t totalLength_ = 0;
-  uint8_t fragCount_ = 0;
-  uint16_t fragmentPayloadSize_ = 0;
-  uint32_t receivedMask_ = 0;
-  bool started_ = false;
-};
 
 } // namespace protocol
 } // namespace ota

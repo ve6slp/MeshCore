@@ -1,15 +1,38 @@
 #pragma once
 
-// Bounds-checked, non-throwing byte cursors used by every OTA wire codec.
+// Bounds-checked byte cursors for the canonical boot-safety descriptor.
 // Never allocate; every put/get returns false (leaving the buffer state
 // unchanged) instead of overrunning the caller-owned buffer, so callers can
 // safely feed untrusted/truncated/oversized wire data without heap use.
 
-#include "OtaWireTypes.h"
+#include <cstddef>
+#include <cstdint>
 
 namespace meshcore {
 namespace ota {
 namespace protocol {
+
+inline void putOtaBE16(uint8_t* dst, uint16_t v) {
+  dst[0] = static_cast<uint8_t>(v >> 8);
+  dst[1] = static_cast<uint8_t>(v);
+}
+
+inline uint16_t getOtaBE16(const uint8_t* src) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(src[0]) << 8) | src[1]);
+}
+
+inline void putOtaBE32(uint8_t* dst, uint32_t v) {
+  dst[0] = static_cast<uint8_t>(v >> 24);
+  dst[1] = static_cast<uint8_t>(v >> 16);
+  dst[2] = static_cast<uint8_t>(v >> 8);
+  dst[3] = static_cast<uint8_t>(v);
+}
+
+inline uint32_t getOtaBE32(const uint8_t* src) {
+  return (static_cast<uint32_t>(src[0]) << 24) |
+         (static_cast<uint32_t>(src[1]) << 16) |
+         (static_cast<uint32_t>(src[2]) << 8) | src[3];
+}
 
 class OtaBoundedWriter {
 public:
@@ -83,15 +106,6 @@ public:
     if (len == 0) return true;
     if (remaining() < len) return false;
     for (size_t i = 0; i < len; ++i) dst[i] = buf_[pos_ + i];
-    pos_ += len;
-    return true;
-  }
-
-  // Pointer to the unread tail, for zero-copy variable-length payloads.
-  const uint8_t* cursor() const { return buf_ + pos_; }
-
-  bool skip(size_t len) {
-    if (remaining() < len) return false;
     pos_ += len;
     return true;
   }

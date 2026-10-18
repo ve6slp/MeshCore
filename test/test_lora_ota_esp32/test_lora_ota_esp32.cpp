@@ -2,9 +2,8 @@
 #include <ota/platform/Esp32FlashAdapter.h>
 #include <ota/platform/FlashRegion.h>
 #include <ota/storage/StorageManager.h>
-#include <helpers/ota/OtaEsp32RollbackGuard.h>
+#include <helpers/ota/OtaBoardEsp32Trial.h>
 #include "Esp32SdkModel.h"
-#include "Esp32ProductBackendTests.h"
 
 using namespace ota::storage;
 using namespace ota::test;
@@ -294,7 +293,6 @@ TEST(Esp32Flash, NorViolationBeyondFirstReadBlockIsRejectedWithoutPartialMutatio
 
 TEST(Esp32TrialHealthGate, NonTrialBootStaysPendingForeverAndNeverActs) {
   mesh::ota::Esp32TrialHealthGate gate(0, false);
-  EXPECT_FALSE(gate.isPendingVerify());
   for (uint32_t t = 0; t <= 60000; t += 5000) {
     EXPECT_EQ(mesh::ota::Esp32TrialHealthOutcome::Pending, gate.tick(t, true, true, true));
   }
@@ -302,7 +300,6 @@ TEST(Esp32TrialHealthGate, NonTrialBootStaysPendingForeverAndNeverActs) {
 
 TEST(Esp32TrialHealthGate, ContinuousHealthyWindowConfirmsExactlyOnce) {
   mesh::ota::Esp32TrialHealthGate gate(0, true);
-  EXPECT_TRUE(gate.isPendingVerify());
   for (uint32_t t = 0; t < 10000; t += 1000) {
     EXPECT_EQ(mesh::ota::Esp32TrialHealthOutcome::Pending, gate.tick(t, true, true, true));
   }

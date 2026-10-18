@@ -1,7 +1,7 @@
 #pragma once
 
-// Abstract signature verification interface used by the descriptor
-// verification pipeline. There is deliberately NO default/"always true"
+// Signature verification interface used by OTA packages and boot safety.
+// There is deliberately NO default/"always true"
 // implementation anywhere in this header or its production callers: a
 // missing/unwired verifier must be a compile-time or explicit
 // construction-time choice, never a silent fallback.

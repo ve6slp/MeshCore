@@ -1,8 +1,8 @@
 #pragma once
 
 // Test-only helper that performs a genuine Ed25519 keypair-generation +
-// signing round trip so tests can construct real, validly-signed
-// ImageDescriptors. It calls straight into the same vendored
+// signing round trip so tests can construct genuinely signed OTA packages
+// and boot descriptors. It calls straight into the same vendored
 // ed25519_create_keypair / ed25519_sign routines that ship in
 // third_party/ed25519 (see NOTICE.txt) -- production firmware code never
 // calls these two functions, only ed25519_verify.

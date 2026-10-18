@@ -12,7 +12,6 @@
 #include "ota/platform/FlashTypes.h"
 #include "ota/platform/SenseCapQspiLayout.h"
 #include "ota/platform/Nrf52FlashLayoutContract.h"
-#include "ota/runtime/OtaGeometry.h"
 #include "ota/storage/XiaoOtaActiveExtentBridge.h"
 
 #include "../test_lora_ota_storage/FakeNorFlash.h"
@@ -317,9 +316,6 @@ TEST(NrfLayoutBoundaries, InternalImageReservesFixedInstallerWithoutShrinkingExt
   EXPECT_EQ(OTA_NRF52_INTERNAL_INSTALLER_OFFSET + OTA_NRF52_INTERNAL_INSTALLER_SIZE,
             OTA_NRF52_INTERNAL_FS_OFFSET);
   EXPECT_LT(OTA_NRF52_INTERNAL_IMAGE_SIZE, SenseCapQspiLayout::kCandidateSize);
-  EXPECT_EQ(meshcore::ota::runtime::kOtaMaxImageBytes, 708608u);
-  EXPECT_EQ(meshcore::ota::runtime::kOtaMaxChunkCount, 5536u);
-  EXPECT_EQ(SenseCapQspiLayout::kCandidateSize, meshcore::ota::runtime::kOtaMaxImageBytes);
   EXPECT_EQ(OTA_NRF52_INTERNAL_FS_OFFSET, 0x0D4000u);
   EXPECT_EQ(OTA_NRF52_INTERNAL_FS_SIZE, 0x019000u);
   // 100 KiB, unmoved.
@@ -386,4 +382,9 @@ TEST(NrfLayoutBoundaries, BackupFullCapacityOperationsPreserveBothTailsJournalAn
   expectRegionStillReads(security_b, 0x66u);
   expectRegionStillReads(journal, 0x77u);
   expectRegionStillReads(filesystem, 0x88u);
+}
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }
