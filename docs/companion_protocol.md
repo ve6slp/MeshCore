@@ -18,54 +18,20 @@ Please see the following repos for existing MeshCore Companion Protocol librarie
 
 ## Optional LoRa OTA USB extension
 
-Explicit OTA builds add **CMD67**, with fixed **reply30**, ABI3 (107 bytes).
-Ordinary **CMD66/reply29 remain the upstream CLI interface**. OTA is disabled
-in standard builds; a DeviceQuery or USB vendor ID does not advertise support.
-The product host is `scripts/ota_uploader.py`; see the
-[deployment/recovery guide](lora_ota_users.md).
+OTA v4 is optional and disabled in standard builds. A USB vendor ID or ordinary
+DeviceQuery is not proof that a device implements it. Ordinary CMD66/reply29
+remain the upstream CLI interface.
 
-The existing USB frame is `<` + little-endian uint16 payload length + request;
-responses use `>`. Multi-byte fields inside the following OTA operations and
-ABI3 replies are **big-endian**:
+The [OTA v4 guide](lora_ota_v4.md) defines the package, radio objects and update
+transaction. Native serial is a thin bridge for those same objects, not a
+second cache/upload protocol. Stock companions use their existing raw-packet
+and signing operations. Neither transport changes the signed manifest,
+receiver admission, explicit activation or authenticated final readback.
 
-| Subop | Operation | Request body |
-| --- | --- | --- |
-| `0x10` | CACHE_BEGIN | flags8, owner public key32, canonical descriptor59, Ed25519 signature64 |
-| `0x11` | CACHE_PUT | block index16, length8, data (1..84 bytes) |
-| `0x12` | CACHE_SEAL | empty |
-| `0x13` | ADD_TARGET | full target public key32 |
-| `0x14` | START | mode8, channel8, frequency kHz32, lease ms16, duty milli-percent32 |
-| `0x15` | COMMIT | target32, descriptor SHA-25632, security counter32, generation32, BEGIN nonce16 |
-| `0x16` | ABORT | target32, image SHA-25632, observed generation32 |
-| `0x17` | STATUS | target32; zero means local cache |
-| `0x18` | SET_CONTACT_ADMIN | contact public key32, enabled8 |
-
-START mode is direct=0, directed=1, background=2. Direct uses channel255,
-an explicit legal off-normal frequency and bounded lease. On-mesh modes use
-frequency/lease zero; background requires a configured channel. The optional
-on-mesh retry extension appends profile0/flags1. It has no stock-host fallback.
-
-Reply byte offsets are code0, ABI1, opcode2, result3, phase4, flags5,
-target6..37, descriptor hash38..69, durable received blocks70..71, total72..73,
-counter74..77, snapshot age ms78..81, retry delay ms82..85, generation86..89,
-BEGIN nonce90..105, wire version106. Wire version is 3 locally. For a remote
-target it is 3 only after a version-3 census report was observed, otherwise 0.
-A reply without a snapshot has an all-zero nonce. COMMIT copies generation and
-nonce from the observed READY. A mismatch returns Mismatch, and a COMMIT without
-them returns BadRequest. Result 5 (Unavailable) means candidate state is
-unreadable, not absent. Hosts refuse any reply whose ABI is not 3 or whose
-length is not 107.
-Flags bit0 marks a valid snapshot; bit1 distinguishes remote from local. A
-successful command result is not itself a valid/fresh candidate snapshot.
-Hosts must bind READY and Installed to the expected target, descriptor, counter,
-generation, scope and freshness. RF status is currently unsigned and is not
-independent cryptographic attestation.
-
-The stock adapter for unchanged MeshCore 1.17.1/1.18.0 companions uses existing
-signing/raw RF commands, not CMD67. It supports direct zero-hop delivery,
-directed delivery through one explicitly selected relay, and background
-collection by exactly two receivers. See the [stock companion guide](lora_ota_users.md#deploy-through-an-unchanged-stock-companion)
-for release-bound USB protocol checks and delivery limits.
+The previous experimental CMD67 ABI3 cache/start/commit operations are removed.
+There is no mixed-version fallback. Earlier lab software and hardware results
+remain in the `feature/lora-ota` branch history, not the current deployment
+instructions.
 
 ## Important Security Note
 
