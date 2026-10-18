@@ -154,6 +154,33 @@ bool saveFloor(uint32_t counter, uint32_t size, const uint8_t hash[32]) {
   return saved && readFloor(previous, previousSize, previousHash, previousBound) && previousBound &&
       previous == counter && previousSize == size && !std::memcmp(previousHash, hash, 32);
 }
+Result receiptMatches(const char* key, const Journal& journal, uint32_t address) {
+  uint8_t receipt[60]; size_t size = sizeof(receipt); nvs_handle_t handle;
+  const esp_err_t opened = nvs_open("meshota", NVS_READONLY, &handle);
+  if (opened == ESP_ERR_NVS_NOT_FOUND) return Result::State;
+  if (opened != ESP_OK) return Result::Io;
+  const esp_err_t loaded = nvs_get_blob(handle, key, receipt, &size);
+  nvs_close(handle);
+  if (loaded == ESP_ERR_NVS_NOT_FOUND) return Result::State;
+  if (loaded != ESP_OK) return Result::Io;
+  return size == sizeof(receipt) && read32(receipt + 56) == crc32(receipt, 56) &&
+      !std::memcmp(receipt, journal.packageHash, 32) &&
+      !std::memcmp(receipt + 32, journal.transaction, 16) &&
+      read32(receipt + 48) == journal.generation && read32(receipt + 52) == address ?
+      Result::Ok : Result::Integrity;
+}
+bool saveReceipt(const char* key, const Journal& journal, uint32_t address) {
+  uint8_t receipt[60] = {};
+  std::memcpy(receipt, journal.packageHash, 32); std::memcpy(receipt + 32, journal.transaction, 16);
+  write32(receipt + 48, journal.generation); write32(receipt + 52, address);
+  write32(receipt + 56, crc32(receipt, 56));
+  nvs_handle_t handle;
+  if (nvs_open("meshota", NVS_READWRITE, &handle) != ESP_OK) return false;
+  const bool saved = nvs_set_blob(handle, key, receipt, sizeof(receipt)) == ESP_OK &&
+      nvs_commit(handle) == ESP_OK;
+  nvs_close(handle);
+  return saved && receiptMatches(key, journal, address) == Result::Ok;
+}
 
 bool readBootPackage(Journal& journal, uint8_t canonical[59], uint8_t signer[32], uint8_t signature[64]) {
   static uint8_t bytes[kMaxManifestBytes];
@@ -164,16 +191,8 @@ bool readBootPackage(Journal& journal, uint8_t canonical[59], uint8_t signer[32]
   if (manifest.parse(bytes, size) != Result::Ok || std::memcmp(manifest.hash(), journal.packageHash, 32) ||
       !signatures.verify(manifest.bootSignature(), 64, manifest.canonical(), 59, manifest.signer(), 32))
     return false;
-  uint8_t receipt[60]; size_t receiptSize = sizeof(receipt); nvs_handle_t handle;
-  if (nvs_open("meshota", NVS_READONLY, &handle) != ESP_OK) return false;
-  const bool loaded = nvs_get_blob(handle, "select4", receipt, &receiptSize) == ESP_OK;
-  nvs_close(handle);
   const auto* app = esp_ota_get_running_partition();
-  if (!loaded || receiptSize != sizeof(receipt) || !app ||
-      read32(receipt + 56) != crc32(receipt, 56) ||
-      std::memcmp(receipt, journal.packageHash, 32) ||
-      std::memcmp(receipt + 32, journal.transaction, 16) ||
-      read32(receipt + 48) != journal.generation || read32(receipt + 52) != app->address)
+  if (!app || receiptMatches("select4", journal, app->address) != Result::Ok)
     return false;
   std::memcpy(canonical, manifest.canonical(), 59);
   std::memcpy(signer, manifest.signer(), 32);
@@ -276,7 +295,26 @@ public:
   Result beginStaging(uint32_t size) override {
     if (mutationAllowed() != Result::Ok || !::ota::platform::isOk(payloadDevice.bind(kImageBytes)))
       return Result::Busy;
+    if (!saveReceipt("stage4", latest_, payloadDevice.partition().address)) return Result::Io;
+    stagingBound_ = true;
     return FirmwarePlatform::beginStaging(size);
+  }
+  Result writeStaging(uint32_t offset, const uint8_t* data, size_t size) override {
+    if (!stagingBound_) {
+      if (mutationAllowed() != Result::Ok || offset % kChunkBytes ||
+          !saveReceipt("stage4", latest_, payloadDevice.partition().address)) return Result::Busy;
+      stagingBound_ = true;
+    }
+    return FirmwarePlatform::writeStaging(offset, data, size);
+  }
+  Result save(const Journal& journal, const uint8_t* bytes, size_t size) override {
+    if (owner.ordinary || !owner.held) return Result::Busy;
+    return FirmwarePlatform::save(journal, bytes, size);
+  }
+  bool ordinaryAllowed() const {
+    return !resetPending && !storageFaultObserved() && (!haveCandidate_ ||
+        latest_.phase == Phase::Confirmed || latest_.phase == Phase::Failed ||
+        latest_.phase == Phase::Aborted || latest_.phase == Phase::Idle);
   }
   Result evidence(RunningEvidence& out) override {
     out = RunningEvidence();
@@ -296,6 +334,10 @@ public:
   }
   Result validateInstall(const uint8_t canonical[59], const uint8_t signature[64],
                           const uint8_t signer[32]) override {
+    if (resetPending && haveCandidate_ && canonical && signature && signer &&
+        !std::memcmp(canonical, canonical_, 59) && !std::memcmp(signer, signer_, 32) &&
+        isCurrentAdmin(signer) && verify(signer, nullptr, 0, canonical, 59, signature))
+      return Result::Ok;
     if (mutationAllowed() != Result::Ok) return Result::Busy;
     const Result valid = verifyRawImage(canonical, signature, signer);
     if (valid != Result::Ok) return valid;
@@ -323,25 +365,7 @@ public:
     if (selected != ESP_OK || esp_ota_get_boot_partition() != app ||
         esp_ota_get_state_partition(app, &state) != ESP_OK || state != ESP_OTA_IMG_NEW)
       return Result::Io;
-    uint8_t receipt[60] = {};
-    std::memcpy(receipt, latest_.packageHash, 32); std::memcpy(receipt + 32, transaction, 16);
-    write32(receipt + 48, generation); write32(receipt + 52, app->address);
-    write32(receipt + 56, crc32(receipt, 56));
-    nvs_handle_t handle;
-    if (nvs_open("meshota", NVS_READWRITE, &handle) != ESP_OK) return Result::Io;
-    bool saved = nvs_set_blob(handle, "select4", receipt, sizeof(receipt)) == ESP_OK &&
-        nvs_commit(handle) == ESP_OK;
-    nvs_close(handle);
-    if (saved) {
-      uint8_t checked[sizeof(receipt)]; size_t size = sizeof(checked);
-      saved = nvs_open("meshota", NVS_READONLY, &handle) == ESP_OK;
-      if (saved) {
-        saved = nvs_get_blob(handle, "select4", checked, &size) == ESP_OK &&
-            size == sizeof(receipt) && !std::memcmp(checked, receipt, size);
-        nvs_close(handle);
-      }
-    }
-    return saved ? Result::Ok : Result::Io;
+    return saveReceipt("select4", latest_, app->address) ? Result::Ok : Result::Io;
   }
   Result lifecycle(Phase& phase) override {
     if (!haveCandidate_) return Result::State;
@@ -361,14 +385,7 @@ public:
       if (v4Sdk.inspect(context) != kEsp32Ok || !Esp32S3PartitionLayout::matches(context)) return Result::Io;
       const auto inactive = context.appStates[context.next.subtype - 0x10];
       if (inactive != Esp32ImageState::Aborted && inactive != Esp32ImageState::Invalid) return Result::State;
-      uint8_t receipt[60]; size_t size = sizeof(receipt); nvs_handle_t handle;
-      if (nvs_open("meshota", NVS_READONLY, &handle) != ESP_OK) return Result::State;
-      const bool loaded = nvs_get_blob(handle, "select4", receipt, &size) == ESP_OK;
-      nvs_close(handle);
-      if (loaded && size == sizeof(receipt) && read32(receipt + 56) == crc32(receipt, 56) &&
-          !std::memcmp(receipt, latest_.packageHash, 32) &&
-          !std::memcmp(receipt + 32, latest_.transaction, 16) &&
-          read32(receipt + 48) == latest_.generation && read32(receipt + 52) == context.next.address) {
+      if (receiptMatches("select4", latest_, context.next.address) == Result::Ok) {
         phase = Phase::Failed;
         return Result::Ok;
       }
@@ -376,10 +393,25 @@ public:
     return Result::State;
   }
 protected:
+  Result prepareRecoveredStaging(uint32_t rawSize) override {
+    stagingBound_ = false;
+    Phase boot;
+    if (lifecycle(boot) == Result::Ok) { staging_.invalidate(); return Result::Ok; }
+    if (!contextNormal()) { staging_.invalidate(); return Result::Ok; }
+    if (!::ota::platform::isOk(payloadDevice.bind(kImageBytes))) return Result::Io;
+    const Result receipt = receiptMatches("stage4", latest_, payloadDevice.partition().address);
+    if (latest_.nextChunk && latest_.phase != Phase::Confirmed && latest_.phase != Phase::Failed &&
+        latest_.phase != Phase::Trial && receipt != Result::Ok)
+      return receipt == Result::Io ? receipt : Result::Integrity;
+    stagingBound_ = receipt == Result::Ok;
+    return staging_.begin(rawSize);
+  }
   Result mutationAllowed() override {
     return owner.held && !owner.ordinary && !resetPending && !trial.activeOrUnknown() &&
         contextNormal() ? Result::Ok : Result::Busy;
   }
+private:
+  bool stagingBound_ = false;
 } platform;
 
 void earlyTrial() { trial.begin(millis()); }
@@ -396,11 +428,20 @@ const char* otaBoardInstallCapabilityStatus() {
 }
 bool otaBoardClaimOrdinaryFirmwareUpdate() {
   earlyTrial();
-  if (trial.activeOrUnknown() || owner.held || resetPending) return false;
+  if (trial.activeOrUnknown() || owner.ordinary || !platform.ordinaryAllowed()) return false;
+  owner.held = false;
   owner.ordinary = true;
+  payloadDevice.unbind();
   return true;
 }
-void otaBoardReleaseOrdinaryFirmwareUpdate() { owner.ordinary = false; }
+void otaBoardReleaseOrdinaryFirmwareUpdate() {
+  owner.ordinary = false;
+  owner.held = contextNormal();
+  if (owner.held && !::ota::platform::isOk(payloadDevice.bind(kImageBytes))) {
+    owner.held = false;
+    storageFault = true;
+  }
+}
 mesh::ota::v4::Receiver* otaBoardConfigureV4Backend(const mesh::ota::v4::RuntimeHooks& hooks) {
   earlyTrial();
   if (owner.ordinary) return nullptr;

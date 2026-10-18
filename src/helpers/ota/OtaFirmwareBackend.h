@@ -70,9 +70,9 @@ public:
       if (package.parse(manifest, size) != Result::Ok ||
           std::memcmp(package.hash(), out.packageHash, 32) ||
           out.nextChunk > package.count()) return Result::Integrity;
-      const Result bound = staging_.begin(package.descriptor().exactSizeBytes);
-      if (bound != Result::Ok) return bound;
       remember(out, package);
+      const Result bound = prepareRecoveredStaging(package.descriptor().exactSizeBytes);
+      if (bound != Result::Ok) return bound;
     } else {
       staging_.invalidate();
     }
@@ -134,9 +134,11 @@ protected:
     haveCandidate_ = true;
   }
   virtual Result mutationAllowed() = 0;
+  virtual Result prepareRecoveredStaging(uint32_t rawSize) { return staging_.begin(rawSize); }
   Result verifyRawImage(const uint8_t canonical[59], const uint8_t signature[64],
                          const uint8_t signer[32]) {
-    if (!canonical || !signature || !signer ||
+    if (!canonical || !signature || !signer || !isCurrentAdmin(signer) || !haveCandidate_ ||
+        std::memcmp(canonical, canonical_, 59) || std::memcmp(signer, signer_, 32) ||
         !signatures_.verify(signature, 64, canonical, 59, signer, 32)) return Result::Denied;
     meshcore::ota::protocol::OtaDescriptor descriptor;
     using namespace meshcore::ota::protocol;

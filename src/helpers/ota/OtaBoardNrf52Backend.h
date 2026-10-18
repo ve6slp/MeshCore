@@ -116,7 +116,7 @@ bool otaBoardEarlyBootTrialOrUnknown() {
 }
 bool otaBoardEarlyBootNormalProven() { return !otaBoardEarlyBootTrialOrUnknown(); }
 bool otaBoardTrialHealthWindowActive() {
-  return !v4Backend || v4Backend->trialActive();
+  return !v4Backend || !v4Normal || v4Backend->trialActive();
 }
 bool otaBoardStorageIoFaultObserved() {
   return !v4FlashReady || (v4Backend && v4Backend->storageFaultObserved());

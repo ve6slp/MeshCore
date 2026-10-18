@@ -131,8 +131,10 @@ public:
     Snapshot snapshot;
     if (!readRunning(snapshot) || !blank(commands_) || !blank(state_) ||
         !blank(floor_) || !blank(confirm_)) return false;
-    NrfRunningContext after;
-    return running_.read(after) && sameRunning(snapshot.running, after);
+    Snapshot after;
+    return readRunning(after) && sameRunning(snapshot.running, after.running) &&
+        snapshot.rawBytes == after.rawBytes && !std::memcmp(snapshot.rawHash, after.rawHash, 32) &&
+        !std::memcmp(snapshot.backupHash, after.backupHash, 32);
   }
 
   bool normal(Snapshot& out) const {
@@ -141,6 +143,9 @@ public:
     uint8_t state[State::kRecordBytes] = {};
     const auto status = State::readNewestWithStatus(state_, state);
     if (status != State::ReadStatus::Blank && status != State::ReadStatus::Found) return false;
+    uint8_t stateDigest[32], floorDigest[32], commandDigest[32];
+    if (!stateWindows(state, status) || !hashRegion(state_, stateDigest) ||
+        !hashRegion(floor_, floorDigest) || !hashRegion(commands_, commandDigest)) return false;
     uint8_t floorHash[32]; uint32_t floorExtent = 0;
     if (!strictFloor(out.floor, floorExtent, floorHash)) return false;
     if (status == State::ReadStatus::Blank) {
@@ -156,7 +161,7 @@ public:
       if (!out.transaction) return false;
       if (out.phase == State::kPhaseConfirmed) {
         const auto bank = Bridge::decodeBank0FromRaw28Bytes(out.running.settings);
-        if (out.floor != out.counter || floorExtent != out.rawBytes ||
+        if (!out.floor || out.floor != out.counter || floorExtent != out.rawBytes ||
             bank.bank_0_crc != Bridge::crc16Compute(out.running.image, out.rawBytes) ||
             std::memcmp(out.rawHash, floorHash, 32) ||
             std::memcmp(out.rawHash, out.candidateHash, 32) ||
@@ -173,12 +178,19 @@ public:
     }
     if (!commandsSafe(out)) return false;
     uint8_t afterState[State::kRecordBytes] = {}, afterHash[32]; uint32_t afterFloor, afterExtent;
-    NrfRunningContext after;
+    Snapshot after;
+    uint8_t digest[32];
     return State::readNewestWithStatus(state_, afterState) == status &&
         !std::memcmp(state, afterState, sizeof(state)) &&
         strictFloor(afterFloor, afterExtent, afterHash) && afterFloor == out.floor &&
         afterExtent == floorExtent && !std::memcmp(afterHash, floorHash, 32) &&
-        running_.read(after) && sameRunning(out.running, after);
+        stateWindows(afterState, status) &&
+        hashRegion(state_, digest) && !std::memcmp(digest, stateDigest, 32) &&
+        hashRegion(floor_, digest) && !std::memcmp(digest, floorDigest, 32) &&
+        hashRegion(commands_, digest) && !std::memcmp(digest, commandDigest, 32) &&
+        readRunning(after) && sameRunning(out.running, after.running) &&
+        out.rawBytes == after.rawBytes && !std::memcmp(out.rawHash, after.rawHash, 32) &&
+        !std::memcmp(out.backupHash, after.backupHash, 32);
   }
 
   bool readRunning(Snapshot& out) const {
@@ -202,7 +214,7 @@ public:
 
   bool strictFloor(uint32_t& counter, uint32_t& extent, uint8_t hash[32]) const {
     uint8_t best[Floor::kRecordBytes] = {};
-    uint32_t sequence = 0; bool found = false;
+    uint32_t sequence = 0, count = 0; bool found = false;
     if (!pairGeometry(floor_)) return false;
     for (uint32_t slot = 0; slot < 2; ++slot) {
       uint8_t record[Floor::kRecordBytes];
@@ -216,10 +228,14 @@ public:
         return false;
       const uint32_t next = le32(record + 8);
       if (found && sequence == next) return false;
+      ++count;
       if (!found || next > sequence) { found = true; sequence = next; std::memcpy(best, record, sizeof(best)); }
     }
     if (!found) return false;
     counter = le32(best + 12); extent = le32(best + 16); std::memcpy(hash, best + 20, 32);
+    if (!counter && !extent)
+      return count == 1 && sequence == 1 && all(hash, 32, 0);
+    if (!extent) return false;
     return true;
   }
 
@@ -253,6 +269,47 @@ private:
   static bool pairGeometry(const ::ota::platform::FlashRegion& region) {
     return region.isValid() && region.eraseUnitBytes() == 4096 && region.sizeBytes() == 8192;
   }
+  static bool hashRegion(const ::ota::platform::FlashRegion& region, uint8_t out[32]) {
+    ::ota::trust::Sha256 hash; uint8_t bytes[256];
+    for (uint32_t done = 0; done < region.sizeBytes();) {
+      const uint32_t count = region.sizeBytes() - done < sizeof(bytes) ? region.sizeBytes() - done : sizeof(bytes);
+      if (!read(region, done, bytes, count)) return false;
+      hash.update(bytes, count); done += count;
+    }
+    hash.finish(out);
+    return true;
+  }
+  bool stateWindows(const uint8_t newest[State::kRecordBytes], State::ReadStatus status) const {
+    if (!pairGeometry(state_)) return false;
+    uint32_t sequence = 0; bool found = false;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      const uint32_t offset = slot * state_.eraseUnitBytes();
+      uint8_t prefix[256], sidecar[88];
+      if (!read(state_, offset, prefix, sizeof(prefix)) ||
+          !read(state_, offset + 0x100, sidecar, sizeof(sidecar))) return false;
+      const bool valid = State::isValidRecord(prefix, State::kRecordBytes);
+      if (valid) {
+        const uint32_t next = le32(prefix + 8);
+        if (status != State::ReadStatus::Found || (found && sequence == next) ||
+            next > le32(newest + 8)) return false;
+        const uint32_t phase = State::phase(prefix);
+        if (phase != 0 && phase != State::kPhaseConfirmed && phase != State::kPhaseFailedMax &&
+            (next >= le32(newest + 8) ||
+             State::transactionNonce(prefix) != State::transactionNonce(newest))) return false;
+        sequence = next; found = true;
+      } else if (!all(prefix, State::kRecordBytes, 0xFF)) return false;
+      if (!all(prefix + State::kRecordBytes, sizeof(prefix) - State::kRecordBytes, 0xFF)) return false;
+      if (!all(sidecar, sizeof(sidecar), 0xFF) &&
+          (!valid || le32(sidecar) != 0x58534944 || sidecar[4] != 1 || sidecar[5] ||
+           sidecar[6] != sizeof(sidecar) || sidecar[7] ||
+           le32(sidecar + 80) != ::ota::storage::Crc32::computeFinalized(sidecar, 80) ||
+           le32(sidecar + 84) != State::kCommitMarker || std::memcmp(sidecar + 8, prefix + 8, 12) ||
+           std::memcmp(sidecar + 52, prefix + 36, 4) || std::memcmp(sidecar + 60, prefix + 40, 4)))
+        return false;
+      if (!blankRange(state_, offset + 0x158, state_.eraseUnitBytes() - 0x158)) return false;
+    }
+    return true;
+  }
   bool savedSettingsMatch(const uint8_t state[State::kRecordBytes], const NrfRunningContext& running) const {
     for (uint32_t slot = 0; slot < 2; ++slot) {
       uint8_t record[State::kRecordBytes], sidecar[88];
@@ -264,6 +321,7 @@ private:
           sidecar[6] == sizeof(sidecar) && !sidecar[7] &&
           le32(sidecar + 80) == ::ota::storage::Crc32::computeFinalized(sidecar, 80) &&
           le32(sidecar + 84) == State::kCommitMarker && !std::memcmp(sidecar + 8, state + 8, 12) &&
+          !std::memcmp(sidecar + 52, state + 36, 4) && !std::memcmp(sidecar + 60, state + 40, 4) &&
           !std::memcmp(sidecar + 52, running.settings, 28);
     }
     return false;
@@ -283,6 +341,7 @@ private:
       }
       if (!blankRange(commands_, offset + sizeof(records[slot]),
                        commands_.eraseUnitBytes() - sizeof(records[slot]))) return false;
+      if (!snapshot.phase) return false;
       using namespace meshcore::ota::protocol;
       auto& d = descriptors[slot];
       if (decodeOtaDescriptorCanonical(Command::wireDescriptorOf(records[slot]), 59, d) !=
@@ -345,27 +404,41 @@ public:
   Result evidence(RunningEvidence& out) override {
     out = RunningEvidence();
     NrfBootSafety::Snapshot snapshot;
-    if (!safety_.qualified()) return Result::Unsupported;
-    if (trial_.isTrialActive()) {
-      if (safety_.readRunning(snapshot)) { std::memcpy(out.hash, snapshot.rawHash, 32); out.flags = 2; }
-      uint32_t extent; uint8_t hash[32];
-      if (safety_.strictFloor(out.floor, extent, hash)) out.flags |= 1;
-      return Result::Ok;
+    if (safety_.readRunning(snapshot)) {
+      std::memcpy(out.hash, snapshot.rawHash, 32); out.flags = RunningHashKnown;
     }
-    if (!safety_.normal(snapshot)) return Result::State;
-    out.floor = snapshot.floor;
-    std::memcpy(out.hash, snapshot.rawHash, 32);
-    out.flags = 3 | (snapshot.confirmed ? 4 : 0);
+    if (!safety_.qualified()) return Result::Ok;
+    uint32_t extent; uint8_t hash[32];
+    if (safety_.strictFloor(out.floor, extent, hash)) out.flags |= FloorKnown;
+    uint8_t state[NrfBootSafety::State::kRecordBytes];
+    if (!trial_.isTrialActive() &&
+        NrfBootSafety::State::readNewestWithStatus(state_, state) ==
+            NrfBootSafety::State::ReadStatus::Found &&
+        NrfBootSafety::State::phase(state) == NrfBootSafety::State::kPhaseConfirmed &&
+        safety_.normal(snapshot) && snapshot.confirmed) {
+      out.floor = snapshot.floor; std::memcpy(out.hash, snapshot.rawHash, 32);
+      out.flags = FloorKnown | RunningHashKnown | RunningConfirmed;
+    }
     return Result::Ok;
   }
   Result validateInstall(const uint8_t canonical[59], const uint8_t signature[64],
                           const uint8_t signer[32]) override {
+    if (samePublishedIntent(canonical, signature, signer)) return Result::Ok;
     if (mutationAllowed() != Result::Ok) return Result::Busy;
     return verifyRawImage(canonical, signature, signer);
+  }
+  Result repair(const Journal& idle) override {
+    NrfBootSafety::Snapshot snapshot;
+    if (!safety_.qualified() || !safety_.normal(snapshot)) return Result::Busy;
+    return FirmwarePlatform::repair(idle);
   }
   Result activate(const uint8_t canonical[59], const uint8_t signature[64],
                   const uint8_t signer[32], const uint8_t transaction[16], uint32_t generation) override {
     if (!canonical || !signature || !signer || !transaction || !generation) return Result::Invalid;
+    if (!haveCandidate_ || generation != latest_.generation ||
+        std::memcmp(transaction, latest_.transaction, 16) ||
+        std::memcmp(canonical, canonical_, 59) || std::memcmp(signer, signer_, 32) ||
+        !isCurrentAdmin(signer)) return Result::Denied;
     const uint64_t nonce = transactionNonce(transaction, generation, canonical, signer);
     if (!nonce) return Result::Invalid;
     using Command = ::ota::storage::XiaoOtaCommandRecordV3;
@@ -415,6 +488,7 @@ public:
     return Result::State;
   }
   OtaBoardTrialHealthOutcome health(uint32_t now, bool radio, bool filesystem, bool loop) {
+    if (!safety_.qualified()) return OtaBoardTrialHealthOutcome::Pending;
     return trial_.tick(now, radio, filesystem && !storageFaultObserved(), loop);
   }
   bool trialActive() const { return trial_.isTrialActive(); }
@@ -436,6 +510,20 @@ protected:
     return stagingAllowed_ && !installPending_ && !trial_.isTrialActive() ? Result::Ok : Result::Busy;
   }
 private:
+  bool samePublishedIntent(const uint8_t canonical[59], const uint8_t signature[64],
+                            const uint8_t signer[32]) const {
+    if (!haveCandidate_ || !canonical || !signature || !signer || !hooks_.isCurrentAdmin ||
+        !hooks_.isCurrentAdmin(hooks_.context, signer) || std::memcmp(canonical, canonical_, 59) ||
+        std::memcmp(signer, signer_, 32)) return false;
+    using Command = NrfBootSafety::Command;
+    uint8_t record[Command::kRecordBytes];
+    return Command::readNewest(commands_, record) &&
+        Command::transactionNonceOf(record) == transactionNonce(latest_.transaction, latest_.generation,
+                                                               canonical, signer) &&
+        !std::memcmp(Command::wireDescriptorOf(record), canonical, 59) &&
+        !std::memcmp(Command::signatureOf(record), signature, 64) &&
+        !std::memcmp(Command::admittedSignerKeyOf(record), signer, 32);
+  }
   ::ota::platform::FlashRegion& commands_;
   ::ota::platform::FlashRegion& state_;
   NrfBootSafety safety_;
