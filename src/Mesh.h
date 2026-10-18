@@ -179,7 +179,6 @@ protected:
     : Dispatcher(radio, ms, mgr), _rng(&rng), _rtc(&rtc), _tables(&tables)
   {
 #if MESHCORE_LORA_OTA
-    attachOtaIntegration(&_ota);
 #endif
   }
 
@@ -210,8 +209,8 @@ public:
   Packet* createControlData(const uint8_t* data, size_t len);
 
 #if MESHCORE_LORA_OTA
-  mesh::ota::OtaFirmwareIntegration& getOtaIntegration() { return _ota; }
-  const mesh::ota::OtaFirmwareIntegration& getOtaIntegration() const { return _ota; }
+  mesh::ota::OtaFirmwareIntegration& getOtaIntegration() { return getDispatcherOtaIntegration(); }
+  const mesh::ota::OtaFirmwareIntegration& getOtaIntegration() const { return getDispatcherOtaIntegration(); }
 #endif
 
   /**
@@ -251,7 +250,6 @@ public:
 private:
   void pumpOtaControl();
   DispatcherAction onRecvOrdinaryPacket(Packet* pkt);
-  mesh::ota::OtaFirmwareIntegration _ota;
 #endif
 };
 

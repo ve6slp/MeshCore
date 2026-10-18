@@ -7,6 +7,13 @@
 #include <vector>
 
 namespace {
+#if MESHCORE_LORA_OTA
+void otaPayload(mesh::Packet& packet) {
+  const uint8_t tag[8] = {}, data[] = {0x55};
+  packet.payload_len = mesh::ota::v4::encodeFrame(mesh::ota::v4::Kind::Data, 1, tag, 0, 1, 0,
+      data, sizeof(data), packet.payload, sizeof(packet.payload));
+}
+#endif
 class Clock : public mesh::MillisecondClock {
 public:
   unsigned long now = 1;
@@ -65,6 +72,10 @@ public:
 };
 class Mesh : public mesh::Mesh {
 public:
+#if MESHCORE_LORA_OTA
+  struct Completion { bool success; uint32_t airtime; };
+  std::vector<Completion> completions;
+#endif
   unsigned long window = 3600000;
   int rx_delay = 0;
   int ota_received = 0;
@@ -84,6 +95,11 @@ protected:
   int calcRxDelay(float, uint32_t) const override { return rx_delay; }
   unsigned long getDutyCycleWindowMs() const override { return window; }
   void onOtaDataRecv(mesh::Packet*) override { ++ota_received; }
+#if MESHCORE_LORA_OTA
+  void onOtaTransmitComplete(const mesh::Packet* packet, bool success, uint32_t airtime) override {
+    if (packet->getPayloadType() == PAYLOAD_TYPE_LORA_OTA) completions.push_back({success, airtime});
+  }
+#endif
 };
 struct Fixture : ::testing::Test {
   Clock clock;
@@ -99,6 +115,9 @@ struct Fixture : ::testing::Test {
     p->header = (type << PH_TYPE_SHIFT) | route;
     p->payload_len = 1;
     p->payload[0] = 0x55;
+#if MESHCORE_LORA_OTA
+    if (type == PAYLOAD_TYPE_LORA_OTA) otaPayload(*p);
+#endif
     return p;
   }
 };
@@ -383,8 +402,9 @@ struct EnabledFixture : ::testing::Test {
   StaticPoolPacketManager manager{12};
   Mesh mesh{radio, clock, random, rtc, manager, tables};
   mesh::Packet* ota() {
-    const uint8_t data[] = {0x55};
-    return mesh.createOtaData(data, sizeof(data));
+    mesh::Packet frame;
+    otaPayload(frame);
+    return mesh.createOtaData(frame.payload, frame.payload_len);
   }
 };
 
@@ -396,8 +416,7 @@ TEST_F(EnabledFixture, ReservedAllocationAndRawAdmissionProtectOrdinaryPool) {
   ASSERT_NE(nullptr, ordinary);  // Ordinary caller still uses the reserve.
   mesh::Packet incoming;
   incoming.header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
-  incoming.payload_len = 1;
-  incoming.payload[0] = 0x55;
+  otaPayload(incoming);
   mesh.begin();
   radio.receive(incoming);
   clock.now = 2;
@@ -471,8 +490,7 @@ TEST_F(EnabledFixture, DelayedIngressRelayChecksReserveAgainAfterPoolPressureCha
   mesh.begin();
   mesh::Packet incoming;
   incoming.header = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_LORA_OTA << PH_TYPE_SHIFT);
-  incoming.payload_len = 1;
-  incoming.payload[0] = 0x55;
+  otaPayload(incoming);
   radio.receive(incoming);
   clock.now = 2;
   mesh.loop();
@@ -527,6 +545,50 @@ TEST_F(EnabledFixture, FutureScheduledOrdinaryTrafficDoesNotBlockReadyOta) {
   EXPECT_EQ(1, manager.getOutboundTotal());
 }
 
+TEST_F(EnabledFixture, PhysicalCompletionIsNotReportedAtQueueAdmissionAndChargesActualAirtimeOnce) {
+  mesh.begin();
+  auto* packet = ota();
+  packet->header |= ROUTE_TYPE_DIRECT;
+  ASSERT_TRUE(mesh.sendPacket(packet, 0));
+  EXPECT_TRUE(mesh.completions.empty());
+  clock.now = 2;
+  mesh.loop();
+  ASSERT_TRUE(mesh.isSendInProgress());
+  EXPECT_TRUE(mesh.completions.empty());
+  clock.now = 32;
+  radio.completed = true;
+  mesh.loop();
+  ASSERT_EQ(1u, mesh.completions.size());
+  EXPECT_TRUE(mesh.completions[0].success);
+  EXPECT_EQ(30u, mesh.completions[0].airtime);
+  EXPECT_EQ(30u, mesh.getTotalAirTime());
+  EXPECT_EQ(71970u, mesh.getRemainingOtaAirtimeBudget(clock.now));
+  mesh.loop();
+  EXPECT_EQ(1u, mesh.completions.size());
+  EXPECT_EQ(12, manager.getFreeCount());
+}
+
+TEST_F(EnabledFixture, TimedOutSendReportsFailureAndStillChargesActualOccupiedAirtime) {
+  mesh.begin();
+  auto* packet = ota();
+  packet->header |= ROUTE_TYPE_DIRECT;
+  ASSERT_TRUE(mesh.sendPacket(packet, 0));
+  clock.now = 2;
+  mesh.loop();
+  ASSERT_TRUE(mesh.isSendInProgress());
+  clock.now = 403;
+  mesh.loop();
+  ASSERT_EQ(1u, mesh.completions.size());
+  EXPECT_FALSE(mesh.completions[0].success);
+  EXPECT_EQ(401u, mesh.completions[0].airtime);
+  EXPECT_EQ(401u, mesh.getTotalAirTime());
+  EXPECT_EQ(71599u, mesh.getRemainingOtaAirtimeBudget(clock.now));
+  EXPECT_EQ(1u, mesh.getTxTimeoutCount());
+  mesh.loop();
+  EXPECT_EQ(1u, mesh.completions.size());
+  EXPECT_EQ(12, manager.getFreeCount());
+}
+
 TEST(PacketQueueCompatibility, ConfirmedOtaFailureConsumesExactlyOnceInDispatcher) {
   RefusingManager manager;
   Radio radio;
@@ -535,8 +597,9 @@ TEST(PacketQueueCompatibility, ConfirmedOtaFailureConsumesExactlyOnceInDispatche
   RealtimeClock rtc;
   Tables tables;
   Mesh mesh(radio, clock, random, rtc, manager, tables);
-  const uint8_t data[] = {0x55};
-  auto* packet = mesh.createOtaData(data, sizeof(data));
+  mesh::Packet frame;
+  otaPayload(frame);
+  auto* packet = mesh.createOtaData(frame.payload, frame.payload_len);
   ASSERT_NE(nullptr, packet);
   EXPECT_FALSE(mesh.sendPacket(packet, 0));
   EXPECT_EQ(1, manager.releases);

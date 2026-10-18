@@ -1,8 +1,5 @@
 #include <Arduino.h>
 #include "CommonCLI.h"
-#if MESHCORE_LORA_OTA
-#include <helpers/ota/OtaDirectLease.h>
-#endif
 #include "TxtDataHelpers.h"
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
@@ -270,41 +267,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
 #if MESHCORE_LORA_OTA
     } else if (memcmp(command, "ota status", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
       _callbacks->formatOtaStatusReply(reply);
-    } else if (memcmp(command, "ota abort", 9) == 0 && (command[9] == 0 || command[9] == ' ')) {
-      strcpy(reply, _callbacks->abortOtaSession() ? "OK - OTA aborted" : "Error: OTA unsupported");
-    } else if (memcmp(command, "ota rollback", 12) == 0 && (command[12] == 0 || command[12] == ' ')) {
-      strcpy(reply, _callbacks->rollbackOtaSession() ? "OK - OTA rollback requested" : "Error: OTA unsupported");
-    } else if (memcmp(command, "ota direct ", 11) == 0) {
-      strcpy(tmp, &command[11]);
-      const char *parts[5];
-      int num = mesh::Utils::parseTextParts(tmp, parts, 5);
-      float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
-      float bw    = num > 1 ? strtof(parts[1], nullptr) : 0.0f;
-      uint8_t sf  = num > 2 ? atoi(parts[2]) : 0;
-      uint8_t cr  = num > 3 ? atoi(parts[3]) : 0;
-      int timeout_mins  = num > 4 ? atoi(parts[4]) : 0;
-      mesh::ota::OtaDirectLeaseParams lease{freq, bw, sf, cr, timeout_mins};
-      if (mesh::ota::isValidOtaDirectLease(lease)) {
-        class CliLeaseHandler : public mesh::ota::OtaDirectLeaseHandler {
-        public:
-          explicit CliLeaseHandler(CommonCLICallbacks* callbacks) : callbacks_(callbacks) {}
-          bool setOtaDirectMode() override { return callbacks_->setOtaMode("direct"); }
-          void applyOtaDirectLease(const mesh::ota::OtaDirectLeaseParams& params) override {
-            callbacks_->applyTempRadioParams(params.freqMhz, params.bandwidthKhz,
-                                             params.spreadingFactor, params.codingRate,
-                                             params.timeoutMinutes);
-          }
-        private:
-          CommonCLICallbacks* callbacks_;
-        } handler(_callbacks);
-        if (mesh::ota::requestOtaDirectLease(handler, lease)) {
-          sprintf(reply, "OK - OTA direct lease for %d mins", timeout_mins);
-        } else {
-          strcpy(reply, "Error: OTA backend unavailable");
-        }
-      } else {
-        strcpy(reply, "Error, invalid params");
-      }
+    } else if (!strcmp(command, "ota progress") || !strcmp(command, "ota repair") || !strcmp(command, "ota abort")) {
+      strcpy(reply, "Use signed OTA v4 query/repair/abort frames");
 #endif
     } else if (memcmp(command, "password ", 9) == 0) {
       // change admin password
@@ -528,20 +492,14 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
 void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
 #if MESHCORE_LORA_OTA
-  if (memcmp(config, "ota.mode ", 9) == 0) {
-    if (_callbacks->setOtaMode(&config[9])) {
-      strcpy(reply, "OK");
-    } else {
-      strcpy(reply, "Error, must be direct, routed, or fleet");
-    }
-  } else if (memcmp(config, "ota.dutycycle ", 14) == 0) {
+  if (memcmp(config, "ota.dutycycle ", 14) == 0) {
     float dc = atof(&config[14]);
     if (_callbacks->setOtaDutyCycle(dc)) {
       int dc_int = (int)dc;
       int dc_frac = (int)((dc - dc_int) * 10.0f + 0.5f);
       sprintf(reply, "OK - OTA %d.%d%%", dc_int, dc_frac);
     } else {
-      strcpy(reply, "ERROR: ota.dutycycle must be >0 and <=100");
+      strcpy(reply, "ERROR: ota.dutycycle must be >=0 and <=100");
     }
   } else
 #endif
@@ -760,9 +718,7 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
 void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
 #if MESHCORE_LORA_OTA
-  if (memcmp(config, "ota.mode", 8) == 0) {
-    sprintf(reply, "> %s", _callbacks->getOtaMode());
-  } else if (memcmp(config, "ota.dutycycle", 13) == 0) {
+  if (memcmp(config, "ota.dutycycle", 13) == 0) {
     float dc = _callbacks->getOtaDutyCycle();
     int dc_int = (int)dc;
     int dc_frac = (int)((dc - dc_int) * 10.0f + 0.5f);
