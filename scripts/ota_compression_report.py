@@ -57,7 +57,7 @@ def measure(package, route, recipients=1, bandwidth=62500, sf=7, cr=5):
     for chunk in package.chunks:
         object_frames(Kind.DATA, len(chunk.stored))
     bursts = sum(math.ceil(math.ceil(len(c.stored) / 128) / 16) for c in package.chunks)
-    surveys = 6 + bursts // 8
+    surveys = 7 + bursts // 8
     # The scheduler's no-loss, immediate-processing scenario. Real extra polls,
     # repairs and interrupted transmissions are captured in the durable job.
     object_frames(Kind.QUERY, 48, recipients * surveys)

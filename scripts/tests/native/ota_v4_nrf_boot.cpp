@@ -71,7 +71,8 @@ static bool entropy(uint8_t* bytes, size_t size) {
 }
 
 int main(int argc, char** argv) {
-  assert(argc == 6);
+  assert(argc == 6 || argc == 7);
+  const bool metadataIoFault = argc == 7 && std::string(argv[6]) == "metadata-io";
   const std::string directory = argv[1];
   const Bytes admin = unhex(argv[2]), seed = unhex(argv[3]);
   assert(admin.size() == 32 && seed.size() == 32);
@@ -110,8 +111,18 @@ int main(int argc, char** argv) {
   hooks.isCurrentAdmin = Keys::adminHook; hooks.sign = Keys::signHook;
   platform.attach(hooks);
   platform.installationReady();
+  if (metadataIoFault) {
+    ::ota::test::FakeNorFlash::FaultSpec fault;
+    fault.kind = ::ota::test::FakeNorFlash::OpKind::Read;
+    fault.timing = ::ota::test::FakeNorFlash::InjectionTiming::Before;
+    fault.trigger_op_count = flash.readOpCount() + 1;
+    flash.armFault(fault);
+  }
   Receiver receiver(platform);
-  assert(receiver.begin() == Result::Ok);
+  const Result begun = receiver.begin();
+  assert(begun == Result::Ok || begun == Result::Integrity || begun == Result::Io);
+  if (metadataIoFault) assert(begun == Result::Io);
+  flash.clearFault();
   auto flush = [&] {
     save(directory + "/qspi.bin", flash.rawBuffer(), flash.rawSize());
     save(directory + "/internal.bin", internal.data(), internal.size());
@@ -125,7 +136,13 @@ int main(int argc, char** argv) {
       for (uint32_t now = 500; now < 10500; now += 50)
         assert(platform.health(now, true, true, true) == mesh::ota::OtaBoardTrialHealthOutcome::Pending);
       assert(NrfBootSafety::blank(confirm));
-      assert(platform.health(10500, true, true, true) == mesh::ota::OtaBoardTrialHealthOutcome::Confirmed);
+      const auto outcome = platform.health(10500, true, true, true);
+      if (metadataIoFault) {
+        assert(outcome == mesh::ota::OtaBoardTrialHealthOutcome::Pending);
+        assert(NrfBootSafety::blank(confirm));
+      } else {
+        assert(outcome == mesh::ota::OtaBoardTrialHealthOutcome::Confirmed);
+      }
       assert(!std::memcmp(before.data(), flash.rawBuffer() + 0x192000, before.size()));
       RunningEvidence evidence;
       assert(platform.evidence(evidence) == Result::Ok && !(evidence.flags & RunningConfirmed));

@@ -304,6 +304,23 @@ static void sameImageTransaction(unsigned originalSlot, esp_ota_img_states_t out
   unchangedOutsideMetadata(installedBytes);
 }
 
+static void damagedMetadataStillBlocksOrdinaryUpdate() {
+  nativeEsp.reset(0);
+  storageFault = resetPending = resetWaiting = false;
+  owner.held = true; owner.ordinary = false;
+  nativeEsp.flash[0x33c000] = 0x33;
+  const uint8_t seed[32] = {0x41};
+  ::ota::test::Ed25519TestSigner signer(seed);
+  EspFirmwarePlatform damaged; damaged.attach(hooksFor(signer));
+  Receiver receiver(damaged);
+  assert(receiver.begin() == Result::Integrity);
+  assert(receiver.journal().phase == Phase::MetadataFault);
+  assert(!damaged.storageFaultObserved());
+  assert(!damaged.ordinaryAllowed());
+  signedRepair(receiver, signer);
+  assert(damaged.ordinaryAllowed());
+}
+
 int main() {
   actualMetadataCapability();
   for (unsigned slot = 0; slot < 2; ++slot) {
@@ -311,5 +328,6 @@ int main() {
     sameImageTransaction(slot, ESP_OTA_IMG_ABORTED);
     sameImageTransaction(slot, ESP_OTA_IMG_VALID);
   }
+  damagedMetadataStillBlocksOrdinaryUpdate();
   std::puts("ESP production metadata capability and same-image higher-counter rollback/confirmation passed");
 }

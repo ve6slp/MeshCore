@@ -337,7 +337,7 @@ public:
     return storageFault ? Result::Io : Result::Ok;
   }
   bool ordinaryAllowed() const {
-    return !resetPending && !storageFaultObserved() && (!haveCandidate_ ||
+    return !resetPending && !storageFaultObserved() && !journal_.faulted() && (!haveCandidate_ ||
         latest_.phase == Phase::Confirmed || latest_.phase == Phase::Failed ||
         latest_.phase == Phase::Aborted || latest_.phase == Phase::Idle);
   }

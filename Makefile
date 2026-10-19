@@ -69,9 +69,9 @@ tmpdir:
 	@mkdir -p "$(TMPDIR)"
 test: tmpdir test-ota-host
 	$(PLATFORMIO) test $(foreach e,$(NATIVE_TEST_ENVS),-e $(e))
-test-ota: test-ota-host test-ota-native test-ota-disabled test-ota-queue-compatibility test-xiao-ota-bootloader
+test-ota: test-ota-host test-ota-native test-ota-v4-platform test-ota-v4-esp test-ota-v4-boot test-ota-v4-decoder test-ota-disabled test-ota-queue-compatibility test-xiao-ota-bootloader
 OTA_V4_DRIVER := $(TMPDIR)/ota-v4/receiver
-.PHONY: build-ota-v4-driver test-ota-v4-e2e test-ota-v4-platform
+.PHONY: build-ota-v4-driver test-ota-v4-e2e test-ota-v4-platform test-ota-v4-esp test-ota-v4-boot
 build-ota-v4-driver: tmpdir
 	@mkdir -p "$(TMPDIR)/ota-v4"
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-function -I src \
@@ -92,6 +92,10 @@ test-ota-v4-image: build-ota-v4-driver
 	  test_ota_deploy.NativeEndToEndTests.test_genuine_firmware_image_reaches_byte_exact_signed_confirmed_state
 test-ota-v4-platform: tmpdir
 	$(MAKE) --no-print-directory -f test/test_lora_ota_v4_platform/Makefile test
+test-ota-v4-esp: tmpdir
+	$(MAKE) --no-print-directory -f test/test_lora_ota_v4_esp/Makefile test
+test-ota-v4-boot: tmpdir
+	$(MAKE) --no-print-directory -f test/test_lora_ota_v4_boot/Makefile test
 test-ota-native: tmpdir
 	$(OTA_GTEST_ENV) $(PLATFORMIO) test -e native $(foreach filter,$(OTA_TEST_FILTER),-f '$(filter)')
 .PHONY: test-ota-v4-native
@@ -257,51 +261,7 @@ test-nrf-unadmitted-boot-process: tmpdir
 	  -o "$(TMPDIR)/rf-n1-boot-host/test_nrf_unadmitted_boot_process"
 	"$(TMPDIR)/rf-n1-boot-host/test_nrf_unadmitted_boot_process" $(if $(OTA_NRF_REMOTE_BOOT_PROOF_PREFIX),"$(OTA_NRF_REMOTE_BOOT_PROOF_PREFIX)")
 
-test-ota-rf-to-boot: tmpdir
-	@mkdir -p "$(TMPDIR)/ota-rf-to-boot"
-	@set -eu; \
-	  for family in 584e3430 53435031; do \
-	    for role in 0 1; do \
-	      for suffix in command candidate running sdk floor \
-	        retired-candidate retired-canonical retired-command-region retired-floor \
-	        retired-previous-command retired-running retired-sdk retired-state-region \
-	        rollback-command rollback-candidate rollback-running rollback-sdk rollback-floor \
-	        rollback-next-candidate rollback-next-canonical rollback-retained-command-region \
-	        multi-rollback-command-a multi-rollback-command-b \
-	        multi-rollback-candidate-a multi-rollback-candidate-b \
-	        multi-rollback-running multi-rollback-sdk multi-rollback-floor \
-	        multi-rollback-command-region multi-rollback-next-candidate multi-rollback-next-canonical \
-	        original-command original-candidate original-running original-sdk original-floor original-state-region \
-	        original-failed-command-region original-failed-state-region original-failed-running original-failed-sdk \
-	        original-failed-nonzero-command-region original-failed-nonzero-state-region \
-	        original-failed-nonzero-running original-failed-nonzero-sdk; do \
-	        rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role-$$suffix.bin"; \
-	      done; \
-	    done; \
-	  done
-	env -u GTEST_FILTER -u OTA_NRF_ORIGINAL_FAILED_PROOF_DIR \
-	  OTA_NRF_REMOTE_BOOT_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
-	  $(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER=
-	@set -eu; \
-	  for board in xiao_nrf52840 sensecap_solar_p1; do \
-	    case "$$board" in \
-	      xiao_nrf52840) target=XIAO_OTA_TARGET_XIAO_NRF52840; family=584e3430 ;; \
-	      sensecap_solar_p1) target=XIAO_OTA_TARGET_SENSECAP_SOLAR_P1; family=53435031 ;; \
-	    esac; \
-	    for role in 0 1; do \
-	      $(MAKE) --no-print-directory test-nrf-unadmitted-boot-process \
-	        XIAO_OTA_TEST_BOARD_TARGET="$$target" XIAO_OTA_ROLE_ID="$$role" \
-	        OTA_NRF_REMOTE_BOOT_PROOF_PREFIX="$(abspath $(TMPDIR)/ota-rf-to-boot)/$$family-role$$role"; \
-	    done; \
-	  done
-	@rm -f -- "$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)"
-	env -u OTA_NRF_REMOTE_BOOT_PROOF_DIR \
-	  GTEST_FILTER='LoraOtaQualifiedOriginal.FullColdFailedMaxBothSdkPoliciesRestoreAfterCommandReplacementAndBindNextCommit' \
-	  GTEST_OUTPUT="json:$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)" \
-	  OTA_NRF_ORIGINAL_FAILED_PROOF_DIR="$(abspath $(TMPDIR)/ota-rf-to-boot)" \
-	  $(MAKE) --no-print-directory test-ota-integration OTA_GTEST_FILTER=
-	@# Google Test accepts an empty filter; require the actual returned-proof test.
-	@python3 -c 'import json, sys; report = json.load(open(sys.argv[1])); cases = [case for suite in report["testsuites"] for case in suite["testsuite"]]; valid = report["tests"] == 1 and report["failures"] == 0 and len(cases) == 1 and cases[0]["status"] == "RUN" and cases[0]["result"] == "COMPLETED"; sys.exit(0 if valid else "Returned FailedMax proof did not execute exactly one complete passing test")' "$(abspath $(TMPDIR)/ota-rf-to-boot/consumer.json)"
+test-ota-rf-to-boot: test-ota-v4-boot
 
 test-xiao-ota-bootloader: tmpdir test-xiao-ota-bootloader-tools test-xiao-ota-boot-process
 	@mkdir -p "$(TMPDIR)/xiao-ota-host"

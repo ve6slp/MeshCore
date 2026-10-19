@@ -12,10 +12,11 @@ import unittest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from test_ota_uploader import ADMIN, ADMIN_PRIVATE, POLICY, Scratch, TARGET, package
+from test_ota_uploader import ADMIN, ADMIN_PRIVATE, POLICY, Scratch, TARGET, canonical, package
 from test_ota_stock_companion import Clock
 from ota_common import Error, Frame, FramedSerial, Kind, Phase, physical_airtime
 from ota_job import JobStore
+from ota_compression import Package
 from ota_compression_report import measure
 from ota_stock_companion import StockTransport
 from ota_transport import NativeTransport, Route, TxReceipt, packet_payload
@@ -211,6 +212,22 @@ class NativeEndToEndTests(Scratch):
         transport = DriverTransport(drivers, clock)
         return pkg, job, transport, clock
 
+    def test_no_loss_fleet_report_matches_executed_control_and_data_frames(self):
+        image = hashlib.shake_256(b"native v4 frame accounting").digest(24000)
+        pkg, job, transport, clock = self.setup_job(image, 2, compress=False)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        statuses = scheduler.apply(clock() + 1000)
+        self.assertTrue(all(status.installed(pkg) for status in statuses))
+        report = measure(pkg, transport.route, len(job.targets))
+        metrics = scheduler.result()["metrics"]
+        for key, modeled in report["counts"].items():
+            direction, kind = key.split("/")
+            actual = metrics[direction][kind]
+            with self.subTest(key=key):
+                self.assertEqual(modeled["frames"], actual["frames"])
+                self.assertEqual(modeled["ota_bytes"], actual["ota_bytes"])
+
     def test_raw_fleet_lost_slices_shared_once_then_selective_repair_and_signed_installation(self):
         image = hashlib.shake_256(b"native v4 fleet").digest(20000)
         pkg, job, transport, clock = self.setup_job(image, 2, compress=False)
@@ -243,6 +260,51 @@ class NativeEndToEndTests(Scratch):
             scheduler.stage(clock() + 1000)
             self.assertEqual(sum(f.kind == Kind.ADMIT for f in transport.sent), admitted)
             self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    def test_admission_waits_for_receiver_after_manifest_verification(self):
+        _, job, transport, clock = self.setup_job(b"firmware" * 2000)
+        send = transport.send
+        verifying = False
+        dropped = []
+
+        def delayed_receiver(raw, deadline):
+            nonlocal verifying
+            frame = Frame.decode(raw)
+            if verifying and frame.kind in (Kind.ADMIT, Kind.QUERY):
+                dropped.append(frame.kind)
+                transport.sent.append(frame)
+                if frame.kind == Kind.QUERY:
+                    verifying = False
+                size = len(transport.route.packet(raw))
+                return TxReceipt(physical_airtime(size), size, size + 3)
+            receipt = send(raw, deadline)
+            if frame.kind == Kind.MANIFEST and frame.slice == (frame.total - 1) // 128:
+                verifying = True
+            return receipt
+
+        transport.send = delayed_receiver
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        ready = scheduler.stage(clock() + 1000)
+        self.assertEqual(ready[0].phase, Phase.READY)
+        self.assertEqual(dropped, [Kind.QUERY])
+
+    def test_next_package_upgrades_confirmed_receiver_without_repair(self):
+        first, job, transport, clock = self.setup_job(b"first installed firmware" * 500)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        installed = scheduler.apply(clock() + 1000)[0]
+        self.assertTrue(installed.installed(first))
+        image = b"next installed firmware" * 600
+        next_package = Package.build(image, canonical(image, counter=first.counter + 1),
+                                     ADMIN, ADMIN_PRIVATE.sign)
+        with JobStore.create(self.directory / "next-job", next_package, ADMIN, [TARGET], POLICY) as next_job:
+            scheduler = Scheduler(next_job, transport, clock=clock, sleep=clock.sleep)
+            ready = scheduler.stage(clock() + 1000)[0]
+            self.assertEqual((ready.phase, ready.floor, ready.generation),
+                             (Phase.READY, first.counter, installed.generation + 1))
+            self.assertNotEqual(ready.transaction, installed.transaction)
+            self.assertTrue(scheduler.apply(clock() + 1000)[0].installed(next_package))
+        self.assertFalse(any(f.kind in (Kind.REPAIR, Kind.ABORT) for f in transport.sent))
 
     def test_compressed_independent_chunks_use_real_decoder_and_raw_hash(self):
         branch_bytes = bytearray()

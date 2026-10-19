@@ -217,7 +217,7 @@ class Scheduler:
             for op, _ in matching:
                 self.job.resolve(op, "authenticated")
             return status
-        if status.phase != Phase.IDLE:
+        if status.phase not in (Phase.IDLE, Phase.CONFIRMED):
             raise Error("non-idle receiver requires explicit abort/repair, never takeover")
         for (op,) in self.job.uncertain(target, Kind.ADMIT):
             body = self.job.db.execute("SELECT body FROM operations WHERE id=?", (op,)).fetchone()[0]
@@ -261,10 +261,13 @@ class Scheduler:
         return chunk, missing, phase
 
     def stage(self, deadline):
-        statuses = self.reconcile(deadline)
+        self.reconcile(deadline)
         # Manifest is shared once. Recovery resupplies exact authenticated bytes,
         # without changing the receiver's admitted transaction.
         self._send(Kind.MANIFEST, self.package.manifest, deadline)
+        # Signature checks can outlast the next RF packet. Wait for a signed
+        # response before sending admission fragments, rather than guessing a delay.
+        statuses = self.reconcile(deadline)
         active = {}
         for status in statuses:
             if status.installed(self.package):

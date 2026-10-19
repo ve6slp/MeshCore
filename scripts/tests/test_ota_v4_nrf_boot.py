@@ -31,10 +31,12 @@ APP = 0x27000
 
 
 class NrfDriver(Driver):
-    def __init__(self, directory, board, role):
+    def __init__(self, directory, board, role, *, metadata_io_fault=False):
         self.directory = directory
         self.arguments = [str(Path(BUILD) / "receiver"), str(directory), ADMIN.hex(),
                           (bytes([2]) * 32).hex(), hex(board), str(role)]
+        if metadata_io_fault:
+            self.arguments.append("metadata-io")
         self.log = (directory / "receiver.log").open("a")
         self.process = subprocess.Popen(self.arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.log, text=True, bufsize=1)
@@ -215,6 +217,39 @@ class NrfBootEndToEndTests(Scratch):
                 self.assertEqual(self.media(directory)[0][FLOOR:FLOOR + 8192],
                                  baseline[0][FLOOR:FLOOR + 8192])
                 self.persona_unchanged(baseline, self.media(directory))
+
+    def test_legacy_staging_metadata_does_not_block_boot_owned_trial_confirmation(self):
+        fixture = self.fixture()
+        directory, helper, _, _, package = fixture[:5]
+        self.activate(fixture)
+        qspi, _ = self.media(directory)
+        qspi = bytearray(qspi)
+        qspi[0xAB000:0xAD000] = b"\x33" * 8192
+        (directory / "qspi.bin").write_bytes(qspi)
+        self.assertEqual(self.boot(helper, directory)["phase"], 5)
+        driver, scheduler = self.fresh_scheduler(fixture)
+        clock = fixture[-1]
+        self.assertEqual(scheduler.query(TARGET, clock() + 1000).phase, Phase.METADATA_FAULT)
+        driver.exchange("health")
+        driver.close()
+        self.assertEqual(self.media(directory)[0][0xAB000:0xAD000], qspi[0xAB000:0xAD000])
+        confirmed = self.boot(helper, directory)
+        self.assertEqual((confirmed["phase"], confirmed["floor"]), (6, package.counter))
+        self.assertEqual(confirmed["hash"], package.raw_hash.hex())
+
+    def test_metadata_read_io_failure_blocks_trial_confirmation_even_after_reads_recover(self):
+        fixture = self.fixture()
+        directory, helper, board, role = fixture[:4]
+        baseline = self.media(directory)
+        self.activate(fixture)
+        self.assertEqual(self.boot(helper, directory)["phase"], 5)
+        driver = NrfDriver(directory, board, role, metadata_io_fault=True)
+        self.addCleanup(driver.close)
+        driver.exchange("health")
+        driver.close()
+        self.assertEqual(self.media(directory)[0][FLOOR:FLOOR + 8192],
+                         baseline[0][FLOOR:FLOOR + 8192])
+        self.assertNotEqual(self.boot(helper, directory)["phase"], 6)
 
     def test_wrong_confirmation_nonce_never_advances_floor_and_real_boot_rolls_back(self):
         fixture = self.fixture()

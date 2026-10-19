@@ -176,10 +176,18 @@ and ambiguous metadata fail closed; recovery must not revive a revoked READY
 record. An administrator can explicitly repair OTA staging without formatting
 the personality store or resetting the confirmed floor.
 
+A readable staging record from an earlier protocol leaves the receiver in
+MetadataFault and requires explicit repair before another transfer. It does
+not prevent a healthy nRF boot-owned trial from confirming its installed
+image. A flash read, write or erase I/O failure still blocks trial confirmation.
+
 The board adapter alone owns storage geometry, boot command construction,
 trial confirmation, rollback and installed-image evidence. The receiver owns
 the protocol transaction. The host owns one durable job and a transmitter-wide
 airtime scheduler, with transports limited to framing, routing and device I/O.
+After sending the manifest, the host waits for a fresh signed receiver response
+before sending admission fragments. This lets the receiver finish signature
+verification without relying on a fixed delay.
 An owned radio override expires and restores the unchanged ordinary settings,
 including the user's forwarding preference.
 
@@ -200,6 +208,9 @@ make build ENV=Xiao_S3_WIO_repeater_ota_usb
 make build-ota-solar OTA_IMAGE_FREEZE="$PWD/.tmp/ota-boot-builds/my-v4-solar"
 make test-ota-v4-native
 make test-ota-v4-decoder
+make test-ota-v4-platform
+make test-ota-v4-esp
+make test-ota-v4-boot
 make ota-v4-arm-size OTA_IMAGE_FREEZE="$PWD/.tmp/ota-boot-builds/my-v4-solar"
 make ota OTA_ARGS='--help'
 ```
@@ -253,6 +264,9 @@ overwritten. Select a counter above the authenticated confirmed floor.
 
 Repeat the same deploy command with the existing job to resume. Changing
 targets, package, route, transport or duty policy while resuming is refused.
+A later firmware version uses a new package and job with a counter above the
+confirmed floor. A confirmed receiver accepts that signed admission without
+clearing its staging metadata or resetting its floor.
 A restart authenticates fresh receiver state and reconciles uncertain
 operations before sending more data. `--stage-only` stops at authenticated
 READY without authorizing activation. A later deploy of that same job
@@ -282,6 +296,20 @@ simulated boot-confirmation event do not establish physical flash or RF
 qualification. `make test-ota-v4-platform` exercises real journal/staging and
 boot command construction against fault-injected flash models.
 
+`make test-ota-v4-esp` runs the production ESP adapter against a native SDK
+model, including its journal-only flash access and same-image, higher-counter
+rollback and confirmation. `make test-ota-v4-boot` passes production host frames
+through the nRF receiver, flash adapter, C installer and trial-health confirmation
+for both board families and roles. `make test-ota-rf-to-boot` selects that same
+v4 test. These targets use modeled media and do not transmit or flash devices.
+`make test-ota` includes all three alongside the host, native and decoder checks.
+
+The nRF main-loop task has a 4 KiB stack. Boot-record proof workspaces live in
+the board adapter, and image hashing and boot-command writing keep their stack
+frames separate from signature verification. When changing these paths, check
+the target build's `.su` files and nested RF receive calls, including status
+queries after a confirmed install.
+
 For a genuine firmware byte-stream run and a persistent encoder/frame report:
 
 ```sh
@@ -308,16 +336,16 @@ byte-exact raw integrity and fresh signed simulated confirmation.
 | Data frames | 4074 | 2650 |
 | Raw chunk size | 8064 | 8192 |
 | Manifest bytes | Different v3 format | 2467 |
-| Host transmissions | 5490 on hardware | 2892, no-loss simulated transport |
+| Host transmissions | 5490 on hardware | 2893, no-loss simulated transport |
 
 V4 requires about 35% fewer data frames for this exact image; almost all of
 that gain comes from removing packet signatures, not a compression-ratio
 claim. The software run additionally sent 20 manifest slices, 189 progress
-queries, 29 signed-status queries and four admission/activation slices.
-Its 189 progress replies and 58 status reply frames are counted separately.
+queries, 30 signed-status queries and four admission/activation slices.
+Its 189 progress replies and 60 status reply frames are counted separately.
 
 At BW62.5 kHz/SF7/CR5 with at most one path byte, the conservative size-based
-model estimates 1523.632 seconds of host TX and 89.610 seconds of receiver
+model estimates 1523.948 seconds of host TX and 90.641 seconds of receiver
 replies, excluding loss, contention, duty waiting and platform CPU/flash time.
 These are modeled airtimes, not physical measurements; the historical v3
 7505.821-second campaign duration is elapsed time and cannot serve as an

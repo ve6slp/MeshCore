@@ -162,8 +162,10 @@ private:
   }
 };
 
-inline bool XiaoOtaCommandRecordV3::writeNext(platform::FlashRegion& region, const XiaoOtaCommandV3Fields& fields,
-                                              uint32_t* out_sequence_written) {
+// Keep record-writing scratch separate from callers' install validation.
+inline __attribute__((noinline)) bool XiaoOtaCommandRecordV3::writeNext(
+    platform::FlashRegion& region, const XiaoOtaCommandV3Fields& fields,
+    uint32_t* out_sequence_written) {
   if (!regionIsValid(region)) {
     return false;
   }

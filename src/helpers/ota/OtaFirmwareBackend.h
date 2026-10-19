@@ -124,7 +124,9 @@ public:
     }
     return result;
   }
-  bool storageFaultObserved() const { return storageFault_ || journal_.faulted(); }
+  // Invalid staging records require repair, but a boot-owned trial can still
+  // confirm when the flash is readable and its other health checks pass.
+  bool storageFaultObserved() const { return storageFault_ || journal_.ioFaultObserved(); }
 
 protected:
   void remember(const Journal& journal, const Manifest& package) {

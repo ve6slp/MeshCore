@@ -21,6 +21,7 @@ public:
 
   size_t manifestCapacity() const { return geometry() ? bankBytes() - kHeaderBytes : 0; }
   bool faulted() const { return fault_; }
+  bool ioFaultObserved() const { return ioFault_; }
 
   Result recover(Journal& journal, uint8_t* manifest, size_t capacity, size_t& size) {
     journal = Journal();
@@ -135,6 +136,7 @@ public:
     if (saved != Result::Ok) return saved;
     if (!platform::isOk(region_.eraseRange((1 - slot_) * bankBytes(), bankBytes())))
       return fail(Result::Io);
+    ioFault_ = false;
     return Result::Ok;
   }
 
@@ -216,13 +218,18 @@ private:
     }
     return true;
   }
-  Result fail(Result result) { fault_ = true; return result; }
+  Result fail(Result result) {
+    fault_ = true;
+    ioFault_ = ioFault_ || result == Result::Io;
+    return result;
+  }
 
   platform::FlashRegion& region_;
   uint32_t sequence_ = 0;
   uint32_t slot_ = 0;
   bool loaded_ = false;
   bool fault_ = false;
+  bool ioFault_ = false;
 };
 
 }}

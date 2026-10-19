@@ -258,25 +258,37 @@ public:
   ::ota::storage::Esp32SdkError inspect(::ota::storage::Esp32PartitionSnapshot& out) const override {
     out = snapshot; return 0;
   }
-  ::ota::storage::Esp32SdkError read(const ::ota::storage::Esp32PartitionIdentity& p, uint32_t offset,
-                                    uint8_t* out, uint32_t size) const override {
-    bounds(p, offset, size); std::memcpy(out, bytes.data() + p.address + offset, size); return 0;
+  ::ota::storage::Esp32SdkError read(const ::ota::storage::Esp32PartitionIdentity&, uint32_t,
+                                    uint8_t*, uint32_t) const override {
+    return ::ota::storage::kEsp32InvalidArgument;
   }
-  ::ota::storage::Esp32SdkError write(const ::ota::storage::Esp32PartitionIdentity& p, uint32_t offset,
-                                     const uint8_t* in, uint32_t size) override {
-    bounds(p, offset, size); std::memcpy(bytes.data() + p.address + offset, in, size); return 0;
+  ::ota::storage::Esp32SdkError write(const ::ota::storage::Esp32PartitionIdentity&, uint32_t,
+                                     const uint8_t*, uint32_t) override {
+    return ::ota::storage::kEsp32InvalidArgument;
   }
-  ::ota::storage::Esp32SdkError erase(const ::ota::storage::Esp32PartitionIdentity& p, uint32_t offset,
-                                     uint32_t size) override {
-    bounds(p, offset, size); std::memset(bytes.data() + p.address + offset, 0xff, size); return 0;
+  ::ota::storage::Esp32SdkError erase(const ::ota::storage::Esp32PartitionIdentity&, uint32_t,
+                                     uint32_t) override {
+    return ::ota::storage::kEsp32InvalidArgument;
+  }
+  ::ota::storage::Esp32SdkError readOtaMetadata(uint32_t offset, uint8_t* out,
+                                              uint32_t size) const override {
+    bounds(offset, size); std::memcpy(out, bytes.data() + address(offset), size); return 0;
+  }
+  ::ota::storage::Esp32SdkError writeOtaMetadata(uint32_t offset, const uint8_t* in,
+                                               uint32_t size) override {
+    bounds(offset, size); std::memcpy(bytes.data() + address(offset), in, size); return 0;
+  }
+  ::ota::storage::Esp32SdkError eraseOtaMetadata(uint32_t offset, uint32_t size) override {
+    bounds(offset, size); std::memset(bytes.data() + address(offset), 0xff, size); return 0;
   }
   std::vector<uint8_t> bytes;
   ::ota::storage::Esp32PartitionSnapshot snapshot;
 private:
-  static void bounds(const ::ota::storage::Esp32PartitionIdentity& p, uint32_t offset, uint32_t size) {
-    assert(::ota::storage::esp32PartitionEquals(p, ::ota::storage::Esp32S3PartitionLayout::entry(2)));
-    assert(offset >= ::ota::platform::Esp32OtaMetadataAdapter::kOffset &&
-        offset <= p.size && size <= p.size - offset);
+  static uint32_t address(uint32_t offset) {
+    return ::ota::storage::Esp32S3PartitionLayout::entry(2).address + kOtaMetadataOffset + offset;
+  }
+  static void bounds(uint32_t offset, uint32_t size) {
+    assert(offset <= kOtaMetadataBytes && size <= kOtaMetadataBytes - offset);
   }
 };
 static void espMetadataHasNoPersonaOrPayloadCapability() {

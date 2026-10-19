@@ -141,16 +141,20 @@ public:
         !std::memcmp(snapshot.backupHash, after.backupHash, 32);
   }
 
-  bool normal(Snapshot& out) const {
+  bool normal(Snapshot& out) {
     out = Snapshot();
     if (!readRunning(out)) return false;
-    uint8_t state[State::kRecordBytes] = {};
+    auto& state = proof_.state;
+    std::memset(state, 0, sizeof(state));
     const auto status = State::readNewestWithStatus(state_, state);
     if (status != State::ReadStatus::Blank && status != State::ReadStatus::Found) return false;
-    uint8_t stateDigest[32], floorDigest[32], commandDigest[32];
+    auto& stateDigest = proof_.stateDigest;
+    auto& floorDigest = proof_.floorDigest;
+    auto& commandDigest = proof_.commandDigest;
     if (!stateWindows(state, status) || !hashRegion(state_, stateDigest) ||
         !hashRegion(floor_, floorDigest) || !hashRegion(commands_, commandDigest)) return false;
-    uint8_t floorHash[32]; uint32_t floorExtent = 0;
+    auto& floorHash = proof_.floorHash;
+    uint32_t floorExtent = 0;
     if (!strictFloor(out.floor, floorExtent, floorHash)) return false;
     if (status == State::ReadStatus::Blank) {
       if (out.floor || !blank(confirm_)) return false;
@@ -181,9 +185,12 @@ public:
       } else return false;
     }
     if (!commandsSafe(out)) return false;
-    uint8_t afterState[State::kRecordBytes] = {}, afterHash[32]; uint32_t afterFloor, afterExtent;
-    Snapshot after;
-    uint8_t digest[32];
+    auto& afterState = proof_.afterState;
+    std::memset(afterState, 0, sizeof(afterState));
+    auto& afterHash = proof_.afterHash;
+    uint32_t afterFloor, afterExtent;
+    auto& after = proof_.after;
+    auto& digest = proof_.digest;
     return State::readNewestWithStatus(state_, afterState) == status &&
         !std::memcmp(state, afterState, sizeof(state)) &&
         strictFloor(afterFloor, afterExtent, afterHash) && afterFloor == out.floor &&
@@ -330,10 +337,11 @@ private:
     }
     return false;
   }
-  bool commandsSafe(const Snapshot& snapshot) const {
+  bool commandsSafe(const Snapshot& snapshot) {
     if (!pairGeometry(commands_)) return false;
-    uint8_t records[2][Command::kRecordBytes]; bool valid[2] = {};
-    meshcore::ota::protocol::OtaDescriptor descriptors[2];
+    auto& records = proof_.commands;
+    bool valid[2] = {};
+    auto& descriptors = proof_.descriptors;
     int newest = -1;
     for (uint32_t slot = 0; slot < 2; ++slot) {
       const uint32_t offset = slot * commands_.eraseUnitBytes();
@@ -372,6 +380,16 @@ private:
     }
     return true;
   }
+  // The main-loop owner serializes these proofs. Keep their scratch records
+  // off the 4 KiB nRF task stack, which also carries signature verification.
+  struct ProofWorkspace {
+    uint8_t state[State::kRecordBytes], afterState[State::kRecordBytes];
+    uint8_t stateDigest[32], floorDigest[32], commandDigest[32];
+    uint8_t floorHash[32], afterHash[32], digest[32];
+    Snapshot after;
+    uint8_t commands[2][Command::kRecordBytes];
+    meshcore::ota::protocol::OtaDescriptor descriptors[2];
+  } proof_;
   ::ota::platform::FlashRegion& commands_;
   ::ota::platform::FlashRegion& state_;
   ::ota::platform::FlashRegion& floor_;

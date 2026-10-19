@@ -18,7 +18,8 @@ hw_text = (root / "src" / "xiao_ota_boot.c").read_text()
 text = (root / "src" / "xiao_ota_boot_io.c").read_text()
 
 entry = hw_text[hw_text.index("void xiao_ota_boot_process(void)"):]
-assert "xiao_ota_boot_process_io(&hardware_io)" in entry, (
+assert "const xiao_ota_io_t *hardware_io = complete_io();" in entry
+assert "xiao_ota_boot_process_io(hardware_io)" in entry, (
     "the production entry point must call the shared processor with its "
     "hardware io_t, not reimplement any decision logic itself"
 )

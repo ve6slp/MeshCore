@@ -32,8 +32,8 @@ MeshCore provides the ability to create wireless mesh networks, similar to Mesht
 - Watch the [MeshCore Technical Presentation](https://www.youtube.com/watch?v=OwmkVkZQTf4) by Liam Cottle.
 - Read through our [Frequently Asked Questions](./docs/faq.md) and [Documentation](https://docs.meshcore.io).
   - Experimental [LoRa OTA v4 updates](./docs/lora_ota_v4.md) are optional and off by default.
-    Direct nRF hardware updates have succeeded; ESP/Solar hardware and routed/fleet
-    updates are not yet tested. Public-fork soak only, not an upstream release.
+    See the guide for supported builds, nRF bootloader commissioning and the
+    package/deploy commands.
 - Flash the MeshCore firmware on a supported device.
 - Connect with a supported client.
 

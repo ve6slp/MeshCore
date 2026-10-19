@@ -50,7 +50,8 @@ public:
     return platform::isOk(payload_.read(offset, bytes, size)) ? Result::Ok : Result::Io;
   }
 
-  Result verifyImage(uint32_t rawSize, const uint8_t expected[32]) const {
+  // Do not keep the hash workspace on a caller's signature-verification stack.
+  __attribute__((noinline)) Result verifyImage(uint32_t rawSize, const uint8_t expected[32]) const {
     if (!expected || !rawSize || rawSize > payload_.sizeBytes()) return Result::Invalid;
     uint8_t bytes[256], actual[32];
     trust::Sha256 hash;
