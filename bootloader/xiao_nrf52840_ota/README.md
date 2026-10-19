@@ -223,9 +223,9 @@ other local serial clients can also request a destructive upload.
 
 Normal boot establishes both ACL locks before calling the signed installer or
 APP; BLE recovery establishes them before enabling BLE. USB recovery defers those
-locks without giving an APP execution grant. If normal installation qualification
-fails after locks have been established, the primary resets once into vendor USB
-recovery rather than trying to unlock ACL. Field role/signature/floor/trial policy
+locks without giving an APP execution grant. If a normal installation attempt
+fails after locks have been established, BP1.5 restarts automatically and
+establishes the locks again before retrying. Field role/signature/floor/trial policy
 is unchanged. USB MSC/UF2 is omitted to fit the fixed primary budget: use Adafruit
 serial DFU ZIPs, not BOOT-update UF2 copies.
 
