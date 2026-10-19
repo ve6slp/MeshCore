@@ -172,12 +172,11 @@ static bool qspi_wait_for(uint32_t timeout_ms) {
 }
 
 static bool nvmc_wait_for(uint32_t timeout_ms) {
-  hw_ensure_cycle_counter_enabled();
-  const uint32_t start = DWT->CYCCNT;
-  const uint32_t deadline_cycles = hw_deadline_cycles(timeout_ms);
+  qspi_deadline_t deadline;
+  qspi_deadline_start(&deadline, timeout_ms);
   while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {
     bench_feed_existing_watchdog();
-    if ((uint32_t)(DWT->CYCCNT - start) >= deadline_cycles) return false;
+    if (qspi_deadline_expired(&deadline)) return false;
   }
   return true;
 }

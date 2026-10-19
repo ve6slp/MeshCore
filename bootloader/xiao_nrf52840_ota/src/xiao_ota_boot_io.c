@@ -2538,11 +2538,9 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
        * a routine "no acceptable command" outcome. Silently `return`ing
        * here would let the device boot the running app as if nothing
        * were wrong, indistinguishable from an ordinary unsigned-command
-       * boot, hiding that anomaly. force_recovery() instead gives an
-       * explicit, externally observable diagnostic (the same USB UF2/CDC
-       * recovery escalation used for every other fail-closed case in this
-       * function) -- nothing has been mutated yet, so this is still a
-       * safe, non-destructive refusal; it is simply not a silent one. */
+       * boot, hiding that anomaly. Report the failed attempt to the primary
+       * instead; it retries boot without granting application execution or
+       * changing these unexpected settings bytes. */
       bool tail_blank;
       if (!settings_page_tail_erased(io, &tail_blank) || !tail_blank) {
         goto recover;

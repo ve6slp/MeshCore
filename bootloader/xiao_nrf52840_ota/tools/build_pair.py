@@ -15,7 +15,7 @@ from pathlib import Path
 PRODUCT = Path(__file__).resolve().parents[1]
 ROOT = PRODUCT.parents[1]
 PIN = "a62825be4733f500271c89b5ec489fd609748e97"
-RELEASE = "0.9.2-OTAFIX2.3-BP1.4"
+RELEASE = "0.9.2-OTAFIX2.3-BP1.5"
 USB_BENCH = "serial-usb-cdc-fresh-v2"
 BSP = {"xiao_nrf52840": "xiao_nrf52840_ble",
        "xiao_nrf52840_sense": "xiao_nrf52840_ble_sense",
@@ -328,9 +328,11 @@ def prepare_primary(out, tree, board, role, stage):
         "    *dbl_reset_mem = prior_marker;\n"
         "  }\n"
         "  bool const forced = (!escape && !pair_intact) || pair_init != NRF_SUCCESS;\n"
-        "  if (forced) {\n"
-        "    NRF_POWER->GPREGRET = DFU_MAGIC_UF2_RESET;\n"
-        "    if (!escape) NVIC_SystemReset();\n"
+        "  if (forced && !escape) {\n"
+        "    NRF_POWER->GPREGRET = 0;\n"
+        "    *dbl_reset_mem = 0;\n"
+        "    NRFX_DELAY_MS(1000);\n"
+        "    NVIC_SystemReset();\n"
         "  }\n\n"
         "  // Check all inputs and enter DFU if needed")
     text = once(text, "  check_dfu_mode();",
@@ -419,7 +421,7 @@ def test_pair(out, vendor, board, role):
         "static uint32_t entry_gpregret, entry_resetreas;\n" +
         generated[start:end] + "\n")
     shutil.copy2(out / "primary-source/src/xiao_ota/pair_expected.h", folder / "pair_expected.h")
-    flags = ["-std=c11", "-D_GNU_SOURCE", "-O2", "-Wall", "-Wextra", "-Werror",
+    flags = ["-std=c11", "-D_GNU_SOURCE", "-O2", "-g", "-Wall", "-Wextra", "-Werror",
              "-Wno-unused-function", "-Wno-sign-compare",
              "-Wno-unterminated-string-initialization",
              "-Wno-pointer-to-int-cast", "-Wno-int-to-pointer-cast", "-fno-pie", "-no-pie",
@@ -450,7 +452,7 @@ def test_pair(out, vendor, board, role):
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         (out / "logs" / (executable.name + ".test.log")).write_text(result.stdout)
         if negative:
-            assert result.returncode != 0 and "dfu_calls == 1" in result.stdout, result.stdout
+            assert result.returncode != 0 and "mock_power.GPREGRET == 0" in result.stdout, result.stdout
         else:
             assert result.returncode == 0, result.stdout
             print(result.stdout, end="")

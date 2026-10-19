@@ -2366,7 +2366,7 @@ static void test_settings_tail_poisoned_refuses_write(void) {
 
   /* A poisoned settings-page tail is unexplained device anomaly, not an
    * ordinary "no acceptable command this boot" outcome -- it must
-   * force_recovery() (the same observable USB UF2/CDC escalation used
+   * force_recovery() (the same failed-attempt result used
    * for every other fail-closed case), not silently continue as if
    * nothing were wrong. Nothing is mutated either way: no state record,
    * running app untouched. */

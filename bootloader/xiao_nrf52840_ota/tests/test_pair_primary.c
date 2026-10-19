@@ -1,6 +1,11 @@
 #include "pair_abi.h"
 #include "pair_expected.h"
 #include "xiao_ota_boot_io.h"
+#include "xiao_ota_record.h"
+#include "xiao_ota_layout.h"
+#include "xiao_ota_sha256.h"
+#include "tweetnacl.h"
+#include "crc16.h"
 #include "stage_recovery.h"
 #include "nrf.h"
 #include <assert.h>
@@ -9,9 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#ifdef PAIR_VENDOR_LIFECYCLE
 #include <ucontext.h>
-#endif
 
 typedef struct { uint32_t CC[4]; } mock_timer_t;
 #ifdef PAIR_VENDOR_LIFECYCLE
@@ -46,6 +49,10 @@ static uint32_t timeout, pending_result;
 static uint32_t retention_at_dfu;
 static unsigned init_sd_calls;
 static uint32_t init_sd_error;
+static unsigned primary_init_calls, primary_init_failures;
+static unsigned automatic_retry_budget, automatic_retries;
+static unsigned retry_delays;
+static bool fail_trial_app;
 static jmp_buf route;
 bool _ota_dfu, _ota_connected, _sd_inited;
 #define NRF_TIMER2 (&timer)
@@ -74,7 +81,7 @@ bool _ota_dfu, _ota_connected, _sd_inited;
 #define APP_ERROR_CHECK(error) do { if ((error) != NRF_SUCCESS) longjmp(route, 3); } while (0)
 #define APP_ASKS_FOR_SINGLE_TAP_RESET() single_tap
 #define PRINTF(...) ((void)0)
-#define NRFX_DELAY_MS(ms) ((void)(ms))
+#define NRFX_DELAY_MS(ms) do { if ((ms) == 1000u) ++retry_delays; } while (0)
 static void check_dfu_mode(bool);
 static uint32_t ble_stack_init(void) {
   assert(_sd_inited);
@@ -119,7 +126,14 @@ static void sd_softdevice_disable(void) {}
 #ifdef PAIR_VENDOR_LIFECYCLE
 static uint32_t xiao_ota_primary_init(void) { return lifecycle_sdk_init(); }
 #else
-static uint32_t xiao_ota_primary_init(void) { return 0; }
+static uint32_t xiao_ota_primary_init(void) {
+  ++primary_init_calls;
+  if (primary_init_failures) {
+    --primary_init_failures;
+    return NRF_ERROR_INTERNAL;
+  }
+  return NRF_SUCCESS;
+}
 static bool bootloader_dfu_sd_in_progress(void) { return pending; }
 static uint32_t bootloader_dfu_sd_update_continue(void) {
   assert(mock_acl.ACL[0].SIZE == 0 && mock_acl.ACL[1].SIZE == 0);
@@ -169,7 +183,9 @@ static uint32_t bootloader_dfu_start(bool ble, uint32_t ms, bool startup) {
 static bool xiao_ota_vendor_recovery_complete(void) { ++getter_calls; return false; }
 #endif
 static __attribute__((noreturn)) void bootloader_app_start(void) {
-  ++app_calls; longjmp(route, 1);
+  ++app_calls;
+  if (fail_trial_app && mock_wdt.TASKS_START) NVIC_SystemReset();
+  longjmp(route, 1);
 }
 __attribute__((noreturn)) void NVIC_SystemReset(void) { longjmp(route, 2); }
 extern pair_result_t stage_run(const pair_request_t *);
@@ -200,9 +216,14 @@ static int boot(void) {
     int value = setjmp(route);
     if (!value) { boot_entry_active = true; vendor_main(); assert(!"main returned"); }
     if (value == 2 && !in_stage_call && !dfu_calls &&
-        mock_power.GPREGRET == DFU_MAGIC_UF2_RESET) {
-      assert(resets++ == 0);
-      assert(mock_acl.ACL[0].SIZE && mock_acl.ACL[1].SIZE);
+        (mock_power.GPREGRET == DFU_MAGIC_UF2_RESET ||
+         (mock_power.GPREGRET == 0 && automatic_retries < automatic_retry_budget))) {
+      if (mock_power.GPREGRET == DFU_MAGIC_UF2_RESET) {
+        assert(resets++ == 0);
+        assert(mock_acl.ACL[0].SIZE && mock_acl.ACL[1].SIZE);
+      } else {
+        ++automatic_retries;
+      }
       reset_adapter();
       mock_power.RESETREAS = 4;
       usb_bench = bench_stage_repair = false;
@@ -221,17 +242,18 @@ static void fresh_runtime(void) {
   service_calls = dfu_calls = getter_calls = app_calls = pending_calls = 0;
   pending_result = 0;
   init_sd_calls = 0; init_sd_error = 0;
+  primary_init_calls = primary_init_failures = 0;
+  automatic_retry_budget = automatic_retries = 0;
+  retry_delays = 0;
+  fail_trial_app = false;
   _ota_dfu = _ota_connected = _sd_inited = single_tap = pending = dfu_button = false;
   usb_bench = bench_stage_repair = usb_mounted = usb_sdk_error = false;
   complete_boot_upload = in_stage_call = false;
 }
 
-#ifdef PAIR_VENDOR_LIFECYCLE
 static int boot_result;
 static void low_stack_boot(void) { boot_result = boot(); }
-int lifecycle_boot(uint32_t marker) {
-  fresh_runtime();
-  mock_power.GPREGRET = marker;
+static int mapped_boot(void) {
   void *stack = mmap((void *)0x20030000, 65536, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   assert(stack == (void *)0x20030000);
@@ -243,10 +265,119 @@ int lifecycle_boot(uint32_t marker) {
   assert(swapcontext(&caller, &entry) == 0);
   return boot_result;
 }
+#ifdef PAIR_VENDOR_LIFECYCLE
+int lifecycle_boot(uint32_t marker) {
+  fresh_runtime();
+  mock_power.GPREGRET = marker;
+  return mapped_boot();
+}
 unsigned lifecycle_init_calls(void) { return init_sd_calls; }
 uint32_t lifecycle_timeout(void) { return timeout; }
 void lifecycle_initialize_sd(void) { mbr_init_sd(); }
 #else
+void pair_test_flash(uint8_t *, bool, uint32_t, unsigned);
+unsigned pair_test_failed_operations(void);
+void randombytes(unsigned char *bytes, unsigned long long size) {
+  static uint32_t value = 1;
+  while (size--) {
+    value = value * 1664525u + 1013904223u;
+    *bytes++ = value >> 24;
+  }
+}
+
+static void transaction_failure_recovers_without_dfu(void *app, void *settings,
+                                                     bool install_read, bool failed_trial) {
+  static uint8_t flash[2u * 1024u * 1024u];
+  memset(flash, 255, sizeof(flash));
+  memset(settings, 255, 4096);
+  const uint32_t vectors[4] = {0x2003E000, PAIR_APP_START + 1, 0x11223344, 0x55667788};
+  memcpy(app, vectors, sizeof(vectors));
+  const uint16_t crc = crc16_compute(app, sizeof(vectors), NULL);
+  uint8_t raw[28] = {1, 0, 0, 0, 0xFE};
+  memcpy(raw + 2, &crc, sizeof(crc));
+  raw[8] = sizeof(vectors);
+  memcpy(settings, raw, sizeof(raw));
+
+  xiao_ota_sha256_t sha;
+  uint8_t hash[32], candidate_hash[32];
+  xiao_ota_sha256_init(&sha);
+  xiao_ota_sha256_update(&sha, app, sizeof(vectors));
+  xiao_ota_sha256_final(&sha, hash);
+  uint32_t candidate[4];
+  memcpy(candidate, vectors, sizeof(candidate));
+  candidate[2] ^= 0xA55AA55A;
+  memcpy(flash + XIAO_OTA_CANDIDATE_BASE, candidate, sizeof(candidate));
+  xiao_ota_sha256_init(&sha);
+  xiao_ota_sha256_update(&sha, candidate, sizeof(candidate));
+  xiao_ota_sha256_final(&sha, candidate_hash);
+
+  xiao_ota_floor_t floor = {0};
+  floor.magic = XIAO_OTA_FLOOR_MAGIC;
+  floor.record_version = XIAO_OTA_FORMAT_VERSION;
+  floor.record_bytes = sizeof(floor);
+  floor.sequence = 1;
+  floor.active_image_extent = sizeof(vectors);
+  memcpy(floor.confirmed_hash_sha256, hash, sizeof(hash));
+  floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
+  floor.commit_marker = XIAO_OTA_COMMIT_MARKER;
+  memcpy(flash + XIAO_OTA_FLOOR_A, &floor, sizeof(floor));
+
+  xiao_ota_wire_descriptor_t descriptor = {0};
+  descriptor.board_family = XIAO_OTA_BOARD_TARGET >> 16;
+  descriptor.board_variant = XIAO_OTA_BOARD_TARGET & 0xFFFFu;
+  descriptor.role = XIAO_OTA_COMPILED_ROLE_ID;
+  descriptor.app_address = XIAO_OTA_APP_START;
+  descriptor.exact_size_bytes = sizeof(vectors);
+  memcpy(descriptor.sha256, candidate_hash, sizeof(candidate_hash));
+  descriptor.security_counter = 1;
+  descriptor.min_boot_capabilities = XIAO_OTA_CAP_QSPI_INSTALL;
+  descriptor.format_id = XIAO_OTA_DESCRIPTOR_FORMAT;
+  descriptor.key_id = XIAO_OTA_KEY_ID;
+  descriptor.algorithm_id = XIAO_OTA_ALGORITHM_ED25519;
+  xiao_ota_command_v2_t command = {0};
+  command.magic = XIAO_OTA_RECORD_MAGIC;
+  command.record_version = XIAO_OTA_COMMAND_VERSION_CURRENT;
+  command.record_bytes = sizeof(command);
+  command.sequence = 1;
+  command.transaction_nonce = 123;
+  xiao_ota_wire_descriptor_encode(&descriptor, command.wire_descriptor);
+  uint8_t secret[64], signed_message[64 + XIAO_OTA_WIRE_DESCRIPTOR_SIZE];
+  unsigned long long signed_size;
+  crypto_sign_keypair(command.admitted_signer_public_key_ed25519, secret);
+  crypto_sign(signed_message, &signed_size, command.wire_descriptor,
+              sizeof(command.wire_descriptor), secret);
+  assert(signed_size == sizeof(signed_message));
+  memcpy(command.signature_ed25519, signed_message, 64);
+  command.active_image_extent = sizeof(vectors);
+  memcpy(command.active_image_hash_sha256, hash, sizeof(hash));
+  command.crc32 = xiao_ota_crc32(&command, offsetof(xiao_ota_command_v2_t, crc32));
+  command.commit_marker = XIAO_OTA_COMMIT_MARKER;
+  memcpy(flash + XIAO_OTA_COMMAND_A, &command, sizeof(command));
+
+  fresh_runtime();
+  pair_test_flash(flash, install_read,
+                  install_read ? XIAO_OTA_CANDIDATE_BASE : XIAO_OTA_BACKUP_BASE,
+                  install_read ? 3 : 1);
+  fail_trial_app = failed_trial;
+  automatic_retry_budget = 1 + (failed_trial ? XIAO_OTA_MAX_TRIAL_BOOTS : 0);
+  assert(mapped_boot() == 1);
+  assert(pair_test_failed_operations() == 1 && automatic_retries == automatic_retry_budget);
+  assert(service_calls == 1 + automatic_retries && !dfu_calls);
+  assert(app_calls == 1 + (failed_trial ? XIAO_OTA_MAX_TRIAL_BOOTS : 0));
+  assert(!mock_power.GPREGRET && retry_delays == 1);
+  assert((bool)mock_wdt.TASKS_START == (!install_read && !failed_trial));
+  const xiao_ota_state_t *a = (const void *)(flash + XIAO_OTA_STATE_A);
+  const xiao_ota_state_t *b = (const void *)(flash + XIAO_OTA_STATE_B);
+  assert(xiao_ota_state_valid(a) && xiao_ota_state_valid(b));
+  const xiao_ota_state_t *state = a->sequence > b->sequence ? a : b;
+  const bool rolled_back = install_read || failed_trial;
+  assert(state->phase == (rolled_back ? XIAO_OTA_PHASE_FAILED : XIAO_OTA_PHASE_TRIAL_BOOT));
+  assert(state->transaction_nonce == 123);
+  assert(!memcmp(app, rolled_back ? vectors : candidate, sizeof(vectors)));
+  assert(!memcmp(flash + XIAO_OTA_FLOOR_A, &floor, sizeof(floor)));
+  pair_test_flash(NULL, false, 0, 0);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   void *stage = mmap((void *)PAIR_STAGE_START, 65536, PROT_READ | PROT_WRITE,
@@ -263,8 +394,8 @@ int main(int argc, char **argv) {
   memset(settings, 255, 4096);
   uint8_t before[4096]; memcpy(before, settings, 4096);
   fresh_runtime();
-  assert(boot() == 2 && service_calls == 1 && dfu_calls == 1);
-  assert(timeout == 0 && mock_power.GPREGRET == 0 && getter_calls == 1);
+  assert(boot() == 2 && service_calls == 1 && dfu_calls == 0);
+  assert(mock_power.GPREGRET == 0 && getter_calls == 0 && retention == 0);
   assert(xiao_ota_stage2_recovery_requested());
   assert(!memcmp(before, settings, 4096));
   assert(!mock_nvmc.CONFIG && !mock_nvmc.ERASEPAGE && !mock_qspi.TASKS_WRITESTART &&
@@ -285,7 +416,7 @@ int main(int argc, char **argv) {
   fresh_runtime(); ((uint8_t *)stage)[40] ^= 1;
   mock_power.RESETREAS = POWER_RESETREAS_RESETPIN_Msk;
   assert(boot() == 2 && !xiao_ota_vendor_usb_bench_mode());
-  assert(retention_at_dfu != DFU_DBL_RESET_MAGIC && !mock_acl.ACL[0].SIZE);
+  assert(retention == 0 && !dfu_calls && mock_acl.ACL[0].SIZE);
   fresh_runtime(); mock_power.RESETREAS = POWER_RESETREAS_RESETPIN_Msk;
   retention = DFU_DBL_RESET_MAGIC;
   assert(boot() == 2 && !xiao_ota_vendor_usb_bench_mode() && !mock_acl.ACL[0].SIZE);
@@ -311,15 +442,27 @@ int main(int argc, char **argv) {
   assert(boot() == 2 && pending_calls == 2 && xiao_ota_vendor_usb_bench_mode());
   puts("USB single reset ignores RAM token; USB recovery is not admission; BLE locks and post-upload BOOT copy route PASS");
   fresh_runtime(); ((uint8_t *)stage)[40] ^= 1;
-  assert(boot() == 2 && !service_calls && dfu_calls == 1 && timeout == 0);
+  assert(boot() == 2 && !service_calls && dfu_calls == 0 && mock_power.GPREGRET == 0);
   ((uint8_t *)stage)[40] ^= 1;
   fresh_runtime(); pending = true; pending_result = 1;
-  assert(boot() == 2 && !service_calls && dfu_calls == 1 && timeout == 0);
+  assert(boot() == 2 && !service_calls && dfu_calls == 0 && mock_power.GPREGRET == 0);
   fresh_runtime();
   const uint32_t vectors[2] = {0x2003E000, PAIR_APP_START + 1};
   memcpy(app, vectors, 8);
   const uint8_t valid[28] = {1,0,0,0,0xfe,0,0,0,8};
   memcpy(settings, valid, 28);
+  primary_init_failures = 1;
+  automatic_retry_budget = 1;
+  assert(boot() == 1 && primary_init_calls == 2 && automatic_retries == 1);
+  assert(service_calls == 1 && app_calls == 1 && dfu_calls == 0);
+  assert(mock_power.GPREGRET == 0 && !retention && retry_delays == 1);
+  fresh_runtime();
+  primary_init_failures = 3;
+  automatic_retry_budget = 2;
+  assert(boot() == 2 && primary_init_calls == 3 && automatic_retries == 2);
+  assert(!service_calls && !app_calls && !dfu_calls && mock_power.GPREGRET == 0);
+  assert(retry_delays == 3);
+  fresh_runtime();
   single_tap = true;
   assert(boot() == 2 && service_calls == 1 && dfu_calls == 1 && timeout == 3000);
   assert(retention == DFU_DBL_RESET_APP && mock_power.GPREGRET == 0);
@@ -336,7 +479,12 @@ int main(int argc, char **argv) {
   fresh_runtime(); init_sd_error = 1;
   if (!setjmp(route)) { mbr_init_sd(); assert(!"failed INIT_SD returned"); }
   assert(!_sd_inited && init_sd_calls == 1);
+  transaction_failure_recovers_without_dfu(app, settings, false, false);
+  transaction_failure_recovers_without_dfu(app, settings, true, false);
+  transaction_failure_recovers_without_dfu(app, settings, false, true);
   puts("Sense selected main + actual adapter/kernel/runtime: R1 recovery, SDK unchanged, "
        "timeout separation, pending-first/error, grant invalidation/fresh stage PASS");
+  puts("Field failure retries automatically without latching DFU; transient failure returns to APP PASS");
+  puts("Signed backup/install I/O failures and failed trial -> automatic resume/rollback, no DFU PASS");
 }
 #endif

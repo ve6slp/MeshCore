@@ -91,13 +91,10 @@ typedef struct xiao_ota_io {
 
   void (*start_trial_watchdog)(void *ctx);
 
-  /*
-   * Trigger an unconditional recovery boot (UF2/CDC DFU). On real
-   * hardware this resets the MCU and never returns. The processor still
-   * `return`s immediately after invoking it (harmless in production,
-   * since the reset already happened; required so a fake can observe the
-   * call and let the test driver decide what "next boot" means).
-   */
+  /* Stop this transaction attempt without further mutations. The returning
+   * installer reports the failure to the primary, which restarts the installer
+   * after one second. Explicit USB/BLE recovery is selected separately before
+   * entering the installer. The callback may return; the caller must stop. */
   void (*force_recovery)(void *ctx);
 } xiao_ota_io_t;
 

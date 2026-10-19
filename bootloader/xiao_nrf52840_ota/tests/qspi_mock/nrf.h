@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include "nrf52840_bitfields.h"
 
-/* Only QSPI and DWT have behavior. The other adapters are compiled but
- * never invoked. Nordic bitfields come from the pinned SDK, not a copy. */
+/* Nordic bitfields come from the pinned SDK. The pair test also models
+ * NVMC page erasure in its mapped internal flash. */
 typedef struct {
   volatile uint32_t TASKS_ACTIVATE, TASKS_READSTART, TASKS_WRITESTART;
   volatile uint32_t TASKS_ERASESTART, TASKS_DEACTIVATE;
@@ -36,6 +36,7 @@ typedef struct { mock_acl_region_t ACL[8]; } mock_acl_t;
 extern mock_acl_t mock_acl;
 
 void mock_qspi_poll(void);
+void mock_nvmc_poll(void);
 void mock_clock_tick(void);
 void mock_barrier(void);
 void NVIC_SystemReset(void);
@@ -43,7 +44,7 @@ void NVIC_SystemReset(void);
 #define NRF_QSPI (mock_qspi_poll(), &mock_qspi)
 #define DWT (mock_clock_tick(), &mock_dwt)
 #define CoreDebug (&mock_coredebug)
-#define NRF_NVMC (&mock_nvmc)
+#define NRF_NVMC (mock_nvmc_poll(), &mock_nvmc)
 #define NRF_WDT (&mock_wdt)
 #define NRF_POWER (&mock_power)
 #define NRF_FICR (&mock_ficr)

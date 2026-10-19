@@ -1,9 +1,9 @@
 # nRF52840 paired LoRa OTA bootloader
 
 The optional nRF backend needs a matching small primary and a fixed returning
-installer, not just a new application. The primary provides vendor CDC serial/BLE recovery; native USB serial
+installer. The primary provides vendor CDC serial/BLE recovery; native USB serial
 bench recovery additionally supports fresh pair replacement. The installer processes signed QSPI transactions,
-backup/install/trial/rollback and returns to that recovery path when needed.
+backup/install/trial/rollback. Failed field installation attempts restart automatically.
 The informational boot marker is not a signing authority: admission still uses
 the receiver's current MeshCore administrator permissions.
 During initial commissioning, provision the intended sender contact and
@@ -19,10 +19,28 @@ is only an optional offline artifact comparison, never command authorization.
 The public vendor source is
 [OTAFIX](https://github.com/oltaco/Adafruit_nRF52_Bootloader_OTAFIX), pinned to
 `a62825be4733f500271c89b5ec489fd609748e97`
-(`0.9.2-OTAFIX2.3-BP1.4`). The preserving patch and installer sources are in this
+and pair builds identify as `0.9.2-OTAFIX2.3-BP1.5`. The preserving patch and installer sources are in this
 directory. Base XIAO, Sense XIAO and SenseCAP select their actual vendor BSP;
 Sense retains its own CF2/USB identity while sharing logical Xiao OTA family.
 Both role IDs are supported: companion 0, repeater 1.
+
+## Automatic field recovery
+
+BP1.5 retries an unsuccessful bootloader or installer attempt after one second.
+Each restart reads the saved transaction again and resumes installation or
+rollback from its durable checkpoint. It leaves identity, settings and the
+confirmed rollback floor in place. A transient flash timeout therefore does
+not leave the node waiting for a USB upload or a reset-button press.
+
+An unconfirmed application boots under a 60-second watchdog. After three
+unconfirmed application boots, the installer restores the verified backup.
+If power fails during that restore, the next boot resumes it. Explicit USB
+or BLE recovery requests still select the vendor recovery service.
+
+If flash remains unreadable or no trustworthy application or backup survives,
+the node remains offline and retries. Failed storage or lost images can still
+require local service. An application-only firmware update does not replace
+an older bootloader pair.
 
 ## OTA v4 platform boundary
 
@@ -88,6 +106,9 @@ make test-xiao-ota-bootloader-pair \
 Native pair tests exercise the actual returning adapter and reject the legacy
 reset adapter. Host tests create/reparse standard packages and reject changed
 board/role, APP, stage, init bytes, CRC, extra images and mismatched readback.
+The primary tests follow automatic resets through a backup write timeout,
+a candidate read timeout after application erasure and an unconfirmed trial,
+checking that installation or rollback reaches the application without DFU.
 Passing software tests are not proof of physical installation.
 When no actual APP ZIP/build context is supplied, real-APP packaging tests are
 skipped; native pair tests still run. Deployment packaging requires both.

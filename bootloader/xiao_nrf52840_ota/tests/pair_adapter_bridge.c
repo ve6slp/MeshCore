@@ -1,5 +1,6 @@
 #include "nrf.h"
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -20,22 +21,59 @@ __asm__(".globl __data_start__\n.set __data_start__, runtime_window + 16\n"
 
 #ifdef PAIR_VENDOR_LIFECYCLE
 extern uint8_t *lifecycle_qspi_flash(void);
+#else
+static uint8_t *test_flash;
+static uint32_t fail_address;
+static unsigned fail_after, matching_operations, failed_operations;
+static bool fail_read;
+void pair_test_flash(uint8_t *flash, bool read, uint32_t address, unsigned after) {
+  test_flash = flash;
+  fail_read = read;
+  fail_address = address;
+  fail_after = after;
+  matching_operations = failed_operations = 0;
+}
+unsigned pair_test_failed_operations(void) { return failed_operations; }
+static bool fail_operation(bool read, uint32_t address) {
+  if (read != fail_read || address != fail_address ||
+      ++matching_operations != fail_after) return false;
+  ++failed_operations;
+  return true;
+}
+#endif
 static unsigned reads;
 unsigned lifecycle_qspi_reads(void) { return reads; }
 void mock_qspi_poll(void) {
   if (mock_qspi.ENABLE != QSPI_ENABLE_ENABLE_Enabled) return;
+#ifdef PAIR_VENDOR_LIFECYCLE
   uint8_t *flash = lifecycle_qspi_flash();
+#else
+  uint8_t *flash = test_flash;
+  if (!flash) return;
+#endif
   if (mock_qspi.TASKS_ACTIVATE) {
     mock_qspi.TASKS_ACTIVATE = 0;
     mock_qspi.EVENTS_READY = 1;
   }
   if (mock_qspi.TASKS_READSTART) {
+#ifndef PAIR_VENDOR_LIFECYCLE
+    if (fail_operation(true, mock_qspi.READ.SRC)) {
+      mock_qspi.TASKS_READSTART = 0;
+      return;
+    }
+#endif
     assert(mock_qspi.READ.SRC + mock_qspi.READ.CNT <= 2u * 1024u * 1024u);
     memcpy((void *)(uintptr_t)mock_qspi.READ.DST, flash + mock_qspi.READ.SRC,
            mock_qspi.READ.CNT);
     mock_qspi.TASKS_READSTART = 0; mock_qspi.EVENTS_READY = 1; ++reads;
   }
   if (mock_qspi.TASKS_WRITESTART) {
+#ifndef PAIR_VENDOR_LIFECYCLE
+    if (fail_operation(false, mock_qspi.WRITE.DST)) {
+      mock_qspi.TASKS_WRITESTART = 0;
+      return;
+    }
+#endif
     assert(mock_qspi.WRITE.DST + mock_qspi.WRITE.CNT <= 2u * 1024u * 1024u);
     const uint8_t *source = (const void *)(uintptr_t)mock_qspi.WRITE.SRC;
     for (uint32_t n = 0; n < mock_qspi.WRITE.CNT; ++n)
@@ -54,15 +92,20 @@ void mock_qspi_poll(void) {
       case 0x05: mock_qspi.CINSTRDAT0 = 0; break;
       case 0x35: mock_qspi.CINSTRDAT0 = 2; break;
       case 0x06: case 0x31: case 0xab: break;
-      default: assert(!"unexpected healthy QSPI opcode");
+      default: assert(!"unexpected QSPI opcode");
     }
     mock_qspi.CINSTRCONF = 0; mock_qspi.EVENTS_READY = 1;
   }
 }
-#else
-void mock_qspi_poll(void) {}
-#endif
 void mock_clock_tick(void) { mock_dwt.CYCCNT += 64000; }
+void mock_nvmc_poll(void) {
+#ifndef PAIR_VENDOR_LIFECYCLE
+  if (test_flash && mock_nvmc.READY && mock_nvmc.ERASEPAGE) {
+    memset((void *)(uintptr_t)mock_nvmc.ERASEPAGE, 255, 4096);
+    mock_nvmc.ERASEPAGE = 0;
+  }
+#endif
+}
 void mock_barrier(void) {}
 void mock_delay_us(uint32_t us) { (void)us; }
 void nrf_qspi_disable(NRF_QSPI_Type *qspi) { qspi->ENABLE = 0; }

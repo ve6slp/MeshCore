@@ -34,7 +34,7 @@ typedef struct {
 
 typedef uint32_t pair_result_t;
 enum {
-  PAIR_RECOVERY = 0,
+  PAIR_RECOVERY = 0,  /* Primary retries boot; explicit DFU bypasses the installer. */
   PAIR_APP_INTACT = 1,
   PAIR_BENCH_READY = 2
 };

@@ -184,6 +184,7 @@ void mock_barrier(void) {
   mock_qspi_poll();
 }
 
+void mock_nvmc_poll(void) {}
 void NVIC_SystemReset(void) { assert(!"hardware recovery is outside this test"); }
 bool xiao_ota_explicit_dfu_requested(uint32_t value) { (void)value; return false; }
 void xiao_ota_boot_process_io(const xiao_ota_io_t *hardware_io) { io = hardware_io; }
@@ -378,6 +379,19 @@ static void quick_completion_and_wrap(void) {
   assert(sr2 == 2 && !busy_until);
 }
 
+static void nvmc_waits_are_bounded_with_a_stopped_clock(void) {
+  initialize();
+  mock_nvmc.READY = NVMC_READY_READY_Busy;
+  frozen_clock = true;
+  unsigned before = ticks;
+  assert(!io->internal_erase_page(NULL, 0x27000));
+  assert(ticks - before < 1100u);
+  assert(mock_nvmc.CONFIG == NVMC_CONFIG_WEN_Ren && !mock_nvmc.ERASEPAGE);
+  before = ticks;
+  assert(!io->internal_write(NULL, 0x27000, source, sizeof(source)));
+  assert(ticks - before < 1100u && mock_nvmc.CONFIG == NVMC_CONFIG_WEN_Ren);
+}
+
 static void bench_watchdog_scope(void) {
   reset_model();
   memset(&mock_wdt, 0, sizeof(mock_wdt));
@@ -408,6 +422,7 @@ int main(int argc, char **argv) {
     {"deadline", deadline_and_error_propagation},
     {"lost-ready", lost_ready_and_read_timeout},
     {"stopped-clock", stopped_clock},
+    {"nvmc-stopped-clock", nvmc_waits_are_bounded_with_a_stopped_clock},
     {"quick-wrap", quick_completion_and_wrap},
   };
   unsigned ran = 0;
