@@ -32,6 +32,7 @@ static uint8_t verify_buffer[COPY_CHUNK] __attribute__((aligned(4)));
 /* Startup is non-reentrant. Once external reads fail, do not reclassify
  * unknown history using later successful reads in the same boot. */
 static bool qspi_read_failed;
+static bool qspi_history_known, qspi_fallback_permitted;
 
 static void recover_or_boot_intact(const xiao_ota_io_t *io);
 
@@ -1865,7 +1866,12 @@ bool xiao_ota_vendor_pending_settings_write(const xiao_ota_io_t *io, const uint8
 }
 
 static void recover_or_boot_intact(const xiao_ota_io_t *io) {
-  if (qspi_read_failed && xiao_ota_app_is_intact(io)) return;
+  if (qspi_read_failed && qspi_fallback_permitted && xiao_ota_app_is_intact(io)) {
+    /* Unreadable history may hide an unconfirmed candidate. A hung fallback
+     * must still reset so the installer can retry when storage recovers. */
+    if (!qspi_history_known) io->start_trial_watchdog(io->ctx);
+    return;
+  }
   io->force_recovery(io->ctx);
 }
 
@@ -2114,6 +2120,7 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
   xiao_ota_settings_sidecar_t sidecar __attribute__((aligned(4)));
   uint8_t digest[32] __attribute__((aligned(4)));
   bool have_state, have_floor, confirmed, floor_trustworthy;
+  bool repair_state = false;
   bool have_sidecar, sidecar_trustworthy, sidecar_matches_state;
   bool have_active_extent;
   uint32_t expected_active_extent = 0;
@@ -2129,6 +2136,8 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
    * after this hook. Never let a persistent OTA transaction intercept recovery.
    */
   qspi_read_failed = false;
+  qspi_history_known = false;
+  qspi_fallback_permitted = true;
   if (io->explicit_dfu_requested(io->ctx)) return;
 
   if (!io->qspi_init(io->ctx)) {
@@ -2208,6 +2217,24 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
       memset(&state, 0, sizeof(state));
       break;
     case XIAO_OTA_PAIR_DAMAGED:
+      /* An interrupted replacement can leave only the previous checkpoint
+       * readable. Do not resume its trial allowance or trust the damaged
+       * slot: resolve it below against the confirmed image and its backup. */
+      if (xiao_ota_state_valid(&state_a) != xiao_ota_state_valid(&state_b)) {
+        bool blank;
+        uint32_t damaged = xiao_ota_state_valid(&state_a)
+            ? XIAO_OTA_STATE_B : XIAO_OTA_STATE_A;
+        if (!state_sector_tail_erased(io, damaged, &blank) || !blank) goto recover;
+        state = xiao_ota_state_valid(&state_a) ? state_a : state_b;
+        state_slot_address = xiao_ota_state_valid(&state_a)
+            ? XIAO_OTA_STATE_A : XIAO_OTA_STATE_B;
+        if (xiao_ota_command_acceptable_phase(true, (xiao_ota_phase_t)state.phase))
+          goto recover;
+        have_state = true;
+        repair_state = true;
+        break;
+      }
+      goto recover;
     case XIAO_OTA_PAIR_IO_ERROR:
     default:
       /* Torn/bit-rotted state (not genuinely blank) or an unreadable
@@ -2217,6 +2244,9 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
        * go completely uninspected. Fail closed before any mutation. */
       goto recover;
   }
+  qspi_history_known = true;
+  qspi_fallback_permitted = !have_state ||
+      xiao_ota_command_acceptable_phase(true, (xiao_ota_phase_t)state.phase);
 
   /* Boot-private settings sidecar (xiao_ota_layout.h): co-located inside
    * the SAME sector as its accompanying state record, always written
@@ -2387,6 +2417,64 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
     case XIAO_OTA_PAIR_IO_ERROR:
     default:
       goto recover;
+  }
+
+  if (repair_state) {
+    uint32_t extent;
+    uint32_t original_extent = floor.active_image_extent;
+    const uint8_t *original_hash = floor.confirmed_hash_sha256;
+    if (!have_floor || !floor_trustworthy || !sidecar_matches_state ||
+        !active_image_extent_bounded(state.active_image_extent)) goto recover;
+    const uint8_t zero_hash[32] = {0};
+    if (floor.confirmed_counter_floor == 0 && original_extent == 0 &&
+        all_equal(original_hash, zero_hash)) {
+      /* Before the first confirmed OTA, the admitted command supplies the
+       * original image snapshot. Bind every image field before using it. */
+      if (command_status != XIAO_OTA_PAIR_FOUND ||
+          !command_cryptographically_and_statically_authentic(io, &command) ||
+          intent.transaction_nonce != state.transaction_nonce ||
+          intent.monotonic_counter != state.candidate_counter ||
+          intent.active_image_extent != state.active_image_extent ||
+          !all_equal(intent.active_image_hash_sha256, state.backup_hash_sha256) ||
+          !all_equal(intent.image_hash_sha256, state.candidate_hash_sha256))
+        goto recover;
+      original_extent = state.active_image_extent;
+      original_hash = state.backup_hash_sha256;
+    }
+    if ((active_extent_from_settings(io, &extent) ||
+         (floor.confirmed_counter_floor < state.candidate_counter &&
+          all_equal(original_hash, state.backup_hash_sha256) &&
+          original_extent_from_settings(io, original_hash, &extent))) &&
+        extent == original_extent &&
+        hash_internal(io, XIAO_OTA_APP_START, extent, digest) &&
+        all_equal(digest, original_hash)) {
+      if (floor.confirmed_counter_floor == state.candidate_counter &&
+          all_equal(digest, state.candidate_hash_sha256)) {
+        state.phase = XIAO_OTA_PHASE_CONFIRMED;
+      } else if (floor.confirmed_counter_floor < state.candidate_counter &&
+                 extent == state.active_image_extent &&
+                 all_equal(digest, state.backup_hash_sha256)) {
+        xiao_ota_settings_raw_t current;
+        if (!settings_read_raw(io, &current) ||
+            memcmp(&current, sidecar.original_settings_raw, sizeof(current)) != 0)
+          goto recover;
+        state.phase = XIAO_OTA_PHASE_FAILED;
+      } else {
+        goto recover;
+      }
+      (void)persist_state_or_recover(io, &state, &sidecar, &state_slot_address);
+      return;
+    }
+    /* A valid floor is the independent identity of the image to restore.
+     * Never roll back from an older checkpoint across a newer floor. */
+    if (floor.confirmed_counter_floor >= state.candidate_counter ||
+        original_extent != state.active_image_extent ||
+        !all_equal(original_hash, state.backup_hash_sha256) ||
+        !hash_qspi(io, XIAO_OTA_BACKUP_BASE, state.active_image_extent, digest) ||
+        !all_equal(digest, original_hash)) goto recover;
+    state.phase = XIAO_OTA_PHASE_ROLLBACK_COPYING;
+    state.progress_bytes = 0;
+    if (!persist_state_or_recover(io, &state, &sidecar, &state_slot_address)) return;
   }
 
 
@@ -2563,6 +2651,7 @@ void xiao_ota_boot_process_io(const xiao_ota_io_t *io) {
       state.sequence = previous_sequence;
     }
     state.transaction_nonce = intent.transaction_nonce;
+    qspi_fallback_permitted = false;
     state.phase = XIAO_OTA_PHASE_BACKUP_COPYING;
     state.active_image_extent = intent.active_image_extent;
     state.candidate_counter = intent.monotonic_counter;

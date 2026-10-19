@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include "xiao_ota_layout.h"
 
 NRF_QSPI_Type mock_qspi;
 mock_dwt_t mock_dwt;
@@ -25,6 +26,8 @@ extern uint8_t *lifecycle_qspi_flash(void);
 static uint8_t *test_flash;
 static uint32_t fail_address;
 static unsigned fail_after, matching_operations, failed_operations;
+static unsigned fail_remaining;
+static uint32_t fail_phase;
 static bool fail_read;
 void pair_test_flash(uint8_t *flash, bool read, uint32_t address, unsigned after) {
   test_flash = flash;
@@ -32,11 +35,25 @@ void pair_test_flash(uint8_t *flash, bool read, uint32_t address, unsigned after
   fail_address = address;
   fail_after = after;
   matching_operations = failed_operations = 0;
+  fail_remaining = 1;
+  fail_phase = UINT32_MAX;
+}
+void pair_test_flash_failure_phase(uint32_t phase, unsigned repetitions) {
+  fail_phase = phase;
+  fail_remaining = repetitions;
 }
 unsigned pair_test_failed_operations(void) { return failed_operations; }
 static bool fail_operation(bool read, uint32_t address) {
-  if (read != fail_read || address != fail_address ||
-      ++matching_operations != fail_after) return false;
+  if (read != fail_read || address != fail_address || !fail_remaining) return false;
+  if (fail_phase != UINT32_MAX) {
+    const xiao_ota_state_t *a = (const void *)(test_flash + XIAO_OTA_STATE_A);
+    const xiao_ota_state_t *b = (const void *)(test_flash + XIAO_OTA_STATE_B);
+    const xiao_ota_state_t *state = !xiao_ota_state_valid(a) ? b :
+        !xiao_ota_state_valid(b) || a->sequence > b->sequence ? a : b;
+    if (!xiao_ota_state_valid(state) || state->phase != fail_phase) return false;
+  }
+  if (++matching_operations < fail_after || !fail_after) return false;
+  --fail_remaining;
   ++failed_operations;
   return true;
 }
@@ -53,6 +70,9 @@ void mock_qspi_poll(void) {
 #endif
   if (mock_qspi.TASKS_ACTIVATE) {
     mock_qspi.TASKS_ACTIVATE = 0;
+#ifndef PAIR_VENDOR_LIFECYCLE
+    if (fail_operation(true, UINT32_MAX)) return;
+#endif
     mock_qspi.EVENTS_READY = 1;
   }
   if (mock_qspi.TASKS_READSTART) {

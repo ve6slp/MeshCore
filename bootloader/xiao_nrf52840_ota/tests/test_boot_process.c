@@ -1988,7 +1988,7 @@ static void test_intact_qspi_error_fallback(void) {
     s.fail.op = test < 2 ? FAKE_IO_OP_QSPI_INIT : FAKE_IO_OP_QSPI_READ;
     s.fail.after = 1;
     assert(fake_io_run_boot(&s) == 0);
-    assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == 0);
+    assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == 1);
     assert(s.app_erase_calls == 0 && s.bank_clear_writes == 0);
     assert(memcmp(before, s.qspi, FAKE_IO_QSPI_SIZE) == 0);
     assert(xiao_ota_app_is_intact(&io));
@@ -2136,7 +2136,7 @@ static void test_qspi_read_error_after_barrier_and_published_trial(void) {
   s.fail.op = FAKE_IO_OP_QSPI_INIT;
   s.fail.after = 1;
   assert(fake_io_run_boot(&s) == 0);
-  assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == watches);
+  assert(s.force_recovery_calls == 0 && s.watchdog_start_calls == watches + 1);
   assert(read_state(&s, &after) && memcmp(&before, &after, sizeof(before)) == 0);
   assert(read_floor(&s, &floor_after) &&
          memcmp(&floor_before, &floor_after, sizeof(floor_before)) == 0);
@@ -3578,6 +3578,7 @@ static uint32_t setup_retry_publication_target(fake_io_state_t *s,
 }
 
 static void assert_retry_outcome_safe(fake_io_state_t *s,
+                                      const uint8_t old_hash[32],
                                       const uint8_t candidate_hash[32],
                                       uint32_t size) {
   xiao_ota_state_t final_state;
@@ -3597,19 +3598,20 @@ static void assert_retry_outcome_safe(fake_io_state_t *s,
    * in TRIAL_BOOT phase -- exactly the delta that durable bytes alone
    * can never safely recredit (see state_ambiguous_binding_ok()'s
    * doc-comment): it is indistinguishable from a bit-rotted record of
-   * an ALREADY-armed watchdog cycle. Failing closed to force_recovery
-   * here is the required, safe outcome, not a bug -- mirror the same
-   * either/or shape main's own retry-damage regressions use instead of
-   * asserting resume unconditionally. */
+   * an ALREADY-armed watchdog cycle. A damaged checkpoint can instead
+   * restore the independently verified confirmed image, without granting
+   * another trial. Unresolvable corruption still refuses recovery. */
   if (s->force_recovery_calls != 0) {
     return;
   }
   assert(read_state(s, &final_state));
-  assert(final_state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
+  assert(final_state.phase == XIAO_OTA_PHASE_TRIAL_BOOT ||
+         final_state.phase == XIAO_OTA_PHASE_FAILED);
   assert(final_state.transaction_nonce == 703);
   assert(final_state.trial_attempts <= 2u);
   sha256_of(s->internal_flash + XIAO_OTA_APP_START, size, running_hash);
-  assert(memcmp(running_hash, candidate_hash, 32) == 0);
+  assert(memcmp(running_hash, final_state.phase == XIAO_OTA_PHASE_FAILED
+                                ? old_hash : candidate_hash, 32) == 0);
 }
 
 static void run_publication_cut_matrix_active_retry(void) {
@@ -3646,7 +3648,7 @@ static void run_publication_cut_matrix_active_retry(void) {
       s.tear.after = -1;
       s.tear_crash = false;
       assert(fake_io_run_boot(&s) == 0);
-      assert_retry_outcome_safe(&s, candidate_hash, size);
+      assert_retry_outcome_safe(&s, old_hash, candidate_hash, size);
     }
   }
 }
@@ -3672,7 +3674,7 @@ static void run_publication_erase_crash_active_retry(void) {
 
   s.crash.after = -1;
   assert(fake_io_run_boot(&s) == 0);
-  assert_retry_outcome_safe(&s, candidate_hash, size);
+  assert_retry_outcome_safe(&s, old_hash, candidate_hash, size);
 }
 
 static void test_publication_erase_crash_active_retry_resumes(void) {
@@ -3764,7 +3766,7 @@ static void test_signed_zero_crc_candidate_installs_confirms_and_resolves_next_b
     s.fail.after = 1;
     assert(fake_io_run_boot(&s) == 0 && s.force_recovery_calls == 0);
     assert(read_state(&s, &state) && state.phase == XIAO_OTA_PHASE_TRIAL_BOOT);
-    assert(state.trial_attempts == 0 && s.watchdog_start_calls == 1);
+    assert(state.trial_attempts == 0 && s.watchdog_start_calls == 2);
     s.fail.op = FAKE_IO_OP_NONE;
   }
 

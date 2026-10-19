@@ -228,7 +228,7 @@ backup before an explicitly destructive conversion. Merely entering USB
 recovery must not erase identity, administrators or settings. An application
 OTA update never invokes commissioning, resets the rollback floor, changes
 identity, or silently falls back to USB/SWD.
-Use the BP1.5 pair for unattended nRF nodes: failed installer attempts restart
+Use the BP1.6 pair for unattended nRF nodes: failed installer attempts restart
 automatically and resume installation or rollback. Updating the application
 alone leaves an older pair unchanged.
 

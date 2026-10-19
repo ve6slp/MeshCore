@@ -15,7 +15,7 @@ from pathlib import Path
 PRODUCT = Path(__file__).resolve().parents[1]
 ROOT = PRODUCT.parents[1]
 PIN = "a62825be4733f500271c89b5ec489fd609748e97"
-RELEASE = "0.9.2-OTAFIX2.3-BP1.5"
+RELEASE = "0.9.2-OTAFIX2.3-BP1.6"
 USB_BENCH = "serial-usb-cdc-fresh-v2"
 BSP = {"xiao_nrf52840": "xiao_nrf52840_ble",
        "xiao_nrf52840_sense": "xiao_nrf52840_ble_sense",
@@ -438,7 +438,8 @@ def test_pair(out, vendor, board, role):
                 "pair_protect.c")]
     sources += [PRODUCT / "third_party/tweetnacl/tweetnacl.c",
                 PRODUCT / "tests/crc16_host.c",
-                PRODUCT / "tests/pair_adapter_bridge.c", PRODUCT / "tests/test_pair_primary.c"]
+                PRODUCT / "tests/pair_adapter_bridge.c", PRODUCT / "tests/pair_faults.c",
+                PRODUCT / "tests/test_pair_primary.c"]
     gate = folder / "pair_gate.o"
     run(["cc", *flags, "-Dpair_call=pair_arm_call", "-c", PRODUCT / "src/pair_gate.c",
          "-o", gate], ROOT, out / "logs/pair_gate.native.compile.log")
@@ -446,10 +447,12 @@ def test_pair(out, vendor, board, role):
     for negative in (False, True):
         executable = folder / ("legacy-reset-negative" if negative else "selected-pair")
         define = "-DPAIR_LEGACY_NEGATIVE" if negative else "-DXIAO_OTA_FIXED_STAGE2_RETURNING"
-        run(["cc", *flags, define, *sources, "-o", executable], ROOT,
+        run(["cc", *flags, define, *sources, "-Wl,--wrap=xiao_ota_boot_process_io",
+             "-o", executable], ROOT,
             out / "logs" / (executable.name + ".compile.log"))
         result = subprocess.run([str(executable), str(out / "stage2/stage2.bin")], cwd=ROOT,
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=180)
         (out / "logs" / (executable.name + ".test.log")).write_text(result.stdout)
         if negative:
             assert result.returncode != 0 and "mock_power.GPREGRET == 0" in result.stdout, result.stdout

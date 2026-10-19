@@ -7,6 +7,7 @@
 #include "tweetnacl.h"
 #include "crc16.h"
 #include "stage_recovery.h"
+#include "pair_faults.h"
 #include "nrf.h"
 #include <assert.h>
 #include <setjmp.h>
@@ -53,6 +54,13 @@ static unsigned primary_init_calls, primary_init_failures;
 static unsigned automatic_retry_budget, automatic_retries;
 static unsigned retry_delays;
 static bool fail_trial_app;
+static bool campaign, confirm_trial, crash_trial;
+static unsigned power_cuts, watchdog_resets, app_resets;
+#ifdef PAIR_VENDOR_LIFECYCLE
+static void campaign_app(void) {}
+#else
+static void campaign_app(void);
+#endif
 static jmp_buf route;
 bool _ota_dfu, _ota_connected, _sd_inited;
 #define NRF_TIMER2 (&timer)
@@ -184,10 +192,12 @@ static bool xiao_ota_vendor_recovery_complete(void) { ++getter_calls; return fal
 #endif
 static __attribute__((noreturn)) void bootloader_app_start(void) {
   ++app_calls;
+  if (campaign) campaign_app();
   if (fail_trial_app && mock_wdt.TASKS_START) NVIC_SystemReset();
   longjmp(route, 1);
 }
 __attribute__((noreturn)) void NVIC_SystemReset(void) { longjmp(route, 2); }
+void pair_fault_power_cut(void) { longjmp(route, 4); }
 extern pair_result_t stage_run(const pair_request_t *);
 extern void reset_adapter(void);
 
@@ -215,7 +225,15 @@ static int boot(void) {
   for (;;) {
     int value = setjmp(route);
     if (!value) { boot_entry_active = true; vendor_main(); assert(!"main returned"); }
-    if (value == 2 && !in_stage_call && !dfu_calls &&
+    if (value == 4 || value == 5) {
+      assert(campaign && automatic_retries < automatic_retry_budget && !dfu_calls);
+      if (value == 4) ++power_cuts;
+      else ++watchdog_resets;
+      ++automatic_retries;
+      retention = 0;
+      mock_power.GPREGRET = 0;
+      in_stage_call = false;
+    } else if (value == 2 && !in_stage_call && !dfu_calls &&
         (mock_power.GPREGRET == DFU_MAGIC_UF2_RESET ||
          (mock_power.GPREGRET == 0 && automatic_retries < automatic_retry_budget))) {
       if (mock_power.GPREGRET == DFU_MAGIC_UF2_RESET) {
@@ -224,14 +242,14 @@ static int boot(void) {
       } else {
         ++automatic_retries;
       }
-      reset_adapter();
-      mock_power.RESETREAS = 4;
-      usb_bench = bench_stage_repair = false;
-      _ota_dfu = _sd_inited = false;
-      continue;
+    } else {
+      boot_entry_active = false;
+      return value;
     }
-    boot_entry_active = false;
-    return value;
+    reset_adapter();
+    mock_power.RESETREAS = value == 5 ? POWER_RESETREAS_DOG_Msk : value == 4 ? 0 : 4;
+    usb_bench = bench_stage_repair = false;
+    _ota_dfu = _sd_inited = false;
   }
 }
 
@@ -246,6 +264,8 @@ static void fresh_runtime(void) {
   automatic_retry_budget = automatic_retries = 0;
   retry_delays = 0;
   fail_trial_app = false;
+  campaign = confirm_trial = crash_trial = false;
+  power_cuts = watchdog_resets = app_resets = 0;
   _ota_dfu = _ota_connected = _sd_inited = single_tap = pending = dfu_button = false;
   usb_bench = bench_stage_repair = usb_mounted = usb_sdk_error = false;
   complete_boot_upload = in_stage_call = false;
@@ -276,6 +296,7 @@ uint32_t lifecycle_timeout(void) { return timeout; }
 void lifecycle_initialize_sd(void) { mbr_init_sd(); }
 #else
 void pair_test_flash(uint8_t *, bool, uint32_t, unsigned);
+void pair_test_flash_failure_phase(uint32_t, unsigned);
 unsigned pair_test_failed_operations(void);
 void randombytes(unsigned char *bytes, unsigned long long size) {
   static uint32_t value = 1;
@@ -285,30 +306,26 @@ void randombytes(unsigned char *bytes, unsigned long long size) {
   }
 }
 
-static void transaction_failure_recovers_without_dfu(void *app, void *settings,
-                                                     bool install_read, bool failed_trial) {
-  static uint8_t flash[2u * 1024u * 1024u];
-  memset(flash, 255, sizeof(flash));
+static void provision_transaction(void *app, void *settings, uint8_t *flash,
+                                  const void *original, const void *candidate,
+                                  uint32_t size) {
+  memset(flash, 255, 2u * 1024u * 1024u);
   memset(settings, 255, 4096);
-  const uint32_t vectors[4] = {0x2003E000, PAIR_APP_START + 1, 0x11223344, 0x55667788};
-  memcpy(app, vectors, sizeof(vectors));
-  const uint16_t crc = crc16_compute(app, sizeof(vectors), NULL);
+  memcpy(app, original, size);
+  const uint16_t crc = crc16_compute(app, size, NULL);
   uint8_t raw[28] = {1, 0, 0, 0, 0xFE};
   memcpy(raw + 2, &crc, sizeof(crc));
-  raw[8] = sizeof(vectors);
+  memcpy(raw + 8, &size, sizeof(size));
   memcpy(settings, raw, sizeof(raw));
 
   xiao_ota_sha256_t sha;
   uint8_t hash[32], candidate_hash[32];
   xiao_ota_sha256_init(&sha);
-  xiao_ota_sha256_update(&sha, app, sizeof(vectors));
+  xiao_ota_sha256_update(&sha, app, size);
   xiao_ota_sha256_final(&sha, hash);
-  uint32_t candidate[4];
-  memcpy(candidate, vectors, sizeof(candidate));
-  candidate[2] ^= 0xA55AA55A;
-  memcpy(flash + XIAO_OTA_CANDIDATE_BASE, candidate, sizeof(candidate));
+  memcpy(flash + XIAO_OTA_CANDIDATE_BASE, candidate, size);
   xiao_ota_sha256_init(&sha);
-  xiao_ota_sha256_update(&sha, candidate, sizeof(candidate));
+  xiao_ota_sha256_update(&sha, candidate, size);
   xiao_ota_sha256_final(&sha, candidate_hash);
 
   xiao_ota_floor_t floor = {0};
@@ -316,7 +333,8 @@ static void transaction_failure_recovers_without_dfu(void *app, void *settings,
   floor.record_version = XIAO_OTA_FORMAT_VERSION;
   floor.record_bytes = sizeof(floor);
   floor.sequence = 1;
-  floor.active_image_extent = sizeof(vectors);
+  floor.confirmed_counter_floor = 7;
+  floor.active_image_extent = size;
   memcpy(floor.confirmed_hash_sha256, hash, sizeof(hash));
   floor.crc32 = xiao_ota_crc32(&floor, offsetof(xiao_ota_floor_t, crc32));
   floor.commit_marker = XIAO_OTA_COMMIT_MARKER;
@@ -327,9 +345,9 @@ static void transaction_failure_recovers_without_dfu(void *app, void *settings,
   descriptor.board_variant = XIAO_OTA_BOARD_TARGET & 0xFFFFu;
   descriptor.role = XIAO_OTA_COMPILED_ROLE_ID;
   descriptor.app_address = XIAO_OTA_APP_START;
-  descriptor.exact_size_bytes = sizeof(vectors);
+  descriptor.exact_size_bytes = size;
   memcpy(descriptor.sha256, candidate_hash, sizeof(candidate_hash));
-  descriptor.security_counter = 1;
+  descriptor.security_counter = 8;
   descriptor.min_boot_capabilities = XIAO_OTA_CAP_QSPI_INSTALL;
   descriptor.format_id = XIAO_OTA_DESCRIPTOR_FORMAT;
   descriptor.key_id = XIAO_OTA_KEY_ID;
@@ -348,12 +366,23 @@ static void transaction_failure_recovers_without_dfu(void *app, void *settings,
               sizeof(command.wire_descriptor), secret);
   assert(signed_size == sizeof(signed_message));
   memcpy(command.signature_ed25519, signed_message, 64);
-  command.active_image_extent = sizeof(vectors);
+  command.active_image_extent = size;
   memcpy(command.active_image_hash_sha256, hash, sizeof(hash));
   command.crc32 = xiao_ota_crc32(&command, offsetof(xiao_ota_command_v2_t, crc32));
   command.commit_marker = XIAO_OTA_COMMIT_MARKER;
   memcpy(flash + XIAO_OTA_COMMAND_A, &command, sizeof(command));
+}
 
+static void transaction_failure_recovers_without_dfu(void *app, void *settings,
+                                                     bool install_read, bool failed_trial) {
+  static uint8_t flash[2u * 1024u * 1024u];
+  const uint32_t vectors[4] = {0x2003E000, PAIR_APP_START + 1, 0x11223344, 0x55667788};
+  uint32_t candidate[4];
+  memcpy(candidate, vectors, sizeof(candidate));
+  candidate[2] ^= 0xA55AA55A;
+  provision_transaction(app, settings, flash, vectors, candidate, sizeof(vectors));
+  xiao_ota_floor_t floor;
+  memcpy(&floor, flash + XIAO_OTA_FLOOR_A, sizeof(floor));
   fresh_runtime();
   pair_test_flash(flash, install_read,
                   install_read ? XIAO_OTA_CANDIDATE_BASE : XIAO_OTA_BACKUP_BASE,
@@ -378,16 +407,220 @@ static void transaction_failure_recovers_without_dfu(void *app, void *settings,
   pair_test_flash(NULL, false, 0, 0);
 }
 
+#define CAMPAIGN_IMAGE_SIZE (8192u + 16u)
+static uint8_t campaign_flash[2u * 1024u * 1024u], fixture_flash[sizeof(campaign_flash)];
+static uint8_t original_image[CAMPAIGN_IMAGE_SIZE], candidate_image[CAMPAIGN_IMAGE_SIZE];
+static uint8_t original_settings[4096], protected_stage[65536];
+static unsigned rollback_read_failures, trial_startup_failures;
+
+static bool campaign_state_visible(const xiao_ota_state_t *state) {
+  return xiao_ota_state_valid(state) ||
+      (xiao_ota_state_body_valid(state) &&
+       (state->phase == XIAO_OTA_PHASE_FAILED || state->phase == XIAO_OTA_PHASE_CONFIRMED));
+}
+
+static const xiao_ota_state_t *campaign_state(void) {
+  const xiao_ota_state_t *a = (const void *)(campaign_flash + XIAO_OTA_STATE_A);
+  const xiao_ota_state_t *b = (const void *)(campaign_flash + XIAO_OTA_STATE_B);
+  if (!campaign_state_visible(a)) return campaign_state_visible(b) ? b : NULL;
+  if (!campaign_state_visible(b)) return a;
+  return a->sequence > b->sequence ? a : b;
+}
+
+static void campaign_app(void) {
+  const xiao_ota_state_t *state = campaign_state();
+  if (!state || state->phase != XIAO_OTA_PHASE_TRIAL_BOOT) return;
+  assert(mock_wdt.TASKS_START && mock_wdt.CRV == 60u * 32768u &&
+         mock_wdt.RREN == WDT_RREN_RR0_Msk);
+  if (confirm_trial) {
+    xiao_ota_confirmation_t confirmation = {0};
+    confirmation.magic = XIAO_OTA_CONFIRM_MAGIC;
+    confirmation.record_version = XIAO_OTA_FORMAT_VERSION;
+    confirmation.record_bytes = sizeof(confirmation);
+    confirmation.sequence = 1;
+    confirmation.transaction_nonce = state->transaction_nonce;
+    confirmation.confirmed_counter = state->candidate_counter;
+    memcpy(confirmation.confirmed_hash_sha256, state->installed_hash_sha256, 32);
+    confirmation.crc32 = xiao_ota_crc32(&confirmation, offsetof(xiao_ota_confirmation_t, crc32));
+    confirmation.commit_marker = XIAO_OTA_COMMIT_MARKER;
+    memcpy(campaign_flash + XIAO_OTA_CONFIRM_A, &confirmation, sizeof(confirmation));
+    ++app_resets;
+    NVIC_SystemReset();
+  }
+  if (crash_trial) {
+    ++app_resets;
+    NVIC_SystemReset();
+  }
+  /* The model advances to the unserviced watchdog's configured expiry.
+   * It never supplies a reset to an installer that merely returned an error. */
+  longjmp(route, 5);
+}
+
+static void assert_pattern(const uint8_t *bytes, size_t length, uint8_t value) {
+  for (size_t i = 0; i < length; ++i) assert(bytes[i] == value);
+}
+
+static void campaign_run(void *app, void *settings, bool confirm, bool crash,
+                         unsigned target, pair_fault_effect_t effect,
+                         size_t prefix, unsigned repetitions) {
+  memset(app, 255, XIAO_OTA_INSTALL_MAX_SIZE);
+  memcpy(app, original_image, sizeof(original_image));
+  memcpy(settings, original_settings, sizeof(original_settings));
+  memcpy(campaign_flash, fixture_flash, sizeof(campaign_flash));
+  fresh_runtime();
+  campaign = true;
+  confirm_trial = confirm;
+  crash_trial = crash;
+  automatic_retry_budget = 32;
+  pair_test_flash(campaign_flash, false, 0, 0);
+  if (rollback_read_failures) {
+    pair_test_flash(campaign_flash, true, XIAO_OTA_BACKUP_BASE, 1);
+    pair_test_flash_failure_phase(XIAO_OTA_PHASE_ROLLBACK_COPYING, rollback_read_failures);
+  }
+  if (trial_startup_failures) {
+    pair_test_flash(campaign_flash, true, UINT32_MAX, 1);
+    pair_test_flash_failure_phase(XIAO_OTA_PHASE_TRIAL_BOOT, trial_startup_failures);
+  }
+  pair_fault_begin(campaign_flash, target, effect, prefix, repetitions);
+  int result = mapped_boot();
+  if (result != 1 || dfu_calls || (effect != PAIR_FAULT_NONE && !pair_fault_hits())) {
+    fprintf(stderr, "campaign confirm=%u crash=%u target=%u effect=%u prefix=%zu repeat=%u "
+            "result=%d hits=%u retries=%u dfu=%u\n", confirm, crash, target, effect,
+            prefix, repetitions, result, pair_fault_hits(), automatic_retries, dfu_calls);
+    abort();
+  }
+  const xiao_ota_state_t *state = campaign_state();
+  const bool installed = !memcmp(app, candidate_image, sizeof(candidate_image));
+  assert(installed || !memcmp(app, original_image, sizeof(original_image)));
+  assert(bootloader_app_is_valid() && !mock_power.GPREGRET && !mock_power.USBREGSTATUS);
+  if (installed) {
+    assert(confirm && state && state->phase == XIAO_OTA_PHASE_CONFIRMED);
+  } else if (state) {
+    assert(state->phase == XIAO_OTA_PHASE_FAILED);
+  }
+  if (state) assert(state->transaction_nonce == 123);
+  const xiao_ota_floor_t *a = (const void *)(campaign_flash + XIAO_OTA_FLOOR_A);
+  const xiao_ota_floor_t *b = (const void *)(campaign_flash + XIAO_OTA_FLOOR_B);
+  assert(xiao_ota_floor_valid(a) || xiao_ota_floor_valid(b));
+  const xiao_ota_floor_t *floor = !xiao_ota_floor_valid(a) ? b :
+      !xiao_ota_floor_valid(b) || a->sequence > b->sequence ? a : b;
+  const xiao_ota_floor_t *original_floor = (const void *)(fixture_flash + XIAO_OTA_FLOOR_A);
+  assert(floor->confirmed_counter_floor ==
+         (installed ? 8u : original_floor->confirmed_counter_floor));
+  assert(floor->active_image_extent ==
+         (installed ? CAMPAIGN_IMAGE_SIZE : original_floor->active_image_extent) &&
+         !memcmp(floor->confirmed_hash_sha256, installed ? state->candidate_hash_sha256
+                    : original_floor->confirmed_hash_sha256, 32));
+  assert(!memcmp(campaign_flash + XIAO_OTA_FLOOR_A,
+                 fixture_flash + XIAO_OTA_FLOOR_A, sizeof(*floor)));
+  if (!installed) assert(!memcmp(settings, original_settings, sizeof(original_settings)));
+  else {
+    assert(!memcmp((uint8_t *)settings + 4, original_settings + 4, 4096 - 4));
+  }
+  assert(!memcmp(campaign_flash, fixture_flash, XIAO_OTA_CANDIDATE_SIZE));
+  assert(!memcmp(campaign_flash + XIAO_OTA_BACKUP_BASE + XIAO_OTA_INSTALL_MAX_SIZE,
+                 fixture_flash + XIAO_OTA_BACKUP_BASE + XIAO_OTA_INSTALL_MAX_SIZE,
+                 XIAO_OTA_BACKUP_SIZE - XIAO_OTA_INSTALL_MAX_SIZE));
+  assert(!memcmp(campaign_flash + XIAO_OTA_FILESYSTEM_BASE,
+                 fixture_flash + XIAO_OTA_FILESYSTEM_BASE, XIAO_OTA_FILESYSTEM_SIZE));
+  assert(!memcmp((void *)PAIR_STAGE_START, protected_stage, sizeof(protected_stage)));
+  assert_pattern((const void *)0xD4000, 0x19000, 0xA6);
+  assert_pattern((const void *)0xF4000, 0xA000, 0xA6);
+  assert(mock_ficr.DEVICEID[0] == 0x76543210 && mock_ficr.DEVICEID[1] == 0xFEDCBA98);
+  if (rollback_read_failures)
+    assert(pair_test_failed_operations() == rollback_read_failures);
+  if (trial_startup_failures) {
+    assert(pair_test_failed_operations() == trial_startup_failures);
+    assert(watchdog_resets == XIAO_OTA_MAX_TRIAL_BOOTS + trial_startup_failures);
+  }
+  pair_fault_end();
+  pair_test_flash(NULL, false, 0, 0);
+}
+
+static void unattended_fault_campaign(void *app, void *settings) {
+  for (unsigned i = 0; i < sizeof(original_image); ++i) {
+    original_image[i] = (uint8_t)(i * 17u + 5u);
+    candidate_image[i] = (uint8_t)(i * 29u + 11u);
+  }
+  const uint32_t vectors[] = {0x2003E000, PAIR_APP_START + 1};
+  memcpy(original_image, vectors, sizeof(vectors));
+  memcpy(candidate_image, vectors, sizeof(vectors));
+  provision_transaction(app, settings, fixture_flash, original_image,
+                         candidate_image, sizeof(original_image));
+  memcpy(original_settings, settings, sizeof(original_settings));
+  memset(fixture_flash + XIAO_OTA_CANDIDATE_BASE + XIAO_OTA_INSTALL_MAX_SIZE, 0x59,
+         XIAO_OTA_CANDIDATE_SIZE - XIAO_OTA_INSTALL_MAX_SIZE);
+  memset(fixture_flash + XIAO_OTA_BACKUP_BASE + XIAO_OTA_INSTALL_MAX_SIZE, 0x6B,
+         XIAO_OTA_BACKUP_SIZE - XIAO_OTA_INSTALL_MAX_SIZE);
+  memset(fixture_flash + XIAO_OTA_FILESYSTEM_BASE, 0x7D, XIAO_OTA_FILESYSTEM_SIZE);
+  memcpy(protected_stage, (void *)PAIR_STAGE_START, sizeof(protected_stage));
+  memset((void *)0xD4000, 0xA6, 0x19000);
+  memset((void *)0xF4000, 0xA6, 0xA000);
+  mock_ficr.DEVICEID[0] = 0x76543210;
+  mock_ficr.DEVICEID[1] = 0xFEDCBA98;
+  unsigned cases = 0, operations = 0;
+  uint16_t stored_crc;
+  memcpy(&stored_crc, original_settings + 2, sizeof(stored_crc));
+  for (unsigned genesis = 0; genesis < 2; ++genesis) {
+    if (genesis) {
+      xiao_ota_floor_t *floor = (void *)(fixture_flash + XIAO_OTA_FLOOR_A);
+      floor->confirmed_counter_floor = floor->active_image_extent = 0;
+      memset(floor->confirmed_hash_sha256, 0, 32);
+      floor->crc32 = xiao_ota_crc32(floor, offsetof(xiao_ota_floor_t, crc32));
+    }
+    for (unsigned unused_crc = 0; unused_crc < 2; ++unused_crc) {
+      memcpy(original_settings + 2, &stored_crc, sizeof(stored_crc));
+      if (unused_crc) original_settings[2] = original_settings[3] = 0;
+      for (unsigned confirm = 0; confirm < 2; ++confirm) {
+        campaign_run(app, settings, confirm, false, 0, PAIR_FAULT_NONE, 0, 0);
+        assert(confirm ? app_resets == 1 : watchdog_resets == XIAO_OTA_MAX_TRIAL_BOOTS);
+        pair_fault_event_t baseline[1024];
+        unsigned count = pair_fault_count();
+        assert(count && count <= sizeof(baseline) / sizeof(baseline[0]));
+        for (unsigned i = 0; i < count; ++i) baseline[i] = pair_fault_event(i);
+        operations += count;
+        for (unsigned i = 0; i < count; ++i) {
+          for (unsigned mode = PAIR_FAULT_ERROR; mode <= PAIR_FAULT_CUT_AFTER; ++mode) {
+            bool partial = mode == PAIR_FAULT_PARTIAL_ERROR || mode == PAIR_FAULT_CUT_PARTIAL;
+            size_t prefixes[] = {1, baseline[i].length / 2, baseline[i].length - 1, SIZE_MAX};
+            for (unsigned p = 0; p < (partial ? 4u : 1u); ++p) {
+              campaign_run(app, settings, confirm, false, i, mode, prefixes[p], 1);
+              assert(pair_fault_hits() == 1);
+              ++cases;
+            }
+          }
+          campaign_run(app, settings, confirm, false, i, PAIR_FAULT_ERROR, 0, 3);
+          ++cases;
+        }
+      }
+    }
+  }
+  campaign_run(app, settings, false, true, 0, PAIR_FAULT_NONE, 0, 0);
+  assert(app_resets == XIAO_OTA_MAX_TRIAL_BOOTS && !watchdog_resets);
+  rollback_read_failures = 3;
+  campaign_run(app, settings, false, false, 0, PAIR_FAULT_NONE, 0, 0);
+  rollback_read_failures = 0;
+  trial_startup_failures = 3;
+  campaign_run(app, settings, false, false, 0, PAIR_FAULT_NONE, 0, 0);
+  trial_startup_failures = 0;
+  printf("Automatic-reset fault campaign: %u cases at %u install/rollback/confirmation "
+         "mutations; first/later OTA, stored/unused SDK CRC, partial writes/erases, repeated errors, "
+         "power cuts, trial crash/hang PASS\n",
+         cases, operations);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   void *stage = mmap((void *)PAIR_STAGE_START, 65536, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   void *settings = mmap((void *)0xFF000, 4096, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  void *app = mmap((void *)PAIR_APP_START, 4096, PROT_READ | PROT_WRITE,
+  void *app = mmap((void *)PAIR_APP_START, XIAO_OTA_INSTALL_MAX_SIZE, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  void *guards = mmap((void *)0xD4000, 0x2A000, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   assert(stage == (void *)PAIR_STAGE_START && settings == (void *)0xFF000 &&
-         app == (void *)PAIR_APP_START);
+         app == (void *)PAIR_APP_START && guards == (void *)0xD4000);
   FILE *file = fopen(argv[1], "rb");
   assert(file && fread(stage, 1, paired_stage.extent, file) == paired_stage.extent);
   fclose(file);
@@ -482,6 +715,7 @@ int main(int argc, char **argv) {
   transaction_failure_recovers_without_dfu(app, settings, false, false);
   transaction_failure_recovers_without_dfu(app, settings, true, false);
   transaction_failure_recovers_without_dfu(app, settings, false, true);
+  unattended_fault_campaign(app, settings);
   puts("Sense selected main + actual adapter/kernel/runtime: R1 recovery, SDK unchanged, "
        "timeout separation, pending-first/error, grant invalidation/fresh stage PASS");
   puts("Field failure retries automatically without latching DFU; transient failure returns to APP PASS");

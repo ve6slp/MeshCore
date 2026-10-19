@@ -19,23 +19,33 @@ is only an optional offline artifact comparison, never command authorization.
 The public vendor source is
 [OTAFIX](https://github.com/oltaco/Adafruit_nRF52_Bootloader_OTAFIX), pinned to
 `a62825be4733f500271c89b5ec489fd609748e97`
-and pair builds identify as `0.9.2-OTAFIX2.3-BP1.5`. The preserving patch and installer sources are in this
+and pair builds identify as `0.9.2-OTAFIX2.3-BP1.6`. The preserving patch and installer sources are in this
 directory. Base XIAO, Sense XIAO and SenseCAP select their actual vendor BSP;
 Sense retains its own CF2/USB identity while sharing logical Xiao OTA family.
 Both role IDs are supported: companion 0, repeater 1.
 
 ## Automatic field recovery
 
-BP1.5 retries an unsuccessful bootloader or installer attempt after one second.
+The BP1.6 pair retries an unsuccessful bootloader or installer attempt after one second.
 Each restart reads the saved transaction again and resumes installation or
 rollback from its durable checkpoint. It leaves identity, settings and the
 confirmed rollback floor in place. A transient flash timeout therefore does
 not leave the node waiting for a USB upload or a reset-button press.
 
 An unconfirmed application boots under a 60-second watchdog. After three
-unconfirmed application boots, the installer restores the verified backup.
+recorded trial boots without confirmation, the installer restores the verified backup.
 If power fails during that restore, the next boot resumes it. Explicit USB
 or BLE recovery requests still select the vendor recovery service.
+
+If a checkpoint replacement is interrupted, the installer can restore the
+confirmed image using a surviving checkpoint, its matching settings snapshot
+and a backup whose hash matches the confirmed floor. It does not grant another
+trial from the older checkpoint. Before the first confirmed OTA, recovery instead
+checks the original-image snapshot in the admitted command and its matching
+settings snapshot. If the QSPI history cannot be read at startup,
+an intact internal application runs under the watchdog; a hung application
+therefore resets and retries the installer. A read failure during a known
+unfinished transaction retries recovery instead of launching its candidate.
 
 If flash remains unreadable or no trustworthy application or backup survives,
 the node remains offline and retries. Failed storage or lost images can still
@@ -54,8 +64,8 @@ is a retained **bootloader ABI**, not compatibility with an old radio protocol.
 The A/B staging journal retains the full manifest, package hash and transaction
 through activation, trial and confirmation. Real boot state must bind that same
 transaction; a matching running SHA or confirmed counter alone cannot establish
-package-bound `Confirmed`. A malformed or ambiguous journal fails closed, including
-some interrupted metadata writes. Explicit fresh signed staging repair revokes
+package-bound `Confirmed`. Journal damage that cannot be reconciled with a
+verified image prevents installation until repaired. Explicit fresh signed staging repair revokes
 both banks before replacement; it never clears the confirmed floor, personality
 or filesystems. Intact checkpoint recovery rehashes every verified raw chunk.
 The product contract is [OTA v4](../../docs/lora_ota_v4.md).
@@ -106,10 +116,22 @@ make test-xiao-ota-bootloader-pair \
 Native pair tests exercise the actual returning adapter and reject the legacy
 reset adapter. Host tests create/reparse standard packages and reject changed
 board/role, APP, stage, init bytes, CRC, extra images and mismatched readback.
-The primary tests follow automatic resets through a backup write timeout,
-a candidate read timeout after application erasure and an unconfirmed trial,
-checking that installation or rollback reaches the application without DFU.
-Passing software tests are not proof of physical installation.
+The primary tests follow automatic resets through backup/install failures and
+failed trials. A three-page signed-image fixture runs installation, rollback and
+confirmation, injecting failures at every write and erase in those paths.
+Both first-update and later-update fixtures cover stored and vendor-disabled
+SDK CRC values. Each location receives no-effect errors, repeated errors, partial byte-prefix
+and bit-level writes/erases, and power cuts before, during and after the operation.
+Checks compare the running image, SDK settings, confirmed floor, identity/security
+storage, filesystems and bootloader regions. Separate cases exercise repeated
+rollback read timeouts and QSPI startup failures while a trial application hangs.
+
+These tests execute the generated primary and production installer/adapter code
+on the host with modeled registers and flash. The test application supplies a
+confirmation record or crashes; a hang advances to the configured watchdog expiry.
+The reset loop continues only after a firmware reset, watchdog expiry or an
+injected power cut. Electrical power loss, real watchdog timing and radio
+reconnection still need a physical bench test.
 When no actual APP ZIP/build context is supplied, real-APP packaging tests are
 skipped; native pair tests still run. Deployment packaging requires both.
 
@@ -224,7 +246,7 @@ other local serial clients can also request a destructive upload.
 Normal boot establishes both ACL locks before calling the signed installer or
 APP; BLE recovery establishes them before enabling BLE. USB recovery defers those
 locks without giving an APP execution grant. If a normal installation attempt
-fails after locks have been established, BP1.5 restarts automatically and
+fails after locks have been established, the primary restarts automatically and
 establishes the locks again before retrying. Field role/signature/floor/trial policy
 is unchanged. USB MSC/UF2 is omitted to fit the fixed primary budget: use Adafruit
 serial DFU ZIPs, not BOOT-update UF2 copies.
