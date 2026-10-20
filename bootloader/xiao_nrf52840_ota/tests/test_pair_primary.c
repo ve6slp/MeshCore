@@ -8,6 +8,7 @@
 #include "crc16.h"
 #include "stage_recovery.h"
 #include "pair_faults.h"
+#include "xiao_ota_vendor.h"
 #include "nrf.h"
 #include <assert.h>
 #include <setjmp.h>
@@ -18,11 +19,11 @@
 #include <ucontext.h>
 
 typedef struct { uint32_t CC[4]; } mock_timer_t;
-#ifdef PAIR_VENDOR_LIFECYCLE
 typedef struct {
   uint16_t bank_0, bank_0_crc, bank_1, padding;
   uint32_t bank_0_size, sd_image_size, bl_image_size, app_image_size, sd_image_start;
 } bootloader_settings_t;
+#ifdef PAIR_VENDOR_LIFECYCLE
 uint32_t lifecycle_sdk_init(void);
 uint32_t lifecycle_dfu_start(bool, uint32_t, bool);
 uint32_t lifecycle_init_sd(void);
@@ -36,15 +37,12 @@ void bootloader_util_settings_get(const bootloader_settings_t **);
 bool xiao_ota_vendor_recovery_complete(void);
 uint32_t xiao_ota_vendor_sdk_boot_entry(bool);
 uint32_t xiao_ota_vendor_sdk_sd_init_result(uint32_t);
-#else
-typedef struct { uint32_t bank_0; } bootloader_settings_t;
-static bootloader_settings_t sdk = {1};
 #endif
 static mock_timer_t timer;
 static uint32_t retention;
 uint32_t *dbl_reset_mem = &retention;
 static bool single_tap, pending, dfu_button, boot_entry_active, in_stage_call;
-static bool usb_mounted, usb_sdk_error, complete_boot_upload;
+static bool usb_mounted, usb_sdk_error, complete_boot_upload, usb_power_after_init;
 static unsigned service_calls, dfu_calls, getter_calls, app_calls, pending_calls;
 static uint32_t timeout, pending_result;
 static uint32_t retention_at_dfu;
@@ -83,6 +81,8 @@ bool _ota_dfu, _ota_connected, _sd_inited;
 #define STATE_BLE_DISCONNECTED 3
 #define STATE_USB_UNMOUNTED 4
 #define BANK_VALID_APP 1u
+#define BANK_VALID_BOOT 0xAAu
+#define BANK_INVALID_APP 0xFFu
 #define NRF_SUCCESS 0u
 #define NRF_ERROR_INTERNAL 4u
 #define SD_MBR_COMMAND_INIT_SD 2u
@@ -99,7 +99,9 @@ static uint32_t ble_stack_init(void) {
   return 0;
 }
 static bool button_pressed(unsigned button) { return button == BUTTON_DFU && dfu_button; }
-static void board_init(void) {}
+static void board_init(void) {
+  if (usb_power_after_init) mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+}
 static void board_teardown(void) {}
 #ifndef PAIR_VENDOR_LIFECYCLE
 static void bootloader_init(void) {}
@@ -154,7 +156,9 @@ static uint32_t bootloader_dfu_sd_update_finalize(void) {
 static bool bootloader_app_is_valid(void) {
   return xiao_ota_app_is_intact(xiao_ota_boot_internal_io());
 }
-static void bootloader_util_settings_get(const bootloader_settings_t **out) { *out = &sdk; }
+static void bootloader_util_settings_get(const bootloader_settings_t **out) {
+  *out = (const bootloader_settings_t *)0xFF000;
+}
 #endif
 static bool xiao_ota_vendor_sdk_usb_bench_enter(void) {
   return !_ota_dfu && !usb_sdk_error;
@@ -188,7 +192,7 @@ static uint32_t bootloader_dfu_start(bool ble, uint32_t ms, bool startup) {
 #endif
 }
 #ifndef PAIR_VENDOR_LIFECYCLE
-static bool xiao_ota_vendor_recovery_complete(void) { ++getter_calls; return false; }
+bool xiao_ota_vendor_recovery_complete(void) { ++getter_calls; return false; }
 #endif
 static __attribute__((noreturn)) void bootloader_app_start(void) {
   ++app_calls;
@@ -268,7 +272,7 @@ static void fresh_runtime(void) {
   power_cuts = watchdog_resets = app_resets = 0;
   _ota_dfu = _ota_connected = _sd_inited = single_tap = pending = dfu_button = false;
   usb_bench = bench_stage_repair = usb_mounted = usb_sdk_error = false;
-  complete_boot_upload = in_stage_call = false;
+  complete_boot_upload = in_stage_call = usb_power_after_init = false;
 }
 
 static int boot_result;
@@ -662,7 +666,7 @@ int main(int argc, char **argv) {
   for (unsigned marker = 0; marker < 2; ++marker) {
     fresh_runtime();
     mock_power.RESETREAS = POWER_RESETREAS_RESETPIN_Msk | 4u;
-    mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+    usb_power_after_init = true;
     retention = marker ? DFU_DBL_RESET_MAGIC : 0;
     assert(boot() == 2 && !service_calls && !_ota_dfu && timeout == 0);
     assert(!xiao_ota_vendor_usb_bench_mode() && !mock_acl.ACL[0].SIZE);
@@ -670,10 +674,48 @@ int main(int argc, char **argv) {
     assert(xiao_ota_vendor_usb_bench_mode());
   }
   fresh_runtime(); mock_power.GPREGRET = DFU_MAGIC_SERIAL_ONLY_RESET;
-  mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+  usb_power_after_init = true;
   complete_boot_upload = true;
   assert(boot() == 2 && pending_calls == 2 && xiao_ota_vendor_usb_bench_mode());
   puts("USB single reset ignores RAM token; USB recovery is not admission; BLE locks and post-upload BOOT copy route PASS");
+  for (unsigned copied = 0; copied < 2; ++copied) {
+    const bootloader_settings_t handoff = {
+        .bank_0 = BANK_INVALID_APP, .bank_0_crc = 0xFF07,
+        .bank_1 = copied ? BANK_INVALID_APP : BANK_VALID_BOOT,
+        .padding = XIAO_OTA_BENCH_PENDING, .bank_0_size = 0xA000,
+        .bl_image_size = copied ? 0 : 0xA000};
+    memcpy(settings, &handoff, sizeof(handoff));
+    fresh_runtime(); pending = !copied;
+    mock_power.RESETREAS = 4;
+    mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+    assert(boot() == 2 && usb_mounted && dfu_calls == 1 && !service_calls);
+    assert(pending_calls == (copied ? 0 : 2) && !pending);
+    assert(!xiao_ota_vendor_usb_bench_mode() && !mock_acl.ACL[0].SIZE &&
+           !mock_acl.ACL[1].SIZE && !app_calls && !_sd_inited);
+    assert(xiao_ota_vendor_usb_bench_enter());
+    assert(xiao_ota_vendor_usb_bench_mode());
+  }
+  fresh_runtime();
+  assert(boot() == 2 && dfu_calls == 1 && !service_calls && !usb_mounted);
+  assert(!xiao_ota_vendor_usb_bench_mode());
+  fresh_runtime(); mock_power.GPREGRET = DFU_MAGIC_OTA_APPJUM;
+  mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+  assert(boot() == 2 && _ota_dfu && _sd_inited && !init_sd_calls && !service_calls);
+  ((bootloader_settings_t *)settings)->padding = 0;
+  fresh_runtime(); usb_power_after_init = true;
+  assert(boot() == 2 && !dfu_calls && service_calls == 1);
+  const bootloader_settings_t compound = {
+      .bank_0 = BANK_VALID_APP, .bank_1 = BANK_INVALID_APP,
+      .bank_0_size = PAIR_STAGE_START - PAIR_APP_START + paired_stage.extent};
+  memcpy(settings, &compound, sizeof(compound));
+  fresh_runtime(); mock_power.USBREGSTATUS = POWER_USBREGSTATUS_VBUSDETECT_Msk;
+  assert(boot() == 2 && usb_mounted && dfu_calls == 1 && !service_calls);
+  assert(!xiao_ota_vendor_usb_bench_mode() && !mock_acl.ACL[0].SIZE && !app_calls);
+  fresh_runtime();
+  assert(boot() == 2 && dfu_calls == 1 && !service_calls && !usb_mounted);
+  assert(!xiao_ota_vendor_usb_bench_mode());
+  memset(settings, 255, 4096);
+  puts("Cold compound/BOOT handoff waits for USB without granting bench; routed BLE entry unchanged PASS");
   fresh_runtime(); ((uint8_t *)stage)[40] ^= 1;
   assert(boot() == 2 && !service_calls && dfu_calls == 0 && mock_power.GPREGRET == 0);
   ((uint8_t *)stage)[40] ^= 1;

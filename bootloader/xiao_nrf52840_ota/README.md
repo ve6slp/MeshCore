@@ -307,6 +307,14 @@ marker written only when a USB-admitted BOOT upload completes. After that
 verified upload returns, the primary rechecks its bounded receipt and CRC and
 performs the MBR copy in the same USB-admitted session; no additional physical
 reset authorizes it. Wait for the new BOOT endpoint before the final APP phase.
+The new primary uses the saved BOOT-upload marker to return to serial recovery
+across the copy/reset, including after pending
+settings have been finalized. A completed compound preload also returns to
+serial recovery, using its SDK image extent through the end of the matched
+installer. It waits for the next phase without requiring another button press,
+including if the USB cable is connected later.
+This does not start a new upload or erase data;
+the next USB START packet still admits the destructive bench operation.
 The writable SDK marker alone never grants BOOT replacement: ordinary pending
 updates still require
 already-identical primary bytes. The accepted BOOT upload persists its actual
@@ -317,16 +325,15 @@ The real SDK getter copies all 28 bytes, including the persisted marker,
 rather than leaving implicit padding uninitialized. SDK padding remains
 preserved when finalizing, as in ordinary recovery.
 A primary update can displace
-the APP, so the final ordinary APP phase is mandatory. After any failed or
-interrupted phase, stay in recovery, inspect the actual USB/board/pair state and
-retry the explicitly selected correct phase; do not infer a completed pair.
+the APP, so the final ordinary APP phase is mandatory. APP preparation clears
+the saved BOOT marker. If a reset interrupts that upload, enter serial recovery
+again before restoring the APP. After a failed transfer, inspect the running
+device before choosing another upload.
 
-Verify actual new-role BOOT/stage/APP qualification, fresh public identity,
-usable filesystem/configuration and a durably initialized floor0 on a cold boot.
-Reconfigure the device and administrator permissions explicitly. A subsequent
-real signed OTA install must still confirm normally and advance the floor; all
-field role/signature/counter/rollback protections remain unchanged. Packaging
-and native tests do not establish physical USB or RF qualification.
+After the APP starts, check its public identity, filesystem/configuration and
+OTA status, then restart and check them again. Fresh commissioning creates a
+new identity and initializes counter floor0. Reconfigure the device and
+administrator permissions explicitly.
 
 #### Legacy locked-pair limitation
 
