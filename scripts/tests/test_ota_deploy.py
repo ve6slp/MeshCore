@@ -72,6 +72,7 @@ class DriverTransport:
         self.interrupt_activate = False
         self.interrupt_kind = None
         self.auto_confirm = True
+        self.auto_rollback = False
 
     def sign(self, message, _):
         return ADMIN_PRIVATE.sign(message)
@@ -87,6 +88,8 @@ class DriverTransport:
             self.queue.extend(driver.exchange(raw.hex()))
             if self.auto_confirm and frame.kind == Kind.ACTIVATE and frame.slice == (frame.total - 1) // 128:
                 self.queue.extend(driver.exchange("confirm"))
+            if self.auto_rollback and frame.kind == Kind.ACTIVATE and frame.slice == (frame.total - 1) // 128:
+                self.queue.extend(driver.exchange("rollback"))
         self.clock.sleep(.001)
         if ((self.interrupt_activate and frame.kind == Kind.ACTIVATE) or frame.kind == self.interrupt_kind) \
                 and frame.slice == (frame.total - 1) // 128:
@@ -306,6 +309,35 @@ class NativeEndToEndTests(Scratch):
             scheduler.stage(clock() + 1000)
             self.assertEqual(sum(f.kind == Kind.ADMIT for f in transport.sent), admitted)
             self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    def test_immediate_rollback_is_saved_as_failure_without_repeating_activation(self):
+        _, job, transport, clock = self.setup_job(b"firmware" * 2000)
+        transport.auto_confirm, transport.auto_rollback = False, True
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        with self.assertRaisesRegex(Error, "reports failed candidate after activation"):
+            scheduler.apply(clock() + 1000)
+        saved = job.previous_status(TARGET)
+        self.assertEqual(saved[124], Phase.FAILED)
+        self.assertFalse(job.uncertain(TARGET, Kind.ACTIVATE))
+        activations = sum(f.kind == Kind.ACTIVATE for f in transport.sent)
+        with self.assertRaisesRegex(Error, "candidate is failed"):
+            scheduler.apply(clock() + 1000)
+        self.assertEqual(sum(f.kind == Kind.ACTIVATE for f in transport.sent), activations)
+
+    def test_uncertain_activation_reconciles_terminal_failure_without_replay(self):
+        _, job, transport, clock = self.setup_job(b"firmware" * 2000)
+        transport.auto_confirm, transport.auto_rollback = False, True
+        transport.interrupt_activate = True
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        with self.assertRaises(ConnectionError):
+            scheduler.apply(clock() + 1000)
+        self.assertTrue(job.uncertain(TARGET, Kind.ACTIVATE))
+        activations = sum(f.kind == Kind.ACTIVATE for f in transport.sent)
+        self.assertEqual(scheduler.reconcile(clock() + 1000)[0].phase, Phase.FAILED)
+        self.assertFalse(job.uncertain(TARGET, Kind.ACTIVATE))
+        self.assertEqual(sum(f.kind == Kind.ACTIVATE for f in transport.sent), activations)
 
     def test_admission_waits_for_receiver_after_manifest_verification(self):
         _, job, transport, clock = self.setup_job(b"firmware" * 2000)

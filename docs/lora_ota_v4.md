@@ -299,6 +299,9 @@ A restart authenticates fresh receiver state and reconciles uncertain
 operations before sending more data. `--stage-only` stops at authenticated
 READY without authorizing activation. A later deploy of that same job
 deliberately requests activation and waits for matching signed confirmation.
+If the receiver reports a failed candidate after activation, the job saves that
+signed result. Read `status --job ...` to inspect recovery; activation is not
+automatically repeated.
 `abort --job ...` and `repair --job ...` are explicit administrator actions;
 neither is an automatic timeout or admission fallback.
 

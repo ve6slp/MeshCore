@@ -168,7 +168,7 @@ class Scheduler:
                     raise Error("receiver transaction changed; refusing implicit re-admission")
         for status in statuses:
             self.job.status(status)
-            if status.phase in (Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED):
+            if status.phase in (Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED, Phase.FAILED):
                 for (operation,) in self.job.uncertain(status.target, Kind.ACTIVATE):
                     body = self.job.db.execute("SELECT body FROM operations WHERE id=?", (operation,)).fetchone()[0]
                     if (body[64:96] == status.package and body[96:112] == status.transaction
@@ -349,10 +349,16 @@ class Scheduler:
                 if self.job.uncertain(status.target, Kind.ACTIVATE):
                     raise Error("uncertain activation needs explicit reconciliation; not blindly repeated")
                 operation, after = self._command(Kind.ACTIVATE, status.target, status, deadline)
+                if (after.package != status.package or after.transaction != status.transaction
+                        or after.generation != status.generation or after.counter != status.counter):
+                    raise Error("receiver transaction changed during activation")
+                self.job.status(after)
+                if after.phase == Phase.FAILED:
+                    self.job.resolve(operation, "authenticated")
+                    raise Error(f"receiver {status.target.hex()} reports failed candidate after activation")
                 if after.phase not in (Phase.ACTIVATION_PENDING, Phase.TRIAL, Phase.CONFIRMED):
                     raise Error("activation was not authenticated as accepted")
                 self.job.resolve(operation, "authenticated")
-                self.job.status(after)
         while True:
             statuses = self.reconcile(deadline)
             for status in statuses:

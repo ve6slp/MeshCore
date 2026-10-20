@@ -235,6 +235,12 @@ public:
     boot_.resize(65); boot_[4] = static_cast<uint8_t>(Phase::Confirmed); putHash(boot_);
     return writeFile("boot", boot_);
   }
+  Result rollback() {
+    if (boot_.empty() || boot_[4] != static_cast<uint8_t>(Phase::ActivationPending))
+      return Result::State;
+    boot_.resize(65); boot_[4] = static_cast<uint8_t>(Phase::Failed); putHash(boot_);
+    return writeFile("boot", boot_);
+  }
   void fault(const std::string& which) {
     failSave_ = which == "save"; failRead_ = which == "read"; failWrite_ = which == "write";
     revoked_ = which == "admin";
@@ -318,6 +324,9 @@ int main(int argc, char** argv) {
       receiver.reset(new Receiver(platform)); result = receiver->begin();
     } else if (line == "confirm") {
       result = platform.confirm();
+      if (result == Result::Ok) result = receiver->tick();
+    } else if (line == "rollback") {
+      result = platform.rollback();
       if (result == Result::Ok) result = receiver->tick();
     } else if (line == "tick") result = receiver->tick();
     else if (line.compare(0, 6, "fault ") == 0) platform.fault(line.substr(6));
