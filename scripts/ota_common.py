@@ -271,7 +271,10 @@ class FramedSerial:
     def _read_bytes(self, timeout):
         if not select.select([self.fd], [], [], timeout)[0]:
             return b""
-        data = os.read(self.fd, 4096)
+        try:
+            data = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return b""
         if not data:
             raise ConnectionError("companion disconnected")
         return data

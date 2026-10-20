@@ -306,7 +306,10 @@ automatically repeated.
 neither is an automatic timeout or admission fallback.
 
 For an OTA-aware native companion select `--transport native`; its radio
-bridge carries the same frames. `--local` feeds that companion's own receiver
+bridge carries the same frames. Received OTA packets are copied to USB without
+waiting for a disconnected or full USB connection; those copies can be dropped.
+The host retries queries and repairs missing data through the existing job.
+`--local` feeds that companion's own receiver
 without RF, using the same signed transaction and a target equal to its
 full public key.
 
@@ -322,6 +325,11 @@ The default transfer leaves ordinary sender radio and forwarding preferences
 unchanged. Stock CMD11 persists preferences and has no autonomous expiry:
 the stock adapter refuses to call it as a supposedly temporary lease.
 Sender and receiver must already share a suitable legal radio profile.
+For a relayed route, select `--path HEX` and a lower `--duty` to leave airtime
+for each relay to receive and forward between sender transmissions.
+Sender and relay OTA airtime allowances also apply. If a device has used its
+allowance, keep it running while earlier transmissions age out of the one-hour
+window, then resume the same job.
 The declared maximum path growth must fit the 176-byte stock boundary in
 both directions; routes outside that bound fail before admission.
 

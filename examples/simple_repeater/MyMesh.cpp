@@ -1724,9 +1724,11 @@ void MyMesh::tickOtaTrialHealth() {
     radio_stuck_non_recv = isRadioStuckOutOfRecv(now_ms);
     radio_genuinely_servicing = _radio->isInRecvMode() || isSendInProgress();
   }
+  const bool probe_trial_storage =
+      otaBoardTrialHealthWindowActive() || otaBoardBootLifecycleVerificationPending();
   const bool filesystem_ready_now =
       _ota_trial_filesystem_ready && !otaBoardStorageIoFaultObserved() && !_ota_service_.trialFilesystemFaultObserved() &&
-      probeIdentityStorageReadiness();
+      (!probe_trial_storage || probeIdentityStorageReadiness());
 
   const mesh::ota::OtaMeshTrialHealthTickInputs tick_in{
       now_ms, _radio_available_ && _radio != nullptr, _ota_trial_radio_ready, radio_stuck_non_recv,

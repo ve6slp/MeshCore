@@ -294,6 +294,31 @@ class AccessTests(unittest.TestCase):
             with self.subTest(size=size), self.assertRaisesRegex(devices.lab.Error, "frame length"):
                 node.poll()
 
+    def test_ready_serial_can_temporarily_have_no_bytes_without_losing_partial_frame(self):
+        node = devices.lab.FramedSerial.__new__(devices.lab.FramedSerial)
+        node.fd = 10
+        node.buffer, node.pending = bytearray(b">\x02\0\x1e"), []
+        with mock.patch.object(devices.lab.select, "select", return_value=([10], [], [])), \
+                mock.patch.object(devices.lab.os, "read",
+                                  side_effect=[BlockingIOError(), b"\x04"]):
+            node.poll()
+            self.assertEqual(node.buffer, b">\x02\0\x1e")
+            self.assertEqual(node.pending, [])
+            node.poll()
+        self.assertEqual(node.buffer, b"")
+        self.assertEqual([frame for _, frame in node.pending], [b"\x1e\x04"])
+
+    def test_serial_eof_and_io_errors_still_fail(self):
+        node = devices.lab.FramedSerial.__new__(devices.lab.FramedSerial)
+        node.fd = 10
+        with mock.patch.object(devices.lab.select, "select", return_value=([10], [], [])), \
+                mock.patch.object(devices.lab.os, "read", return_value=b"") as read:
+            with self.assertRaisesRegex(ConnectionError, "disconnected"):
+                node._read_bytes(0)
+            read.side_effect = OSError("serial I/O failed")
+            with self.assertRaisesRegex(OSError, "serial I/O failed"):
+                node._read_bytes(0)
+
 
 if __name__ == "__main__":
     unittest.main()

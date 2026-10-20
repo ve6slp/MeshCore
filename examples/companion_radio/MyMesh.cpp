@@ -1442,7 +1442,7 @@ void MyMesh::onOtaDataRecv(mesh::Packet* packet) {
     uint8_t bytes[MAX_FRAME_SIZE];
     bytes[0] = mesh::ota::usb::kRawPacketPush;
     const size_t size = packet->writeTo(bytes + 1);
-    _serial->writeFrame(bytes, size + 1);
+    _serial->tryWriteFrame(bytes, size + 1);
   }
   mesh::Mesh::onOtaDataRecv(packet);
 }
@@ -3326,7 +3326,9 @@ void MyMesh::tickOtaTrialHealth() {
   // check) plus a real prefs.json open-then-immediately-close, performed
   // on EVERY tick during the window, so a real mid-trial storage failure
   // is still observed even if the user never happens to save anything.
-  if (_store != nullptr && !_store->probeStorageReadiness(self_id)) {
+  const bool probe_trial_storage =
+      otaBoardTrialHealthWindowActive() || otaBoardBootLifecycleVerificationPending();
+  if (probe_trial_storage && _store != nullptr && !_store->probeStorageReadiness(self_id)) {
     _ota_service_.noteStorageIoResult(false);
   }
   // Sampled fresh THIS tick only -- never persisted across ticks (see
