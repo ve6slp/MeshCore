@@ -308,7 +308,15 @@ neither is an automatic timeout or admission fallback.
 For an OTA-aware native companion select `--transport native`; its radio
 bridge carries the same frames. `--local` feeds that companion's own receiver
 without RF, using the same signed transaction and a target equal to its
-full public key. This is not a separate cache/upload engine.
+full public key.
+
+After the last chunk, the receiver reports `Verifying` while checking the
+complete staged image. This work continues if the host command reaches its
+deadline. A receiver restart also rechecks the previously saved chunks.
+On ESP32, these checks can take several minutes, including for a USB-local
+update. Let verification finish and resume the existing job with a longer
+`--timeout` if needed. Resuming continues the same transaction from the
+receiver's saved chunks.
 
 The default transfer leaves ordinary sender radio and forwarding preferences
 unchanged. Stock CMD11 persists preferences and has no autonomous expiry:
