@@ -109,6 +109,16 @@ static void actualMetadataCapability() {
   }
 }
 
+static void oldApplicationTailLayoutIsRejectedBeforeMutation() {
+  nativeEsp.reset(0);
+  nativeEsp.partitionCount = 6;
+  nativeEsp.partitions[2].size = 0x330000;
+  Esp32IdfPartitionApi sdk;
+  Esp32OtaMetadataAdapter metadata(sdk);
+  assert(metadata.eraseSector(0) == FlashStatus::InvalidArgument);
+  assert(nativeEsp.writes == 0 && nativeEsp.erases == 0);
+}
+
 static void writeLe32(uint8_t* p, uint32_t value) {
   for (unsigned i = 0; i < 4; ++i) p[i] = value >> (8 * i);
 }
@@ -323,6 +333,7 @@ static void damagedMetadataStillBlocksOrdinaryUpdate() {
 
 int main() {
   actualMetadataCapability();
+  oldApplicationTailLayoutIsRejectedBeforeMutation();
   for (unsigned slot = 0; slot < 2; ++slot) {
     sameImageTransaction(slot, ESP_OTA_IMG_INVALID);
     sameImageTransaction(slot, ESP_OTA_IMG_ABORTED);

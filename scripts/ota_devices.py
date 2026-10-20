@@ -91,7 +91,7 @@ def _endpoint(by_id):
 def physical_endpoint(by_id, serial, *, by_path=None, id_path=None, vid=None, pid=None,
                       sys_tty=Path("/sys/class/tty"), sys_usb=Path("/sys/bus/usb/devices"),
                       udev_data=Path("/run/udev/data")):
-    if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", serial):
+    if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", serial):
         raise ValueError("explicit physical USB serial required")
     if by_path is None:
         endpoint = _endpoint(by_id)

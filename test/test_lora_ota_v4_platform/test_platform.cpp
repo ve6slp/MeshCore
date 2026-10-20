@@ -249,10 +249,11 @@ class EspMetadataModel final : public ::ota::storage::Esp32PartitionApi {
 public:
   EspMetadataModel() : bytes(0x800000, 0x5a) {
     using namespace ::ota::storage;
-    snapshot.count = 6; snapshot.flashSize = snapshot.physicalFlashSize = bytes.size();
-    for (size_t i = 0; i < 6; ++i) snapshot.table[i] = Esp32S3PartitionLayout::entry(i);
+    snapshot.count = Esp32PartitionSnapshot::kPartitionCount;
+    snapshot.flashSize = snapshot.physicalFlashSize = bytes.size();
+    for (size_t i = 0; i < snapshot.count; ++i) snapshot.table[i] = Esp32S3PartitionLayout::entry(i);
     snapshot.running = snapshot.boot = snapshot.table[2]; snapshot.next = snapshot.table[3];
-    const auto begin = snapshot.table[2].address + ::ota::platform::Esp32OtaMetadataAdapter::kOffset;
+    const auto begin = kOtaMetadataAddress;
     std::fill(bytes.begin() + begin, bytes.begin() + begin + 16384, 0xff);
   }
   ::ota::storage::Esp32SdkError inspect(::ota::storage::Esp32PartitionSnapshot& out) const override {
@@ -285,7 +286,7 @@ public:
   ::ota::storage::Esp32PartitionSnapshot snapshot;
 private:
   static uint32_t address(uint32_t offset) {
-    return ::ota::storage::Esp32S3PartitionLayout::entry(2).address + kOtaMetadataOffset + offset;
+    return kOtaMetadataAddress + offset;
   }
   static void bounds(uint32_t offset, uint32_t size) {
     assert(offset <= kOtaMetadataBytes && size <= kOtaMetadataBytes - offset);
@@ -308,7 +309,7 @@ static void espMetadataHasNoPersonaOrPayloadCapability() {
   const uint8_t zero = 0;
   assert(device.program(UINT32_MAX, &zero, 1) == ::ota::platform::FlashStatus::OutOfRange);
   assert(device.eraseSector(device.kBytes) == ::ota::platform::FlashStatus::OutOfRange);
-  const auto begin = 0x10000 + device.kOffset;
+  const auto begin = sdk.kOtaMetadataAddress;
   for (size_t i = 0; i < sdk.bytes.size(); ++i)
     if (i < begin || i >= begin + device.kBytes) assert(sdk.bytes[i] == 0x5a);
   sdk.snapshot.table[0].address += 4096;

@@ -43,7 +43,7 @@ TEST(Esp32Flash, ActualPartitionIoBothSlotDirectionsPreservesEveryOtherByte) {
     Esp32FlashAdapter flash(sdk, owners);
     const auto before = sdk.bytes;
     ASSERT_EQ(FlashStatus::Ok, flash.bind(4097));
-    EXPECT_EQ(0x330000u, flash.totalSizeBytes());
+    EXPECT_EQ(running_app1 ? 0x32c000u : 0x330000u, flash.totalSizeBytes());
     EXPECT_EQ(4096u, flash.eraseUnitBytes());
     EXPECT_EQ(1u, flash.programUnitBytes());
     EXPECT_TRUE(esp32PartitionEquals(sdk.snapshot.next, flash.partition()));
@@ -72,14 +72,14 @@ TEST(Esp32Flash, ReorderedExactTableIsAcceptedButDuplicateOrExtraEntryIsNot) {
   sdk.snapshot.table[0] = sdk.snapshot.table[1];
   EXPECT_EQ(FlashStatus::InvalidArgument, flash.bind(1));
   EXPECT_EQ(Esp32FlashAdapter::Refusal::Table, flash.lastRefusal());
-  sdk.snapshot.count = 7;
+  sdk.snapshot.count = Esp32PartitionSnapshot::kPartitionCount + 1;
   EXPECT_EQ(FlashStatus::InvalidArgument, flash.bind(1));
   EXPECT_EQ(0u, sdk.writeCalls);
   EXPECT_TRUE(sdk.erasedOffsets.empty());
 }
 
 TEST(Esp32Flash, EveryAlteredPartitionTableFieldRefusesBeforeMutation) {
-  for (size_t entry = 0; entry < 6; ++entry) {
+  for (size_t entry = 0; entry < Esp32PartitionSnapshot::kPartitionCount; ++entry) {
     for (size_t field = 0; field < 7; ++field) {
       SCOPED_TRACE(entry);
       SCOPED_TRACE(field);
@@ -105,13 +105,13 @@ TEST(Esp32Flash, EveryAlteredPartitionTableFieldRefusesBeforeMutation) {
 }
 
 TEST(Esp32Flash, RunningFilesystemNvsOtadataCoredumpAndBootAreNeverBindable) {
-  for (size_t entry : {size_t(0), size_t(1), size_t(2), size_t(4), size_t(5), size_t(6)}) {
+  for (size_t entry : {size_t(0), size_t(1), size_t(2), size_t(4), size_t(5), size_t(6), size_t(7)}) {
     Esp32PartitionModel sdk;
     Esp32Owners owners;
     Esp32FlashAdapter flash(sdk, owners);
     const auto before = sdk.bytes;
-    sdk.snapshot.next = entry == 6 ? Esp32PartitionIdentity{} : Esp32S3PartitionLayout::entry(entry);
-    if (entry == 6) {
+    sdk.snapshot.next = entry == 7 ? Esp32PartitionIdentity{} : Esp32S3PartitionLayout::entry(entry);
+    if (entry == 7) {
       sdk.snapshot.next.size = 0x8000;
       memcpy(sdk.snapshot.next.label, "bootloader", 11);
       sdk.snapshot.next.defaultFlash = true;
@@ -128,7 +128,7 @@ TEST(Esp32Flash, PersistedPartitionCannotSelectWrongLabelSlotOrGeometry) {
   Esp32PartitionModel sdk;
   Esp32Owners owners;
   Esp32FlashAdapter flash(sdk, owners);
-  for (size_t i = 0; i < 6; ++i) {
+  for (size_t i = 0; i < Esp32PartitionSnapshot::kPartitionCount; ++i) {
     if (i == 3) continue;
     const auto persisted = Esp32S3PartitionLayout::entry(i);
     EXPECT_EQ(FlashStatus::InvalidArgument, flash.bind(4096, &persisted));

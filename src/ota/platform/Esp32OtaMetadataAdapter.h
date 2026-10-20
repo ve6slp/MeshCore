@@ -6,11 +6,10 @@
 namespace ota { namespace platform {
 
 // One fixed journal, not a second APP writer. The capability exposes only the
-// final 16 KiB of app0; neither image slot, NVS, otadata nor userdata is reachable.
+// 16 KiB meshota data partition; neither image slot nor userdata is reachable.
 class Esp32OtaMetadataAdapter final : public FlashDevice {
 public:
   static constexpr uint32_t kBytes = storage::Esp32PartitionApi::kOtaMetadataBytes;
-  static constexpr uint32_t kOffset = storage::Esp32PartitionApi::kOtaMetadataOffset;
   explicit Esp32OtaMetadataAdapter(storage::Esp32PartitionApi& api) : api_(api) {}
   uint32_t totalSizeBytes() const override { return kBytes; }
   uint32_t eraseUnitBytes() const override { return 4096; }

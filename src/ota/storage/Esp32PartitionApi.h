@@ -48,7 +48,7 @@ enum class Esp32ImageState : uint32_t {
 };
 
 struct Esp32PartitionSnapshot {
-  static constexpr size_t kPartitionCount = 6;
+  static constexpr size_t kPartitionCount = 7;
   uint32_t flashSize = 0;
   uint32_t physicalFlashSize = 0;
   size_t count = 0;
@@ -62,11 +62,11 @@ struct Esp32PartitionSnapshot {
 class Esp32S3PartitionLayout {
 public:
   static Esp32PartitionIdentity entry(size_t index) {
-    static const char* const labels[] = {"nvs", "otadata", "app0", "app1", "spiffs", "coredump"};
-    static const uint32_t addresses[] = {0x9000, 0xe000, 0x10000, 0x340000, 0x670000, 0x7f0000};
-    static const uint32_t sizes[] = {0x5000, 0x2000, 0x330000, 0x330000, 0x180000, 0x10000};
-    static const uint8_t types[] = {1, 1, 0, 0, 1, 1};
-    static const uint8_t subtypes[] = {2, 0, 0x10, 0x11, 0x82, 3};
+    static const char* const labels[] = {"nvs", "otadata", "app0", "app1", "spiffs", "coredump", "meshota"};
+    static const uint32_t addresses[] = {0x9000, 0xe000, 0x10000, 0x340000, 0x670000, 0x7f0000, 0x33c000};
+    static const uint32_t sizes[] = {0x5000, 0x2000, 0x32c000, 0x330000, 0x180000, 0x10000, 0x4000};
+    static const uint8_t types[] = {1, 1, 0, 0, 1, 1, 1};
+    static const uint8_t subtypes[] = {2, 0, 0x10, 0x11, 0x82, 3, 0x40};
     Esp32PartitionIdentity out;
     if (index >= Esp32PartitionSnapshot::kPartitionCount) return out;
     out.address = addresses[index];
@@ -107,7 +107,7 @@ public:
 class Esp32PartitionApi {
 public:
   static constexpr uint32_t kOtaMetadataBytes = 16384;
-  static constexpr uint32_t kOtaMetadataOffset = 0x330000 - kOtaMetadataBytes;
+  static constexpr uint32_t kOtaMetadataAddress = 0x33c000;
   virtual ~Esp32PartitionApi() = default;
   virtual Esp32SdkError inspect(Esp32PartitionSnapshot& out) const = 0;
   virtual Esp32SdkError read(const Esp32PartitionIdentity& partition, uint32_t offset,
@@ -116,7 +116,7 @@ public:
                              const uint8_t* data, uint32_t len) = 0;
   virtual Esp32SdkError erase(const Esp32PartitionIdentity& partition, uint32_t offset,
                              uint32_t len) = 0;
-  // Separate, tail-relative capability; it never grants active image access.
+  // Separate data-partition capability; it never grants active image access.
   virtual Esp32SdkError readOtaMetadata(uint32_t, uint8_t*, uint32_t) const {
     return kEsp32InvalidArgument;
   }

@@ -111,7 +111,7 @@ def qualify_build(build, image, role):
     app_elf = build / "firmware.elf"
     boot_bin = build / "bootloader.bin"
     assert (build / "firmware.bin").read_bytes() == image, "input is not the exact qualified compiled app"
-    expected_env = "Xiao_S3_WIO_companion_radio_usb" if role == 0 else "Xiao_S3_WIO_repeater_ota_usb"
+    expected_env = "Xiao_S3_WIO_companion_radio_ota_usb" if role == 0 else "Xiao_S3_WIO_repeater_ota_usb"
     assert build.name == expected_env, "manifest role does not match the qualified build profile"
     sys.path.insert(0, str(framework / "tools"))
     from gen_esp32part import PartitionTable
@@ -121,7 +121,8 @@ def qualify_build(build, image, role):
     expected = [
         ("nvs", 1, 2, 0x9000, 0x5000, False),
         ("otadata", 1, 0, 0xe000, 0x2000, False),
-        ("app0", 0, 0x10, 0x10000, 0x330000, False),
+        ("app0", 0, 0x10, 0x10000, 0x32c000, False),
+        ("meshota", 1, 0x40, 0x33c000, 0x4000, False),
         ("app1", 0, 0x11, 0x340000, 0x330000, False),
         ("spiffs", 1, 0x82, 0x670000, 0x180000, False),
         ("coredump", 1, 3, 0x7f0000, 0x10000, False),

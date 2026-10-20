@@ -188,6 +188,9 @@ airtime scheduler, with transports limited to framing, routing and device I/O.
 After sending the manifest, the host waits for a fresh signed receiver response
 before sending admission fragments. This lets the receiver finish signature
 verification without relying on a fixed delay.
+If a signed readback shows that admission was not accepted, the host resends
+the manifest and retries admission, up to three attempts. It does not repeat
+an accepted admission or an uncertain activation.
 An owned radio override expires and restores the unchanged ordinary settings,
 including the user's forwarding preference.
 
@@ -232,6 +235,26 @@ Use the BP1.6 pair for unattended nRF nodes: failed installer attempts restart
 automatically and resume installation or rollback. Updating the application
 alone leaves an older pair unchanged.
 
+The ESP32 OTA environments use
+[`ota_partitions.csv`](../variants/xiao_s3_wio/ota_partitions.csv).
+Commission that layout over USB before using RF updates:
+
+```sh
+pio run -e Xiao_S3_WIO_repeater_ota_usb -t upload --upload-port "$PORT"
+```
+
+Select `Xiao_S3_WIO_companion_radio_ota_usb` instead for a companion.
+This initial upload installs the application, partition table and vendor
+bootloader. Back up existing identities and settings before converting a
+device. The 16 KiB `meshota` data partition occupies `0x33c000..0x340000`,
+shortening app0 to `0x32c000` bytes. NVS, otadata, app1, SPIFFS and coredump
+keep their standard 8 MiB addresses. The journal has its own partition because
+the SDK protects the entire running application partition from writes,
+including unused space after the image. An application-only upload cannot
+convert the old partition layout. Subsequent RF updates leave the table and
+personality storage unchanged. Ordinary non-OTA environments use their
+existing partition table.
+
 Earlier v3 lab builds require a deliberate one-time bootstrap using their
 frozen tools or an explicitly approved application-only recovery procedure.
 The v4 product contains no v3 radio handler or automatic migration path.
@@ -248,6 +271,8 @@ from ordinary contact permissions.
 The following variables represent explicit selections, not auto-discovered
 devices. The stock transport also requires `--usb-serial` with its actual
 physical serial. Use a stable physical-path anchor for duplicate serials.
+For Espressif native USB, keep the colons in the device's USB serial number
+(for example, `AA:BB:CC:DD:EE:FF`).
 
 ```sh
 make ota OTA_ARGS="build --by-id $PORT --owner $OWNER --transport stock --usb-serial $SERIAL \

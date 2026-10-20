@@ -242,6 +242,52 @@ class NativeEndToEndTests(Scratch):
         self.assertEqual(scheduler.result()["metrics"]["repair_frames"], 2)
         self.assertEqual(len({(f.object, f.slice) for f in sent}), initial)
 
+    def test_lost_manifest_slice_is_repaired_without_readmitting_the_other_receiver(self):
+        pkg, job, transport, clock = self.setup_job(b"firmware" * 2000, 2)
+        send = transport.send
+        lost = False
+
+        def lose_manifest(raw, deadline):
+            nonlocal lost
+            frame = Frame.decode(raw)
+            if frame.kind == Kind.MANIFEST and frame.slice == 0 and not lost:
+                lost = True
+                transport.sent.append(frame)
+                transport.queue.extend(transport.drivers[0].exchange(raw.hex()))
+                size = len(transport.route.packet(raw))
+                return TxReceipt(physical_airtime(size), size, size + 3)
+            return send(raw, deadline)
+
+        transport.send = lose_manifest
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        self.assertTrue(lost)
+        self.assertEqual([s.generation for s in scheduler.statuses.values()], [1, 1])
+        states = [row[0] for row in job.db.execute("SELECT state FROM operations")]
+        self.assertEqual(states.count("authenticated"), 2)
+        self.assertEqual(states.count("not-accepted"), 1)
+        self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+
+    def test_unreceived_admission_is_retried_but_persistent_loss_stops(self):
+        _, job, transport, clock = self.setup_job(b"firmware" * 2000)
+        send = transport.send
+
+        def lose_admission(raw, deadline):
+            frame = Frame.decode(raw)
+            if frame.kind == Kind.ADMIT and frame.slice == 1:
+                transport.sent.append(frame)
+                size = len(transport.route.packet(raw))
+                return TxReceipt(physical_airtime(size), size, size + 3)
+            return send(raw, deadline)
+
+        transport.send = lose_admission
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        with self.assertRaisesRegex(Error, "phase=idle.*generation=0"):
+            scheduler.stage(clock() + 1000)
+        states = [row[0] for row in job.db.execute("SELECT state FROM operations")]
+        self.assertEqual(states, ["not-accepted"] * 3)
+        self.assertFalse(any(f.kind in (Kind.DATA, Kind.ACTIVATE) for f in transport.sent))
+
     def test_host_and_receiver_restart_resume_without_second_admission(self):
         image = hashlib.shake_256(b"native v4 restart").digest(24000)
         pkg, job, transport, clock = self.setup_job(image, compress=False)

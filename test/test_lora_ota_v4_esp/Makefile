@@ -36,9 +36,9 @@ test:
 regression-check: test
 	@mkdir -p "$(TMPDIR)/regression/include/ota/platform"
 	@sed \
-	  -e 's/api_\.readOtaMetadata(offset, out, size)/api_.read(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, out, size)/' \
-	  -e 's/api_\.writeOtaMetadata(offset, bytes, size)/api_.write(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, bytes, size)/' \
-	  -e 's/api_\.eraseOtaMetadata(offset, 4096)/api_.erase(storage::Esp32S3PartitionLayout::entry(2), kOffset + offset, 4096)/' \
+	  -e 's/api_\.readOtaMetadata(offset, out, size)/api_.read(storage::Esp32S3PartitionLayout::entry(2), offset, out, size)/' \
+	  -e 's/api_\.writeOtaMetadata(offset, bytes, size)/api_.write(storage::Esp32S3PartitionLayout::entry(2), offset, bytes, size)/' \
+	  -e 's/api_\.eraseOtaMetadata(offset, 4096)/api_.erase(storage::Esp32S3PartitionLayout::entry(2), offset, 4096)/' \
 	  "$(ROOT)/src/ota/platform/Esp32OtaMetadataAdapter.h" \
 	  > "$(TMPDIR)/regression/include/ota/platform/Esp32OtaMetadataAdapter.h"
 	@ulimit -c 0; if $(MAKE) --no-print-directory -f "$(lastword $(MAKEFILE_LIST))" test \

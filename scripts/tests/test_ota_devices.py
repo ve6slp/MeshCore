@@ -6,6 +6,7 @@ from pathlib import Path
 import stat
 import struct
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -148,6 +149,25 @@ class IdentityTests(unittest.TestCase):
 
 
 class AccessTests(unittest.TestCase):
+    def test_colon_separated_esp_serial_is_matched_against_the_physical_device(self):
+        serial = "20:6E:F1:88:07:B0"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owner = root / "usb" / "1-1"
+            owner.mkdir(parents=True)
+            (owner / "idVendor").write_text("303a")
+            (owner / "idProduct").write_text("1001")
+            (owner / "serial").write_text(serial)
+            tty = root / "tty" / "ttyACM99"
+            tty.mkdir(parents=True)
+            (tty / "device").symlink_to(owner, target_is_directory=True)
+            with mock.patch.object(devices, "_endpoint", return_value=ENDPOINT):
+                self.assertEqual(devices.physical_endpoint(
+                    PATH, serial, sys_tty=root / "tty", sys_usb=root / "usb"), ENDPOINT)
+                with self.assertRaisesRegex(ValueError, "serial mismatch"):
+                    devices.physical_endpoint(
+                        PATH, "20:6E:F1:88:07:B1", sys_tty=root / "tty", sys_usb=root / "usb")
+
     def setUp(self):
         self.port = SimpleNamespace(port=None, dtr=True, rts=True, fileno=lambda: 10,
                                     open=mock.Mock(), close=mock.Mock(), write=mock.Mock())

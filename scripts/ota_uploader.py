@@ -192,7 +192,10 @@ class Scheduler:
         package = self.package
         if (status.package != package.digest or status.counter != package.counter
                 or not any(status.transaction) or status.next_chunk > len(package.chunks)):
-            raise Error("receiver does not have this exact package/transaction")
+            raise Error("receiver does not have this exact package/transaction "
+                        f"(target={status.target.hex()} phase={status.phase.name.lower()} "
+                        f"result={status.result.name.lower()} generation={status.generation} "
+                        f"counter={status.counter})")
         if status.phase in (Phase.ABORTED, Phase.FAILED, Phase.METADATA_FAULT):
             raise Error(f"receiver candidate is {status.phase.name.lower()}")
         if status.next_chunk < len(package.chunks):
@@ -224,15 +227,30 @@ class Scheduler:
             if struct.unpack_from(">I", body, 112)[0] != status.generation:
                 raise Error("uncertain admission does not match fresh idle generation")
             self.job.resolve(op, "not-accepted")
-        if not status.evidence & 1 or self.package.counter <= status.floor:
-            raise Error("package must exceed authenticated confirmed floor")
-        operation, after = self._command(Kind.ADMIT, target, status, deadline)
-        self._check_active(after)
-        if after.generation != status.generation + 1 or after.transaction == status.challenge:
-            raise Error("admission did not create a distinct new transaction")
-        self.job.resolve(operation, "authenticated")
-        self.job.status(after)
-        return after
+        for attempt in range(3):
+            if not status.evidence & 1 or self.package.counter <= status.floor:
+                raise Error("package must exceed authenticated confirmed floor")
+            operation, after = self._command(Kind.ADMIT, target, status, deadline)
+            unchanged = (after.phase == status.phase and after.generation == status.generation
+                         and after.package == status.package and after.transaction == status.transaction
+                         and after.counter == status.counter)
+            if unchanged:
+                self.job.resolve(operation, "not-accepted")
+                if attempt < 2:
+                    self._send(Kind.MANIFEST, self.package.manifest, deadline, repair=True)
+                    refreshed = self.query(target, deadline)
+                    if (refreshed.phase != after.phase or refreshed.generation != after.generation
+                            or refreshed.package != after.package or refreshed.transaction != after.transaction
+                            or refreshed.counter != after.counter):
+                        raise Error("receiver transaction changed while retrying unaccepted admission")
+                    status = refreshed
+                    continue
+            self._check_active(after)
+            if after.generation != status.generation + 1 or after.transaction == status.challenge:
+                raise Error("admission did not create a distinct new transaction")
+            self.job.resolve(operation, "authenticated")
+            self.job.status(after)
+            return after
 
     def progress(self, target, deadline):
         for attempt in range(3):

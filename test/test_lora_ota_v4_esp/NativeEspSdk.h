@@ -32,20 +32,20 @@ struct esp_partition_t {
 };
 struct NativeEspState {
   std::vector<uint8_t> flash;
-  esp_partition_t partitions[6] = {};
+  esp_partition_t partitions[7] = {};
   esp_ota_img_states_t states[2] = {ESP_OTA_IMG_VALID, ESP_OTA_IMG_UNDEFINED};
   unsigned running = 0, boot = 0, restarts = 0, markValidCalls = 0;
   uint32_t entropy = 0, physicalSize = 0x800000;
-  size_t partitionCount = 6, reads = 0, writes = 0, erases = 0;
+  size_t partitionCount = 7, reads = 0, writes = 0, erases = 0;
   std::map<std::string, std::map<std::string, std::vector<uint8_t>>> nvs;
   std::vector<std::string> handles;
   void reset(unsigned slot) {
     flash.assign(0x800000, 0x5a);
-    const char* labels[] = {"nvs", "otadata", "app0", "app1", "spiffs", "coredump"};
-    const uint32_t addresses[] = {0x9000, 0xe000, 0x10000, 0x340000, 0x670000, 0x7f0000};
-    const uint32_t sizes[] = {0x5000, 0x2000, 0x330000, 0x330000, 0x180000, 0x10000};
-    const unsigned subtypes[] = {2, 0, 0x10, 0x11, 0x82, 3};
-    for (unsigned i = 0; i < 6; ++i) {
+    const char* labels[] = {"nvs", "otadata", "app0", "app1", "spiffs", "coredump", "meshota"};
+    const uint32_t addresses[] = {0x9000, 0xe000, 0x10000, 0x340000, 0x670000, 0x7f0000, 0x33c000};
+    const uint32_t sizes[] = {0x5000, 0x2000, 0x32c000, 0x330000, 0x180000, 0x10000, 0x4000};
+    const unsigned subtypes[] = {2, 0, 0x10, 0x11, 0x82, 3, 0x40};
+    for (unsigned i = 0; i < 7; ++i) {
       partitions[i] = {esp_flash_default_chip, i == 2 || i == 3 ?
           ESP_PARTITION_TYPE_APP : ESP_PARTITION_TYPE_DATA,
           static_cast<esp_partition_subtype_t>(subtypes[i]), addresses[i], sizes[i], {}, false};
@@ -54,7 +54,7 @@ struct NativeEspState {
     std::fill(flash.begin() + 0x33c000, flash.begin() + 0x340000, 0xff);
     states[0] = states[1] = ESP_OTA_IMG_VALID;
     running = boot = slot; restarts = markValidCalls = 0;
-    physicalSize = 0x800000; partitionCount = 6; reads = writes = erases = 0;
+    physicalSize = 0x800000; partitionCount = 7; reads = writes = erases = 0;
     nvs.clear(); handles.clear();
     nvs["personality"]["identity"] = {0x21, 0x33, 0x87};
     nvs["personality"]["radio"] = {0x44, 0x57, 0x18};
@@ -128,12 +128,14 @@ inline esp_err_t esp_partition_read(const esp_partition_t* p, uint32_t offset, v
 inline esp_err_t esp_partition_write(const esp_partition_t* p, uint32_t offset,
                                     const void* data, size_t size) {
   if (!nativeRange(p, offset, size) || (!data && size)) return ESP_ERR_INVALID_ARG;
+  assert(p != esp_ota_get_running_partition() && "SDK aborts writes anywhere in the running app partition");
   const auto* in = static_cast<const uint8_t*>(data);
   for (size_t i = 0; i < size; ++i) nativeEsp.flash[p->address + offset + i] &= in[i];
   ++nativeEsp.writes; return ESP_OK;
 }
 inline esp_err_t esp_partition_erase_range(const esp_partition_t* p, uint32_t offset, size_t size) {
   if (!nativeRange(p, offset, size) || offset % 4096 || size % 4096) return ESP_ERR_INVALID_ARG;
+  assert(p != esp_ota_get_running_partition() && "SDK aborts erases anywhere in the running app partition");
   std::fill(nativeEsp.flash.begin() + p->address + offset,
             nativeEsp.flash.begin() + p->address + offset + size, 0xff);
   ++nativeEsp.erases; return ESP_OK;
