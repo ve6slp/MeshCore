@@ -141,6 +141,7 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy 
 }
 
 bool CommonCLI::savePrefs(FILESYSTEM* fs, const char* prefs_filename) {
+  if (!_callbacks->allowUserdataWrites()) return false;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   fs->remove(prefs_filename);
   File file = fs->open(prefs_filename, FILE_O_WRITE);
@@ -160,6 +161,7 @@ bool CommonCLI::savePrefs(FILESYSTEM* fs, const char* prefs_filename) {
 #define MIN_LOCAL_ADVERT_INTERVAL   60
 
 void CommonCLI::savePrefs() {
+  if (!_callbacks->allowUserdataWrites()) return;
   if (_prefs->advert_interval * 2 < MIN_LOCAL_ADVERT_INTERVAL) {
     _prefs->advert_interval = 0;  // turn it off, now that device has been manually configured
   }
@@ -180,13 +182,40 @@ uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
   }
 }
 
+bool CommonCLI::checkCommandWritePermission(const char* command, char* reply) const {
+  if (_callbacks->allowUserdataWrites()) return true;
+
+  // Unknown/variant commands stay blocked until this boot can change userdata.
+  static const char* const reads[] = {
+    "clock", "ver", "board", "power", "neighbors",
+    "stats-core", "stats-radio", "stats-packets", "get acl",
+    "gps", "gps diag", "gps advert", "powersaving", "log",
+    "region", "region home", "region default", "sensor list",
+    "ota status", "ota progress", "ota identity", "ota preflight", "ota capability"
+  };
+  for (const char* read : reads) {
+    if (strcmp(command, read) == 0) return true;
+  }
+  if (strncmp(command, "get ", 4) == 0 ||
+      strncmp(command, "sensor get ", 11) == 0 ||
+      strncmp(command, "region get ", 11) == 0) return true;
+  if (strncmp(command, "sensor list ", 12) == 0) {
+    const char* offset = command + 12;
+    while (*offset >= '0' && *offset <= '9') ++offset;
+    if (offset != command + 12 && *offset == 0) return true;
+  }
+  strcpy(reply, "Err - userdata writes held during OTA trial or unresolved boot");
+  return false;
+}
+
 void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
+    if (!checkCommandWritePermission(command, reply)) return;
     if (_prefs->getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {   // is a radio CLI command?
       if (_prefs->getRadioPrefs()->isDirty()) { savePrefs(); }
       return;
     }
     // hook for variant-specific CLI processing
-    if (_board->handleCommand(command, sender_timestamp, reply)) {
+    if (_callbacks->allowUserdataWrites() && _board->handleCommand(command, sender_timestamp, reply)) {
       if (_prefs->isDirty()) { savePrefs(); }
       return;
     }

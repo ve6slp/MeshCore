@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <cstdio>
 
 // Mock Stream class for native testing
 // Provides minimal interface needed by Utils.h
@@ -15,6 +16,14 @@
 class Print
 {
 public:
+    template<typename... Args>
+    size_t printf(const char* format, Args... args) {
+        char bytes[256];
+        const int size = std::snprintf(bytes, sizeof(bytes), format, args...);
+        if (size < 0) return 0;
+        return write(reinterpret_cast<const uint8_t*>(bytes),
+                     static_cast<size_t>(size) < sizeof(bytes) ? size : sizeof(bytes) - 1);
+    }
     virtual size_t write(uint8_t b) { return 1; }
     size_t write(const char *str)
     {

@@ -24,12 +24,13 @@ public:
     }
   }
 
-  void finalize(uint8_t* hash, size_t hashLen) {
+  void finalize(void* dest, size_t hashLen) {
+    auto* hash = static_cast<uint8_t*>(dest);
     for (size_t i = 0; i < hashLen; i++) {
       hash[i] = _state[i % 32];
     }
   }
 
   void resetHMAC(const uint8_t* key, size_t keyLen) {}
-  void finalizeHMAC(const uint8_t* key, size_t keyLen, uint8_t* hash, size_t hashLen) {}
+  void finalizeHMAC(const uint8_t* key, size_t keyLen, void* hash, size_t hashLen) {}
 };

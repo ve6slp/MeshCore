@@ -437,10 +437,13 @@ mesh::Packet *MyMesh::createSelfAdvert() {
 
 File MyMesh::openAppend(const char *fname) {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  if (_ota_destructive_writes_disallowed_) return File(*_fs);
   return _fs->open(fname, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
+  if (_ota_destructive_writes_disallowed_) return File();
   return _fs->open(fname, "a");
 #else
+  if (_ota_destructive_writes_disallowed_) return File();
   return _fs->open(fname, "a", true);
 #endif
 }
@@ -1014,7 +1017,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _prefs_filename = resolveRepeaterPrefsFilename(*_fs);
 #if MESHCORE_REPEATER_RELAY_PROFILE
   // Avoid CommonCLI's implicit legacy /com_prefs migration in a role change.
-  if (_identity_available_ && !_ota_destructive_writes_disallowed_ && _fs->exists(_prefs_filename))
+  if (_identity_available_ && _fs->exists(_prefs_filename))
 #endif
   _cli.loadPrefs(_fs, _prefs_filename);
   // acl.load() keys every entry against self_id's own identity -- skip it
@@ -1178,6 +1181,7 @@ void MyMesh::revertTempRadioLeaseIfDue() {
 }
 
 bool MyMesh::formatFileSystem() {
+  if (_ota_destructive_writes_disallowed_) return false;
 #if MESHCORE_REPEATER_RELAY_PROFILE
   return false;
 #elif defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -1312,6 +1316,7 @@ void MyMesh::removeNeighbor(const uint8_t *pubkey, int key_len) {
 }
 
 void MyMesh::startRegionsLoad() {
+  if (_ota_destructive_writes_disallowed_) return;
   temp_map.resetFrom(region_map);   // rebuild regions in a temp instance
   memset(load_stack, 0, sizeof(load_stack));
   load_stack[0] = &temp_map.getWildcard();
@@ -1319,6 +1324,7 @@ void MyMesh::startRegionsLoad() {
 }
 
 bool MyMesh::saveRegions() {
+  if (_ota_destructive_writes_disallowed_) return false;
 #if MESHCORE_REPEATER_RELAY_PROFILE
   return false;
 #else
@@ -1348,6 +1354,7 @@ void MyMesh::formatPacketStatsReply(char *reply) {
 }
 
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
+  if (_ota_destructive_writes_disallowed_) return;
 #if MESHCORE_REPEATER_RELAY_PROFILE
   (void)new_id;
 #else
@@ -1394,6 +1401,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
                           const uint8_t* authenticated_admin) {
   (void)local_usb;
   (void)authenticated_admin;
+  if (region_load_active && _ota_destructive_writes_disallowed_) {
+    strcpy(reply, "Err - userdata writes held during OTA trial or unresolved boot");
+    return;
+  }
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1435,6 +1446,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     reply += 3;
     command += 3;
   }
+
+  if (!_cli.checkCommandWritePermission(command, reply)) return;
 
 #if MESHCORE_REPEATER_RELAY_PROFILE
   if (strncmp(command, "set prv.key", 11) == 0 || strncmp(command, "get prv.key", 11) == 0 ||

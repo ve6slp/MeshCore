@@ -242,6 +242,7 @@ public:
 
 class CommonCLICallbacks {
 public:
+  virtual bool allowUserdataWrites() const { return true; }
   virtual void savePrefs() = 0;
   virtual const char* getFirmwareVer() = 0;
   virtual const char* getBuildDate() = 0;
@@ -336,11 +337,12 @@ public:
   // distinct filename (e.g. "/repeater_prefs.json") lets a DIFFERENT
   // sketch (same board family) keep its own prefs file genuinely
   // separate, never loading/overwriting another role's file on the
-  // same filesystem. Legacy "/com_prefs" migration is unaffected (still
-  // only consulted when the (possibly non-default) prefs_filename
-  // itself doesn't exist).
+  // same filesystem. Legacy "/com_prefs" is only consulted when that
+  // filename does not exist. It is read without creating the new file
+  // while callbacks disallow userdata writes.
   void loadPrefs(FILESYSTEM* _fs, const char* prefs_filename = "/prefs.json");
   bool savePrefs(FILESYSTEM* _fs, const char* prefs_filename = "/prefs.json");
+  bool checkCommandWritePermission(const char* command, char* reply) const;
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
 };

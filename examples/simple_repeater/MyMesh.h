@@ -154,18 +154,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   // still serve USB maintenance/CLI/OTA-trial-health with radio absent.
   bool _radio_available_ = true;
 
-  // Mirrors companion_radio's DataStore::_destructive_writes_disallowed_
-  // (same OtaWriteGate.h contract, same meaning): true only during an
-  // OTA trial/unknown boot (ota_allow_destructive_boot_writes computed
-  // in main.cpp's setup() via otaBoardEarlyBootTrialOrUnknown()), set
-  // once via notifyDestructiveWritesDisallowed() below. Repeater has no
-  // DataStore-equivalent wrapper, so loop()'s own acl.save(_fs) call
-  // must consult this flag directly (via ota_write_gate::guardedPersist)
-  // rather than unconditionally mutating storage and mislabeling a
-  // policy-refused write as persisted. Unconditional (not
-  // MESHCORE_LORA_OTA-gated) so it compiles identically whether or not
-  // OTA is enabled; defaults to false (writes allowed) for ordinary
-  // non-OTA builds.
+  // Latched by setup() for a trial or unresolved boot. Gates CLI mutations,
+  // legacy preference migration and every userdata persistence callback.
+  // Ordinary non-OTA builds leave writes enabled.
   bool _ota_destructive_writes_disallowed_ = false;
 
 #if MESHCORE_LORA_OTA
@@ -285,10 +276,10 @@ public:
     return _prefs.advert_interval == 0 && _prefs.flood_advert_interval == 0;
   }
 
+  bool allowUserdataWrites() const override { return !_ota_destructive_writes_disallowed_; }
+
   void savePrefs() override {
-#if MESHCORE_REPEATER_RELAY_PROFILE
     if (_ota_destructive_writes_disallowed_) return;
-#endif
     _cli.savePrefs(_fs, _prefs_filename);
   }
 
@@ -304,6 +295,7 @@ public:
   void setLoggingOn(bool enable) override { _logging = enable; }
 
   void eraseLogFile() override {
+    if (_ota_destructive_writes_disallowed_) return;
     _fs->remove(PACKET_LOG_FILE);
   }
 

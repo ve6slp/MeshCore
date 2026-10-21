@@ -463,6 +463,10 @@ void earlyTrial() { trial.begin(millis()); }
 extern "C" bool verifyRollbackLater() { earlyTrial(); return true; }
 bool otaBoardEarlyBootTrialOrUnknown() { earlyTrial(); return trial.activeOrUnknown(); }
 bool otaBoardEarlyBootNormalProven() { return !otaBoardEarlyBootTrialOrUnknown(); }
+const char* otaBoardEarlyWriteDiagnostic() {
+  return otaBoardEarlyBootNormalProven() && contextNormal() ?
+      "proof=sdk-normal" : "proof=trial-or-unknown";
+}
 bool otaBoardTrialHealthWindowActive() { return trial.activeOrUnknown(); }
 bool otaBoardUnknownStartupRecoveryHeld() { return trial.unknownServiceHeld(); }
 bool otaBoardStorageIoFaultObserved() { return storageFault || platform.storageFaultObserved(); }

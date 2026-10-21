@@ -9,6 +9,7 @@ import math
 import os
 import select
 import struct
+import termios
 import time
 import zlib
 
@@ -254,6 +255,7 @@ class FramedSerial:
             self.stream.open()
             self.fd = self.stream.fileno()
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.ioctl(self.fd, termios.TIOCEXCL)
         except BaseException:
             self.close()
             raise
@@ -276,7 +278,12 @@ class FramedSerial:
         except BlockingIOError:
             return b""
         if not data:
-            raise ConnectionError("companion disconnected")
+            # A VMIN=0 tty can return no bytes without hanging up.
+            poll = select.poll()
+            faults = select.POLLERR | select.POLLHUP | select.POLLNVAL
+            poll.register(self.fd, select.POLLIN | faults)
+            if any(events & faults for _, events in poll.poll(0)):
+                raise ConnectionError("companion disconnected")
         return data
 
     def write_frame(self, payload):

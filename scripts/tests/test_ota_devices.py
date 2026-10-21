@@ -176,6 +176,9 @@ class AccessTests(unittest.TestCase):
         quiet = mock.patch.object(devices, "quiet_serial_factory", self.factory)
         quiet.start()
         self.addCleanup(quiet.stop)
+        exclusive = mock.patch.object(devices.lab.fcntl, "ioctl")
+        self.exclusive = exclusive.start()
+        self.addCleanup(exclusive.stop)
 
     def test_import_never_opens_serial(self):
         with mock.patch.dict(sys.modules, serial=self.serial), \
@@ -196,6 +199,7 @@ class AccessTests(unittest.TestCase):
                 self.assertIsInstance(node, devices.lab.FramedSerial)
                 self.assertTrue(node.no_reset)
                 lock.assert_called_once_with(10, devices.lab.fcntl.LOCK_EX | devices.lab.fcntl.LOCK_NB)
+                self.exclusive.assert_called_once_with(10, devices.lab.termios.TIOCEXCL)
                 self.port.close.assert_not_called()
             node.close()
         self.factory.assert_called_once_with(port=None, baudrate=115200, timeout=0,
@@ -233,10 +237,11 @@ class AccessTests(unittest.TestCase):
         self.port.close.assert_called_once()
 
     def test_open_lock_and_disconnect_failures_close_port(self):
-        for stage in ("open", "lock", "identity", "read"):
+        for stage in ("open", "lock", "exclusive", "identity", "read"):
             self.port.open.reset_mock()
             self.port.open.side_effect = PermissionError("open denied") if stage == "open" else None
             self.port.close.reset_mock()
+            self.exclusive.side_effect = OSError("exclusive access failed") if stage == "exclusive" else None
             lock = mock.Mock(side_effect=BlockingIOError("reader busy") if stage == "lock" else None)
             info = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=456) if stage == "identity" else CHAR_INFO
             with self.subTest(stage=stage), mock.patch.dict(sys.modules, serial=self.serial), \
@@ -299,11 +304,14 @@ class AccessTests(unittest.TestCase):
         node.fd = 10
         node.buffer, node.pending = bytearray(b">\x02\0\x1e"), []
         with mock.patch.object(devices.lab.select, "select", return_value=([10], [], [])), \
+                mock.patch.object(devices.lab.select, "poll") as poll, \
                 mock.patch.object(devices.lab.os, "read",
-                                  side_effect=[BlockingIOError(), b"\x04"]):
-            node.poll()
-            self.assertEqual(node.buffer, b">\x02\0\x1e")
-            self.assertEqual(node.pending, [])
+                                  side_effect=[BlockingIOError(), b"", b"\x04"]):
+            poll.return_value.poll.return_value = []
+            for _ in range(2):
+                node.poll()
+                self.assertEqual(node.buffer, b">\x02\0\x1e")
+                self.assertEqual(node.pending, [])
             node.poll()
         self.assertEqual(node.buffer, b"")
         self.assertEqual([frame for _, frame in node.pending], [b"\x1e\x04"])
@@ -312,7 +320,9 @@ class AccessTests(unittest.TestCase):
         node = devices.lab.FramedSerial.__new__(devices.lab.FramedSerial)
         node.fd = 10
         with mock.patch.object(devices.lab.select, "select", return_value=([10], [], [])), \
+                mock.patch.object(devices.lab.select, "poll") as poll, \
                 mock.patch.object(devices.lab.os, "read", return_value=b"") as read:
+            poll.return_value.poll.return_value = [(10, devices.lab.select.POLLHUP)]
             with self.assertRaisesRegex(ConnectionError, "disconnected"):
                 node._read_bytes(0)
             read.side_effect = OSError("serial I/O failed")

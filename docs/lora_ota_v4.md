@@ -88,6 +88,12 @@ They must reject a route that cannot carry these fixed slices rather than
 truncate, rely on implicit fragmentation, or silently change protocols.
 Native serial and stock serial carry the same OTA objects.
 
+A stock companion can send an update. Multihop updates require OTA-enabled
+relays on the reply path: receivers send STATUS and PROGRESS as floods.
+Unmodified MeshCore 1.18.0 repeaters forward payload `0x0c` along an explicit
+direct route, but drop its flood replies. A working outbound route through
+those repeaters therefore cannot carry a complete update by itself.
+
 ## Authority and transaction
 
 One receiver engine owns `Receiving -> Verifying -> Ready ->
@@ -125,6 +131,12 @@ running-image evidence. Unsigned bitmap progress is scheduling advice only;
 it cannot establish authorization, READY, successful activation or installation.
 An ambiguous activation response is reconciled, never automatically re-admitted
 or blindly activated again.
+
+During a repeater's trial or unresolved boot, CLI queries remain available,
+but commands that change identity, preferences, ACLs, regions or logs return
+`Err - userdata writes held during OTA trial or unresolved boot`. Legacy
+preferences can be read without migrating them to a new file. Those writes
+resume on a later boot whose installed application is confirmed.
 
 ### Query, status and repair objects
 
@@ -255,6 +267,12 @@ convert the old partition layout. Subsequent RF updates leave the table and
 personality storage unchanged. Ordinary non-OTA environments use their
 existing partition table.
 
+On ESP32, `ota preflight` reports `proof=sdk-normal` when the SDK partition
+layout and boot selection permit normal startup, or `proof=trial-or-unknown`
+while a trial or unresolved boot state holds writes. `ota identity` reports
+whether the role loaded its identity and observed a storage fault during this
+boot; `ota status` reports the update transaction separately.
+
 Earlier v3 lab builds require a deliberate one-time bootstrap using their
 frozen tools or an explicitly approved application-only recovery procedure.
 The v4 product contains no v3 radio handler or automatic migration path.
@@ -273,6 +291,8 @@ devices. The stock transport also requires `--usb-serial` with its actual
 physical serial. Use a stable physical-path anchor for duplicate serials.
 For Espressif native USB, keep the colons in the device's USB serial number
 (for example, `AA:BB:CC:DD:EE:FF`).
+Close other applications and serial monitors using that companion first.
+The updater reserves its serial connection until the command finishes.
 
 ```sh
 make ota OTA_ARGS="build --by-id $PORT --owner $OWNER --transport stock --usb-serial $SERIAL \
