@@ -12,12 +12,33 @@ class Route:
     path: bytes = b""
     width: int = 1
     max_path_bytes: int = 0
+    return_path: bytes | None = None
+    return_width: int | None = None
 
     def validate(self):
         if (self.width not in (1, 2, 3) or len(self.path) % self.width
                 or len(self.path) > self.max_path_bytes or not 0 <= self.max_path_bytes <= 20
                 or (self.flood and (self.path or self.width != 1))):
             raise ValueError("stock-safe route requires explicit maximum path growth of 0..20 bytes")
+        width = self.width if self.return_width is None else self.return_width
+        if (self.return_path is None and self.return_width is not None
+                or width not in (1, 2, 3)
+                or (self.return_path is not None and
+                    (len(self.return_path) % width or len(self.return_path) > self.max_path_bytes))):
+            raise ValueError("return path requires whole 1..3-byte hashes within the maximum path budget")
+
+    def reply_path(self):
+        self.validate()
+        if self.return_path is None:
+            if self.flood or not self.path:
+                return b""
+            path = b"".join(self.path[i:i + self.width]
+                            for i in range(len(self.path) - self.width, -1, -self.width))
+            width = self.width
+        else:
+            path = self.return_path
+            width = self.width if self.return_width is None else self.return_width
+        return bytes([((width - 1) << 6) | (len(path) // width)]) + path
 
     def packet(self, frame):
         self.validate()
@@ -28,17 +49,22 @@ class Route:
                 + self.path + frame)
 
     def policy(self):
-        return {"flood": self.flood, "path": self.path.hex(), "width": self.width,
-                "max_path_bytes": self.max_path_bytes}
+        policy = {"flood": self.flood, "path": self.path.hex(), "width": self.width,
+                  "max_path_bytes": self.max_path_bytes}
+        if self.return_path is not None:
+            policy.update(return_path=self.return_path.hex(), return_width=self.return_width)
+        return policy
 
     @classmethod
     def from_policy(cls, value):
-        route = cls(value["flood"], bytes.fromhex(value["path"]), value["width"], value["max_path_bytes"])
+        route = cls(value["flood"], bytes.fromhex(value["path"]), value["width"], value["max_path_bytes"],
+                    bytes.fromhex(value["return_path"]) if "return_path" in value else None,
+                    value.get("return_width"))
         route.validate()
         return route
 
 
-def packet_payload(packet, bound=20):
+def packet_payload(packet, bound=20, *, require_delivered=False):
     if len(packet) < 3:
         return None
     header, encoded = packet[:2]
@@ -46,6 +72,8 @@ def packet_payload(packet, bound=20):
     path = width * count
     if (header >> 6 or (header >> 2) & 15 != 12 or header & 3 not in (1, 2)
             or width > 3 or path > bound or 2 + path >= len(packet)):
+        return None
+    if require_delivered and header & 3 == 2 and count:
         return None
     return packet[2 + path:]
 
@@ -133,7 +161,7 @@ class NativeTransport:
                     return frame[3:]
                 if not self.local and frame[0] == 0x91:
                     self.node.pending.pop(index)
-                    payload = packet_payload(frame[1:], self.route.max_path_bytes)
+                    payload = packet_payload(frame[1:], self.route.max_path_bytes, require_delivered=True)
                     if payload is not None:
                         self.last_rx_bytes = (len(frame) - 1, len(frame))
                         return payload

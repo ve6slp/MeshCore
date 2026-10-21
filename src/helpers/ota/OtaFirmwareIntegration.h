@@ -75,12 +75,22 @@ public:
     return receiver_ ? receiver_->begin() : Result::Unsupported;
   }
   v4::Receiver* receiver() const { return receiver_; }
-  Result onFrame(const uint8_t* bytes, size_t size, bool local = false, uint32_t now = 0) {
+  Result onFrame(const uint8_t* bytes, size_t size, bool local = false, uint32_t now = 0,
+                 const uint8_t* flood_path = nullptr, uint8_t flood_path_len = 0) {
     if (!receiver_) return Result::Unsupported;
     v4::Frame frame;
     if (!v4::decodeFrame(bytes, size, frame)) return Result::Invalid;
     size_t pending = 0;
     if (receiver_->peek(pending)) return Result::Busy;
+    const bool query = frame.kind == v4::Kind::Query || frame.kind == v4::Kind::ProgressQuery;
+    const uint8_t* reply_path = nullptr;
+    uint8_t reply_path_len = 0;
+    if (query) {
+      if (!v4::decodeQueryReplyPath(frame, reply_path, reply_path_len)) return Result::Invalid;
+      const size_t width = (flood_path_len >> 6) + 1;
+      if (flood_path && (width > 3 || (flood_path_len & 63) * width > v4::kMaxReplyPathBytes))
+        return Result::Invalid;
+    }
     if (frame.kind == v4::Kind::Query) {
       if (queried_ && static_cast<uint32_t>(now - last_query_) < 250) return Result::Busy;
       last_query_ = now;
@@ -88,6 +98,17 @@ public:
     }
     local_reply_ = local;
     const Result result = receiver_->onFrame(bytes, size);
+    if (result == Result::Ok && query && receiver_->peek(pending)) {
+      reply_path_len_ = reply_path_len;
+      if (reply_path) {
+        std::memcpy(reply_path_, reply_path, (reply_path_len & 63) * ((reply_path_len >> 6) + 1));
+      } else if (flood_path) {
+        reply_path_len_ = flood_path_len;
+        const size_t width = (flood_path_len >> 6) + 1, count = flood_path_len & 63;
+        for (size_t i = 0; i < count; ++i)
+          std::memcpy(reply_path_ + i * width, flood_path + (count - i - 1) * width, width);
+      }
+    }
     if (result == Result::Ok && lease_active_ &&
         ((frame.kind == v4::Kind::Abort && phase() == v4::Phase::Aborted) ||
          (frame.kind == v4::Kind::Repair && phase() == v4::Phase::Idle))) {
@@ -112,6 +133,8 @@ public:
   }
   void release() { if (receiver_) receiver_->release(); }
   bool localReply() const { return local_reply_; }
+  const uint8_t* replyPath() const { return reply_path_; }
+  uint8_t replyPathLen() const { return reply_path_len_; }
   bool hasPendingRfWork() const {
     size_t size = 0;
     return !local_reply_ && peek(size) != nullptr;
@@ -182,6 +205,7 @@ private:
   void* context_ = nullptr;
   ProfileFn profile_ = nullptr;
   uint32_t lease_expiry_ = 0, last_query_ = 0, restore_after_ = 0;
+  uint8_t reply_path_[v4::kMaxReplyPathBytes]{}, reply_path_len_ = 0;
   float duty_percent_ = 2;
   bool lease_active_ = false, local_reply_ = false, accounting_fault_ = false, queried_ = false;
   bool restore_retry_ = false;

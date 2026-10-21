@@ -28,6 +28,7 @@ inline constexpr size_t kQueryBytes = 32 + 16;
 inline constexpr size_t kSignedStatusBytes = 169;
 inline constexpr size_t kStatusBytes = kSignedStatusBytes + kSignatureBytes;
 inline constexpr size_t kProgressQueryBytes = 32;
+inline constexpr size_t kMaxReplyPathBytes = 20;
 inline constexpr size_t kProgressBytes = 32 + 4 + 2 + 8 + 1 + 1;
 inline constexpr size_t kLeaseParametersBytes = 4 + 4 + 1 + 1 + 4;
 inline constexpr size_t kLeaseCommandBytes = kCommandBytes + kLeaseParametersBytes;
@@ -141,6 +142,22 @@ struct Frame {
   const uint8_t* data = nullptr;
   size_t size = 0;
 };
+
+inline bool decodeQueryReplyPath(const Frame& frame, const uint8_t*& path, uint8_t& encoded) {
+  const size_t base = frame.kind == Kind::Query ? kQueryBytes :
+      frame.kind == Kind::ProgressQuery ? kProgressQueryBytes : 0;
+  path = nullptr;
+  encoded = 0;
+  if (!base || frame.slice || frame.size != frame.total) return false;
+  if (frame.total == base) return true;
+  if (frame.total <= base) return false;
+  encoded = frame.data[base];
+  const size_t width = (encoded >> 6) + 1;
+  const size_t size = (encoded & 63) * width;
+  if (width > 3 || size > kMaxReplyPathBytes || frame.total != base + 1 + size) return false;
+  path = frame.data + base + 1;
+  return true;
+}
 
 inline size_t sliceSize(size_t total, size_t slice) {
   const size_t offset = slice * kSliceBytes;

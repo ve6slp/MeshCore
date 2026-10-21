@@ -25,18 +25,16 @@ __attribute__((noinline)) void Mesh::pumpOtaControl() {
   const uint8_t* frame = ota.peek(len);
   if (frame && !ota.localReply() && !hasQueuedNormalTraffic() &&
       !hasQueuedOtaTraffic() && !isSendInProgress()) {
-    const auto airtime = _radio->getEstAirtimeFor(static_cast<int>(len + 4));
+    const uint8_t path_len = ota.replyPathLen();
+    const auto airtime = _radio->getEstAirtimeFor(static_cast<int>(
+        len + 2 + (path_len & 63) * ((path_len >> 6) + 1)));
     if (ota.canTransmit(_ms->getMillis(), airtime, true, hasQueuedNormalTraffic())) {
       auto* packet = createOtaData(frame, len);
       if (packet) {
-        if (ota.leaseActive()) {
-          packet->header = (packet->header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT;
-          packet->path_len = 0;
-          _tables->markSeen(packet);
-          if (sendPacket(packet, ota::kOtaForwardPriority)) ota.release();
-        } else if (sendFlood(packet)) {
-          ota.release();
-        }
+        packet->header = (packet->header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT;
+        packet->path_len = Packet::copyPath(packet->path, ota.replyPath(), path_len);
+        _tables->markSeen(packet);
+        if (sendPacket(packet, ota::kOtaForwardPriority)) ota.release();
       }
     }
   }
@@ -419,7 +417,8 @@ DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
 
 void Mesh::onOtaDataRecv(Packet* packet) {
 #if MESHCORE_LORA_OTA
-  getOtaIntegration().onFrame(packet->payload, packet->payload_len, false, _ms->getMillis());
+  getOtaIntegration().onFrame(packet->payload, packet->payload_len, false, _ms->getMillis(),
+      packet->isRouteFlood() ? packet->path : nullptr, packet->path_len);
 #else
   (void)packet;
 #endif

@@ -231,6 +231,22 @@ class NativeEndToEndTests(Scratch):
                 self.assertEqual(modeled["frames"], actual["frames"])
                 self.assertEqual(modeled["ota_bytes"], actual["ota_bytes"])
 
+    def test_routed_queries_reach_real_receiver_with_nonce_and_reply_route_intact(self):
+        pkg, job, transport, clock = self.setup_job(b"routed image" * 1000)
+        transport.route = Route(path=bytes.fromhex("11223344"), width=2, max_path_bytes=6)
+        scheduler = Scheduler(job, transport, clock=clock, sleep=clock.sleep)
+        scheduler.stage(clock() + 1000)
+        self.assertTrue(all(s.installed(pkg) for s in scheduler.apply(clock() + 1000)))
+        queries = [f for f in transport.sent if f.kind in (Kind.QUERY, Kind.PROGRESS_QUERY)]
+        self.assertTrue(queries)
+        for frame in queries:
+            base = 48 if frame.kind == Kind.QUERY else 32
+            self.assertEqual(TARGET, frame.data[:32])
+            self.assertEqual(bytes.fromhex("4233441122"), frame.data[base:])
+        report = measure(pkg, transport.route)
+        self.assertEqual(76, report["counts"]["tx/query"]["ota_bytes"] //
+                         report["counts"]["tx/query"]["frames"])
+
     def test_raw_fleet_lost_slices_shared_once_then_selective_repair_and_signed_installation(self):
         image = hashlib.shake_256(b"native v4 fleet").digest(20000)
         pkg, job, transport, clock = self.setup_job(image, 2, compress=False)

@@ -90,7 +90,7 @@ class StockTransport:
             for index, (_, frame) in enumerate(self.node.pending):
                 if frame[0] == 0x88:
                     self.node.pending.pop(index)
-                    payload = packet_payload(frame[3:], self.route.max_path_bytes)
+                    payload = packet_payload(frame[3:], self.route.max_path_bytes, require_delivered=True)
                     if payload is not None:
                         self.last_rx_bytes = (len(frame) - 3, len(frame))
                         return payload

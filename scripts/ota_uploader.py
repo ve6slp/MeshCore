@@ -123,7 +123,8 @@ class Scheduler:
             raise ValueError("query target is outside the durable job")
         for attempt in range(3):
             request, nonce = self.job.request(), os.urandom(16)
-            self._send(Kind.QUERY, target + nonce, deadline, obj=request, tag=bytes(8))
+            reply_path = b"" if self.transport.local else self.transport.route.reply_path()
+            self._send(Kind.QUERY, target + nonce + reply_path, deadline, obj=request, tag=bytes(8))
             try:
                 body, tag = self._receive(Kind.STATUS, request, min(deadline, self.clock() + 30))
                 break
@@ -255,7 +256,8 @@ class Scheduler:
     def progress(self, target, deadline):
         for attempt in range(3):
             request = self.job.request()
-            self._send(Kind.PROGRESS_QUERY, target, deadline, obj=request)
+            reply_path = b"" if self.transport.local else self.transport.route.reply_path()
+            self._send(Kind.PROGRESS_QUERY, target + reply_path, deadline, obj=request)
             try:
                 body, _ = self._receive(Kind.PROGRESS, request, min(deadline, self.clock() + 30), self.package.tag)
                 break
@@ -422,6 +424,10 @@ def parser():
         command.add_argument("--path-width", type=int, choices=(1, 2, 3))
         command.add_argument("--max-path-bytes", type=int,
                              help="explicit maximum grown RX/TX path, at most20")
+        command.add_argument("--return-path",
+                             help="reply route in hex; default reverses --path or the received flood path")
+        command.add_argument("--return-path-width", type=int, choices=(1, 2, 3),
+                             help="reply hash width; requires --return-path, defaults to --path-width")
     for command in commands.choices.values():
         command.add_argument("--by-id", required=True)
         command.add_argument("--usb-serial", help="physical serial; required for stock")
@@ -459,9 +465,10 @@ def main(argv=None):
                     raise Error("resume cannot replace the target set")
                 route = Route.from_policy(policy["route"])
                 selected = {"flood": args.flood, "path": args.path, "width": args.path_width,
-                            "max_path_bytes": args.max_path_bytes}
+                            "max_path_bytes": args.max_path_bytes, "return_path": args.return_path,
+                            "return_width": args.return_path_width}
                 if ((args.duty is not None and args.duty != policy["duty"])
-                        or any(value is not None and value != policy["route"][key]
+                        or any(value is not None and value != policy["route"].get(key)
                                for key, value in selected.items())):
                     raise Error("resume cannot silently change route or airtime policy")
                 if getattr(args, "package", None) is not None and Package.open(args.package).encode() != job.package.encode():
@@ -475,7 +482,9 @@ def main(argv=None):
                 if args.local and args.target != [args.owner]:
                     raise ValueError("native local feed requires the companion's own full target key")
                 route = Route(bool(args.flood), bytes.fromhex(args.path or ""), args.path_width or 1,
-                              args.max_path_bytes or 0)
+                              args.max_path_bytes or 0,
+                              bytes.fromhex(args.return_path) if args.return_path is not None else None,
+                              args.return_path_width)
                 route.validate()
                 policy = {"duty": duty, "route": route.policy(), "transport": args.transport, "local": args.local}
                 job = stack.enter_context(JobStore.create(args.job, Package.open(args.package), args.owner,

@@ -88,11 +88,20 @@ They must reject a route that cannot carry these fixed slices rather than
 truncate, rely on implicit fragmentation, or silently change protocols.
 Native serial and stock serial carry the same OTA objects.
 
-A stock companion can send an update. Multihop updates require OTA-enabled
-relays on the reply path: receivers send STATUS and PROGRESS as floods.
-Unmodified MeshCore 1.18.0 repeaters forward payload `0x0c` along an explicit
-direct route, but drop its flood replies. A working outbound route through
-those repeaters therefore cannot carry a complete update by itself.
+A companion can send an update through MeshCore repeaters using explicit
+routes in both directions. STATUS and PROGRESS use direct routing. For a
+direct request, the host supplies the reverse of its outbound route; set
+`--return-path HEX` when the return route uses different repeaters. For a
+flood request, the receiver reverses the collected ingress path unless the
+host supplies an explicit return path.
+
+Unmodified MeshCore 1.18.0 repeaters forward these direct packets without an
+OTA installer. Use `--path HEX` when crossing them: they still drop payload
+`0x0c` floods, so flood distribution requires OTA-aware outbound relays.
+Receivers running the earlier v4 firmware need an application update before
+they can use routed replies. Install that update using a direct radio link,
+the existing flood-capable relay path, or the device's supported local update
+procedure before selecting an explicit multihop return route.
 
 ## Authority and transaction
 
@@ -173,6 +182,21 @@ and contains target key (32), generation (u32), next chunk (u16), missing-slice
 bitmap (u64), phase (u8), and result (u8). A set bitmap bit means that slice
 is missing. Its full-package tag must match the active job; this unsigned
 object does not prove success or replace fresh signed reconciliation.
+
+Both query kinds may append a reply route: one encoded path-length byte
+`((hash_width - 1) << 6) | hop_count`, followed by the hop hashes in transmission
+order. Hash width is 1, 2 or 3 bytes, with at most 20 path bytes. The route and
+query must fit in one radio slice. A zero-hop supplied route is the single byte
+`0x00`. Invalid widths, lengths, extra bytes or oversized paths are rejected.
+Without a supplied route, RF replies reverse a flood request's collected path,
+or use zero-hop direct routing for a direct request. Local USB replies stay on
+USB. The selected route stays with all slices of that reply; another request
+cannot replace it while a reply is pending.
+
+The route is an unauthenticated delivery hint. It changes neither STATUS's
+signed fields nor the commands, nonces and signatures that authorize updates.
+The host ignores overheard direct packets that still name relay hops; a routed
+reply is delivered only after the last relay has consumed its path.
 
 REPAIR uses the standard signed-command shape, current receiver challenge,
 and zero package hash. It explicitly discards only OTA staging. It is refused
@@ -347,6 +371,12 @@ the stock adapter refuses to call it as a supposedly temporary lease.
 Sender and receiver must already share a suitable legal radio profile.
 For a relayed route, select `--path HEX` and a lower `--duty` to leave airtime
 for each relay to receive and forward between sender transmissions.
+By default, replies reverse the outbound hop order while keeping each hop's
+whole hash. For an asymmetric route, add `--return-path HEX`; use
+`--return-path-width 1|2|3` if its hash width differs from `--path-width`.
+An explicit empty `--return-path ''` requests a zero-hop reply.
+Both directions must fit `--max-path-bytes`. The return route is saved in
+the job policy and cannot be changed when resuming.
 Sender and relay OTA airtime allowances also apply. If a device has used its
 allowance, keep it running while earlier transmissions age out of the one-hour
 window, then resume the same job.

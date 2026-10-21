@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import unittest
+from unittest import mock
 import uuid
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -104,6 +105,23 @@ int main() {
 
 
 class JobTests(Scratch):
+    def test_resume_refuses_return_route_changes_before_opening_the_radio(self):
+        from ota_transport import Route
+        from ota_uploader import main
+        route = Route(path=b"\x11", max_path_bytes=3, return_path=b"\x22")
+        policy = {**POLICY, "route": route.policy()}
+        path = self.directory / "job"
+        with JobStore.create(path, package(), ADMIN, [TARGET], policy):
+            pass
+        with mock.patch("ota_devices.open_companion") as open_radio:
+            with self.assertRaisesRegex(Error, "route or airtime policy"):
+                main(["status", "--job", str(path), "--owner", ADMIN.hex(),
+                      "--transport", "native", "--by-id", "/dev/serial/by-id/test-radio",
+                      "--return-path", "33"])
+        open_radio.assert_not_called()
+        with JobStore.open(path) as job:
+            self.assertEqual(route, Route.from_policy(job.policy["route"]))
+
     def test_exclusive_restart_retains_uncertain_intent_and_exact_signed_package(self):
         pkg = package()
         path = self.directory / "job"

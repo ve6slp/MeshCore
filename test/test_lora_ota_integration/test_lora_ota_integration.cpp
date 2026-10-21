@@ -102,6 +102,43 @@ TEST_F(Integration, LocalFeedUsesTheSameReceiverButNeverCreatesRfWork) {
   EXPECT_EQ(2u, platform.signatures);
 }
 
+TEST_F(Integration, ReplyPathStaysWithEveryPendingSliceAndCannotBeReplacedByAnotherQuery) {
+  uint8_t body[kQueryBytes + 5] = {}, routed[kMaxFrameBytes], tag[8]{};
+  memset(body, 0xA1, 32);
+  body[kQueryBytes] = 0x42;
+  const uint8_t path[]{0x11, 0x22, 0x33, 0x44};
+  memcpy(body + kQueryBytes + 1, path, sizeof(path));
+  const auto size = encodeFrame(Kind::Query, 8, tag, 124, sizeof(body), 0,
+      body, sizeof(body), routed, sizeof(routed));
+  ASSERT_EQ(Result::Ok, integration.onFrame(routed, size, false, 1000));
+  EXPECT_EQ(0x42, integration.replyPathLen());
+  EXPECT_EQ(0, memcmp(path, integration.replyPath(), sizeof(path)));
+  EXPECT_EQ(Result::Busy, integration.onFrame(query, query_size, false, 1500));
+  integration.release();
+  EXPECT_EQ(0x42, integration.replyPathLen());
+  EXPECT_EQ(0, memcmp(path, integration.replyPath(), sizeof(path)));
+  drain();
+  ASSERT_EQ(Result::Ok, integration.onFrame(query, query_size, false, 1600));
+  EXPECT_EQ(0, integration.replyPathLen());
+}
+
+TEST_F(Integration, MalformedReplyPathsAndOversizedFloodPathsNeverProduceAReply) {
+  const std::vector<std::vector<uint8_t>> bad{{0xC0}, {1}, {0, 0}, {21}};
+  for (const auto& suffix : bad) {
+    uint8_t body[kQueryBytes + 2]{}, routed[kMaxFrameBytes], tag[8]{};
+    memset(body, 0xA1, 32);
+    memcpy(body + kQueryBytes, suffix.data(), suffix.size());
+    const auto size = encodeFrame(Kind::Query, 8, tag, 124, kQueryBytes + suffix.size(), 0,
+        body, kQueryBytes + suffix.size(), routed, sizeof(routed));
+    EXPECT_EQ(Result::Invalid, integration.onFrame(routed, size, false, 1000));
+    size_t pending;
+    EXPECT_EQ(nullptr, integration.peek(pending));
+  }
+  uint8_t path[21]{};
+  EXPECT_EQ(Result::Invalid, integration.onFrame(query, query_size, false, 1000, path, 21));
+  EXPECT_EQ(0u, platform.signatures);
+}
+
 TEST_F(Integration, LeaseExpiryAndFailedRestorationRemainOwnedAndDoNotRewritePreferences) {
   struct Radio { unsigned changes = 0, restores = 0; bool restore_ok = false; } radio;
   integration.attachProfile(&radio, [](void* ctx, uint32_t, uint32_t, uint8_t, uint8_t, bool restore) {
@@ -266,6 +303,7 @@ TEST_F(MeshReceiver, ActualMeshFeedsOneReceiverAndDrainsBothGenericStatusSlicesT
   mesh.loop();
   ASSERT_EQ(2u, radio.sent.size());
   for (size_t i = 0; i < radio.sent.size(); ++i) {
+    EXPECT_EQ(ROUTE_TYPE_DIRECT, radio.sent[i][0] & PH_ROUTE_MASK);
     Frame frame;
     ASSERT_TRUE(decodeFrame(radio.sent[i].data() + 2, radio.sent[i].size() - 2, frame));
     EXPECT_EQ(Kind::Status, frame.kind);
@@ -275,6 +313,54 @@ TEST_F(MeshReceiver, ActualMeshFeedsOneReceiverAndDrainsBothGenericStatusSlicesT
   size_t size;
   EXPECT_EQ(nullptr, receiver.peek(size));
   EXPECT_EQ(1u, platform.signatures);
+}
+
+TEST_F(MeshReceiver, FloodQueryRepliesReverseWholeMultiByteHopHashesWithoutFlooding) {
+  query.setPathHashSizeAndCount(2, 2);
+  const uint8_t ingress[]{0x11, 0x22, 0x33, 0x44};
+  memcpy(query.path, ingress, sizeof(ingress));
+  mesh.receive(query);
+  for (unsigned i = 0; i < 8 && radio.sent.size() < 2; ++i) {
+    if (radio.transmitting) radio.complete = true;
+    clock.now += 250;
+    mesh.loop();
+  }
+  ASSERT_EQ(2u, radio.sent.size());
+  for (const auto& raw : radio.sent) {
+    mesh::Packet packet;
+    ASSERT_TRUE(packet.readFrom(raw.data(), raw.size()));
+    EXPECT_EQ(ROUTE_TYPE_DIRECT, packet.getRouteType());
+    EXPECT_EQ(0x42, packet.path_len);
+    const uint8_t reverse[]{0x33, 0x44, 0x11, 0x22};
+    EXPECT_EQ(0, memcmp(reverse, packet.path, sizeof(reverse)));
+    Frame reply;
+    ASSERT_TRUE(decodeFrame(packet.payload, packet.payload_len, reply));
+    EXPECT_EQ(Kind::Status, reply.kind);
+  }
+}
+
+TEST_F(MeshReceiver, ExplicitReplyPathOverridesFloodIngressForAsymmetricRoutes) {
+  uint8_t body[kQueryBytes + 3]{}, tag[8]{};
+  memset(body, 0xA1, 32);
+  body[kQueryBytes] = 2;
+  body[kQueryBytes + 1] = 0x55;
+  body[kQueryBytes + 2] = 0x66;
+  query.payload_len = encodeFrame(Kind::Query, 8, tag, 124, sizeof(body), 0,
+      body, sizeof(body), query.payload, sizeof(query.payload));
+  query.path_len = 1;
+  query.path[0] = 0x77;
+  mesh.receive(query);
+  clock.now = 2;
+  mesh.loop();
+  clock.now = 3;
+  mesh.loop();
+  ASSERT_EQ(1u, radio.sent.size());
+  mesh::Packet reply;
+  ASSERT_TRUE(reply.readFrom(radio.sent[0].data(), radio.sent[0].size()));
+  EXPECT_EQ(ROUTE_TYPE_DIRECT, reply.getRouteType());
+  EXPECT_EQ(2, reply.path_len);
+  EXPECT_EQ(0x55, reply.path[0]);
+  EXPECT_EQ(0x66, reply.path[1]);
 }
 
 TEST_F(MeshReceiver, SameAttemptIsSuppressedButANewV4AttemptReachesTheSameReceiver) {

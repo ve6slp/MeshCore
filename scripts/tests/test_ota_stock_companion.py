@@ -69,6 +69,37 @@ class TransportTests(unittest.TestCase):
             Route(path=bytes(21), max_path_bytes=21).packet(self.frame())
         self.assertEqual(Route().packet(self.frame())[2:4], b"\xd4\x05")
 
+    def test_reply_routes_reverse_whole_hashes_and_allow_an_explicit_asymmetric_path(self):
+        route = Route(path=bytes.fromhex("11223344"), width=2, max_path_bytes=6)
+        self.assertEqual(bytes.fromhex("4233441122"), route.reply_path())
+        self.assertEqual(route, Route.from_policy(route.policy()))
+        asymmetric = Route(path=b"\x11", max_path_bytes=6,
+                           return_path=bytes.fromhex("aabbcc"), return_width=3)
+        self.assertEqual(bytes.fromhex("81aabbcc"), asymmetric.reply_path())
+        self.assertEqual(asymmetric, Route.from_policy(asymmetric.policy()))
+        self.assertEqual(b"", Route(flood=True, max_path_bytes=20).reply_path())
+        self.assertEqual(b"", Route().reply_path())
+        self.assertEqual(b"\0", Route(return_path=b"").reply_path())
+        with self.assertRaises(ValueError):
+            Route(return_width=2).validate()
+        with self.assertRaises(ValueError):
+            Route(return_path=b"\x11", return_width=2, max_path_bytes=2).validate()
+        with self.assertRaises(ValueError):
+            Route(return_path=bytes(21), max_path_bytes=20).validate()
+
+    def test_stock_raw_receive_ignores_routed_replies_before_the_last_relay(self):
+        clock = Clock()
+        reply = Frame(Kind.STATUS, 1, b"P" * 8, 9, 1, 0, b"x").encode()
+        before_relay = b"\x88\x08\xc0" + Route(path=b"\xab", max_path_bytes=1).packet(reply)
+        delivered = b"\x88\x08\xc0" + Route().packet(reply)
+        node = SimpleNamespace(pending=[(clock(), before_relay), (clock(), delivered)],
+                               poll=lambda *_: clock.sleep(.1))
+        transport = StockTransport(node, ADMIN, Route(max_path_bytes=1), clock=clock)
+        self.assertEqual(reply, transport.receive(clock() + 1))
+        self.assertEqual([], node.pending)
+        node.pending.append((clock(), before_relay))
+        self.assertIsNone(transport.receive(clock() + 1))
+
     def test_native_local_and_physical_bridge_preserve_exact_frame(self):
         clock = Clock()
         node = SimpleNamespace(pending=[], stream=SimpleNamespace(write_timeout=0))

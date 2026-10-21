@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <Mesh.h>
 #include <helpers/StaticPoolPacketManager.h>
+#include <helpers/ota/OtaV4Protocol.h>
 #include "legacy_packet_manager.h"
 #include <array>
 #include <deque>
@@ -217,6 +218,37 @@ TEST_F(Fixture, ForwardedOtaDirectPacketKeepsPriorityAtConfiguredDelay) {
 #endif
   EXPECT_EQ(0, p->getPathHashCount());
   mesh.releasePacket(p);
+}
+
+TEST_F(Fixture, RoutedStatusAndProgressPassThroughRelaysWithTheirPayloadUnchanged) {
+  for (const auto kind : {mesh::ota::v4::Kind::Status, mesh::ota::v4::Kind::Progress}) {
+    for (uint8_t width : {1, 2, 3}) {
+      auto* p = packet(PAYLOAD_TYPE_LORA_OTA, ROUTE_TYPE_DIRECT);
+      p->setPathHashSizeAndCount(width, 2);
+      memset(mesh.self_id.pub_key, 0, sizeof(mesh.self_id.pub_key));
+      mesh.self_id.pub_key[0] = 0xAB;
+      memset(p->path, 0, 2 * width);
+      p->path[0] = 0xAB;
+      p->path[width] = 0xCD;
+      const uint8_t tag[8]{}, body[128]{};
+      const size_t total = kind == mesh::ota::v4::Kind::Status ? 233 : 48;
+      const size_t slice = total < 128 ? total : 128;
+      p->payload_len = mesh::ota::v4::encodeFrame(kind, 1, tag, 123, total, 0,
+          body, slice, p->payload, sizeof(p->payload));
+      const std::vector<uint8_t> before(p->payload, p->payload + p->payload_len);
+#if MESHCORE_LORA_OTA || MESHCORE_LORA_OTA_RELAY
+      EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(mesh::ota::kOtaForwardPriority, 0), mesh.receive(p));
+#else
+      EXPECT_EQ(ACTION_RETRANSMIT_DELAYED(0, 0), mesh.receive(p));
+#endif
+      EXPECT_EQ(1, p->getPathHashCount());
+      EXPECT_EQ(width, p->getPathHashSize());
+      EXPECT_EQ(0xCD, p->path[0]);
+      EXPECT_EQ(before, std::vector<uint8_t>(p->payload, p->payload + p->payload_len));
+      EXPECT_EQ(0, mesh.ota_received);
+      mesh.releasePacket(p);
+    }
+  }
 }
 
 TEST_F(Fixture, ForwardedDirectAcksApplyConfiguredDelayOnceBeforeSpacedCopies) {

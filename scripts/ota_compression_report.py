@@ -60,11 +60,12 @@ def measure(package, route, recipients=1, bandwidth=62500, sf=7, cr=5):
     surveys = 7 + bursts // 8
     # The scheduler's no-loss, immediate-processing scenario. Real extra polls,
     # repairs and interrupted transmissions are captured in the durable job.
-    object_frames(Kind.QUERY, 48, recipients * surveys)
+    reply_path_bytes = len(route.reply_path())
+    object_frames(Kind.QUERY, 48 + reply_path_bytes, recipients * surveys)
     object_frames(Kind.STATUS, 233, recipients * surveys, "rx")
     object_frames(Kind.ADMIT, 180, recipients)
     object_frames(Kind.ACTIVATE, 180, recipients)
-    object_frames(Kind.PROGRESS_QUERY, 32, recipients * bursts)
+    object_frames(Kind.PROGRESS_QUERY, 32 + reply_path_bytes, recipients * bursts)
     object_frames(Kind.PROGRESS, 48, recipients * bursts, "rx")
     host_air = sum(c["estimated_air_s"] for k, c in counts.items() if k.startswith("tx/"))
     reply_air = sum(c["estimated_air_s"] for k, c in counts.items() if k.startswith("rx/"))

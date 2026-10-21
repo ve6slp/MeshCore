@@ -214,8 +214,13 @@ Result Receiver::onFrame(const uint8_t* bytes, size_t size) {
 Result Receiver::control(const Frame& f) {
   size_t expected = 0;
   switch (f.kind) {
-    case Kind::Query: expected = kQueryBytes; break;
-    case Kind::ProgressQuery: expected = kProgressQueryBytes; break;
+    case Kind::Query: case Kind::ProgressQuery: {
+      const uint8_t* path;
+      uint8_t encoded;
+      if (!decodeQueryReplyPath(f, path, encoded)) return Result::Invalid;
+      expected = f.total;
+      break;
+    }
     case Kind::Admit: case Kind::Activate: case Kind::Abort: case Kind::Repair:
       expected = kCommandBytes; break;
     case Kind::Lease: expected = kLeaseCommandBytes; break;
